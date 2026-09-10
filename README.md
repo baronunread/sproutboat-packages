@@ -4,6 +4,11 @@ One repo, multiple packages. These contracts are version-locked by nature:
 the CLI writes them and the platform reads them, so they must change
 atomically. That is why they live together instead of one repo per package.
 
+## Issues
+
+Tracked centrally in [baronunread/sproutboat](https://github.com/baronunread/sproutboat/issues).
+Please file there.
+
 | Package | Owns | Lives today in |
 | --- | --- | --- |
 | `@sproutboat/config` | `sproutboat.jsonc` parsing, validation, binding slots | adopted (was `sproutboat-cli/src/config.ts`) |
