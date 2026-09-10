@@ -6,11 +6,13 @@ atomically. That is why they live together instead of one repo per package.
 
 | Package | Owns | Lives today in |
 | --- | --- | --- |
-| `@sproutboat/config` | `sproutboat.jsonc` parsing, validation, binding slots | `sproutboat-cli/src/config.ts` (+ the platform's copy) |
-| `@sproutboat/artifact` | Artifact manifest schema, bindings report | `sproutboat-cli/src/manifest.ts`, `src/report.ts` (+ the platform's copy) |
+| `@sproutboat/config` | `sproutboat.jsonc` parsing, validation, binding slots | adopted (was `sproutboat-cli/src/config.ts`) |
+| `@sproutboat/artifact` | Artifact manifest schema, bindings report | adopted (was `sproutboat-cli/src/manifest.ts`) |
+| `@sproutboat/wire` | Broker frame protocol, JSON utilities | adopted (was `sproutboat-cli/src/broker.ts`, `json.ts`) |
+| `@sproutboat/assets` | Static asset manifests and key resolution | adopted (was `sproutboat-cli/src/assets.ts`) |
+| `@sproutboat/runtime` | Wrapper, source validation, transports, prelude | adopted (was `sproutboat-cli/src/wrap.ts` et al) |
 
-Later candidates: `@sproutboat/wire` (broker frame ops), `@sproutboat/crypto`
-(prelude shims shared by both transports).
+Later candidates: `@sproutboat/crypto` (prelude shims shared by both transports).
 
 ## Workflow
 
@@ -33,5 +35,7 @@ imports these packages yet.
 
 ## Adoption
 
-- Packages home (this repo): baronunread/sproutboat-packages#1 (transferred from baronunread/sproutboat#150)
-- CLI: baronunread/sproutboat-cli#33
+- Packages home (this repo): baronunread/sproutboat-packages#1
+- CLI consumer: baronunread/sproutboat-cli#33
+- All five packages adopted; both consumers import them directly. The CLI
+  keeps re-export shims so its `sproutboat/runtime/*` export paths hold.

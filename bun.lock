@@ -16,9 +16,24 @@
       "name": "@sproutboat/artifact",
       "version": "0.1.0",
     },
+    "packages/assets": {
+      "name": "@sproutboat/assets",
+      "version": "0.1.0",
+    },
     "packages/config": {
       "name": "@sproutboat/config",
       "version": "0.1.0",
+    },
+    "packages/runtime": {
+      "name": "@sproutboat/runtime",
+      "version": "0.1.0",
+    },
+    "packages/wire": {
+      "name": "@sproutboat/wire",
+      "version": "0.1.0",
+      "dependencies": {
+        "@sproutboat/assets": "workspace:*",
+      },
     },
   },
   "packages": {
@@ -106,7 +121,13 @@
 
     "@sproutboat/artifact": ["@sproutboat/artifact@workspace:packages/artifact"],
 
+    "@sproutboat/assets": ["@sproutboat/assets@workspace:packages/assets"],
+
     "@sproutboat/config": ["@sproutboat/config@workspace:packages/config"],
+
+    "@sproutboat/runtime": ["@sproutboat/runtime@workspace:packages/runtime"],
+
+    "@sproutboat/wire": ["@sproutboat/wire@workspace:packages/wire"],
 
     "@types/node": ["@types/node@22.20.2", "", { "dependencies": { "undici-types": "~6.21.0" } }, "sha512-xlvWf4Vs9n1PEVYwP1n4vvG07M6y8WgvJ2t0vbrWTmijsIHp1cS+uJ2kMIRdY3nHZK0nCYKrPeD171+SzF4/zw=="],
 
