@@ -14,23 +14,27 @@
     },
     "packages/artifact": {
       "name": "@sproutboat/artifact",
-      "version": "0.1.0",
+      "version": "0.2.0",
     },
     "packages/assets": {
       "name": "@sproutboat/assets",
-      "version": "0.1.0",
+      "version": "0.2.0",
     },
     "packages/config": {
       "name": "@sproutboat/config",
-      "version": "0.1.0",
+      "version": "0.2.0",
     },
     "packages/runtime": {
       "name": "@sproutboat/runtime",
-      "version": "0.1.0",
+      "version": "0.3.0",
+    },
+    "packages/toolchain": {
+      "name": "@sproutboat/toolchain",
+      "version": "0.3.0",
     },
     "packages/wire": {
       "name": "@sproutboat/wire",
-      "version": "0.1.0",
+      "version": "0.3.0",
       "dependencies": {
         "@sproutboat/assets": "workspace:*",
       },
@@ -126,6 +130,8 @@
     "@sproutboat/config": ["@sproutboat/config@workspace:packages/config"],
 
     "@sproutboat/runtime": ["@sproutboat/runtime@workspace:packages/runtime"],
+
+    "@sproutboat/toolchain": ["@sproutboat/toolchain@workspace:packages/toolchain"],
 
     "@sproutboat/wire": ["@sproutboat/wire@workspace:packages/wire"],
 

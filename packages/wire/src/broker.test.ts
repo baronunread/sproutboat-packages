@@ -105,6 +105,30 @@ test("D1: query / run / batch on a bound database, isolated per name", async () 
   await expect(b.dispatch({ op: "d1.query", db: "NOPE", sql: "SELECT 1", params: [] })).rejects.toThrow("not bound");
 });
 
+test("D1: backup writes an integrity-checked snapshot, replayed from cache", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "sb-broker-backup-"));
+  try {
+    const b = make({ db: join(dir, "store.sqlite"), bindings: { d1: ["DB"] } });
+    await b.dispatch({ op: "d1.exec", db: "DB", sql: "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)" });
+    await b.dispatch({ op: "d1.query", db: "DB", sql: "INSERT INTO t (name) VALUES (?)", params: ["ada"] });
+
+    const bk = await b.dispatch({ op: "d1.backup", db: "DB", name: "snap.sqlite" });
+    expect(bk.ok).toBe(true);
+    expect(String(bk.path).endsWith(join("backups", "snap.sqlite"))).toBe(true);
+    expect(Number(bk.bytes)).toBeGreaterThan(0);
+    expect(existsSync(String(bk.path))).toBe(true);
+
+    // the snapshot is a real, readable database with the row in it
+    const snap = new Database(String(bk.path), { readonly: true });
+    expect(snap.query("SELECT name FROM t").all()).toEqual([{ name: "ada" }]);
+    snap.close();
+
+    await expect(b.dispatch({ op: "d1.backup", db: "NOPE" })).rejects.toThrow("not bound");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("R2: put / get / head / list / delete on a bound bucket", async () => {
   const b = make({ bindings: { r2: ["ASSETS"] } });
   const put = await b.dispatch({

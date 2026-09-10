@@ -1,16 +1,14 @@
 {
-  "name": "@sproutboat/wire",
+  "name": "@sproutboat/toolchain",
   "version": "0.3.0",
   "license": "MIT",
   "type": "module",
   "main": "./src/index.ts",
   "types": "./src/index.ts",
-  "dependencies": {
-    "@sproutboat/assets": "^0.2.0"
-  },
   "exports": {
     ".": "./src/index.ts",
-    "./broker": "./src/broker.ts",
+    "./pin": "./src/pin.ts",
+    "./patch": "./src/patch.ts",
     "./package.json": "./package.json"
   },
   "scripts": {

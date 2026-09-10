@@ -35,6 +35,7 @@ extern int sqlite3_prepare_v2(sqlite3*, const char*, int, sqlite3_stmt**, const 
 extern int sqlite3_step(sqlite3_stmt*);
 extern int sqlite3_finalize(sqlite3_stmt*);
 extern int sqlite3_reset(sqlite3_stmt*);
+extern int sqlite3_clear_bindings(sqlite3_stmt*);
 extern int sqlite3_column_count(sqlite3_stmt*);
 extern int sqlite3_column_type(sqlite3_stmt*, int);
 extern const unsigned char* sqlite3_column_text(sqlite3_stmt*, int);
@@ -50,6 +51,7 @@ extern const void* sqlite3_column_blob(sqlite3_stmt*, int);
 extern int sqlite3_changes(sqlite3*);
 extern int64_t sqlite3_last_insert_rowid(sqlite3*);
 extern const char* sqlite3_errmsg(sqlite3*);
+extern int sqlite3_close(sqlite3*);
 
 #define SB_SQLITE_ROW 100
 #define SB_SQLITE_DONE 101
@@ -101,6 +103,42 @@ static int sb_db_for(const char* path) {
   sb_dbs[sb_db_count] = db;
   snprintf(sb_db_names[sb_db_count], 256, "%s", path);
   return sb_db_count++;
+}
+
+// #155 — a prepared-statement cache per database. Every binding op (KV, D1, DO
+// storage, queue, AE) funnels through sb_sql_run, which used to prepare and
+// finalize on every call — measured at ~0.6 ms/op, that compile step was most
+// of an op's cost. Keyed by exact SQL text; reset and re-bound on reuse.
+//
+// ponytail: FIFO eviction over 32 slots, linear scan, no lock (the runtime
+// serves one turn at a time). Move to LRU + a hash if a real app keeps >32 hot
+// statements per db, or if execution ever overlaps. Entries are never finalized
+// on shutdown — sb_db_for never closes a handle, the process owns it for life.
+#define SB_STMT_CACHE 32
+typedef struct { char* sql; sqlite3_stmt* st; } sb_cached_stmt;
+static sb_cached_stmt sb_stmt_cache[SB_MAX_DB][SB_STMT_CACHE];
+static int sb_stmt_fifo[SB_MAX_DB];
+
+static sqlite3_stmt* sb_stmt_get(int idx, sqlite3* db, const char* sql) {
+  sb_cached_stmt* slots = sb_stmt_cache[idx];
+  for (int i = 0; i < SB_STMT_CACHE; i++) {
+    if (slots[i].sql && strcmp(slots[i].sql, sql) == 0) {
+      sqlite3_reset(slots[i].st);
+      sqlite3_clear_bindings(slots[i].st);
+      return slots[i].st;
+    }
+  }
+  sqlite3_stmt* st = 0;
+  if (sqlite3_prepare_v2(db, sql, -1, &st, 0) != 0 || !st) return 0;
+  int slot = sb_stmt_fifo[idx];
+  sb_stmt_fifo[idx] = (slot + 1) % SB_STMT_CACHE;
+  if (slots[slot].st) sqlite3_finalize(slots[slot].st);
+  free(slots[slot].sql);
+  size_t n = strlen(sql);
+  slots[slot].sql = (char*)malloc(n + 1);
+  if (slots[slot].sql) memcpy(slots[slot].sql, sql, n + 1);
+  slots[slot].st = st;
+  return st;
 }
 
 // --- a growable output buffer, for building the reply JSON ------------------
@@ -319,8 +357,8 @@ static char* sb_sql_run(const char* path, const char* sql, const char* params) {
   int idx = sb_db_for(path);
   if (idx < 0) { sb_puts(&b, "{\"ok\":false,\"error\":\"cannot open database\"}"); return b.p; }
   sqlite3* db = sb_dbs[idx];
-  sqlite3_stmt* st = 0;
-  if (sqlite3_prepare_v2(db, sql, -1, &st, 0) != 0 || !st) {
+  sqlite3_stmt* st = sb_stmt_get(idx, db, sql);
+  if (!st) {
     sb_puts(&b, "{\"ok\":false,\"error\":");
     const char* m = sqlite3_errmsg(db);
     sb_putjson(&b, m, strlen(m));
@@ -361,7 +399,9 @@ static char* sb_sql_run(const char* path, const char* sql, const char* params) {
   char tail[96];
   int k = snprintf(tail, 96, "],\"changes\":%d,\"rowid\":%lld}", sqlite3_changes(db), (long long)sqlite3_last_insert_rowid(db));
   sb_put(&b, tail, (size_t)k);
-  sqlite3_finalize(st);
+  // Reset, don't finalize: the statement stays compiled in sb_stmt_cache. Reset
+  // now (not just on next reuse) so a SELECT stops holding its read transaction.
+  sqlite3_reset(st);
   if (rc != SB_SQLITE_DONE && rc != SB_SQLITE_ROW) {
     free(b.p);
     sb_buf e = { 0, 0, 0 };
@@ -371,6 +411,67 @@ static char* sb_sql_run(const char* path, const char* sql, const char* params) {
     sb_puts(&e, "}");
     return e.p;
   }
+  return b.p;
+}
+
+// #164 — an online, consistent single-file snapshot of a database, via
+// VACUUM INTO. Runs against the live db with no downtime (SQLite holds a read
+// transaction for the copy) and writes a fresh, defragmented file with no WAL
+// sidecars — exactly what you copy off the box. The copy is then reopened and
+// PRAGMA integrity_check'd, so a bad backup fails here, not on restore.
+// Returns {"ok":true,"bytes":n} or {"ok":false,"error":"..."}.
+static char* sb_sql_backup(const char* src_path, const char* dest_path) {
+  sb_buf b = { 0, 0, 0 };
+  int idx = sb_db_for(src_path);
+  if (idx < 0) { sb_puts(&b, "{\"ok\":false,\"error\":\"cannot open database\"}"); return b.p; }
+  sqlite3* db = sb_dbs[idx];
+
+  sb_mkdirs(dest_path);
+  unlink(dest_path); // VACUUM INTO refuses to overwrite an existing file
+
+  sqlite3_stmt* st = 0;
+  if (sqlite3_prepare_v2(db, "VACUUM INTO ?1", -1, &st, 0) != 0 || !st) {
+    sb_puts(&b, "{\"ok\":false,\"error\":");
+    const char* m = sqlite3_errmsg(db);
+    sb_putjson(&b, m, strlen(m));
+    sb_puts(&b, "}");
+    return b.p;
+  }
+  sqlite3_bind_text(st, 1, dest_path, -1, SB_SQLITE_TRANSIENT);
+  int rc = sqlite3_step(st);
+  sqlite3_finalize(st);
+  if (rc != SB_SQLITE_DONE) {
+    sb_puts(&b, "{\"ok\":false,\"error\":");
+    const char* m = sqlite3_errmsg(db);
+    sb_putjson(&b, m, strlen(m));
+    sb_puts(&b, "}");
+    return b.p;
+  }
+
+  sqlite3* chk = 0;
+  int ok = 0;
+  if (sqlite3_open(dest_path, &chk) == 0 && chk) {
+    sqlite3_stmt* cs = 0;
+    if (sqlite3_prepare_v2(chk, "PRAGMA integrity_check", -1, &cs, 0) == 0 && cs) {
+      if (sqlite3_step(cs) == SB_SQLITE_ROW) {
+        const unsigned char* r = sqlite3_column_text(cs, 0);
+        ok = r && strcmp((const char*)r, "ok") == 0;
+      }
+      sqlite3_finalize(cs);
+    }
+  }
+  if (chk) sqlite3_close(chk);
+  if (!ok) {
+    unlink(dest_path);
+    sb_puts(&b, "{\"ok\":false,\"error\":\"integrity check failed on the backup\"}");
+    return b.p;
+  }
+
+  struct stat sbuf;
+  long long bytes = stat(dest_path, &sbuf) == 0 ? (long long)sbuf.st_size : -1;
+  char head[64];
+  int k = snprintf(head, sizeof(head), "{\"ok\":true,\"bytes\":%lld}", bytes);
+  sb_put(&b, head, (size_t)k);
   return b.p;
 }
 
@@ -894,6 +995,33 @@ function __sbSqlScriptRaw(path, sql) {
   return res;
 }
 
+// #164 — VACUUM INTO a fresh file. Two strings in, JSON out. Same pattern as
+// __sbSqlScriptRaw.
+// oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
+function __sbD1BackupRaw(src, dest) {
+  let res = "";
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    const char* __s; size_t __sl; char* __so = 0;
+    porf_native_fetch_read_value(src, &__s, &__sl, &__so);
+    char* __src = (char*)malloc(__sl + 1); memcpy(__src, __s, __sl); __src[__sl] = 0;
+    if (__so) free(__so);
+
+    const char* __d; size_t __dl; char* __do = 0;
+    porf_native_fetch_read_value(dest, &__d, &__dl, &__do);
+    char* __dest = (char*)malloc(__dl + 1); memcpy(__dest, __d, __dl); __dest[__dl] = 0;
+    if (__do) free(__do);
+
+    char* __out = sb_sql_backup(__src, __dest);
+    free(__src); free(__dest);
+    if (__out) {
+      res = porf_box((f64)porf_native_fetch_alloc_bytestring(__out, strlen(__out)), 195);
+      free(__out);
+    }
+  `;
+  return res;
+}
+
 // Outbound HTTP. String params so C can read each directly; the JS side has
 // already split the URL and enforced the allowlist. `tlsFlag` is "1" or "0" —
 // a string like the rest, so the marshalling stays uniform.
@@ -1197,6 +1325,20 @@ function __sbEmbeddedDispatch(msg) {
     }
     const one = __sbD1Run(path, msg.sql, msg.params);
     return { ok: true, results: one.results, meta: one.meta, success: true };
+  }
+
+  if (op === "d1.backup") {
+    const src = __sbD1Path(String(msg.db));
+    // A caller-supplied name must be a plain basename; anything else falls back
+    // to the timestamped default, so nothing can climb out of backups/.
+    const given = String(msg.name || "");
+    const name = /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(given)
+      ? given
+      : String(msg.db) + "-" + new Date().toISOString().replace(/[:.]/g, "-") + ".sqlite";
+    const dest = __sbDir() + "/backups/" + name;
+    const reply = JSON.parse(__sbD1BackupRaw(src, dest));
+    if (reply.ok === false) throw new Error("d1 backup: " + reply.error);
+    return { ok: true, path: dest, bytes: reply.bytes };
   }
 
   if (op === "r2.put") {

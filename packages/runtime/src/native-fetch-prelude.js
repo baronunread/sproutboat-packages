@@ -421,6 +421,14 @@ function __sbMakeD1(dbName) {
       __sbRpc("d1.exec", { db: dbName, sql: String(sql) });
       return { count: (String(sql).match(/;/g) || []).length, duration: 0 };
     },
+    // Sproutboat extension (not in CF Workers D1): an online, integrity-checked
+    // snapshot of this database. Standalone only for now — the broker transport
+    // returns an error until hosted backup (#139) covers it. `name` lands under
+    // `<data-dir>/backups/`; omit it for a timestamped default. See #164.
+    backup(name) {
+      const r = __sbRpc("d1.backup", { db: dbName, name: name == null ? "" : String(name) });
+      return { path: r.path, bytes: r.bytes };
+    },
   };
 }
 
@@ -844,9 +852,119 @@ function __sbTriggerAuthed(request) {
   return request.headers.get("x-sb-token") === want;
 }
 
+// #163 — the connection's remote address, for `request.cf.clientIp`.
+//
+// `x-sb-remote-addr` is the TCP peer, appended by the server (see
+// patches/UPSTREAM.md #163) and stripped from anything a client sends, so it
+// cannot be forged. With no proxy in front, that is the client. Behind one, set
+// `SB_TRUSTED_PROXIES` to a comma-separated list of trusted CIDRs (or bare IPs):
+// when the peer is trusted, the client is the rightmost `x-forwarded-for` entry
+// that is not itself a trusted hop.
+//
+// ponytail: IPv4 CIDR ranges + exact-string match (which covers a bare IPv6).
+// An IPv6 *prefix* in SB_TRUSTED_PROXIES matches nothing — widen __sbIpInCidr if
+// a deployment ever fronts its sprout with an IPv6 proxy range.
+function __sbParseHex(s) {
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    let d = -1;
+    if (c >= 48 && c <= 57) d = c - 48;
+    else if (c >= 97 && c <= 102) d = c - 87;
+    else if (c >= 65 && c <= 70) d = c - 55;
+    if (d < 0) return -1;
+    n = n * 16 + d;
+  }
+  return n;
+}
+// uWS hands back IPv4-mapped IPv6 for IPv4 clients on a dual-stack socket
+// (`::ffff:1.2.3.4`, or fully expanded `0:0:0:0:0:ffff:0102:0304`). Fold those
+// to the dotted IPv4 so CIDR matching and `clientIp` see a plain address.
+function __sbNormalizeIp(ip) {
+  const s = String(ip || "");
+  if (s.indexOf(":") === -1) return s;
+  const low = s.toLowerCase();
+  const dotted = low.indexOf("::ffff:");
+  if (dotted === 0 && low.indexOf(".") !== -1) return low.slice(7);
+  const g = low.split(":");
+  if (g.length === 8) {
+    let mapped = __sbParseHex(g[5]) === 0xffff;
+    for (let i = 0; i < 5; i++) if (__sbParseHex(g[i] || "0") !== 0) mapped = false;
+    if (mapped) {
+      const hi = __sbParseHex(g[6] || "0");
+      const lo = __sbParseHex(g[7] || "0");
+      if (hi >= 0 && lo >= 0) {
+        return ((hi / 256) | 0) + "." + (hi & 0xff) + "." + ((lo / 256) | 0) + "." + (lo & 0xff);
+      }
+    }
+  }
+  return s;
+}
+function __sbTrim(s) {
+  let a = 0;
+  let b = s.length;
+  while (a < b && (s.charCodeAt(a) === 32 || s.charCodeAt(a) === 9)) a++;
+  while (b > a && (s.charCodeAt(b - 1) === 32 || s.charCodeAt(b - 1) === 9)) b--;
+  return s.slice(a, b);
+}
+function __sbSplitList(raw) {
+  const out = [];
+  const parts = String(raw || "").split(",");
+  for (let i = 0; i < parts.length; i++) {
+    const v = __sbTrim(parts[i]);
+    if (v) out.push(v);
+  }
+  return out;
+}
+function __sbIpToLong(ip) {
+  const p = String(ip).split(".");
+  if (p.length !== 4) return -1;
+  let n = 0;
+  for (let i = 0; i < 4; i++) {
+    if (p[i] === "" || p[i].length > 3) return -1;
+    const o = Number(p[i]);
+    if (!(o >= 0 && o <= 255) || o !== (o | 0)) return -1;
+    n = n * 256 + o;
+  }
+  return n;
+}
+function __sbIpInCidr(ip, cidr) {
+  const slash = cidr.indexOf("/");
+  if (slash === -1) return ip === cidr; // bare IP: exact match, covers IPv6
+  const addr = __sbIpToLong(ip);
+  const base = __sbIpToLong(cidr.slice(0, slash));
+  const bits = Number(cidr.slice(slash + 1));
+  if (addr < 0 || base < 0 || !(bits >= 0 && bits <= 32)) return false;
+  if (bits === 0) return true;
+  if (bits === 32) return addr === base;
+  // Divide rather than mask: a 32-bit `&` in JS is signed and would miscompare
+  // addresses above 2^31.
+  const size = Math.pow(2, 32 - bits);
+  return Math.floor(addr / size) === Math.floor(base / size);
+}
+function __sbIpTrusted(ip, list) {
+  for (let i = 0; i < list.length; i++) if (__sbIpInCidr(ip, list[i])) return true;
+  return false;
+}
+function __sbClientIp(request) {
+  const peer = __sbNormalizeIp(request.headers.get("x-sb-remote-addr") || "");
+  const trusted = __sbSplitList(__sbEnv("SB_TRUSTED_PROXIES"));
+  if (!trusted.length || !__sbIpTrusted(peer, trusted)) return peer;
+  const xff = __sbSplitList(request.headers.get("x-forwarded-for"));
+  for (let i = xff.length - 1; i >= 0; i--) {
+    const hop = __sbNormalizeIp(xff[i]);
+    if (!__sbIpTrusted(hop, trusted)) return hop;
+  }
+  return peer;
+}
+
 globalThis.__sbEntry = function (handlers, request) {
   const trigger = request.headers.get("x-sb-trigger");
   if (!trigger) {
+    // #163 — expose the resolved client IP the Workers way, before the handler runs.
+    const __cf = request.cf || {};
+    __cf.clientIp = __sbClientIp(request);
+    request.cf = __cf;
     // #28 — per-invocation CPU time. One fetch turn per process (serial), so the
     // process CPU delta across the handler is this invocation's CPU.
     // ponytail: serial-turn assumption; revisit if the profile ever allows

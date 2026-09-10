@@ -19,7 +19,7 @@
  */
 import { Database, type Statement } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { dirname, join, normalize, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { resolveAssetKey, type AssetManifest } from "@sproutboat/assets";
@@ -375,6 +375,34 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     };
   };
 
+  // #164 — an online, integrity-checked snapshot of a D1 database via
+  // VACUUM INTO. Standalone (transport-embedded) is the primary target; the
+  // broker carries it too so one conformance suite covers both backends.
+  const d1Backup = (conn: Database, dbName: string, name: string) => {
+    const source = conn.filename;
+    if (!source || source === ":memory:") throw new Error("d1 backup needs a file-backed database");
+    // A caller-supplied name must be a plain basename; else use the default.
+    const file = /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)
+      ? name
+      : `${dbName}-${new Date().toISOString().replace(/[:.]/g, "-")}.sqlite`;
+    const dir = join(dirname(dirname(resolve(source))), "backups");
+    mkdirSync(dir, { recursive: true });
+    const dest = join(dir, file);
+    if (existsSync(dest)) rmSync(dest); // VACUUM INTO refuses an existing target
+    conn.run("VACUUM INTO ?", [dest]);
+    const copy = new Database(dest, { readonly: true });
+    try {
+      const row = copy.query<{ integrity_check: string }, []>("PRAGMA integrity_check").get();
+      if (row?.integrity_check !== "ok") {
+        rmSync(dest, { force: true });
+        throw new Error("integrity check failed on the backup");
+      }
+    } finally {
+      copy.close();
+    }
+    return { path: dest, bytes: statSync(dest).size };
+  };
+
   /** An object body as bytes, whichever storage class it came back in. */
   const r2Bytes = (body: string | Uint8Array): Uint8Array =>
     body instanceof Uint8Array ? body : new TextEncoder().encode(body);
@@ -552,6 +580,10 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         const conn = d1(requireD1(msg.db));
         conn.exec(str(msg.sql));
         return { ok: true };
+      }
+      case "d1.backup": {
+        const name = requireD1(msg.db);
+        return { ok: true, ...d1Backup(d1(name), name, msg.name == null ? "" : str(msg.name)) };
       }
 
       case "r2.put": {
@@ -864,6 +896,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     "d1.query",
     "d1.exec",
     "d1.batch",
+    "d1.backup",
     "r2.put",
     "r2.delete",
     "do.storage.put",
