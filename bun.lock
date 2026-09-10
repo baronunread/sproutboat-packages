@@ -22,11 +22,11 @@
     },
     "packages/config": {
       "name": "@sproutboat/config",
-      "version": "0.2.0",
+      "version": "0.3.0",
     },
     "packages/runtime": {
       "name": "@sproutboat/runtime",
-      "version": "0.3.0",
+      "version": "0.4.0",
     },
     "packages/toolchain": {
       "name": "@sproutboat/toolchain",
@@ -34,7 +34,7 @@
     },
     "packages/wire": {
       "name": "@sproutboat/wire",
-      "version": "0.3.0",
+      "version": "0.4.0",
       "dependencies": {
         "@sproutboat/assets": "workspace:*",
       },

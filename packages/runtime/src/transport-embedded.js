@@ -96,8 +96,13 @@ static int sb_db_for(const char* path) {
   // copy it saves once the file holds a few large objects. The page cache is
   // capped instead, and journal_size_limit stops the WAL staying huge after one
   // big write.
+  // busy_timeout: within one binary every binding op is serial, so there is no
+  // self-contention. It matters when the same data dir is served by several
+  // copies of the binary behind SO_REUSEPORT (#154 scaling recipe): WAL takes
+  // concurrent readers plus one writer across processes, and this makes a
+  // writer wait for the lock instead of failing SQLITE_BUSY.
   sqlite3_exec(db,
-    "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;"
+    "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;"
     "PRAGMA cache_size=-2000; PRAGMA journal_size_limit=16777216;",
     0, 0, 0);
   sb_dbs[sb_db_count] = db;
@@ -1179,6 +1184,10 @@ function __sbEnsureSchema() {
     s,
     "CREATE TABLE IF NOT EXISTS ae (dataset TEXT NOT NULL, ts INTEGER NOT NULL, indexes_json TEXT NOT NULL, blobs_json TEXT NOT NULL, doubles_json TEXT NOT NULL)",
   );
+  __sbSql(
+    s,
+    "CREATE TABLE IF NOT EXISTS ratelimit (name TEXT NOT NULL, key TEXT NOT NULL, window_start INTEGER NOT NULL, count INTEGER NOT NULL, PRIMARY KEY (name, key))",
+  );
 }
 
 function __sbHex(n) {
@@ -1511,6 +1520,26 @@ function __sbEmbeddedDispatch(msg) {
       });
     }
     return { ok: true, count: total.rows.length ? Number(total.rows[0][0]) : 0, rows };
+  }
+
+  if (op === "ratelimit.check") {
+    // #69 — fixed window. limit/period come in the message (the transport holds
+    // no config). One upsert: same window -> count+1, new window -> reset to 1.
+    // ponytail: fixed window, so a burst straddling the boundary can briefly
+    // reach ~2x limit. Swap for a two-window weighted count if that matters.
+    const limit = Math.max(Number(msg.limit) || 1, 1);
+    const period = Math.max(Number(msg.period) || 60, 1);
+    const now = Math.floor(Date.now() / 1000);
+    const windowStart = now - (now % period);
+    const r = __sbSql(
+      store,
+      "INSERT INTO ratelimit (name, key, window_start, count) VALUES (?1, ?2, ?3, 1) " +
+        "ON CONFLICT (name, key) DO UPDATE SET count = CASE WHEN window_start = ?3 THEN count + 1 ELSE 1 END, " +
+        "window_start = ?3 RETURNING count",
+      [String(msg.name), String(msg.key == null ? "" : msg.key), windowStart],
+    );
+    const count = r.rows.length ? Number(r.rows[0][0]) : 1;
+    return { ok: true, success: count <= limit };
   }
 
   throw new Error("unknown op: " + op);

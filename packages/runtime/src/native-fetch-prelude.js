@@ -4,8 +4,10 @@
 // json(). This adds, additively, the rest of the WHATWG surface Worker code
 // expects: URLSearchParams (read + write), URL.prototype.searchParams and the
 // protocol/host/hostname/port/hash accessors, static Response.json,
-// crypto.randomUUID / crypto.getRandomValues, and structuredClone. Each is
-// feature-detected; delete a block once Porffor ships that global.
+// crypto.randomUUID / crypto.getRandomValues, crypto.subtle (digest + HMAC
+// sign/verify, #133), and structuredClone. Each is feature-detected; delete a
+// block once Porffor ships that global. crypto.scryptVerify (#153) is a
+// Sproutboat extension, not WHATWG, and stays.
 // Tracked upstream in patches/UPSTREAM.md.
 //
 // Declared before it is referenced: a getter body that names a later top-level
@@ -276,6 +278,141 @@ if (globalThis.crypto.randomUUID == null) {
   };
 }
 
+// #133 — a WebCrypto subset: crypto.subtle.digest (SHA-256/384/512) and HMAC
+// sign/verify over a raw key. Enough for JWTs and hand-rolled sessions; not a
+// complete SubtleCrypto (no ECDSA, no AES, no key wrapping). The surface is
+// exactly standard so it can be deleted when Porffor ships Web Crypto
+// (CanadaHonk/porffor#347). Backed by the inline-C SHA-2 above, not a link
+// dependency, so it works on the broker transport too.
+function __sbHashBits(algo) {
+  const n = String((algo && algo.name) || algo || "").toUpperCase();
+  if (n === "SHA-256" || n === "SHA256") return "256";
+  if (n === "SHA-384" || n === "SHA384") return "384";
+  if (n === "SHA-512" || n === "SHA512") return "512";
+  return "";
+}
+// -> a latin1 string, one char per byte. Strings are UTF-8 encoded (matching
+// TextEncoder); ArrayBuffer / typed-array input is copied byte for byte.
+function __sbToBytes(input) {
+  if (input == null) return "";
+  if (__sbIsStr(input)) {
+    let s = "";
+    for (let i = 0; i < input.length; i++) {
+      const c = input.charCodeAt(i);
+      if (c < 0x80) s += String.fromCharCode(c);
+      else if (c < 0x800) s += String.fromCharCode(0xc0 | (c >> 6)) + String.fromCharCode(0x80 | (c & 0x3f));
+      else if (c >= 0xd800 && c < 0xdc00 && i + 1 < input.length) {
+        const cp = 0x10000 + ((c - 0xd800) << 10) + (input.charCodeAt(++i) - 0xdc00);
+        s +=
+          String.fromCharCode(0xf0 | (cp >> 18)) +
+          String.fromCharCode(0x80 | ((cp >> 12) & 0x3f)) +
+          String.fromCharCode(0x80 | ((cp >> 6) & 0x3f)) +
+          String.fromCharCode(0x80 | (cp & 0x3f));
+      } else
+        s +=
+          String.fromCharCode(0xe0 | (c >> 12)) +
+          String.fromCharCode(0x80 | ((c >> 6) & 0x3f)) +
+          String.fromCharCode(0x80 | (c & 0x3f));
+    }
+    return s;
+  }
+  const view = input.length !== undefined && input.buffer !== undefined ? input : new Uint8Array(input);
+  let s = "";
+  for (let i = 0; i < view.length; i++) s += String.fromCharCode(view[i] & 0xff);
+  return s;
+}
+function __sbBufFrom(latin1) {
+  const b = new Uint8Array(latin1.length);
+  for (let i = 0; i < latin1.length; i++) b[i] = latin1.charCodeAt(i) & 0xff;
+  return b.buffer;
+}
+// Constant-time compare of two latin1 byte strings.
+function __sbEqCt(a, b) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+// An even-length all-hex string -> its bytes; anything else -> its raw bytes.
+function __sbHexOrBytes(value) {
+  if (__sbIsStr(value) && value.length > 0 && value.length % 2 === 0) {
+    let out = "";
+    for (let i = 0; i < value.length; i++) {
+      const c = value.charCodeAt(i);
+      const d = c >= 48 && c <= 57 ? c - 48 : c >= 97 && c <= 102 ? c - 87 : c >= 65 && c <= 70 ? c - 55 : -1;
+      if (d < 0) return __sbToBytes(value);
+      if (i % 2 === 0) out += String.fromCharCode(d << 4);
+      else out = out.slice(0, -1) + String.fromCharCode(out.charCodeAt(out.length - 1) | d);
+    }
+    return out;
+  }
+  return __sbToBytes(value);
+}
+
+if (globalThis.crypto.subtle == null) {
+  globalThis.crypto.subtle = {
+    async digest(algo, data) {
+      const bits = __sbHashBits(algo);
+      if (!bits) throw new Error("crypto.subtle.digest: unsupported algorithm");
+      const out = __sbDigestRaw(bits, __sbToBytes(data));
+      if (!out) throw new Error("crypto.subtle.digest failed");
+      return __sbBufFrom(out);
+    },
+    async importKey(format, keyData, algo, extractable, usages) {
+      if (format !== "raw") throw new Error("crypto.subtle.importKey: only format 'raw' is supported");
+      const name = String((algo && algo.name) || algo || "").toUpperCase();
+      if (name !== "HMAC") throw new Error("crypto.subtle.importKey: only HMAC keys are supported");
+      const bits = __sbHashBits((algo && algo.hash) || "SHA-256");
+      if (!bits) throw new Error("crypto.subtle.importKey: unsupported hash");
+      return {
+        type: "secret",
+        extractable: !!extractable,
+        algorithm: { name: "HMAC", hash: { name: "SHA-" + bits } },
+        usages: usages || [],
+        __sbKey: __sbToBytes(keyData),
+        __sbBits: bits,
+      };
+    },
+    async sign(algo, key, data) {
+      if (!key || key.__sbKey == null) throw new Error("crypto.subtle.sign: only HMAC keys from importKey are supported");
+      const out = __sbHmacRaw(key.__sbBits, key.__sbKey, __sbToBytes(data));
+      if (!out) throw new Error("crypto.subtle.sign failed");
+      return __sbBufFrom(out);
+    },
+    async verify(algo, key, signature, data) {
+      if (!key || key.__sbKey == null) throw new Error("crypto.subtle.verify: only HMAC keys are supported");
+      const mac = __sbHmacRaw(key.__sbBits, key.__sbKey, __sbToBytes(data));
+      if (!mac) return false;
+      return __sbEqCt(mac, __sbToBytes(signature));
+    },
+  };
+}
+
+// #153 — scrypt verification, for migrating password hashes made elsewhere
+// (Node/Bun `scrypt`, N/r/p). Not on WebCrypto; deliberately verify-only, so it
+// is a migration tool rather than a KDF blessed for new credentials — new
+// credentials should use HMAC/PBKDF2 via crypto.subtle. `expected` is the stored
+// hash: a hex string, or bytes (ArrayBuffer / Uint8Array).
+if (globalThis.crypto.scryptVerify == null) {
+  globalThis.crypto.scryptVerify = function (password, salt, expected, params) {
+    const p = params || {};
+    const N = p.N || p.cost || 16384;
+    const r = p.r || p.blockSize || 8;
+    const par = p.p || p.parallelization || 1;
+    const want = __sbHexOrBytes(expected);
+    if (want.length === 0) return false;
+    const dk = __sbScryptRaw(
+      __sbToBytes(password),
+      __sbToBytes(salt),
+      String(N),
+      String(r),
+      String(par),
+      String(want.length),
+    );
+    return dk.length === want.length && __sbEqCt(dk, want);
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Bindings: env.<KV>, env.<SECRET>, env.<D1>, env.<R2>, and globalThis.fetch,
 // backed by a Bun broker on a loopback TCP port. The transport is inline C —
@@ -300,9 +437,290 @@ Porffor.c`
 #include <fcntl.h>
 #include <errno.h>
 #include <time.h>
+#include <stdint.h>
 
 u32 porf_native_fetch_alloc_bytestring(const char* input, size_t len);
 int porf_native_fetch_read_value(jsval value, const char** out_buf, size_t* out_len, char** out_owned);
+
+// --- #133: SHA-2 + HMAC ---------------------------------------------------
+// Standalone links BearSSL, but a deployed sprout does not, and this inline C
+// is shared by both transports — so a plain reference SHA-2 rather than a link
+// dependency. It also lets a handler drop a vendored pure-JS SHA-256. Exposed
+// as crypto.subtle.digest / sign / verify (HMAC), which deletes cleanly when
+// Porffor ships Web Crypto (CanadaHonk/porffor#347).
+#define SB_ROR32(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
+#define SB_ROR64(x, n) (((x) >> (n)) | ((x) << (64 - (n))))
+
+typedef struct { uint32_t h[8]; uint64_t len; unsigned char buf[64]; size_t n; } sb_sha256_ctx;
+static const uint32_t sb_k256[64] = {
+  0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+  0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+  0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+  0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+  0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+  0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+  0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+  0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2 };
+static void sb_sha256_block(sb_sha256_ctx* c, const unsigned char* p) {
+  uint32_t w[64], a,b,cc,d,e,f,g,h,t1,t2;
+  for (int i = 0; i < 16; i++)
+    w[i] = ((uint32_t)p[i*4]<<24)|((uint32_t)p[i*4+1]<<16)|((uint32_t)p[i*4+2]<<8)|((uint32_t)p[i*4+3]);
+  for (int i = 16; i < 64; i++) {
+    uint32_t s0 = SB_ROR32(w[i-15],7) ^ SB_ROR32(w[i-15],18) ^ (w[i-15]>>3);
+    uint32_t s1 = SB_ROR32(w[i-2],17) ^ SB_ROR32(w[i-2],19) ^ (w[i-2]>>10);
+    w[i] = w[i-16] + s0 + w[i-7] + s1;
+  }
+  a=c->h[0];b=c->h[1];cc=c->h[2];d=c->h[3];e=c->h[4];f=c->h[5];g=c->h[6];h=c->h[7];
+  for (int i = 0; i < 64; i++) {
+    uint32_t S1 = SB_ROR32(e,6) ^ SB_ROR32(e,11) ^ SB_ROR32(e,25);
+    uint32_t ch = (e & f) ^ (~e & g);
+    t1 = h + S1 + ch + sb_k256[i] + w[i];
+    uint32_t S0 = SB_ROR32(a,2) ^ SB_ROR32(a,13) ^ SB_ROR32(a,22);
+    uint32_t maj = (a & b) ^ (a & cc) ^ (b & cc);
+    t2 = S0 + maj;
+    h=g;g=f;f=e;e=d+t1;d=cc;cc=b;b=a;a=t1+t2;
+  }
+  c->h[0]+=a;c->h[1]+=b;c->h[2]+=cc;c->h[3]+=d;c->h[4]+=e;c->h[5]+=f;c->h[6]+=g;c->h[7]+=h;
+}
+static void sb_sha256_init(sb_sha256_ctx* c) {
+  c->h[0]=0x6a09e667;c->h[1]=0xbb67ae85;c->h[2]=0x3c6ef372;c->h[3]=0xa54ff53a;
+  c->h[4]=0x510e527f;c->h[5]=0x9b05688c;c->h[6]=0x1f83d9ab;c->h[7]=0x5be0cd19;c->len=0;c->n=0;
+}
+static void sb_sha256_update(sb_sha256_ctx* c, const unsigned char* p, size_t n) {
+  c->len += n;
+  while (n) {
+    size_t k = 64 - c->n; if (k > n) k = n;
+    memcpy(c->buf + c->n, p, k); c->n += k; p += k; n -= k;
+    if (c->n == 64) { sb_sha256_block(c, c->buf); c->n = 0; }
+  }
+}
+static void sb_sha256_final(sb_sha256_ctx* c, unsigned char out[32]) {
+  uint64_t bits = c->len * 8;
+  unsigned char pad = 0x80;
+  sb_sha256_update(c, &pad, 1);
+  unsigned char z = 0;
+  while (c->n != 56) sb_sha256_update(c, &z, 1);
+  unsigned char lb[8];
+  for (int i = 0; i < 8; i++) lb[i] = (unsigned char)(bits >> (56 - i*8));
+  sb_sha256_update(c, lb, 8);
+  for (int i = 0; i < 8; i++) {
+    out[i*4]=(unsigned char)(c->h[i]>>24);out[i*4+1]=(unsigned char)(c->h[i]>>16);
+    out[i*4+2]=(unsigned char)(c->h[i]>>8);out[i*4+3]=(unsigned char)c->h[i];
+  }
+}
+
+typedef struct { uint64_t h[8]; uint64_t lenhi, lenlo; unsigned char buf[128]; size_t n; } sb_sha512_ctx;
+static const uint64_t sb_k512[80] = {
+  0x428a2f98d728ae22ULL,0x7137449123ef65cdULL,0xb5c0fbcfec4d3b2fULL,0xe9b5dba58189dbbcULL,
+  0x3956c25bf348b538ULL,0x59f111f1b605d019ULL,0x923f82a4af194f9bULL,0xab1c5ed5da6d8118ULL,
+  0xd807aa98a3030242ULL,0x12835b0145706fbeULL,0x243185be4ee4b28cULL,0x550c7dc3d5ffb4e2ULL,
+  0x72be5d74f27b896fULL,0x80deb1fe3b1696b1ULL,0x9bdc06a725c71235ULL,0xc19bf174cf692694ULL,
+  0xe49b69c19ef14ad2ULL,0xefbe4786384f25e3ULL,0x0fc19dc68b8cd5b5ULL,0x240ca1cc77ac9c65ULL,
+  0x2de92c6f592b0275ULL,0x4a7484aa6ea6e483ULL,0x5cb0a9dcbd41fbd4ULL,0x76f988da831153b5ULL,
+  0x983e5152ee66dfabULL,0xa831c66d2db43210ULL,0xb00327c898fb213fULL,0xbf597fc7beef0ee4ULL,
+  0xc6e00bf33da88fc2ULL,0xd5a79147930aa725ULL,0x06ca6351e003826fULL,0x142929670a0e6e70ULL,
+  0x27b70a8546d22ffcULL,0x2e1b21385c26c926ULL,0x4d2c6dfc5ac42aedULL,0x53380d139d95b3dfULL,
+  0x650a73548baf63deULL,0x766a0abb3c77b2a8ULL,0x81c2c92e47edaee6ULL,0x92722c851482353bULL,
+  0xa2bfe8a14cf10364ULL,0xa81a664bbc423001ULL,0xc24b8b70d0f89791ULL,0xc76c51a30654be30ULL,
+  0xd192e819d6ef5218ULL,0xd69906245565a910ULL,0xf40e35855771202aULL,0x106aa07032bbd1b8ULL,
+  0x19a4c116b8d2d0c8ULL,0x1e376c085141ab53ULL,0x2748774cdf8eeb99ULL,0x34b0bcb5e19b48a8ULL,
+  0x391c0cb3c5c95a63ULL,0x4ed8aa4ae3418acbULL,0x5b9cca4f7763e373ULL,0x682e6ff3d6b2b8a3ULL,
+  0x748f82ee5defb2fcULL,0x78a5636f43172f60ULL,0x84c87814a1f0ab72ULL,0x8cc702081a6439ecULL,
+  0x90befffa23631e28ULL,0xa4506cebde82bde9ULL,0xbef9a3f7b2c67915ULL,0xc67178f2e372532bULL,
+  0xca273eceea26619cULL,0xd186b8c721c0c207ULL,0xeada7dd6cde0eb1eULL,0xf57d4f7fee6ed178ULL,
+  0x06f067aa72176fbaULL,0x0a637dc5a2c898a6ULL,0x113f9804bef90daeULL,0x1b710b35131c471bULL,
+  0x28db77f523047d84ULL,0x32caab7b40c72493ULL,0x3c9ebe0a15c9bebcULL,0x431d67c49c100d4cULL,
+  0x4cc5d4becb3e42b6ULL,0x597f299cfc657e2aULL,0x5fcb6fab3ad6faecULL,0x6c44198c4a475817ULL };
+static void sb_sha512_block(sb_sha512_ctx* c, const unsigned char* p) {
+  uint64_t w[80], a,b,cc,d,e,f,g,h,t1,t2;
+  for (int i = 0; i < 16; i++) {
+    w[i] = 0; for (int j = 0; j < 8; j++) w[i] = (w[i]<<8) | p[i*8+j];
+  }
+  for (int i = 16; i < 80; i++) {
+    uint64_t s0 = SB_ROR64(w[i-15],1) ^ SB_ROR64(w[i-15],8) ^ (w[i-15]>>7);
+    uint64_t s1 = SB_ROR64(w[i-2],19) ^ SB_ROR64(w[i-2],61) ^ (w[i-2]>>6);
+    w[i] = w[i-16] + s0 + w[i-7] + s1;
+  }
+  a=c->h[0];b=c->h[1];cc=c->h[2];d=c->h[3];e=c->h[4];f=c->h[5];g=c->h[6];h=c->h[7];
+  for (int i = 0; i < 80; i++) {
+    uint64_t S1 = SB_ROR64(e,14) ^ SB_ROR64(e,18) ^ SB_ROR64(e,41);
+    uint64_t ch = (e & f) ^ (~e & g);
+    t1 = h + S1 + ch + sb_k512[i] + w[i];
+    uint64_t S0 = SB_ROR64(a,28) ^ SB_ROR64(a,34) ^ SB_ROR64(a,39);
+    uint64_t maj = (a & b) ^ (a & cc) ^ (b & cc);
+    t2 = S0 + maj;
+    h=g;g=f;f=e;e=d+t1;d=cc;cc=b;b=a;a=t1+t2;
+  }
+  c->h[0]+=a;c->h[1]+=b;c->h[2]+=cc;c->h[3]+=d;c->h[4]+=e;c->h[5]+=f;c->h[6]+=g;c->h[7]+=h;
+}
+static void sb_sha512_init(sb_sha512_ctx* c, int is384) {
+  if (is384) {
+    c->h[0]=0xcbbb9d5dc1059ed8ULL;c->h[1]=0x629a292a367cd507ULL;c->h[2]=0x9159015a3070dd17ULL;c->h[3]=0x152fecd8f70e5939ULL;
+    c->h[4]=0x67332667ffc00b31ULL;c->h[5]=0x8eb44a8768581511ULL;c->h[6]=0xdb0c2e0d64f98fa7ULL;c->h[7]=0x47b5481dbefa4fa4ULL;
+  } else {
+    c->h[0]=0x6a09e667f3bcc908ULL;c->h[1]=0xbb67ae8584caa73bULL;c->h[2]=0x3c6ef372fe94f82bULL;c->h[3]=0xa54ff53a5f1d36f1ULL;
+    c->h[4]=0x510e527fade682d1ULL;c->h[5]=0x9b05688c2b3e6c1fULL;c->h[6]=0x1f83d9abfb41bd6bULL;c->h[7]=0x5be0cd19137e2179ULL;
+  }
+  c->lenhi=0;c->lenlo=0;c->n=0;
+}
+static void sb_sha512_update(sb_sha512_ctx* c, const unsigned char* p, size_t n) {
+  uint64_t add = n; if ((c->lenlo += add) < add) c->lenhi++;
+  while (n) {
+    size_t k = 128 - c->n; if (k > n) k = n;
+    memcpy(c->buf + c->n, p, k); c->n += k; p += k; n -= k;
+    if (c->n == 128) { sb_sha512_block(c, c->buf); c->n = 0; }
+  }
+}
+static void sb_sha512_final(sb_sha512_ctx* c, unsigned char* out, int is384) {
+  uint64_t bhi = (c->lenhi << 3) | (c->lenlo >> 61), blo = c->lenlo << 3;
+  unsigned char pad = 0x80;
+  sb_sha512_update(c, &pad, 1);
+  unsigned char z = 0;
+  while (c->n != 112) sb_sha512_update(c, &z, 1);
+  unsigned char lb[16];
+  for (int i = 0; i < 8; i++) lb[i] = (unsigned char)(bhi >> (56 - i*8));
+  for (int i = 0; i < 8; i++) lb[8+i] = (unsigned char)(blo >> (56 - i*8));
+  sb_sha512_update(c, lb, 16);
+  int words = is384 ? 6 : 8;
+  for (int i = 0; i < words; i++)
+    for (int j = 0; j < 8; j++) out[i*8+j] = (unsigned char)(c->h[i] >> (56 - j*8));
+}
+
+// One-shot digest. algo: 256 | 384 | 512. out must hold 32/48/64 bytes.
+// Returns the digest length, or 0 for an unknown algo.
+static size_t sb_digest(int algo, const unsigned char* msg, size_t mlen, unsigned char* out) {
+  if (algo == 256) { sb_sha256_ctx c; sb_sha256_init(&c); sb_sha256_update(&c, msg, mlen); sb_sha256_final(&c, out); return 32; }
+  if (algo == 384) { sb_sha512_ctx c; sb_sha512_init(&c, 1); sb_sha512_update(&c, msg, mlen); sb_sha512_final(&c, out, 1); return 48; }
+  if (algo == 512) { sb_sha512_ctx c; sb_sha512_init(&c, 0); sb_sha512_update(&c, msg, mlen); sb_sha512_final(&c, out, 0); return 64; }
+  return 0;
+}
+
+// HMAC(algo) per RFC 2104. Block size is 64 for SHA-256, 128 for SHA-384/512.
+static size_t sb_hmac(int algo, const unsigned char* key, size_t klen,
+                      const unsigned char* msg, size_t mlen, unsigned char* out) {
+  size_t bs = algo == 256 ? 64 : 128;
+  unsigned char k[128], ipad[128], opad[128], inner[64];
+  memset(k, 0, sizeof(k));
+  if (klen > bs) { sb_digest(algo, key, klen, k); }
+  else memcpy(k, key, klen);
+  for (size_t i = 0; i < bs; i++) { ipad[i] = k[i] ^ 0x36; opad[i] = k[i] ^ 0x5c; }
+  size_t dl;
+  if (algo == 256) {
+    sb_sha256_ctx c; sb_sha256_init(&c);
+    sb_sha256_update(&c, ipad, bs); sb_sha256_update(&c, msg, mlen); sb_sha256_final(&c, inner);
+    sb_sha256_ctx o; sb_sha256_init(&o);
+    sb_sha256_update(&o, opad, bs); sb_sha256_update(&o, inner, 32); sb_sha256_final(&o, out);
+    dl = 32;
+  } else {
+    int is384 = algo == 384; dl = is384 ? 48 : 64;
+    sb_sha512_ctx c; sb_sha512_init(&c, is384);
+    sb_sha512_update(&c, ipad, bs); sb_sha512_update(&c, msg, mlen); sb_sha512_final(&c, inner, is384);
+    sb_sha512_ctx o; sb_sha512_init(&o, is384);
+    sb_sha512_update(&o, opad, bs); sb_sha512_update(&o, inner, dl); sb_sha512_final(&o, out, is384);
+  }
+  return dl;
+}
+
+// --- #153: scrypt (RFC 7914), for verifying pre-existing password hashes ----
+// PBKDF2-HMAC-SHA256 (reuses sb_hmac) + Salsa20/8 + BlockMix + ROMix. Exposed
+// only as crypto.scryptVerify: a migration path for hashes made elsewhere
+// (Node/Bun scrypt), not a blessed KDF for new credentials.
+static void sb_pbkdf2_hmac256(const unsigned char* pw, size_t pwlen,
+                              const unsigned char* salt, size_t saltlen,
+                              uint32_t iters, unsigned char* out, size_t dklen) {
+  unsigned char block[64], u[32], t[32];
+  uint32_t i = 1;
+  size_t done = 0;
+  while (done < dklen) {
+    unsigned char* s2 = (unsigned char*)malloc(saltlen + 4);
+    memcpy(s2, salt, saltlen);
+    s2[saltlen] = (unsigned char)(i >> 24); s2[saltlen+1] = (unsigned char)(i >> 16);
+    s2[saltlen+2] = (unsigned char)(i >> 8); s2[saltlen+3] = (unsigned char)i;
+    sb_hmac(256, pw, pwlen, s2, saltlen + 4, u);
+    free(s2);
+    memcpy(t, u, 32);
+    // iters is 1 for scrypt's use of PBKDF2, but support the general case.
+    for (uint32_t j = 1; j < iters; j++) {
+      sb_hmac(256, pw, pwlen, u, 32, u);
+      for (int k = 0; k < 32; k++) t[k] ^= u[k];
+    }
+    memcpy(block, t, 32);
+    size_t take = dklen - done; if (take > 32) take = 32;
+    memcpy(out + done, block, take);
+    done += take; i++;
+  }
+}
+static void sb_salsa20_8(uint32_t out[16], const uint32_t in[16]) {
+  uint32_t x[16];
+  for (int i = 0; i < 16; i++) x[i] = in[i];
+  for (int i = 0; i < 4; i++) {
+    x[ 4] ^= SB_ROR32(x[ 0] + x[12], 32 - 7);  x[ 8] ^= SB_ROR32(x[ 4] + x[ 0], 32 - 9);
+    x[12] ^= SB_ROR32(x[ 8] + x[ 4], 32 - 13); x[ 0] ^= SB_ROR32(x[12] + x[ 8], 32 - 18);
+    x[ 9] ^= SB_ROR32(x[ 5] + x[ 1], 32 - 7);  x[13] ^= SB_ROR32(x[ 9] + x[ 5], 32 - 9);
+    x[ 1] ^= SB_ROR32(x[13] + x[ 9], 32 - 13); x[ 5] ^= SB_ROR32(x[ 1] + x[13], 32 - 18);
+    x[14] ^= SB_ROR32(x[10] + x[ 6], 32 - 7);  x[ 2] ^= SB_ROR32(x[14] + x[10], 32 - 9);
+    x[ 6] ^= SB_ROR32(x[ 2] + x[14], 32 - 13); x[10] ^= SB_ROR32(x[ 6] + x[ 2], 32 - 18);
+    x[ 3] ^= SB_ROR32(x[15] + x[11], 32 - 7);  x[ 7] ^= SB_ROR32(x[ 3] + x[15], 32 - 9);
+    x[11] ^= SB_ROR32(x[ 7] + x[ 3], 32 - 13); x[15] ^= SB_ROR32(x[11] + x[ 7], 32 - 18);
+    x[ 1] ^= SB_ROR32(x[ 0] + x[ 3], 32 - 7);  x[ 2] ^= SB_ROR32(x[ 1] + x[ 0], 32 - 9);
+    x[ 3] ^= SB_ROR32(x[ 2] + x[ 1], 32 - 13); x[ 0] ^= SB_ROR32(x[ 3] + x[ 2], 32 - 18);
+    x[ 6] ^= SB_ROR32(x[ 5] + x[ 4], 32 - 7);  x[ 7] ^= SB_ROR32(x[ 6] + x[ 5], 32 - 9);
+    x[ 4] ^= SB_ROR32(x[ 7] + x[ 6], 32 - 13); x[ 5] ^= SB_ROR32(x[ 4] + x[ 7], 32 - 18);
+    x[11] ^= SB_ROR32(x[10] + x[ 9], 32 - 7);  x[ 8] ^= SB_ROR32(x[11] + x[10], 32 - 9);
+    x[ 9] ^= SB_ROR32(x[ 8] + x[11], 32 - 13); x[10] ^= SB_ROR32(x[ 9] + x[ 8], 32 - 18);
+    x[12] ^= SB_ROR32(x[15] + x[14], 32 - 7);  x[13] ^= SB_ROR32(x[12] + x[15], 32 - 9);
+    x[14] ^= SB_ROR32(x[13] + x[12], 32 - 13); x[15] ^= SB_ROR32(x[14] + x[13], 32 - 18);
+  }
+  for (int i = 0; i < 16; i++) out[i] = x[i] + in[i];
+}
+// BlockMix: B is 2r 64-byte blocks (as uint32 words). Result into out.
+static void sb_blockmix(const uint32_t* b, uint32_t* out, size_t r) {
+  uint32_t x[16], y[16];
+  memcpy(x, b + (2*r - 1) * 16, 64);
+  for (size_t i = 0; i < 2*r; i++) {
+    for (int k = 0; k < 16; k++) x[k] ^= b[i*16 + k];
+    sb_salsa20_8(y, x);
+    memcpy(x, y, 64);
+    size_t dst = (i % 2 == 0) ? (i/2) : (r + (i-1)/2);
+    memcpy(out + dst*16, x, 64);
+  }
+}
+static uint64_t sb_integerify(const uint32_t* b, size_t r) {
+  const uint32_t* p = b + (2*r - 1) * 16;
+  return ((uint64_t)p[0]) | (((uint64_t)p[1]) << 32);
+}
+// scrypt(pw, salt, N, r, p) -> dk[dklen]. Returns 0 on success, -1 on bad
+// params or allocation failure. Caps N*r so a bad config cannot ask for GB.
+static int sb_scrypt(const unsigned char* pw, size_t pwlen, const unsigned char* salt, size_t saltlen,
+                     uint64_t N, uint32_t r, uint32_t p, unsigned char* dk, size_t dklen) {
+  if (r == 0 || p == 0 || N < 2 || (N & (N - 1)) != 0) return -1;
+  if ((uint64_t)r * N > (1ULL << 20)) return -1; // <= 128 MiB of V
+  size_t blk = 128 * (size_t)r;                  // one B block, bytes
+  unsigned char* b = (unsigned char*)malloc(blk * p);
+  uint32_t* v = (uint32_t*)malloc(blk * (size_t)N);
+  uint32_t* xy = (uint32_t*)malloc(blk * 2);
+  if (!b || !v || !xy) { free(b); free(v); free(xy); return -1; }
+  sb_pbkdf2_hmac256(pw, pwlen, salt, saltlen, 1, b, blk * p);
+  for (uint32_t i = 0; i < p; i++) {
+    uint32_t* x = (uint32_t*)(b + (size_t)i * blk);
+    uint32_t* y = xy;
+    for (uint64_t j = 0; j < N; j++) {
+      memcpy(v + j * (blk / 4), x, blk);
+      sb_blockmix(x, y, r);
+      memcpy(x, y, blk);
+    }
+    for (uint64_t j = 0; j < N; j++) {
+      uint64_t k = sb_integerify(x, r) & (N - 1);
+      const uint32_t* vk = v + k * (blk / 4);
+      for (size_t w = 0; w < blk / 4; w++) x[w] ^= vk[w];
+      sb_blockmix(x, y, r);
+      memcpy(x, y, blk);
+    }
+  }
+  sb_pbkdf2_hmac256(pw, pwlen, b, blk * p, 1, dk, dklen);
+  free(b); free(v); free(xy);
+  return 0;
+}
 
 // Fill buf with n bytes from the OS CSPRNG. /dev/urandom is present on Linux and
 // macOS and inside the bubblewrap sandbox; blocking is not a concern after the
@@ -350,6 +768,101 @@ function __sbRandomBytes(nStr) {
         free(__b);
       }
     }
+  `;
+  return out;
+}
+
+// #133 — one-shot SHA-2 digest. `algoStr` is "256"|"384"|"512"; `data` is a
+// latin1 string (one char per byte). Returns the raw digest as a bytestring.
+// oxlint-disable-next-line no-unused-vars -- read inside the RawC block, not by JS.
+function __sbDigestRaw(algoStr, data) {
+  let out = "";
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    const char* __as; size_t __asl; char* __aso = 0;
+    porf_native_fetch_read_value(algoStr, &__as, &__asl, &__aso);
+    char __ab[8]; size_t __ak = __asl < 7 ? __asl : 7;
+    memcpy(__ab, __as, __ak); __ab[__ak] = 0;
+    if (__aso) free(__aso);
+    int __algo = atoi(__ab);
+
+    const char* __d; size_t __dl; char* __do = 0;
+    porf_native_fetch_read_value(data, &__d, &__dl, &__do);
+    unsigned char __out[64];
+    size_t __n = sb_digest(__algo, (const unsigned char*)__d, __dl, __out);
+    if (__do) free(__do);
+    if (__n) out = porf_box((f64)porf_native_fetch_alloc_bytestring((const char*)__out, __n), 195);
+  `;
+  return out;
+}
+
+// #133 — HMAC-SHA-2. `algoStr` "256"|"384"|"512"; `key` and `data` latin1.
+// Returns the raw MAC as a bytestring.
+// oxlint-disable-next-line no-unused-vars -- read inside the RawC block, not by JS.
+function __sbHmacRaw(algoStr, key, data) {
+  let out = "";
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    const char* __as; size_t __asl; char* __aso = 0;
+    porf_native_fetch_read_value(algoStr, &__as, &__asl, &__aso);
+    char __ab[8]; size_t __ak = __asl < 7 ? __asl : 7;
+    memcpy(__ab, __as, __ak); __ab[__ak] = 0;
+    if (__aso) free(__aso);
+    int __algo = atoi(__ab);
+
+    const char* __k; size_t __kl; char* __ko = 0;
+    porf_native_fetch_read_value(key, &__k, &__kl, &__ko);
+    unsigned char* __kc = (unsigned char*)malloc(__kl ? __kl : 1);
+    if (__kc) memcpy(__kc, __k, __kl);
+    if (__ko) free(__ko);
+
+    const char* __d; size_t __dl; char* __do = 0;
+    porf_native_fetch_read_value(data, &__d, &__dl, &__do);
+    unsigned char __out[64];
+    size_t __n = __kc ? sb_hmac(__algo, __kc, __kl, (const unsigned char*)__d, __dl, __out) : 0;
+    if (__do) free(__do);
+    if (__kc) free(__kc);
+    if (__n) out = porf_box((f64)porf_native_fetch_alloc_bytestring((const char*)__out, __n), 195);
+  `;
+  return out;
+}
+
+// #153 — scrypt derivation. All params are decimal strings. Returns the derived
+// key as a bytestring, or '' on bad params / allocation failure.
+// oxlint-disable-next-line no-unused-vars -- read inside the RawC block, not by JS.
+function __sbScryptRaw(pw, salt, nStr, rStr, pStr, dkLenStr) {
+  let out = "";
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    const char* __p; size_t __pl; char* __po = 0;
+    porf_native_fetch_read_value(pw, &__p, &__pl, &__po);
+    unsigned char* __pc = (unsigned char*)malloc(__pl ? __pl : 1);
+    if (__pc) memcpy(__pc, __p, __pl);
+    if (__po) free(__po);
+
+    const char* __s; size_t __sl; char* __so = 0;
+    porf_native_fetch_read_value(salt, &__s, &__sl, &__so);
+    unsigned char* __sc = (unsigned char*)malloc(__sl ? __sl : 1);
+    if (__sc) memcpy(__sc, __s, __sl);
+    if (__so) free(__so);
+
+    long __N = 0, __r = 0, __pp = 0, __dk = 0;
+    { const char* q; size_t ql; char* qo = 0; char nb[24];
+      porf_native_fetch_read_value(nStr, &q, &ql, &qo); { size_t k = ql < 23 ? ql : 23; memcpy(nb, q, k); nb[k] = 0; } if (qo) free(qo); __N = atol(nb);
+      porf_native_fetch_read_value(rStr, &q, &ql, &qo); { size_t k = ql < 23 ? ql : 23; memcpy(nb, q, k); nb[k] = 0; } if (qo) free(qo); __r = atol(nb);
+      porf_native_fetch_read_value(pStr, &q, &ql, &qo); { size_t k = ql < 23 ? ql : 23; memcpy(nb, q, k); nb[k] = 0; } if (qo) free(qo); __pp = atol(nb);
+      porf_native_fetch_read_value(dkLenStr, &q, &ql, &qo); { size_t k = ql < 23 ? ql : 23; memcpy(nb, q, k); nb[k] = 0; } if (qo) free(qo); __dk = atol(nb);
+    }
+    if (__pc && __sc && __dk > 0 && __dk <= 1024) {
+      unsigned char* __d = (unsigned char*)malloc((size_t)__dk);
+      if (__d) {
+        if (sb_scrypt(__pc, __pl, __sc, __sl, (uint64_t)__N, (uint32_t)__r, (uint32_t)__pp, __d, (size_t)__dk) == 0)
+          out = porf_box((f64)porf_native_fetch_alloc_bytestring((const char*)__d, (size_t)__dk), 195);
+        free(__d);
+      }
+    }
+    if (__pc) free(__pc);
+    if (__sc) free(__sc);
   `;
   return out;
 }
@@ -591,6 +1104,21 @@ globalThis.__sbInstallBindings = function (target, bindings) {
   for (let i = 0; i < (bindings.do || []).length; i++) {
     const b = bindings.do[i];
     target[b.binding] = __sbMakeDONamespace(b.binding, b.className);
+  }
+
+  // #69 — env.<NAME>.limit({ key }) -> { success }. Fixed window: at most
+  // `limit` calls per `period` seconds for a given key. limit/period travel in
+  // the message so the op stays stateless (the transport has no config).
+  // Returns sync like the other shims (CF's is a Promise; the runtime is sync).
+  for (let i = 0; i < (bindings.ratelimiters || []).length; i++) {
+    const rl = bindings.ratelimiters[i];
+    target[rl.binding] = {
+      limit(options) {
+        const key = options && options.key != null ? String(options.key) : "";
+        const r = __sbRpc("ratelimit.check", { name: rl.binding, key, limit: rl.limit, period: rl.period });
+        return { success: !!r.success };
+      },
+    };
   }
 
   // Static assets: env.<ASSETS>.fetch(request) -> broker `assets.get`. The edge

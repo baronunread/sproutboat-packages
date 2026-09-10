@@ -63,9 +63,14 @@ export type SproutboatConfig = {
   services?: Array<{ binding: string; service: string }>;
   /** Scheduled triggers, e.g. `{ "crons": ["0 3 * * *"] }` — a `scheduled(event)` handler runs on each tick. */
   triggers?: { crons?: string[] };
+  /** Rate-limiter bindings (#69), exposed as `env.<BINDING>.limit({ key }) -> { success }`. */
+  ratelimiters?: RateLimiterConfig[];
   /** Static assets: a directory served edge-first (like Cloudflare), optionally bound as `env.<BINDING>.fetch(request)`. */
   assets?: AssetsConfig;
 };
+
+/** One named fixed-window rate limiter: at most `limit` calls per `period` seconds, per key. */
+export type RateLimiterConfig = { binding: string; limit: number; period: number };
 
 export type AssetsConfig = {
   /** Project-relative directory of files to publish with the artifact. */
@@ -119,6 +124,7 @@ function validateConfig(value: ConfigInput): ConfigValidation {
     "durable_objects",
     "services",
     "triggers",
+    "ratelimiters",
     "assets",
   ]);
   for (const key of Object.keys(value)) if (!allowed.has(key)) errors.push(`unsupported config field: ${key}`);
@@ -256,6 +262,36 @@ function validateConfig(value: ConfigInput): ConfigValidation {
     }
   }
 
+  let ratelimiters: RateLimiterConfig[] | undefined;
+  if (value.ratelimiters !== undefined) {
+    if (!Array.isArray(value.ratelimiters)) {
+      errors.push('ratelimiters must be an array of { binding: "NAME", limit: <n>, period: <seconds> }');
+    } else {
+      ratelimiters = [];
+      const posInt = (n: JsonValue, hi: number): n is number =>
+        Number(n) === n && Number.isInteger(n) && n >= 1 && n <= hi;
+      for (const entry of value.ratelimiters) {
+        const row = isRecord(entry) ? entry : null;
+        const binding = row && isString(row.binding) ? row.binding : "";
+        if (
+          !row ||
+          !bindingName.test(binding) ||
+          !posInt(row.limit, 1_000_000) ||
+          !posInt(row.period, 86_400) ||
+          Object.keys(row).some((key) => key !== "binding" && key !== "limit" && key !== "period")
+        ) {
+          errors.push(
+            'ratelimiters entries must be { binding: "UPPER_SNAKE", limit: 1..1000000, period: 1..86400 (seconds) }',
+          );
+        } else if (ratelimiters.some((r) => r.binding === binding)) {
+          errors.push(`ratelimiters: duplicate binding ${binding}`);
+        } else {
+          ratelimiters.push({ binding, limit: row.limit, period: row.period });
+        }
+      }
+    }
+  }
+
   let triggers: { crons?: string[] } | undefined;
   if (value.triggers !== undefined) {
     if (!isRecord(value.triggers)) {
@@ -325,6 +361,7 @@ function validateConfig(value: ConfigInput): ConfigValidation {
     ...(analytics_engine_datasets ?? []),
     ...Object.keys(durable_objects ?? {}),
     ...(services ?? []).map((entry) => entry.binding),
+    ...(ratelimiters ?? []).map((entry) => entry.binding),
     ...Object.keys(vars ?? {}),
     ...(assets?.binding ? [assets.binding] : []),
   ];
@@ -345,6 +382,7 @@ function validateConfig(value: ConfigInput): ConfigValidation {
   if ("durable_objects" in value) config.durable_objects = durable_objects;
   if ("services" in value) config.services = services;
   if ("triggers" in value) config.triggers = triggers;
+  if ("ratelimiters" in value) config.ratelimiters = ratelimiters;
   if ("assets" in value) config.assets = assets;
   return { ok: true, value: config };
 }

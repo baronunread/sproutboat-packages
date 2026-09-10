@@ -65,6 +65,9 @@ export type Bindings = {
    *  it resolves to is a runtime input, not part of the artifact. */
   services: Array<{ binding: string; service: string }>;
   crons: string[];
+  /** #69 — rate limiters: `env.<binding>.limit({ key }) -> { success }`, a
+   *  fixed window of `limit` calls per `period` seconds, per key. */
+  ratelimiters: Array<{ binding: string; limit: number; period: number }>;
   /** Static-asset binding name for `env.<NAME>.fetch(request)`; `""` when assets are edge-only. */
   assets: string;
 };
@@ -80,6 +83,7 @@ export const EMPTY_BINDINGS: Bindings = {
   do: [],
   services: [],
   crons: [],
+  ratelimiters: [],
   assets: "",
 };
 
@@ -94,6 +98,7 @@ function hasBindings(b: Bindings): boolean {
     b.analytics.length > 0 ||
     b.do.length > 0 ||
     b.services.length > 0 ||
+    b.ratelimiters.length > 0 ||
     b.assets !== ""
   );
 }
@@ -251,6 +256,15 @@ export function readBindingsFromEnv(): Bindings {
       }
     }
   }
+  const isCount = (v: VarsJson): v is number => Number(v) === v && Number.isInteger(v) && v >= 1;
+  const ratelimiters: Array<{ binding: string; limit: number; period: number }> = [];
+  if (Array.isArray(parsed.ratelimiters)) {
+    for (const entry of parsed.ratelimiters) {
+      if (isVarsObject(entry) && isVarsString(entry.binding) && isCount(entry.limit) && isCount(entry.period)) {
+        ratelimiters.push({ binding: entry.binding, limit: entry.limit, period: entry.period });
+      }
+    }
+  }
   return {
     kv: strings(parsed.kv),
     secrets: strings(parsed.secrets),
@@ -262,6 +276,7 @@ export function readBindingsFromEnv(): Bindings {
     do: dos,
     services,
     crons: strings(parsed.crons),
+    ratelimiters,
     assets: isVarsString(parsed.assets) ? parsed.assets : "",
   };
 }

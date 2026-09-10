@@ -737,3 +737,18 @@ test("replaying a read is allowed, since it changes nothing", async () => {
   const c = await read();
   expect(a.subarray(4).toString()).toBe(c.subarray(4).toString());
 });
+
+test("ratelimit: fixed window per key, limit/period from the message (#69)", async () => {
+  const b = make({ bindings: { ratelimiters: [{ binding: "API", limit: 3, period: 60 }] } });
+  const hit = (key: string) => b.dispatch({ op: "ratelimit.check", name: "API", key, limit: 3, period: 60 });
+
+  expect((await hit("a")).success).toBe(true); // 1
+  expect((await hit("a")).success).toBe(true); // 2
+  expect((await hit("a")).success).toBe(true); // 3
+  expect((await hit("a")).success).toBe(false); // 4 — over
+  expect((await hit("b")).success).toBe(true); // a different key has its own count
+
+  await expect(b.dispatch({ op: "ratelimit.check", name: "NOPE", key: "x", limit: 1, period: 60 })).rejects.toThrow(
+    "not bound",
+  );
+});

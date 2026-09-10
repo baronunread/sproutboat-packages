@@ -38,6 +38,9 @@ export type Bindings = {
   /** #48 — worker-to-worker: binding name -> the project it calls. */
   services: Array<{ binding: string; service: string }>;
   crons: string[];
+  /** #69 — rate limiters. Only the names are used here; the message carries
+   *  `limit` / `period` (both come from the same baked config as the handler). */
+  ratelimiters: Array<{ binding: string; limit: number; period: number }>;
   /** Static-asset binding name, or `""` when assets are edge-only. */
   assets: string;
   /**
@@ -181,6 +184,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     do: [],
     services: [],
     crons: [],
+    ratelimiters: [],
     assets: "",
     resources: {},
     ...opts.bindings,
@@ -264,6 +268,11 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   );
   // Alarm polling reads the earliest due objects across classes.
   db.exec("CREATE INDEX IF NOT EXISTS do_alarm_due ON do_alarm (at)");
+  // #69 — fixed-window rate-limiter counters, per binding name + key.
+  db.exec(
+    "CREATE TABLE IF NOT EXISTS ratelimit (name TEXT NOT NULL, key TEXT NOT NULL, window_start INTEGER NOT NULL, " +
+      "count INTEGER NOT NULL, PRIMARY KEY (name, key))",
+  );
 
   // #74 — one SQLite file per account-level resource id, opened on first use.
   const resourceDbs = new Map<string, Database>();
@@ -326,6 +335,8 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   const requireR2 = bound(bindings.r2, "R2 bucket");
   const requireQueue = bound(bindings.queues, "queue");
   const requireAe = bound(bindings.analytics, "analytics dataset");
+  const rateLimiterNames = bindings.ratelimiters.map((r) => r.binding);
+  const requireRateLimiter = bound(rateLimiterNames, "rate limiter");
   const doClasses = new Set(bindings.do.map((d) => d.className));
   const requireDoClass = (cls: JsonValue | undefined): string => {
     const n = str(cls);
@@ -584,6 +595,24 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       case "d1.backup": {
         const name = requireD1(msg.db);
         return { ok: true, ...d1Backup(d1(name), name, msg.name == null ? "" : str(msg.name)) };
+      }
+
+      case "ratelimit.check": {
+        // #69 — fixed window; limit/period arrive in the message. Same upsert as
+        // the embedded transport so one conformance suite covers both.
+        const name = requireRateLimiter(msg.name);
+        const limit = Math.max(Number(msg.limit) || 1, 1);
+        const period = Math.max(Number(msg.period) || 60, 1);
+        const now = Math.floor(Date.now() / 1000);
+        const windowStart = now - (now % period);
+        const row = db
+          .query<{ count: number }, [string, string, number]>(
+            "INSERT INTO ratelimit (name, key, window_start, count) VALUES (?1, ?2, ?3, 1) " +
+              "ON CONFLICT (name, key) DO UPDATE SET count = CASE WHEN window_start = ?3 THEN count + 1 ELSE 1 END, " +
+              "window_start = ?3 RETURNING count",
+          )
+          .get(name, msg.key == null ? "" : str(msg.key), windowStart);
+        return { ok: true, success: (row?.count ?? 1) <= limit };
       }
 
       case "r2.put": {
@@ -897,6 +926,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     "d1.exec",
     "d1.batch",
     "d1.backup",
+    "ratelimit.check",
     "r2.put",
     "r2.delete",
     "do.storage.put",
