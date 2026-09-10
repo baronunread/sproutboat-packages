@@ -1,14 +1,33 @@
 # `@sproutboat/config`
 
-Single source of truth for `sproutboat.jsonc`: parsing, validation errors,
-and binding slots (kv, d1, r2, queues, DO, assets, secrets, vars, triggers,
-services, outbound).
+Parsing, validation, and binding slots for `sproutboat.jsonc`. Single source
+of truth shared by the CLI and the platform; previously duplicated in both.
 
-Current sources (to be consolidated here, not duplicated):
+```sh
+bun add @sproutboat/config
+```
 
-- `sproutboat-cli/src/config.ts` (validation, `validateConfig`)
-- The platform's config copy (edge/control plane side)
+```ts
+import { parseConfig } from "@sproutboat/config";
 
-Consumers import the parser and the types from this package. The CLI's
-`surface.ts` / generated `SURFACE.md` contract list and the platform's
-equivalent keep generating from here so the docs cannot drift from the code.
+const result = parseConfig(await Bun.file("sproutboat.jsonc").text());
+if (!result.ok) {
+  for (const error of result.errors) console.error(error);
+}
+```
+
+## API
+
+- `parseConfig(text)` validates a `sproutboat.jsonc` document and returns the
+  parsed config or a list of errors. Unknown keys are rejected: adding one is
+  a compatibility event.
+- `resourceRefs(field)` normalizes a storage-binding array (`"BINDING"` or
+  `{ binding, id }`) to `{ binding, id? }` rows.
+- `pinBindingId(...)` assigns account-level ids to id-less bindings.
+- Types: `SproutboatConfig`, `AssetsConfig`, `ResourceBinding`,
+  `ResourceRef`, `ConfigValidation`.
+
+## Versioning
+
+Independent versions via changesets. Adding a config key is minor; removing
+or repurposing one is major and ships with both consumers updated.

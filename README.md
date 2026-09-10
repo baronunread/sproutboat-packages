@@ -29,9 +29,9 @@ contract change ships with both consumers updated; the conformance suite
 
 ## Status
 
-Scaffold. Package surfaces are reserved; the extraction from the CLI and
-the platform is tracked in their repos (see Adoption below). Nothing
-imports these packages yet.
+Published on npm at 0.2.0 and consumed by both repos from the registry.
+The CLI keeps re-export shims so its `sproutboat/runtime/*` export paths
+hold; the platform imports the packages directly.
 
 ## Adoption
 

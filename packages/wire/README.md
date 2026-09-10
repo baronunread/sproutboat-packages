@@ -1,15 +1,30 @@
 # `@sproutboat/wire`
 
-Single source of truth for the broker frame protocol: op dispatch, storage
-tables, queue and alarm delivery, plus the JSON validation utilities the
-protocol is built on.
+Broker frame protocol and the JSON validation utilities it is built on.
+Single source of truth shared by the CLI dev broker and the platform's
+edge and supervisor.
 
-Current sources, moved verbatim: `sproutboat-cli/src/broker.ts`,
-`broker.test.ts`, `json.ts`. Contract tests move with the code; the CLI's
-`CONTRACTS.md` broker-wire and storage sections keep generating from here.
+```sh
+bun add @sproutboat/wire
+```
 
-Note: `broker.ts` imports `@sproutboat/assets`, deliberately declared
-nowhere here. Bun resolves transitive `file:` links from the consumer root,
-not the declaring package, so every consumer links all `@sproutboat/*`
-packages it needs at its own root. Add a real version range here at first
-npm publish.
+```ts
+import { createBroker } from "@sproutboat/wire";
+import { parseJsonValue } from "@sproutboat/wire";
+```
+
+## API
+
+- `createBroker(options)` opens a binding broker over a resource file:
+  KV, D1, R2, queues, Durable Object storage and alarms, Analytics Engine
+  points, secrets, outbound fetch. Frame envelope, both directions:
+  `[u32 LE length][payload]`.
+- Frame helpers: `frameOf`, `encodeFrame`, `encodeV1`, `FRAME_V1`,
+  `cronMatches`, plus the `Broker`, `BrokerOptions`, `BrokerServer`,
+  `FetchLike` and `Frame` types.
+- JSON boundary parsing: `parseJsonValue`, `jsonObject`, guards
+  (`isString`, `isBoolean`, `isSafeInteger`), `JsonValue` and `JsonObject`
+  types. Parse at the I/O boundary, then narrow; nothing downstream takes
+  an unparsed value.
+
+See `src/broker.test.ts` for the protocol contract in executable form.
