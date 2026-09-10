@@ -33,5 +33,5 @@ imports these packages yet.
 
 ## Adoption
 
-- Platform: baronunread/sproutboat#150
+- Packages home (this repo): baronunread/sproutboat-packages#1 (transferred from baronunread/sproutboat#150)
 - CLI: baronunread/sproutboat-cli#33
