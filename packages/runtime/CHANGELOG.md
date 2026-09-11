@@ -1,5 +1,17 @@
 # @sproutboat/runtime
 
+## 0.5.0
+
+### Minor Changes
+
+- Rate limiter (baronunread/sproutboat#69): `env.<NAME>.limit({ key })` now
+  returns `{ success, resetAt }`. `resetAt` is epoch milliseconds for when the
+  fixed window rolls and the counter clears, returned on every call (hit or
+  miss), so a rejection can carry an accurate `Retry-After`:
+  `Math.ceil((resetAt - Date.now()) / 1000)`. The `ratelimit.check` op already
+  had `windowStart` and `period` in hand; it just stopped discarding them.
+  Additive: existing callers reading only `success` are unaffected.
+
 ## 0.4.0
 
 ### Minor Changes

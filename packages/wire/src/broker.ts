@@ -612,7 +612,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
               "window_start = ?3 RETURNING count",
           )
           .get(name, msg.key == null ? "" : str(msg.key), windowStart);
-        return { ok: true, success: (row?.count ?? 1) <= limit };
+        return { ok: true, success: (row?.count ?? 1) <= limit, resetAt: (windowStart + period) * 1000 };
       }
 
       case "r2.put": {

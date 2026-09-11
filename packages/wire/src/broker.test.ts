@@ -745,7 +745,11 @@ test("ratelimit: fixed window per key, limit/period from the message (#69)", asy
   expect((await hit("a")).success).toBe(true); // 1
   expect((await hit("a")).success).toBe(true); // 2
   expect((await hit("a")).success).toBe(true); // 3
-  expect((await hit("a")).success).toBe(false); // 4 — over
+  const over = await hit("a"); // 4 — over
+  expect(over.success).toBe(false);
+  // resetAt is epoch ms at the window edge, so it drives a Retry-After.
+  expect(over.resetAt).toBeGreaterThan(Date.now());
+  expect(over.resetAt).toBeLessThanOrEqual(Date.now() + 60_000);
   expect((await hit("b")).success).toBe(true); // a different key has its own count
 
   await expect(b.dispatch({ op: "ratelimit.check", name: "NOPE", key: "x", limit: 1, period: 60 })).rejects.toThrow(

@@ -1106,9 +1106,11 @@ globalThis.__sbInstallBindings = function (target, bindings) {
     target[b.binding] = __sbMakeDONamespace(b.binding, b.className);
   }
 
-  // #69 — env.<NAME>.limit({ key }) -> { success }. Fixed window: at most
-  // `limit` calls per `period` seconds for a given key. limit/period travel in
-  // the message so the op stays stateless (the transport has no config).
+  // #69 — env.<NAME>.limit({ key }) -> { success, resetAt }. Fixed window: at
+  // most `limit` calls per `period` seconds for a given key. limit/period
+  // travel in the message so the op stays stateless (the transport has no
+  // config). `resetAt` is epoch ms when the window rolls and the count clears,
+  // so a 429 can send `Retry-After: ceil((resetAt - Date.now()) / 1000)`.
   // Returns sync like the other shims (CF's is a Promise; the runtime is sync).
   for (let i = 0; i < (bindings.ratelimiters || []).length; i++) {
     const rl = bindings.ratelimiters[i];
@@ -1116,7 +1118,7 @@ globalThis.__sbInstallBindings = function (target, bindings) {
       limit(options) {
         const key = options && options.key != null ? String(options.key) : "";
         const r = __sbRpc("ratelimit.check", { name: rl.binding, key, limit: rl.limit, period: rl.period });
-        return { success: !!r.success };
+        return { success: !!r.success, resetAt: Number(r.resetAt) || 0 };
       },
     };
   }

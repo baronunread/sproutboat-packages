@@ -1539,7 +1539,7 @@ function __sbEmbeddedDispatch(msg) {
       [String(msg.name), String(msg.key == null ? "" : msg.key), windowStart],
     );
     const count = r.rows.length ? Number(r.rows[0][0]) : 1;
-    return { ok: true, success: count <= limit };
+    return { ok: true, success: count <= limit, resetAt: (windowStart + period) * 1000 };
   }
 
   throw new Error("unknown op: " + op);
