@@ -18,7 +18,13 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
     "runtime/index.js": "fixture:runtime/index.js\n",
     "compiler/render.js":
       "void porf_native_fetch_runtime_init(void) {\n  signal(SIGPIPE, SIG_IGN);\n  porf_init(0, NULL);\n}\n" +
-      "f64 porf_native_fetch_get_port(void) {\nfixture:compiler/render.js\n",
+      "f64 porf_native_fetch_get_port(void) {\nfixture:compiler/render.js\n" +
+      "  if (value.type == ${TYPES.bytestring}) {\n" +
+      "    const u32 ptr = (u32)value.val;\n" +
+      "    *out_buf = (const char*)(MEM + ptr + 4);\n" +
+      "    *out_len = (size_t)*(u32*)(MEM + ptr);\n" +
+      "    return 0;\n" +
+      "  }\n",
     "compiler/index.js": "          '-xc', '-', '-c',\n          uSocketsArchive,\n          '-lm'\n",
     "compiler/uwebsockets.js":
       "static const size_t REQUEST_BODY_MAX_BYTES = 1024u * 1024u;\n" +

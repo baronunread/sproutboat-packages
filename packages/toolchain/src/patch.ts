@@ -46,6 +46,47 @@ const RENDER_EDITS = [
   [CONSOLE_MARKER, CONSOLE_ANCHOR, CONSOLE_INJECT, "console output sink (#165)"],
 ] as const;
 
+/**
+ * baronunread/sproutboat#172 — `porf_native_fetch_read_value`'s `bytestring`
+ * branch (Porffor's Latin-1-range string representation) copies the raw code
+ * units straight onto the wire, as if they were already UTF-8 bytes. Any unit
+ * >= 0x80 — any non-ASCII Latin-1 character — reaches the client corrupt
+ * instead of UTF-8 encoded. Response bodies and header values both go through
+ * this function, so both are affected; the sibling `string` (UTF-16) branch a
+ * few lines down already encodes correctly, this makes the `bytestring` one
+ * do the same, one byte in instead of two.
+ */
+const BYTESTRING_ANCHOR =
+  "  if (value.type == ${TYPES.bytestring}) {\n" +
+  "    const u32 ptr = (u32)value.val;\n" +
+  "    *out_buf = (const char*)(MEM + ptr + 4);\n" +
+  "    *out_len = (size_t)*(u32*)(MEM + ptr);\n" +
+  "    return 0;\n" +
+  "  }";
+const BYTESTRING_INJECT =
+  "  if (value.type == ${TYPES.bytestring}) {\n" +
+  "    // sproutboat #172: units are Latin-1 code points, not UTF-8 bytes -- encode them\n" +
+  "    const u32 ptr = (u32)value.val;\n" +
+  "    const size_t len = (size_t)*(u32*)(MEM + ptr);\n" +
+  "    const unsigned char* units = (const unsigned char*)(MEM + ptr + 4);\n" +
+  "    char* utf8 = (char*)malloc(len * 2);\n" +
+  "    if (!utf8 && len > 0) return -1;\n" +
+  "    size_t out_len_local = 0;\n" +
+  "    for (size_t i = 0; i < len; i++) {\n" +
+  "      unsigned char c = units[i];\n" +
+  "      if (c < 0x80) utf8[out_len_local++] = (char)c;\n" +
+  "      else {\n" +
+  "        utf8[out_len_local++] = (char)(0xc0 | (c >> 6));\n" +
+  "        utf8[out_len_local++] = (char)(0x80 | (c & 0x3f));\n" +
+  "      }\n" +
+  "    }\n" +
+  "    *out_buf = utf8;\n" +
+  "    *out_len = out_len_local;\n" +
+  "    *out_owned = utf8;\n" +
+  "    return 0;\n" +
+  "  }";
+const BYTESTRING_MARKER = "sproutboat #172";
+
 // #15 — no `--port` flag: Porffor's native-fetch entry point calls
 // `porf_init(0, NULL)` (see porf_native_fetch_runtime_init in render.js), so a
 // native-fetch binary never sees argv at all. A standalone binary takes its
@@ -244,6 +285,18 @@ export async function patchRenderJs(root: string): Promise<void> {
     src = src.slice(0, at + anchor.length) + inject + src.slice(at + anchor.length);
     changed = true;
   }
+
+  if (!src.includes(BYTESTRING_MARKER)) {
+    if (!src.includes(BYTESTRING_ANCHOR)) {
+      throw new Error(
+        "could not patch Porffor for bytestring UTF-8 encoding (#172): anchor not found in " +
+          `${file}. Porffor's native-fetch renderer changed — check patches/UPSTREAM.md.`,
+      );
+    }
+    src = src.replace(BYTESTRING_ANCHOR, BYTESTRING_INJECT);
+    changed = true;
+  }
+
   if (changed) await writeFile(file, src);
 }
 

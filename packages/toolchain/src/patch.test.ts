@@ -17,6 +17,23 @@ const RENDER = `void porf_native_fetch_runtime_init(void) {
 f64 porf_native_fetch_get_port(void) {
   return __porffor_native_fetch_port.val;
 }
+
+int porf_native_fetch_read_value(jsval value, const char** out_buf, size_t* out_len, char** out_owned) {
+  if (!out_buf || !out_len || !out_owned) return -1;
+
+  *out_buf = NULL;
+  *out_len = 0;
+  *out_owned = NULL;
+
+  if (value.type == \${TYPES.bytestring}) {
+    const u32 ptr = (u32)value.val;
+    *out_buf = (const char*)(MEM + ptr + 4);
+    *out_len = (size_t)*(u32*)(MEM + ptr);
+    return 0;
+  }
+
+  return -1;
+}
 `;
 
 // Porffor's compiler/uwebsockets.js, trimmed to the parts the patch touches:
@@ -125,6 +142,11 @@ test("#165: render.js routes console output to stderr, unbuffered, idempotently"
     expect(once).toMatch(/signal\(SIGPIPE, SIG_IGN\);\n {2}\/\* sproutboat #165/);
     // The $PORT edit still lands too.
     expect(once).toContain('getenv("PORT")');
+
+    // #172: the bytestring branch encodes instead of copying raw bytes.
+    expect(once).toContain("sproutboat #172");
+    expect(once).toContain("(char)(0xc0 | (c >> 6));");
+    expect(once).not.toContain("*out_buf = (const char*)(MEM + ptr + 4);");
 
     await patchRenderJs(root);
     expect(await readFile(join(root, "compiler/render.js"), "utf8")).toBe(once);
