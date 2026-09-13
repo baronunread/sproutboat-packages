@@ -87,6 +87,55 @@ const BYTESTRING_INJECT =
   "  }";
 const BYTESTRING_MARKER = "sproutboat #172";
 
+/**
+ * baronunread/sproutboat#176 — #172 broke the assets binding, which reads a
+ * file's bytes off disk into a `bytestring` specifically so they can pass
+ * through the wire untouched (already-finished bytes: a UTF-8 text file's
+ * bytes are already UTF-8, a binary file's bytes are just bytes, neither
+ * should ever be "encoded" again). A `bytestring` carrying real text a
+ * handler built and one carrying opaque file bytes are the same type with no
+ * way to tell them apart at this point — so the caller has to say which one
+ * this is.
+ *
+ * `porf_native_fetch_read_value` is called from ~30 places across
+ * sproutboat's own inline C (crypto, SQL params, R2/D1 paths, the HTTP
+ * client), every one of them genuine text, every one needing #172's
+ * encoding unchanged — widening its signature would mean touching all of
+ * them for zero behavior change, for one caller that needs something
+ * different. Add a second, dedicated function instead:
+ * `porf_native_fetch_read_raw_bytes`, zero-copy, bytestring-only, no
+ * encoding, ever. Only `write_response_value`'s body read (uwebsockets.js,
+ * below) calls it, gated on the reserved `x-sb-raw-body` response header the
+ * assets binding sets. Every existing call site is untouched.
+ */
+const READ_RAW_ANCHOR = "int porf_native_fetch_read_value(jsval value, const char** out_buf, size_t* out_len, char** out_owned) {";
+const READ_RAW_INJECT =
+  "// sproutboat #176: zero-copy passthrough for a bytestring that is already-\n" +
+  "// finished bytes (an asset read off disk), never a string to UTF-8 encode.\n" +
+  "// Deliberately not folded into porf_native_fetch_read_value above: that one\n" +
+  "// is called from ~30 places across sproutboat's own inline C, all genuine\n" +
+  "// text, all needing its encoding unchanged.\n" +
+  "int porf_native_fetch_read_raw_bytes(jsval value, const char** out_buf, size_t* out_len) {\n" +
+  "  if (value.type != ${TYPES.bytestring}) return -1;\n" +
+  "  const u32 ptr = (u32)value.val;\n" +
+  "  *out_buf = (const char*)(MEM + ptr + 4);\n" +
+  "  *out_len = (size_t)*(u32*)(MEM + ptr);\n" +
+  "  return 0;\n" +
+  "}\n" +
+  "\n" +
+  READ_RAW_ANCHOR;
+const READ_RAW_MARKER = "porf_native_fetch_read_raw_bytes(jsval value";
+
+/**
+ * render.js full-block replacements: `[marker, anchor, inject, what]`, each a
+ * complete swap of the matched region (unlike `RENDER_EDITS`, which only ever
+ * inserts after its anchor).
+ */
+const RENDER_REPLACEMENTS = [
+  [BYTESTRING_MARKER, BYTESTRING_ANCHOR, BYTESTRING_INJECT, "bytestring UTF-8 encoding (#172)"],
+  [READ_RAW_MARKER, READ_RAW_ANCHOR, READ_RAW_INJECT, "raw bytestring passthrough function (#176)"],
+] as const;
+
 // #15 — no `--port` flag: Porffor's native-fetch entry point calls
 // `porf_init(0, NULL)` (see porf_native_fetch_runtime_init in render.js), so a
 // native-fetch binary never sees argv at all. A standalone binary takes its
@@ -207,6 +256,160 @@ const HDR_APPEND_INJECT =
   "  *((i32*)(porf_mem + headers_ptr)) = slot;\n\n  return headers_ptr;";
 const HDR_APPEND_MARKER = "__sb_peer";
 
+/**
+ * baronunread/sproutboat#176 — the uwebsockets.js half of the raw-bytestring
+ * fix: a forward declaration for render.js's new
+ * `porf_native_fetch_read_raw_bytes`, `write_response_value` scanning for a
+ * reserved `x-sb-raw-body` response header before the body read and calling
+ * that function instead of `porf_native_fetch_read_value` when it's present
+ * (header reads are untouched — a header name or value is always real
+ * text), and `is_forbidden_response_header` dropping that header from what
+ * actually reaches the client — same reserved-header pattern as #163's
+ * `x-sb-remote-addr`, just response-side and sproutboat-to-C instead of
+ * C-to-sproutboat.
+ */
+const READ_RAW_DECL_ANCHOR =
+  "int porf_native_fetch_read_value(struct jsval value, const char** out_buf, size_t* out_len, char** out_owned);";
+const READ_RAW_DECL_INJECT =
+  "int porf_native_fetch_read_value(struct jsval value, const char** out_buf, size_t* out_len, char** out_owned);\n" +
+  "int porf_native_fetch_read_raw_bytes(struct jsval value, const char** out_buf, size_t* out_len);";
+const READ_RAW_DECL_MARKER = "porf_native_fetch_read_raw_bytes(struct jsval value";
+
+const FORBIDDEN_HDR_ANCHOR =
+  "static bool is_forbidden_response_header(std::string_view key) {\n" +
+  '  return key == "connection" ||\n' +
+  '         key == "content-length" ||\n' +
+  '         key == "transfer-encoding";\n' +
+  "}";
+const FORBIDDEN_HDR_INJECT =
+  "static bool is_forbidden_response_header(std::string_view key) {\n" +
+  '  return key == "connection" ||\n' +
+  '         key == "content-length" ||\n' +
+  '         key == "transfer-encoding" ||\n' +
+  '         key == "x-sb-raw-body"; // sproutboat #176: internal signal, never sent\n' +
+  "}";
+const FORBIDDEN_HDR_MARKER = 'key == "x-sb-raw-body"';
+
+const WRITE_RESPONSE_ANCHOR =
+  "static void write_response_value(uWS::HttpResponse<false>* res, struct jsval response, bool* aborted) {\n" +
+  "  struct NativeFetchResponseParts response_parts;\n" +
+  "  porf_native_fetch_finalize_response(response.val, response.type, &response_parts);\n" +
+  "  const i32 status = response_parts.status;\n" +
+  "  const struct jsval body_value = response_parts.body;\n" +
+  "  const i32 headers_entries_ptr = (i32)response_parts.headers.val;\n" +
+  "\n" +
+  "  const char* body_buf = nullptr;\n" +
+  "  size_t body_len = 0;\n" +
+  "  char* body_owned = nullptr;\n" +
+  "  porf_native_fetch_read_value(body_value, &body_buf, &body_len, &body_owned);\n" +
+  "\n" +
+  "  if (!aborted || !*aborted) {\n" +
+  "    res->cork([res, status, headers_entries_ptr, body_buf, body_len]() {\n" +
+  "      if (status != 200) res->writeStatus(lookup_status_line(status));\n" +
+  "\n" +
+  "      const i32 headers_len = *((i32*)(porf_mem + headers_entries_ptr)) / 2;\n" +
+  "      const i32 headers_entries = *((i32*)(porf_mem + headers_entries_ptr + 4));\n" +
+  "      for (i32 i = 0; i < headers_len; i++) {\n" +
+  "        const i32 name_base = headers_entries + i * 16;\n" +
+  "        const i32 value_base = name_base + 8;\n" +
+  "        const struct jsval name_value = unpack_jsval(*((u64*)(porf_mem + name_base)));\n" +
+  "        const struct jsval value_value = unpack_jsval(*((u64*)(porf_mem + value_base)));\n" +
+  "\n" +
+  "        const char* name_buf = nullptr;\n" +
+  "        size_t name_len = 0;\n" +
+  "        char* name_owned = nullptr;\n" +
+  "        const char* value_buf = nullptr;\n" +
+  "        size_t value_len = 0;\n" +
+  "        char* value_owned = nullptr;\n" +
+  "        porf_native_fetch_read_value(name_value, &name_buf, &name_len, &name_owned);\n" +
+  "        porf_native_fetch_read_value(value_value, &value_buf, &value_len, &value_owned);\n" +
+  "\n" +
+  "        const std::string_view key(name_buf, name_len);\n" +
+  "        if (!is_forbidden_response_header(key)) {\n" +
+  "          res->writeHeader(key, std::string_view(value_buf, value_len));\n" +
+  "        }\n" +
+  "\n" +
+  "        if (name_owned) free(name_owned);\n" +
+  "        if (value_owned) free(value_owned);\n" +
+  "      }\n" +
+  "\n" +
+  "      res->end(std::string_view(body_buf, body_len));\n" +
+  "    });\n" +
+  "  }\n" +
+  "\n" +
+  "  if (body_owned) free(body_owned);\n" +
+  "}";
+const WRITE_RESPONSE_INJECT =
+  "static void write_response_value(uWS::HttpResponse<false>* res, struct jsval response, bool* aborted) {\n" +
+  "  struct NativeFetchResponseParts response_parts;\n" +
+  "  porf_native_fetch_finalize_response(response.val, response.type, &response_parts);\n" +
+  "  const i32 status = response_parts.status;\n" +
+  "  const struct jsval body_value = response_parts.body;\n" +
+  "  const i32 headers_entries_ptr = (i32)response_parts.headers.val;\n" +
+  "\n" +
+  "  // sproutboat #176: a reserved x-sb-raw-body header (set by the prelude's\n" +
+  "  // assets binding) means the body is already-finished bytes, not a string\n" +
+  "  // to UTF-8 encode -- scanned before the body read so it can steer that one\n" +
+  "  // call onto porf_native_fetch_read_raw_bytes instead.\n" +
+  "  bool raw_body = false;\n" +
+  "  {\n" +
+  "    const i32 scan_len = *((i32*)(porf_mem + headers_entries_ptr)) / 2;\n" +
+  "    const i32 scan_entries = *((i32*)(porf_mem + headers_entries_ptr + 4));\n" +
+  "    for (i32 i = 0; i < scan_len && !raw_body; i++) {\n" +
+  "      const struct jsval scan_name = unpack_jsval(*((u64*)(porf_mem + scan_entries + i * 16)));\n" +
+  "      const char* scan_buf = nullptr;\n" +
+  "      size_t scan_bytes = 0;\n" +
+  "      char* scan_owned = nullptr;\n" +
+  "      porf_native_fetch_read_value(scan_name, &scan_buf, &scan_bytes, &scan_owned);\n" +
+  "      if (std::string_view(scan_buf, scan_bytes) == \"x-sb-raw-body\") raw_body = true;\n" +
+  "      if (scan_owned) free(scan_owned);\n" +
+  "    }\n" +
+  "  }\n" +
+  "\n" +
+  "  const char* body_buf = nullptr;\n" +
+  "  size_t body_len = 0;\n" +
+  "  char* body_owned = nullptr;\n" +
+  "  if (raw_body) porf_native_fetch_read_raw_bytes(body_value, &body_buf, &body_len);\n" +
+  "  else porf_native_fetch_read_value(body_value, &body_buf, &body_len, &body_owned);\n" +
+  "\n" +
+  "  if (!aborted || !*aborted) {\n" +
+  "    res->cork([res, status, headers_entries_ptr, body_buf, body_len]() {\n" +
+  "      if (status != 200) res->writeStatus(lookup_status_line(status));\n" +
+  "\n" +
+  "      const i32 headers_len = *((i32*)(porf_mem + headers_entries_ptr)) / 2;\n" +
+  "      const i32 headers_entries = *((i32*)(porf_mem + headers_entries_ptr + 4));\n" +
+  "      for (i32 i = 0; i < headers_len; i++) {\n" +
+  "        const i32 name_base = headers_entries + i * 16;\n" +
+  "        const i32 value_base = name_base + 8;\n" +
+  "        const struct jsval name_value = unpack_jsval(*((u64*)(porf_mem + name_base)));\n" +
+  "        const struct jsval value_value = unpack_jsval(*((u64*)(porf_mem + value_base)));\n" +
+  "\n" +
+  "        const char* name_buf = nullptr;\n" +
+  "        size_t name_len = 0;\n" +
+  "        char* name_owned = nullptr;\n" +
+  "        const char* value_buf = nullptr;\n" +
+  "        size_t value_len = 0;\n" +
+  "        char* value_owned = nullptr;\n" +
+  "        porf_native_fetch_read_value(name_value, &name_buf, &name_len, &name_owned);\n" +
+  "        porf_native_fetch_read_value(value_value, &value_buf, &value_len, &value_owned);\n" +
+  "\n" +
+  "        const std::string_view key(name_buf, name_len);\n" +
+  "        if (!is_forbidden_response_header(key)) {\n" +
+  "          res->writeHeader(key, std::string_view(value_buf, value_len));\n" +
+  "        }\n" +
+  "\n" +
+  "        if (name_owned) free(name_owned);\n" +
+  "        if (value_owned) free(value_owned);\n" +
+  "      }\n" +
+  "\n" +
+  "      res->end(std::string_view(body_buf, body_len));\n" +
+  "    });\n" +
+  "  }\n" +
+  "\n" +
+  "  if (body_owned) free(body_owned);\n" +
+  "}";
+const WRITE_RESPONSE_MARKER = "porf_native_fetch_read_raw_bytes(body_value";
+
 const done = new Set<string>();
 
 /** Edits to Porffor's uWebSockets shim: `[marker, anchor, inject, what]`. */
@@ -220,6 +423,9 @@ const UWS_EDITS = [
   [HDR_CAP_MARKER, HDR_CAP_ANCHOR, HDR_CAP_INJECT, "remote-addr header capacity (#163)"],
   [HDR_SKIP_MARKER, HDR_SKIP_ANCHOR, HDR_SKIP_INJECT, "drop client-sent x-sb-remote-addr (#163)"],
   [HDR_APPEND_MARKER, HDR_APPEND_ANCHOR, HDR_APPEND_INJECT, "append x-sb-remote-addr (#163)"],
+  [READ_RAW_DECL_MARKER, READ_RAW_DECL_ANCHOR, READ_RAW_DECL_INJECT, "read_raw_bytes decl (#176)"],
+  [FORBIDDEN_HDR_MARKER, FORBIDDEN_HDR_ANCHOR, FORBIDDEN_HDR_INJECT, "drop x-sb-raw-body from the wire (#176)"],
+  [WRITE_RESPONSE_MARKER, WRITE_RESPONSE_ANCHOR, WRITE_RESPONSE_INJECT, "detect x-sb-raw-body, steer the body read (#176)"],
 ] as const;
 
 /** The uWebSockets shim source: body limit + the #156 status-line fix. Exported for tests. */
@@ -286,14 +492,17 @@ export async function patchRenderJs(root: string): Promise<void> {
     changed = true;
   }
 
-  if (!src.includes(BYTESTRING_MARKER)) {
-    if (!src.includes(BYTESTRING_ANCHOR)) {
+  // Full-block replacements, not append-after-anchor: each needs the whole
+  // matched region gone, not just something added alongside it.
+  for (const [marker, anchor, inject, what] of RENDER_REPLACEMENTS) {
+    if (src.includes(marker)) continue;
+    if (!src.includes(anchor)) {
       throw new Error(
-        "could not patch Porffor for bytestring UTF-8 encoding (#172): anchor not found in " +
-          `${file}. Porffor's native-fetch renderer changed — check patches/UPSTREAM.md.`,
+        `could not patch Porffor for ${what}: anchor not found in ${file}. ` +
+          "Porffor's native-fetch renderer changed — check patches/UPSTREAM.md.",
       );
     }
-    src = src.replace(BYTESTRING_ANCHOR, BYTESTRING_INJECT);
+    src = src.replace(anchor, inject);
     changed = true;
   }
 

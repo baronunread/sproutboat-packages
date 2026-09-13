@@ -37,8 +37,12 @@ int porf_native_fetch_read_value(jsval value, const char** out_buf, size_t* out_
 `;
 
 // Porffor's compiler/uwebsockets.js, trimmed to the parts the patch touches:
-// body limit (#56), the #156 status-line switch, and #163's collect_headers.
+// body limit (#56), the #156 status-line switch, #163's collect_headers, and
+// #176's read_value forward decl / is_forbidden_response_header /
+// write_response_value.
 const SHIM = `static const size_t REQUEST_BODY_MAX_BYTES = 1024u * 1024u;
+
+int porf_native_fetch_read_value(struct jsval value, const char** out_buf, size_t* out_len, char** out_owned);
 
 static std::string_view lookup_status_line(i32 status) {
   switch (status) {
@@ -73,6 +77,61 @@ static i32 collect_headers(uWS::HttpRequest* req) {
 
 static void on_request(uWS::HttpResponse<false>* res, uWS::HttpRequest* req) {
   const i32 headers_ptr = collect_headers(req);
+}
+
+static bool is_forbidden_response_header(std::string_view key) {
+  return key == "connection" ||
+         key == "content-length" ||
+         key == "transfer-encoding";
+}
+
+static void write_response_value(uWS::HttpResponse<false>* res, struct jsval response, bool* aborted) {
+  struct NativeFetchResponseParts response_parts;
+  porf_native_fetch_finalize_response(response.val, response.type, &response_parts);
+  const i32 status = response_parts.status;
+  const struct jsval body_value = response_parts.body;
+  const i32 headers_entries_ptr = (i32)response_parts.headers.val;
+
+  const char* body_buf = nullptr;
+  size_t body_len = 0;
+  char* body_owned = nullptr;
+  porf_native_fetch_read_value(body_value, &body_buf, &body_len, &body_owned);
+
+  if (!aborted || !*aborted) {
+    res->cork([res, status, headers_entries_ptr, body_buf, body_len]() {
+      if (status != 200) res->writeStatus(lookup_status_line(status));
+
+      const i32 headers_len = *((i32*)(porf_mem + headers_entries_ptr)) / 2;
+      const i32 headers_entries = *((i32*)(porf_mem + headers_entries_ptr + 4));
+      for (i32 i = 0; i < headers_len; i++) {
+        const i32 name_base = headers_entries + i * 16;
+        const i32 value_base = name_base + 8;
+        const struct jsval name_value = unpack_jsval(*((u64*)(porf_mem + name_base)));
+        const struct jsval value_value = unpack_jsval(*((u64*)(porf_mem + value_base)));
+
+        const char* name_buf = nullptr;
+        size_t name_len = 0;
+        char* name_owned = nullptr;
+        const char* value_buf = nullptr;
+        size_t value_len = 0;
+        char* value_owned = nullptr;
+        porf_native_fetch_read_value(name_value, &name_buf, &name_len, &name_owned);
+        porf_native_fetch_read_value(value_value, &value_buf, &value_len, &value_owned);
+
+        const std::string_view key(name_buf, name_len);
+        if (!is_forbidden_response_header(key)) {
+          res->writeHeader(key, std::string_view(value_buf, value_len));
+        }
+
+        if (name_owned) free(name_owned);
+        if (value_owned) free(value_owned);
+      }
+
+      res->end(std::string_view(body_buf, body_len));
+    });
+  }
+
+  if (body_owned) free(body_owned);
 }
 `;
 
@@ -110,6 +169,23 @@ test("#156: status-line fallback synthesizes a line for unlisted codes, idempote
     expect(once).toContain('porf_native_fetch_alloc_bytestring("x-sb-remote-addr", 16)');
     expect(once).toContain("header_capacity += 2;");
 
+    // #176: a dedicated porf_native_fetch_read_raw_bytes, declared alongside
+    // the untouched original; write_response_value scans for a reserved
+    // x-sb-raw-body header and calls the new function instead of the old one
+    // only for the body, only when it's present -- header reads are
+    // unchanged, and the marker is dropped from what reaches the client.
+    expect(once).toContain(
+      "int porf_native_fetch_read_raw_bytes(struct jsval value, const char** out_buf, size_t* out_len);",
+    );
+    expect(once).toContain('key == "x-sb-raw-body"');
+    expect(once).toContain("bool raw_body = false;");
+    expect(once).toContain('if (std::string_view(scan_buf, scan_bytes) == "x-sb-raw-body") raw_body = true;');
+    expect(once).toContain("if (raw_body) porf_native_fetch_read_raw_bytes(body_value, &body_buf, &body_len);");
+    expect(once).toContain("else porf_native_fetch_read_value(body_value, &body_buf, &body_len, &body_owned);");
+    // Header reads are the original 4-arg call, unchanged.
+    expect(once).toContain("porf_native_fetch_read_value(name_value, &name_buf, &name_len, &name_owned);");
+    expect(once).toContain("porf_native_fetch_read_value(value_value, &value_buf, &value_len, &value_owned);");
+
     await patchUwebsockets(root);
     expect(await readFile(join(root, "compiler/uwebsockets.js"), "utf8")).toBe(once);
   } finally {
@@ -146,7 +222,17 @@ test("#165: render.js routes console output to stderr, unbuffered, idempotently"
     // #172: the bytestring branch encodes instead of copying raw bytes.
     expect(once).toContain("sproutboat #172");
     expect(once).toContain("(char)(0xc0 | (c >> 6));");
-    expect(once).not.toContain("*out_buf = (const char*)(MEM + ptr + 4);");
+    // #176: a separate, dedicated function does the original zero-copy
+    // passthrough for already-finished bytes (an asset) -- porf_native_fetch_
+    // read_value's own signature and behavior are untouched, so its ~30 other
+    // callers across sproutboat's inline C need no changes at all.
+    expect(once).toContain("sproutboat #176");
+    expect(once).toContain(
+      "int porf_native_fetch_read_raw_bytes(jsval value, const char** out_buf, size_t* out_len) {",
+    );
+    expect(once).toContain(
+      "int porf_native_fetch_read_value(jsval value, const char** out_buf, size_t* out_len, char** out_owned) {",
+    );
 
     await patchRenderJs(root);
     expect(await readFile(join(root, "compiler/render.js"), "utf8")).toBe(once);

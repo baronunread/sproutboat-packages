@@ -1140,6 +1140,11 @@ globalThis.__sbInstallBindings = function (target, bindings) {
         const headers = {};
         if (r.type) headers["content-type"] = r.type;
         if (r.found) headers["etag"] = '"' + r.hash + '"';
+        // #176: these bytes came off disk already-finished (UTF-8 text or
+        // binary, doesn't matter which) -- the reserved x-sb-raw-body header
+        // tells the C write path to pass them through untouched instead of
+        // re-encoding as if this were a JS string a handler built.
+        if (r.body != null) headers["x-sb-raw-body"] = "1";
         return new Response(r.body == null ? "" : r.body, { status: r.status || (r.found ? 200 : 404), headers });
       },
     };
@@ -1168,6 +1173,10 @@ globalThis.__sbInstallBindings = function (target, bindings) {
         });
         const respHeaders = new Headers();
         for (let j = 0; j < (r.headers || []).length; j++) respHeaders.set(r.headers[j][0], r.headers[j][1]);
+        // #176: wire bytes from another deployment, not a string this handler
+        // built -- must not be re-encoded if the handler proxies it straight
+        // through (see the assets binding for the same reasoning).
+        if (r.body != null) respHeaders.set("x-sb-raw-body", "1");
         return new Response(r.body == null ? "" : r.body, { status: r.status || 502, headers: respHeaders });
       },
     };
@@ -1190,6 +1199,10 @@ globalThis.__sbInstallBindings = function (target, bindings) {
       });
       const respHeaders = new Headers();
       for (let j = 0; j < (r.headers || []).length; j++) respHeaders.set(r.headers[j][0], r.headers[j][1]);
+      // #176: bytes from an outbound HTTP response, not a string this handler
+      // built -- must not be re-encoded if the handler proxies it straight
+      // through (see the assets binding for the same reasoning).
+      if (r.body != null) respHeaders.set("x-sb-raw-body", "1");
       return new Response(r.body == null ? "" : r.body, { status: r.status || 502, headers: respHeaders });
     };
   }

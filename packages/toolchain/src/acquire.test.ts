@@ -19,15 +19,19 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
     "compiler/render.js":
       "void porf_native_fetch_runtime_init(void) {\n  signal(SIGPIPE, SIG_IGN);\n  porf_init(0, NULL);\n}\n" +
       "f64 porf_native_fetch_get_port(void) {\nfixture:compiler/render.js\n" +
+      "int porf_native_fetch_read_value(jsval value, const char** out_buf, size_t* out_len, char** out_owned) {\n" +
       "  if (value.type == ${TYPES.bytestring}) {\n" +
       "    const u32 ptr = (u32)value.val;\n" +
       "    *out_buf = (const char*)(MEM + ptr + 4);\n" +
       "    *out_len = (size_t)*(u32*)(MEM + ptr);\n" +
       "    return 0;\n" +
-      "  }\n",
+      "  }\n" +
+      "  return -1;\n" +
+      "}\n",
     "compiler/index.js": "          '-xc', '-', '-c',\n          uSocketsArchive,\n          '-lm'\n",
     "compiler/uwebsockets.js":
       "static const size_t REQUEST_BODY_MAX_BYTES = 1024u * 1024u;\n" +
+      "int porf_native_fetch_read_value(struct jsval value, const char** out_buf, size_t* out_len, char** out_owned);\n" +
       "static std::string_view lookup_status_line(i32 status) {\n" +
       '  switch (status) {\n    case 302: return "302 Found";\n    default: return {};\n  }\n}\n' +
       "static i32 collect_headers(uWS::HttpRequest* req) {\n" +
@@ -36,7 +40,60 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "  i32 slot = 0;\n  for (auto [key, value] : *req) {\n    slot++;\n  }\n" +
       "  *((i32*)(porf_mem + headers_ptr)) = slot;\n\n  return headers_ptr;\n}\n" +
       "static void on_request(uWS::HttpResponse<false>* res, uWS::HttpRequest* req) {\n" +
-      "  const i32 headers_ptr = collect_headers(req);\n}\n",
+      "  const i32 headers_ptr = collect_headers(req);\n}\n" +
+      "static bool is_forbidden_response_header(std::string_view key) {\n" +
+      '  return key == "connection" ||\n' +
+      '         key == "content-length" ||\n' +
+      '         key == "transfer-encoding";\n' +
+      "}\n" +
+      "static void write_response_value(uWS::HttpResponse<false>* res, struct jsval response, bool* aborted) {\n" +
+      "  struct NativeFetchResponseParts response_parts;\n" +
+      "  porf_native_fetch_finalize_response(response.val, response.type, &response_parts);\n" +
+      "  const i32 status = response_parts.status;\n" +
+      "  const struct jsval body_value = response_parts.body;\n" +
+      "  const i32 headers_entries_ptr = (i32)response_parts.headers.val;\n" +
+      "\n" +
+      "  const char* body_buf = nullptr;\n" +
+      "  size_t body_len = 0;\n" +
+      "  char* body_owned = nullptr;\n" +
+      "  porf_native_fetch_read_value(body_value, &body_buf, &body_len, &body_owned);\n" +
+      "\n" +
+      "  if (!aborted || !*aborted) {\n" +
+      "    res->cork([res, status, headers_entries_ptr, body_buf, body_len]() {\n" +
+      "      if (status != 200) res->writeStatus(lookup_status_line(status));\n" +
+      "\n" +
+      "      const i32 headers_len = *((i32*)(porf_mem + headers_entries_ptr)) / 2;\n" +
+      "      const i32 headers_entries = *((i32*)(porf_mem + headers_entries_ptr + 4));\n" +
+      "      for (i32 i = 0; i < headers_len; i++) {\n" +
+      "        const i32 name_base = headers_entries + i * 16;\n" +
+      "        const i32 value_base = name_base + 8;\n" +
+      "        const struct jsval name_value = unpack_jsval(*((u64*)(porf_mem + name_base)));\n" +
+      "        const struct jsval value_value = unpack_jsval(*((u64*)(porf_mem + value_base)));\n" +
+      "\n" +
+      "        const char* name_buf = nullptr;\n" +
+      "        size_t name_len = 0;\n" +
+      "        char* name_owned = nullptr;\n" +
+      "        const char* value_buf = nullptr;\n" +
+      "        size_t value_len = 0;\n" +
+      "        char* value_owned = nullptr;\n" +
+      "        porf_native_fetch_read_value(name_value, &name_buf, &name_len, &name_owned);\n" +
+      "        porf_native_fetch_read_value(value_value, &value_buf, &value_len, &value_owned);\n" +
+      "\n" +
+      "        const std::string_view key(name_buf, name_len);\n" +
+      "        if (!is_forbidden_response_header(key)) {\n" +
+      "          res->writeHeader(key, std::string_view(value_buf, value_len));\n" +
+      "        }\n" +
+      "\n" +
+      "        if (name_owned) free(name_owned);\n" +
+      "        if (value_owned) free(value_owned);\n" +
+      "      }\n" +
+      "\n" +
+      "      res->end(std::string_view(body_buf, body_len));\n" +
+      "    });\n" +
+      "  }\n" +
+      "\n" +
+      "  if (body_owned) free(body_owned);\n" +
+      "}\n",
   };
   for (const [file, contents] of Object.entries(files)) {
     const path = join(source, file);
