@@ -1,5 +1,55 @@
 # @sproutboat/runtime
 
+## 0.6.0
+
+### Minor Changes
+
+- ae8c7a8: `ctx.waitUntil` (baronunread/sproutboat#57): `fetch(request, ctx)` now takes a
+  second argument with `waitUntil(promise)`. Registered promises are drained,
+  in-process and sequentially, after the handler returns and before the turn
+  completes, capped at 25s for the whole batch — a task still running past that
+  keeps running, but stops holding up the response. A rejected task is
+  swallowed rather than failing the response.
+  
+  `DurableObjectState.waitUntil` was a silent no-op stub; it now actually queues
+  and drains the same way, scoped to the instance. `alarm()` also used to be
+  fire-and-forget (its promise and any `state.waitUntil()` it queued were
+  dropped the moment the 204 went out) — both are now awaited.
+  
+  Additive: a handler that ignores the second `fetch` argument is unaffected.
+- ae8c7a8: `ctx.waitUntil` for `scheduled` and `queue` (baronunread/sproutboat#171):
+  both now take the same second `ctx` argument as `fetch`, drained the same way.
+  
+  Also fixes a real bug found while wiring it up: `scheduled` and `queue` were
+  fire-and-forget regardless of `ctx` — an async handler's own promise was
+  dropped the instant the reply went out. For `queue` specifically, the default
+  "unhandled messages are acked" pass ran synchronously right after the
+  (discarded) call to the handler, so `ack()`/`retry()` calls made after the
+  handler's first `await` never reached the response. Both are now properly
+  awaited, on every delivery path: broker-dispatched, and the embedded
+  standalone binary's own local cron/queue/DO-alarm timers (the latter had the
+  same gap for `DurableObjectState.waitUntil` from #57 — that local path
+  bypassed the fix there entirely).
+  
+  Additive: a handler that ignores the second argument is unaffected.
+
+### Patch Changes
+
+- 5b76f6b: Fix (baronunread/sproutboat#132): the banned-API capability check matched a bare
+  identifier (`\bprocess\b`), so a locally-declared `function process()` — zod v4
+  declares exactly that — failed the check as readily as a real read of the Node
+  global. Now requires a member access (`process.env`, no whitespace around the
+  `.`, to avoid matching a sentence like "...unique to this process. The...") or
+  `new Buffer(...)`; `node:` now only matches as the start of a quoted string
+  (specifier-shaped), not as a substring anywhere. A handler that imports zod (or
+  anything built on it, e.g. better-auth) and only uses APIs the compiler
+  otherwise supports now passes the capability check and builds.
+  
+  Not fixed here: zod still throws an uncaught `TypeError` at runtime on
+  `.safeParse()` even for the simplest schema (`z.string()`) — a separate,
+  deeper Porffor compatibility gap this change does not touch. This fix removes
+  an incorrect early rejection; it does not make zod usable end to end.
+
 ## 0.5.0
 
 ### Minor Changes
