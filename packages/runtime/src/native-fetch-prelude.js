@@ -1248,7 +1248,10 @@ function __sbMakeDONamespace(binding, className) {
             req = new Request(url, { method: opts.method || "GET", headers });
             if (opts.body != null) req.body = String(opts.body);
           }
-          return __sbGetDOInstance(className, idStr).fetch(req);
+          const inst = __sbGetDOInstance(className, idStr);
+          const res = inst.fetch(req);
+          if (inst.__sbTasks.length || (res && __sbIsFn(res.then))) return __sbFetchWithDrain(res, inst.__sbTasks);
+          return res;
         },
       };
     },
@@ -1267,6 +1270,11 @@ function __sbGetDOInstance(cls, id) {
   const cacheKey = cls + " " + id;
   let inst = __sbDOInstances[cacheKey];
   if (!inst) {
+    // #57 — was a no-op: a DO calling `state.waitUntil(p)` had `p` vanish with
+    // no error. The instance outlives any one call (cached in
+    // `__sbDOInstances`), so the queue lives on `state` too and is drained by
+    // whichever call site invoked `fetch`/`alarm` this turn.
+    const __sbTasks = [];
     const state = {
       id: {
         toString() {
@@ -1277,9 +1285,12 @@ function __sbGetDOInstance(cls, id) {
       blockConcurrencyWhile(fn) {
         return fn();
       },
-      waitUntil() {},
+      waitUntil(p) {
+        if (p && __sbIsFn(p.then)) __sbTasks.push(p);
+      },
     };
     inst = new Ctor(state, globalThis.env);
+    inst.__sbTasks = __sbTasks;
     __sbDOInstances[cacheKey] = inst;
   }
   return inst;
@@ -1488,6 +1499,71 @@ function __sbClientIp(request) {
   return peer;
 }
 
+// #57 — ctx.waitUntil: work that must run before the turn completes but must
+// not block the response the handler already built. `waitUntil(p)` just
+// records `p`; nothing awaits it until the handler itself has returned.
+//
+// The wall-clock cap #25 was meant to gate this on turned out not to apply:
+// #25 was per-tenant abuse control (rate limits, cgroup isolation against a
+// hostile *other* caller) and was closed as not-planned — this deployment
+// model is single-admin, nobody else's handler to isolate from. A drain that
+// never lets go of the worker slot is a local bug either way, so it gets its
+// own timeout rather than waiting on that. Kept under the edge's own
+// `SPROUTBOAT_REQUEST_TIMEOUT_MS` (30s default, services/edge/src/main.ts) so
+// the sprout still gets to answer before the edge gives up on it.
+//
+// ponytail: drained sequentially, one timeout for the whole batch (not one
+// per task — N tasks should not cost N timeouts). A task still running past
+// the cap keeps running; nothing here can cancel a promise it didn't create.
+// No Promise.all (unproven in this runtime, sequential is fine at this
+// volume). A rejected task is swallowed rather than failing the response:
+// dropping a background task's error beats dropping the response it doesn't
+// own.
+const __SB_WAITUNTIL_TIMEOUT_MS = 25000;
+
+function __sbTimeout(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function __sbDrainWaitUntil(tasks) {
+  if (!tasks.length) return;
+  const pending = tasks.splice(0, tasks.length);
+  await Promise.race([__sbDrainAll(pending), __sbTimeout(__SB_WAITUNTIL_TIMEOUT_MS)]);
+}
+
+async function __sbDrainAll(pending) {
+  for (let i = 0; i < pending.length; i++) {
+    try {
+      await pending[i];
+    } catch {
+      /* a background task's rejection must not fail the response */
+    }
+  }
+}
+
+// Tail-called from `__sbEntry`/DO dispatch so the promise this returns is the
+// one *this* async function creates, not a `.then()` derived from someone
+// else's — see the note below on why that distinction matters here.
+async function __sbFetchWithDrain(res, tasks) {
+  const r = res && __sbIsFn(res.then) ? await res : res;
+  await __sbDrainWaitUntil(tasks);
+  return r;
+}
+
+// Shared by alarm and scheduled: both reply with an empty 204 once their
+// handler (and anything it queued via `waitUntil`) has settled.
+async function __sb204WithDrain(res, tasks) {
+  if (res && __sbIsFn(res.then)) await res;
+  await __sbDrainWaitUntil(tasks);
+  return new Response("", { status: 204 });
+}
+
+async function __sbQueueWithDrain(result, tasks) {
+  const r = result && __sbIsFn(result.then) ? await result : result;
+  await __sbDrainWaitUntil(tasks);
+  return new Response(JSON.stringify(r), { headers: { "content-type": "application/json" } });
+}
+
 globalThis.__sbEntry = function (handlers, request) {
   const trigger = request.headers.get("x-sb-trigger");
   if (!trigger) {
@@ -1506,8 +1582,16 @@ globalThis.__sbEntry = function (handlers, request) {
     // tag on hangs the request forever. cpuMs is documented as absent for
     // async handlers (see LogEvent in services/edge) — that is this.
     const __t0 = __sbCpuMs();
-    const __res = handlers.fetch(request);
-    if (__res && __sbIsFn(__res.then)) return __res;
+    const __sbTasks = [];
+    const ctx = {
+      waitUntil(p) {
+        if (p && __sbIsFn(p.then)) __sbTasks.push(p);
+      },
+    };
+    const __res = handlers.fetch(request, ctx);
+    // Same promise-identity rule as above applies to `__sbFetchWithDrain`'s
+    // own return, which is why it's tail-called rather than chained on here.
+    if (__sbTasks.length || (__res && __sbIsFn(__res.then))) return __sbFetchWithDrain(__res, __sbTasks);
     return __sbTagCpu(__res, __t0);
   }
   if (!__sbTriggerAuthed(request)) return new Response("forbidden", { status: 403 });
@@ -1515,21 +1599,50 @@ globalThis.__sbEntry = function (handlers, request) {
   if (trigger === "scheduled") {
     if (!__sbIsFn(handlers.scheduled)) return new Response("no scheduled handler", { status: 404 });
     const body = __sbReadJson(request);
-    handlers.scheduled({ cron: body.cron || "", scheduledTime: body.scheduledTime || Date.now(), noRetry() {} });
+    // #171 — ctx.waitUntil, same shape as fetch's. Was also fire-and-forget
+    // before this: an async `scheduled()`'s own promise was dropped the
+    // moment 204 went out, same bug alarm() had.
+    const __sbTasks = [];
+    const ctx = {
+      waitUntil(p) {
+        if (p && __sbIsFn(p.then)) __sbTasks.push(p);
+      },
+    };
+    const __sres = handlers.scheduled(
+      { cron: body.cron || "", scheduledTime: body.scheduledTime || Date.now(), noRetry() {} },
+      ctx,
+    );
+    if (__sbTasks.length || (__sres && __sbIsFn(__sres.then))) return __sb204WithDrain(__sres, __sbTasks);
     return new Response("", { status: 204 });
   }
 
   if (trigger === "queue") {
     if (!__sbIsFn(handlers.queue)) return new Response("no queue handler", { status: 404 });
-    const result = __sbRunQueueBatch(handlers, __sbReadJson(request));
-    return new Response(JSON.stringify(result), { headers: { "content-type": "application/json" } });
+    // #171 — same ctx.waitUntil shape. `__sbRunQueueBatch` was also
+    // fire-and-forget for an async `queue()`: it computed the default
+    // ack/retry and answered the broker before the handler's own awaits ran,
+    // so any ack()/retry() past the first `await` never made it into the
+    // response. It now awaits the handler itself when it returns a promise.
+    const __sbTasks = [];
+    const ctx = {
+      waitUntil(p) {
+        if (p && __sbIsFn(p.then)) __sbTasks.push(p);
+      },
+    };
+    // Always a promise now (`__sbRunQueueBatch` is async, to await the
+    // handler above), so always tail-call the drain wrapper — same
+    // promise-identity reasoning as `__sbFetchWithDrain`.
+    return __sbQueueWithDrain(__sbRunQueueBatch(handlers, __sbReadJson(request), ctx), __sbTasks);
   }
 
   if (trigger === "alarm") {
     const body = __sbReadJson(request);
     const inst = __sbGetDOInstance(String(body.cls || ""), String(body.id || ""));
     if (!__sbIsFn(inst.alarm)) return new Response("no alarm handler", { status: 404 });
-    inst.alarm();
+    const __ares = inst.alarm();
+    // Was fire-and-forget before: an async `alarm()` and any `state.waitUntil()`
+    // it queued were both dropped the moment 204 went out. Await both.
+    if (inst.__sbTasks.length || (__ares && __sbIsFn(__ares.then))) return __sb204WithDrain(__ares, inst.__sbTasks);
     return new Response("", { status: 204 });
   }
 
@@ -1543,7 +1656,7 @@ globalThis.__sbEntry = function (handlers, request) {
  * (deployed, and the phase-0 standalone launcher), or straight from the local
  * timer in an embedded binary that has no broker to be delivered from.
  */
-function __sbRunQueueBatch(handlers, body) {
+async function __sbRunQueueBatch(handlers, body, ctx) {
   const acked = [];
   const retried = [];
   const raw = body.messages || [];
@@ -1574,7 +1687,11 @@ function __sbRunQueueBatch(handlers, body) {
       for (let i = 0; i < messages.length; i++) messages[i].retry();
     },
   };
-  handlers.queue(batch);
+  const __qres = handlers.queue(batch, ctx);
+  // Was fire-and-forget: an async `queue()` had this default-ack pass run (and
+  // the response go out) before its own `await`s did, so any ack()/retry()
+  // past the first one never counted.
+  if (__qres && __sbIsFn(__qres.then)) await __qres;
   // default: any message neither acked nor retried is treated as acked
   for (let i = 0; i < messages.length; i++) {
     if (acked.indexOf(messages[i].id) === -1 && retried.indexOf(messages[i].id) === -1) acked.push(messages[i].id);

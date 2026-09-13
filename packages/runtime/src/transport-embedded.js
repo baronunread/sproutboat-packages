@@ -1668,7 +1668,7 @@ globalThis.__sbStartLocalTriggers = function (handlers, bindings) {
   const store = __sbStore();
 
   if (crons.length > 0 && __sbIsFn(handlers.scheduled)) {
-    setInterval(function () {
+    setInterval(async function () {
       const now = new Date();
       const stamp =
         now.getUTCFullYear() +
@@ -1684,14 +1684,24 @@ globalThis.__sbStartLocalTriggers = function (handlers, bindings) {
       __sbLastCronTick = stamp;
       for (let i = 0; i < crons.length; i++) {
         if (__sbCronMatches(crons[i], now)) {
-          handlers.scheduled({ cron: crons[i], scheduledTime: now.getTime(), noRetry() {} });
+          // #171 — ctx.waitUntil, and stop dropping the handler's own promise
+          // (was fire-and-forget, same bug the broker-dispatched path had).
+          const __sbTasks = [];
+          const ctx = {
+            waitUntil(p) {
+              if (p && __sbIsFn(p.then)) __sbTasks.push(p);
+            },
+          };
+          const res = handlers.scheduled({ cron: crons[i], scheduledTime: now.getTime(), noRetry() {} }, ctx);
+          if (res && __sbIsFn(res.then)) await res;
+          if (__sbTasks.length) await __sbDrainWaitUntil(__sbTasks);
         }
       }
     }, 15000);
   }
 
   if (queues.length > 0 && __sbIsFn(handlers.queue)) {
-    setInterval(function () {
+    setInterval(async function () {
       __sbEnsureSchema();
       const now = Date.now();
       for (let q = 0; q < queues.length; q++) {
@@ -1709,7 +1719,19 @@ globalThis.__sbStartLocalTriggers = function (handlers, bindings) {
           __sbSql(store, "UPDATE mq SET visible_at = ? WHERE id = ?", [now + 30000, row[0]]);
           messages.push({ id: row[0], body: row[1], timestamp: now, attempts: Number(row[2]) + 1 });
         }
-        const result = __sbRunQueueBatch(handlers, { queue: name, messages });
+        // #171 — same ctx.waitUntil as the broker-delivered path, and the same
+        // fix for the handler's own promise: `__sbRunQueueBatch` used to be
+        // called fire-and-forget here too, so an async `queue()`'s ack/retry
+        // calls made after its first `await` never reached these SQL writes.
+        const __sbTasks = [];
+        const ctx = {
+          waitUntil(p) {
+            if (p && __sbIsFn(p.then)) __sbTasks.push(p);
+          },
+        };
+        let result = __sbRunQueueBatch(handlers, { queue: name, messages }, ctx);
+        if (result && __sbIsFn(result.then)) result = await result;
+        if (__sbTasks.length) await __sbDrainWaitUntil(__sbTasks);
         for (let i = 0; i < result.ack.length; i++) {
           __sbSql(store, "DELETE FROM mq WHERE id = ?", [result.ack[i]]);
         }
@@ -1725,7 +1747,7 @@ globalThis.__sbStartLocalTriggers = function (handlers, bindings) {
   }
 
   if (dos.length > 0) {
-    setInterval(function () {
+    setInterval(async function () {
       __sbEnsureSchema();
       const now = Date.now();
       const due = __sbSql(store, "SELECT cls, id, at, attempts FROM do_alarm WHERE at <= ? ORDER BY at LIMIT 10", [
@@ -1738,7 +1760,14 @@ globalThis.__sbStartLocalTriggers = function (handlers, bindings) {
         // afterwards would erase it. Same rule as the broker (#125).
         __sbSql(store, "DELETE FROM do_alarm WHERE cls = ? AND id = ?", [cls, id]);
         const instance = __sbGetDOInstance(cls, id);
-        if (__sbIsFn(instance.alarm)) instance.alarm();
+        if (__sbIsFn(instance.alarm)) {
+          // #57 gap: this local path bypasses `__sbEntry`'s alarm dispatch
+          // entirely, so it kept the old fire-and-forget behaviour after that
+          // fix landed. Same treatment: await alarm() and drain its waitUntil.
+          const res = instance.alarm();
+          if (res && __sbIsFn(res.then)) await res;
+          if (instance.__sbTasks.length) await __sbDrainWaitUntil(instance.__sbTasks);
+        }
       }
     }, 500);
   }
