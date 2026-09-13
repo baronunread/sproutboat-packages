@@ -3,6 +3,9 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
+// @ts-expect-error Bun's file loader supplies a path; see the pinned-commit
+// check below for why this is safe to trust unconditionally.
+import vendoredPorfforArchive from "../vendor/porffor-1f4ae4a.tar.gz" with { type: "file" };
 import { ensurePorfforPatched } from "./patch";
 import { PORFFOR_ARCHIVE_SHA256, PORFFOR_ARCHIVE_URL, PORFFOR_COMMIT_FULL } from "./pin";
 
@@ -130,7 +133,15 @@ export async function ensurePorffor(options: AcquireOptions = {}): Promise<strin
     await rm(dir, { recursive: true, force: true });
     await mkdir(stage);
     const archive = resolve(stage, "source.tar.gz");
-    await download(options.url ?? PORFFOR_ARCHIVE_URL, archive, options.fetcher ?? fetch, options.timeoutMs ?? 30_000);
+    // The commit tarball ships in the package (`vendor/`), same pattern as
+    // sproutboat-cli's vendored uWebSockets archive: no network needed on the
+    // happy path. Falls back to downloading it if the file is missing or was
+    // left stale by a pin bump (checksum below still catches a wrong file
+    // rather than silently accepting it).
+    const noOverride = options.url === undefined && options.expectedSha256 === undefined;
+    const vendored = noOverride && existsSync(vendoredPorfforArchive) && (await digest(vendoredPorfforArchive)) === expected;
+    if (vendored) await writeFile(archive, await readFile(vendoredPorfforArchive));
+    else await download(options.url ?? PORFFOR_ARCHIVE_URL, archive, options.fetcher ?? fetch, options.timeoutMs ?? 30_000);
     const actual = await digest(archive);
     if (actual !== expected)
       throw new PorfforToolchainError(

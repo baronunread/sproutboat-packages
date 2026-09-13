@@ -150,6 +150,18 @@ test("integrity failures stop acquisition and publish no cache entry", async () 
   expect((await readdir(cacheRoot)).some((name) => name.startsWith("porffor-"))).toBe(false);
 });
 
+test("the default call (no url/expectedSha256 override) never touches the network", async () => {
+  const cacheRoot = await mkdtemp(join(tmpdir(), "sb-porffor-vendored-"));
+  temporary.push(cacheRoot);
+  const dir = await ensurePorffor({
+    cacheRoot,
+    fetcher: async () => {
+      throw new Error("the vendored archive must be used before any network fetch");
+    },
+  });
+  expect(await readFile(join(dir, "runtime/index.js"), "utf8")).not.toBe("");
+});
+
 test("a corrupted warm cache is replaced from the verified archive", async () => {
   const { archive, sha256 } = await fixture();
   const cacheRoot = await mkdtemp(join(tmpdir(), "sb-porffor-corrupt-"));
