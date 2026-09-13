@@ -339,7 +339,15 @@ function __sbBufFrom(latin1) {
 // regardless of whether it holds real Latin-1 text or raw bytes, so this
 // decode is only safe where the caller already knows which one it has.
 function __sbFromUtf8(bytes) {
-  let out = "";
+  // Collected into an array and joined once at the end, not built with
+  // repeated `out +=` -- Porffor's strings have no rope/cons optimization, so
+  // `+=` in a loop copies the whole accumulated string on every append,
+  // making the naive version O(n^2). Measured on the real 43KB homepage
+  // (dynamic, wire-sourced content, not a compile-time constant): each
+  // successive 8000-character chunk took visibly longer than the last, ~2.8s
+  // total -- a real, shipped performance regression on sproutboat.com.
+  // `Array.prototype.join` builds the result in one pass.
+  const out = [];
   const len = bytes.length;
   const cont = (j) => {
     const b = bytes.charCodeAt(j) & 0xff;
@@ -348,13 +356,13 @@ function __sbFromUtf8(bytes) {
   for (let i = 0; i < len; i++) {
     const b0 = bytes.charCodeAt(i) & 0xff;
     if (b0 < 0x80) {
-      out += String.fromCharCode(b0);
+      out.push(String.fromCharCode(b0));
       continue;
     }
     if ((b0 & 0xe0) == 0xc0 && i + 1 < len) {
       const c1 = cont(i + 1);
       if (c1 >= 0) {
-        out += String.fromCharCode(((b0 & 0x1f) << 6) | c1);
+        out.push(String.fromCharCode(((b0 & 0x1f) << 6) | c1));
         i += 1;
         continue;
       }
@@ -362,7 +370,7 @@ function __sbFromUtf8(bytes) {
       const c1 = cont(i + 1);
       const c2 = cont(i + 2);
       if (c1 >= 0 && c2 >= 0) {
-        out += String.fromCharCode(((b0 & 0x0f) << 12) | (c1 << 6) | c2);
+        out.push(String.fromCharCode(((b0 & 0x0f) << 12) | (c1 << 6) | c2));
         i += 2;
         continue;
       }
@@ -373,16 +381,16 @@ function __sbFromUtf8(bytes) {
       if (c1 >= 0 && c2 >= 0 && c3 >= 0) {
         let cp = ((b0 & 0x07) << 18) | (c1 << 12) | (c2 << 6) | c3;
         cp -= 0x10000;
-        out += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+        out.push(String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff)));
         i += 3;
         continue;
       }
     }
     // no lead byte matched, or its continuation bytes weren't 10xxxxxx:
     // pass the single byte through rather than guessing
-    out += String.fromCharCode(b0);
+    out.push(String.fromCharCode(b0));
   }
-  return out;
+  return out.join("");
 }
 // sproutboat #181 — wrap a Response built from raw wire bytes (the assets
 // binding, outbound fetch(), service-binding fetch(): the three `x-sb-raw-
@@ -395,12 +403,24 @@ function __sbFromUtf8(bytes) {
 // safely can't decode by default). Overriding just these three instances,
 // which sproutboat itself builds and knows are bytes, fixes the read side
 // without touching Porffor's generic Response/Request classes at all.
+// Decoded lazily, on first .text()/.json() call, and memoized after that --
+// most raw-body responses (a static asset, a proxied fetch()) are handed
+// straight back to the client and never read as text at all, and Porffor's
+// strings have no rope/cons optimization: `+=`-building a decoded copy costs
+// real time proportional to the body size (measured ~116ms for a 44KB
+// all-ASCII body). Decoding unconditionally at construction paid that cost
+// on every asset request regardless of whether anything used it -- this was
+// a real, shipped performance regression on sproutboat.com, caught after
+// the fact by unexpectedly slow page loads.
 function __sbRawBodyResponse(body, init) {
   const resp = new Response(body == null ? "" : body, init);
   if (body != null) {
-    const decoded = __sbFromUtf8(body);
-    resp.text = () => decoded;
-    resp.json = () => JSON.parse(decoded);
+    let decoded = null;
+    resp.text = () => {
+      if (decoded === null) decoded = __sbFromUtf8(body);
+      return decoded;
+    };
+    resp.json = () => JSON.parse(resp.text());
   }
   return resp;
 }
