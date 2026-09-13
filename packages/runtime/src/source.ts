@@ -11,7 +11,20 @@ const alwaysForbidden: Array<[RegExp, string]> = [
   [/\bimport\s*\(/, "dynamic import() is not supported: nothing can resolve it at build time"],
   [/\brequire\s*\(/, "CommonJS require is not supported"],
   [/\b(WebSocket|XMLHttpRequest)\s*\(/, "WebSocket / XMLHttpRequest are not supported"],
-  [/\b(process|Bun|Deno|Buffer|node:)\b/, "Node, Bun, and Deno APIs are not supported"],
+  // baronunread/sproutboat#132 — a bare identifier match flags a *local*
+  // `function process()` as readily as the global: zod v4 declares exactly
+  // that (its internal `process(schema, ctx)`), so importing zod alone used
+  // to fail this check pointing at code the handler author never wrote. A
+  // Node/Bun/Deno API is always reached through a member access or `new`;
+  // requiring that shape lets a local binding of the same name through.
+  // No whitespace is allowed around the `.`: real member access never has
+  // any (`process.env`, always contiguous), while prose mentioning the word
+  // does (a bundled comment ending "...unique to this process. The id...").
+  [/\b(process|Bun|Deno|Buffer)\.[a-zA-Z_$]|\bnew\s+Buffer\s*\(/, "Node, Bun, and Deno APIs are not supported"],
+  // `node:` only means something as an import specifier; a bare substring
+  // match would also flag it appearing in an ordinary string a dependency
+  // happens to construct (a doc link, a log message).
+  [/['"`]node:/, "Node, Bun, and Deno APIs are not supported"],
   // Porffor alpha-4 compiles `new Proxy(...)` and then ignores the handler: a
   // trapped property reads back as `undefined`, with no throw. Rejecting it
   // here is the difference between a build error and a 502 nobody can explain.
