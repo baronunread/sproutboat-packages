@@ -1,5 +1,31 @@
 # @sproutboat/runtime
 
+## 0.6.3
+
+### Patch Changes
+
+- Fix two compounding performance regressions in the `#181` fix, caught after
+  it went live and made sproutboat.com's homepage take 2.6-2.8s per request:
+  
+  1. `__sbRawBodyResponse` decoded eagerly at construction, paying the cost of
+     `__sbFromUtf8` on every asset/proxied response regardless of whether the
+     handler ever called `.text()`/`.json()` on it (the common case is a
+     response handed straight back to the client, never read as text). Now
+     decodes lazily on first call and memoizes.
+  
+  2. `__sbFromUtf8` built its result with repeated `out +=`. Porffor's strings
+     have no rope/cons optimization, so `+=` in a loop copies the whole
+     accumulated string on every append, making a large decode `O(n^2)`.
+     Measured directly against the real broker-sourced 43KB homepage body,
+     each successive 8000-character chunk took visibly longer than the last.
+     Now builds into an array and joins once.
+  
+  Together these took the homepage from ~2.7s to ~25ms (measured via the
+  runtime's own `x-sb-cpu-ms` header, confirming real CPU time, not I/O wait).
+  Every other route was already unaffected by fix 1 alone, since they never
+  call `.text()`. Verified against a real compiled `porf native` binary with
+  the actual page content, and end to end on sproutboat-site's own deployment.
+
 ## 0.6.2
 
 ### Patch Changes
