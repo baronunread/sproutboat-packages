@@ -326,6 +326,84 @@ function __sbBufFrom(latin1) {
   for (let i = 0; i < latin1.length; i++) b[i] = latin1.charCodeAt(i) & 0xff;
   return b.buffer;
 }
+// The reverse of __sbToBytes: a latin1 string holding raw UTF-8 bytes (one
+// byte per char) -> a real JS string, decoding multi-byte sequences into
+// single characters. Validates each continuation byte (10xxxxxx) before
+// consuming it, so a lead byte with no valid continuation -- the common case
+// for genuine Latin-1 text, e.g. a lone "é" -- passes through unchanged
+// rather than swallowing following characters into a garbage code point.
+// Used only where sproutboat's own glue knows for certain the string is
+// opaque bytes off the wire (the `x-sb-raw-body` producers below), never on
+// a generic string a handler might have built -- Porffor represents any
+// string whose chars are all <= 0xff as this same "bytestring" shape
+// regardless of whether it holds real Latin-1 text or raw bytes, so this
+// decode is only safe where the caller already knows which one it has.
+function __sbFromUtf8(bytes) {
+  let out = "";
+  const len = bytes.length;
+  const cont = (j) => {
+    const b = bytes.charCodeAt(j) & 0xff;
+    return (b & 0xc0) == 0x80 ? b & 0x3f : -1;
+  };
+  for (let i = 0; i < len; i++) {
+    const b0 = bytes.charCodeAt(i) & 0xff;
+    if (b0 < 0x80) {
+      out += String.fromCharCode(b0);
+      continue;
+    }
+    if ((b0 & 0xe0) == 0xc0 && i + 1 < len) {
+      const c1 = cont(i + 1);
+      if (c1 >= 0) {
+        out += String.fromCharCode(((b0 & 0x1f) << 6) | c1);
+        i += 1;
+        continue;
+      }
+    } else if ((b0 & 0xf0) == 0xe0 && i + 2 < len) {
+      const c1 = cont(i + 1);
+      const c2 = cont(i + 2);
+      if (c1 >= 0 && c2 >= 0) {
+        out += String.fromCharCode(((b0 & 0x0f) << 12) | (c1 << 6) | c2);
+        i += 2;
+        continue;
+      }
+    } else if ((b0 & 0xf8) == 0xf0 && i + 3 < len) {
+      const c1 = cont(i + 1);
+      const c2 = cont(i + 2);
+      const c3 = cont(i + 3);
+      if (c1 >= 0 && c2 >= 0 && c3 >= 0) {
+        let cp = ((b0 & 0x07) << 18) | (c1 << 12) | (c2 << 6) | c3;
+        cp -= 0x10000;
+        out += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+        i += 3;
+        continue;
+      }
+    }
+    // no lead byte matched, or its continuation bytes weren't 10xxxxxx:
+    // pass the single byte through rather than guessing
+    out += String.fromCharCode(b0);
+  }
+  return out;
+}
+// sproutboat #181 — wrap a Response built from raw wire bytes (the assets
+// binding, outbound fetch(), service-binding fetch(): the three `x-sb-raw-
+// body` producers) so a handler calling `.text()`/`.json()` on it gets the
+// bytes properly UTF-8-decoded. The wire write path already handles the
+// C-level byte-for-byte passthrough via that same header (#176) -- this is
+// the separate, missing half: Porffor's own `Response.prototype.text()`
+// returns a `bytestring` body verbatim instead of decoding it (it can't tell
+// "opaque bytes" from "a handler's own Latin-1-range string" apart, so it
+// safely can't decode by default). Overriding just these three instances,
+// which sproutboat itself builds and knows are bytes, fixes the read side
+// without touching Porffor's generic Response/Request classes at all.
+function __sbRawBodyResponse(body, init) {
+  const resp = new Response(body == null ? "" : body, init);
+  if (body != null) {
+    const decoded = __sbFromUtf8(body);
+    resp.text = () => decoded;
+    resp.json = () => JSON.parse(decoded);
+  }
+  return resp;
+}
 // Constant-time compare of two latin1 byte strings.
 function __sbEqCt(a, b) {
   if (a.length !== b.length) return false;
@@ -1145,7 +1223,7 @@ globalThis.__sbInstallBindings = function (target, bindings) {
         // tells the C write path to pass them through untouched instead of
         // re-encoding as if this were a JS string a handler built.
         if (r.body != null) headers["x-sb-raw-body"] = "1";
-        return new Response(r.body == null ? "" : r.body, { status: r.status || (r.found ? 200 : 404), headers });
+        return __sbRawBodyResponse(r.body, { status: r.status || (r.found ? 200 : 404), headers });
       },
     };
   }
@@ -1177,7 +1255,7 @@ globalThis.__sbInstallBindings = function (target, bindings) {
         // built -- must not be re-encoded if the handler proxies it straight
         // through (see the assets binding for the same reasoning).
         if (r.body != null) respHeaders.set("x-sb-raw-body", "1");
-        return new Response(r.body == null ? "" : r.body, { status: r.status || 502, headers: respHeaders });
+        return __sbRawBodyResponse(r.body, { status: r.status || 502, headers: respHeaders });
       },
     };
   }
@@ -1203,7 +1281,7 @@ globalThis.__sbInstallBindings = function (target, bindings) {
       // built -- must not be re-encoded if the handler proxies it straight
       // through (see the assets binding for the same reasoning).
       if (r.body != null) respHeaders.set("x-sb-raw-body", "1");
-      return new Response(r.body == null ? "" : r.body, { status: r.status || 502, headers: respHeaders });
+      return __sbRawBodyResponse(r.body, { status: r.status || 502, headers: respHeaders });
     };
   }
 };
