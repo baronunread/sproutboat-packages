@@ -429,6 +429,16 @@ const WRITE_RESPONSE_MARKER = "porf_native_fetch_read_raw_bytes(body_value";
  * `probeFound` flag (so a fixed-point break reads as "no `.then` found",
  * matching how a legitimate null-terminated chain is read) plus the
  * `lastProto` pointer comparison used everywhere else in the runtime.
+ *
+ * A hard iteration cap rides alongside the fixed-point check, not instead of
+ * it: the lldb trace showed the *same* stale pointer on every sample, which
+ * the fixed-point check alone catches on its very next iteration, but that's
+ * one observed corruption shape, not a guarantee about every allocator state
+ * that can produce this bug. A cap makes termination unconditional regardless
+ * of whether some other corrupted state instead drifts (a different bad
+ * pointer each time) or cycles across more than one node — real prototype
+ * chains are a handful of links deep, so 64 iterations is generous headroom
+ * with no risk of cutting off a legitimate lookup.
  */
 const THEN_PROBE_ANCHOR =
   "    const thenHash: i32 = __Porffor_object_hash('then');\n" +
@@ -443,11 +453,14 @@ const THEN_PROBE_INJECT =
   "    let probe: any = value;\n" +
   "    let lastProto: any = probe;\n" +
   "    let probeFound: boolean = false; // sproutboat #168: fixed-point chain reads as \"not found\", not a spin\n" +
+  "    let probeSteps: i32 = 0; // sproutboat #168: hard cap, belt-and-suspenders alongside the fixed-point check\n" +
   "    while (Porffor.type(probe) == Porffor.TYPES.object) {\n" +
   "      if (Porffor.object.lookup(probe, 'then', thenHash) != 0) { probeFound = true; break; }\n" +
   "      probe = __Porffor_object_getPrototype(probe);\n" +
   "      if (Porffor.fastOr(probe == null, Porffor.IR.ptr(probe) == Porffor.IR.ptr(lastProto))) break;\n" +
   "      lastProto = probe;\n" +
+  "      probeSteps++;\n" +
+  "      if (probeSteps > 64) break;\n" +
   "    }\n" +
   "    if (!probeFound) {\n";
 const THEN_PROBE_MARKER = "sproutboat #168";

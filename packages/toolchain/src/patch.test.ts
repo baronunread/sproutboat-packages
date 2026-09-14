@@ -273,6 +273,10 @@ test("#168: promise-resolve's then-probe gets a fixed-point guard, idempotently"
     // The fixed-point guard mirrors _internal_object.ts's lastProto idiom.
     expect(once).toContain("Porffor.fastOr(probe == null, Porffor.IR.ptr(probe) == Porffor.IR.ptr(lastProto))");
     expect(once).toContain("if (!probeFound) {");
+    // Belt-and-suspenders: a hard iteration cap terminates the loop even if
+    // some other corruption shape (a drifting pointer, a longer cycle) defeats
+    // the fixed-point check above.
+    expect(once).toContain("if (probeSteps > 64) break;");
     // The old type-check-only exit condition is gone.
     expect(once).not.toContain("if (Porffor.type(probe) != Porffor.TYPES.object) {");
 
