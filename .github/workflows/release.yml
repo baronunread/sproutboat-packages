@@ -1,0 +1,58 @@
+name: release
+on:
+  push:
+    branches: [main]
+
+# Publishes @sproutboat/{toolchain,runtime,wire,config} via changesets.
+#
+# changesets/action does one of two things on every push to main, depending
+# on whether .changeset/*.md files are pending:
+#   - pending changesets exist -> opens/updates a "Version Packages" PR that
+#     runs `version-packages` (consumes them into package.json bumps +
+#     CHANGELOG entries)
+#   - no pending changesets (i.e. that PR was just merged) -> runs `release`
+#     (`changeset publish`), publishing every package whose version doesn't
+#     match what's live on npm
+#
+# Auth is npm Trusted Publishing (OIDC) -- no token secret, no OTP. One-time
+# setup on npmjs.com, once per package (toolchain, runtime, wire, config):
+# Settings -> Trusted Publisher -> GitHub Actions, user baronunread, repo
+# sproutboat-packages, workflow release.yml. Check "also allow this trusted
+# publisher to publish directly" -- the default staged-publish-only mode
+# fails a plain `npm publish` from CI with E403, it doesn't queue it (hit
+# this exact gotcha setting up sproutboat-cli's platform packages). Provenance
+# is generated automatically; the repo must stay public.
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write # OIDC token for Trusted Publishing + provenance
+
+jobs:
+  release:
+    if: github.repository == 'baronunread/sproutboat-packages'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: npm install -g npm@latest # Trusted Publishing needs npm >= 11.5.1
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun run lint
+      - run: bun run test
+      - name: Version or publish
+        uses: changesets/action@v1
+        with:
+          version: bun run version-packages
+          publish: bun run release
+          commit: "chore: version packages"
+          title: "chore: version packages"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
