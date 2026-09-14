@@ -53,6 +53,13 @@ extern int64_t sqlite3_last_insert_rowid(sqlite3*);
 extern const char* sqlite3_errmsg(sqlite3*);
 extern int sqlite3_close(sqlite3*);
 
+// baronunread/sproutboat#176 — defined in render.js, alongside
+// porf_native_fetch_read_value (which every inline-C block below already
+// calls with no forward declaration of its own — that one gets one from
+// Porffor's own generated prototypes, this one doesn't, since it's a local
+// patch addition, not something Porffor knows to prototype early).
+extern int porf_native_fetch_read_raw_bytes(jsval value, const char** out_buf, size_t* out_len);
+
 #define SB_SQLITE_ROW 100
 #define SB_SQLITE_DONE 101
 #define SB_SQLITE_TRANSIENT ((void*)-1)
@@ -977,10 +984,18 @@ function __sbR2PutRaw(path, bucket, key, body, httpJson, customJson) {
     char* __custom = (char*)malloc(__cl + 1); memcpy(__custom, __c, __cl); __custom[__cl] = 0;
     if (__co) free(__co);
 
-    // The body is read in place and handed straight to fwrite (#56): no
-    // escaping, and no SQLite copy on top of the buffer it already arrived in.
+    // baronunread/sproutboat#184 -- read raw, not through porf_native_fetch_
+    // read_value's bytestring branch, which always UTF-8-encodes (correct for
+    // genuine text, wrong for opaque bytes -- request.body off a raw HTTP
+    // upload is exactly that). R2 is object storage: put()/get() need to be
+    // byte-preserving, not text-preserving. Only a bytestring-typed value can
+    // be read raw; a genuine multi-byte JS string (real Unicode, "string" type
+    // rather than "bytestring") isn't one, so it falls back to the normal
+    // encoding path, which already handles that type correctly.
     const char* __b; size_t __bl; char* __bo = 0;
-    porf_native_fetch_read_value(body, &__b, &__bl, &__bo);
+    if (porf_native_fetch_read_raw_bytes(body, &__b, &__bl) != 0) {
+      porf_native_fetch_read_value(body, &__b, &__bl, &__bo);
+    }
     char* __out = sb_r2_put_c(__path, __bucket, __key, __b, __bl, __http, __custom);
     if (__bo) free(__bo);
 
