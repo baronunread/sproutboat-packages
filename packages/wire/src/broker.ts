@@ -115,6 +115,7 @@ type R2Row = {
   uploaded: string;
   http_json: string;
   custom_json: string;
+  blob_id: string | null;
 };
 type R2UploadRow = {
   key: string;
@@ -123,6 +124,8 @@ type R2UploadRow = {
   custom_json: string;
 };
 type R2PartRow = { part_number: number; size: number; etag: string };
+type R2UploadIdentity = { bucket: string; key: string; upload_id: string };
+const MULTIPART_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000;
 const isNumber = (v: JsonValue | undefined): v is number => Number.isFinite(v);
 const sqlParams = (v: JsonValue | undefined): SqlParam[] => {
   if (!Array.isArray(v)) return [];
@@ -248,8 +251,11 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     conn.exec(
       "CREATE TABLE IF NOT EXISTS r2 (bucket TEXT NOT NULL, key TEXT NOT NULL, size INTEGER NOT NULL, " +
         "etag TEXT NOT NULL, uploaded TEXT NOT NULL, http_json TEXT NOT NULL DEFAULT '{}', custom_json TEXT NOT NULL DEFAULT '{}', " +
+        "blob_id TEXT, " +
         "PRIMARY KEY (bucket, key))",
     );
+    const r2Columns = conn.query<{ name: string }, []>("PRAGMA table_info(r2)").all();
+    if (!r2Columns.some((column) => column.name === "blob_id")) conn.exec("ALTER TABLE r2 ADD COLUMN blob_id TEXT");
     conn.exec(
       "CREATE TABLE IF NOT EXISTS r2_upload (bucket TEXT NOT NULL, key TEXT NOT NULL, upload_id TEXT NOT NULL, " +
         "uploaded TEXT NOT NULL, http_json TEXT NOT NULL DEFAULT '{}', custom_json TEXT NOT NULL DEFAULT '{}', " +
@@ -446,34 +452,51 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
    */
   const r2MemBlobs = new Map<string, Uint8Array>();
   const r2MemParts = new Map<string, Uint8Array>();
-  const r2BlobId = (bucketPart: string, key: string): string =>
-    createHash("sha256").update(`${bucketPart}\0${key}`).digest("hex");
+  const r2BlobId = (bucketPart: string, key: string, generation?: string | null): string =>
+    createHash("sha256")
+      .update(generation ? `${bucketPart}\0${key}\0${generation}` : `${bucketPart}\0${key}`)
+      .digest("hex");
   const r2BlobDir = (store: Database): string | null => {
     const file = store.filename;
     return file && file !== ":memory:" ? join(dirname(resolve(file)), "r2-blobs") : null;
   };
-  const r2BlobPath = (store: Database, bucketPart: string, key: string): string | null => {
+  const r2BlobPath = (store: Database, bucketPart: string, key: string, generation?: string | null): string | null => {
     const dir = r2BlobDir(store);
-    return dir ? join(dir, `${r2BlobId(bucketPart, key)}.blob`) : null;
+    return dir ? join(dir, `${r2BlobId(bucketPart, key, generation)}.blob`) : null;
   };
-  const r2WriteBlob = (store: Database, bucketPart: string, key: string, bytes: Uint8Array): void => {
-    const path = r2BlobPath(store, bucketPart, key);
+  const r2BlobMemKey = (bucketPart: string, key: string, generation?: string | null): string =>
+    generation ? `${bucketPart}\0${key}\0${generation}` : `${bucketPart}\0${key}`;
+  const r2WriteBlob = (
+    store: Database,
+    bucketPart: string,
+    key: string,
+    bytes: Uint8Array,
+    generation: string,
+  ): void => {
+    const path = r2BlobPath(store, bucketPart, key, generation);
     if (!path) {
-      r2MemBlobs.set(`${bucketPart}\0${key}`, bytes);
+      r2MemBlobs.set(r2BlobMemKey(bucketPart, key, generation), bytes);
       return;
     }
     mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, bytes);
+    const temporary = `${path}.tmp`;
+    writeFileSync(temporary, bytes);
+    renameSync(temporary, path);
   };
-  const r2ReadBlob = (store: Database, bucketPart: string, key: string): Uint8Array | null => {
-    const path = r2BlobPath(store, bucketPart, key);
-    if (!path) return r2MemBlobs.get(`${bucketPart}\0${key}`) ?? null;
+  const r2ReadBlob = (
+    store: Database,
+    bucketPart: string,
+    key: string,
+    generation?: string | null,
+  ): Uint8Array | null => {
+    const path = r2BlobPath(store, bucketPart, key, generation);
+    if (!path) return r2MemBlobs.get(r2BlobMemKey(bucketPart, key, generation)) ?? null;
     return existsSync(path) ? readFileSync(path) : null;
   };
-  const r2DeleteBlob = (store: Database, bucketPart: string, key: string): void => {
-    const path = r2BlobPath(store, bucketPart, key);
+  const r2DeleteBlob = (store: Database, bucketPart: string, key: string, generation?: string | null): void => {
+    const path = r2BlobPath(store, bucketPart, key, generation);
     if (!path) {
-      r2MemBlobs.delete(`${bucketPart}\0${key}`);
+      r2MemBlobs.delete(r2BlobMemKey(bucketPart, key, generation));
       return;
     }
     if (existsSync(path)) rmSync(path);
@@ -595,6 +618,62 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     store.query("DELETE FROM r2_upload WHERE bucket = ? AND key = ? AND upload_id = ?").run(bucket, key, uploadId);
   };
 
+  const cleanupExpiredMultipart = (store: Database): void => {
+    const cutoff = new Date(Date.now() - MULTIPART_EXPIRY_MS).toISOString();
+    const expired = store
+      .query<R2UploadIdentity, [string]>("SELECT bucket, key, upload_id FROM r2_upload WHERE uploaded < ?")
+      .all(cutoff);
+    for (const upload of expired) deleteMultipart(store, upload.bucket, upload.key, upload.upload_id);
+  };
+
+  const commitR2Metadata = (
+    store: Database,
+    bucket: string,
+    row: R2Row,
+    previous: Pick<R2Row, "blob_id"> | null,
+  ): void => {
+    try {
+      store
+        .query(
+          "INSERT INTO r2 (bucket, key, size, etag, uploaded, http_json, custom_json, blob_id) " +
+            "VALUES (?1,?2,?3,?4,?5,?6,?7,?8) " +
+            "ON CONFLICT (bucket, key) DO UPDATE SET size=?3, etag=?4, uploaded=?5, http_json=?6, " +
+            "custom_json=?7, blob_id=?8",
+        )
+        .run(bucket, row.key, row.size, row.etag, row.uploaded, row.http_json, row.custom_json, row.blob_id);
+    } catch (error) {
+      if (previous?.blob_id !== row.blob_id) r2DeleteBlob(store, bucket, row.key, row.blob_id);
+      throw error;
+    }
+    if (previous && previous.blob_id !== row.blob_id) r2DeleteBlob(store, bucket, row.key, previous.blob_id);
+  };
+
+  const putR2 = (
+    store: Database,
+    bucket: string,
+    key: string,
+    bytes: Uint8Array,
+    httpJson: string,
+    customJson: string,
+  ): R2Row => {
+    const previous = store
+      .query<Pick<R2Row, "blob_id">, [string, string]>("SELECT blob_id FROM r2 WHERE bucket = ? AND key = ?")
+      .get(bucket, key);
+    const etag = createHash("sha256").update(bytes).digest("hex");
+    const row: R2Row = {
+      key,
+      size: bytes.byteLength,
+      etag,
+      uploaded: new Date().toISOString(),
+      http_json: httpJson,
+      custom_json: customJson,
+      blob_id: etag,
+    };
+    r2WriteBlob(store, bucket, key, bytes, etag);
+    commitR2Metadata(store, bucket, row, previous);
+    return row;
+  };
+
   const completeMultipart = (
     store: Database,
     bucket: string,
@@ -608,10 +687,12 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
 
     const hash = createHash("sha256");
     let size = 0;
-    const destination = r2BlobPath(store, bucket, key);
-    if (destination) {
-      mkdirSync(dirname(destination), { recursive: true });
-      const temporary = `${destination}.${uploadId}.tmp`;
+    const blobDirectory = r2BlobDir(store);
+    let inMemoryBody: Uint8Array | null = null;
+    let temporary: string | null = null;
+    if (blobDirectory) {
+      mkdirSync(blobDirectory, { recursive: true });
+      temporary = join(blobDirectory, `${uploadId}.tmp`);
       writeFileSync(temporary, new Uint8Array(0));
       try {
         for (const part of parts) {
@@ -621,7 +702,6 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
           hash.update(bytes);
           size += bytes.byteLength;
         }
-        renameSync(temporary, destination);
       } catch (error) {
         if (existsSync(temporary)) rmSync(temporary);
         throw error;
@@ -635,19 +715,27 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         hash.update(bytes);
         size += bytes.byteLength;
       }
-      r2WriteBlob(store, bucket, key, Buffer.concat(chunks));
+      inMemoryBody = Buffer.concat(chunks);
     }
 
     const etag = hash.digest("hex");
-    const uploaded = new Date().toISOString();
-    store
-      .query(
-        "INSERT INTO r2 (bucket, key, size, etag, uploaded, http_json, custom_json) VALUES (?1,?2,?3,?4,?5,?6,?7) " +
-          "ON CONFLICT (bucket, key) DO UPDATE SET size=?3, etag=?4, uploaded=?5, http_json=?6, custom_json=?7",
-      )
-      .run(bucket, key, size, etag, uploaded, upload.http_json, upload.custom_json);
+    const previous = store
+      .query<Pick<R2Row, "blob_id">, [string, string]>("SELECT blob_id FROM r2 WHERE bucket = ? AND key = ?")
+      .get(bucket, key);
+    if (temporary) renameSync(temporary, r2BlobPath(store, bucket, key, etag)!);
+    else r2WriteBlob(store, bucket, key, inMemoryBody ?? new Uint8Array(0), etag);
+    const row: R2Row = {
+      key,
+      size,
+      etag,
+      uploaded: new Date().toISOString(),
+      http_json: upload.http_json,
+      custom_json: upload.custom_json,
+      blob_id: etag,
+    };
+    commitR2Metadata(store, bucket, row, previous);
     deleteMultipart(store, bucket, key, uploadId);
-    return r2Row({ key, size, etag, uploaded, http_json: upload.http_json, custom_json: upload.custom_json });
+    return r2Row(row);
   };
 
   const r2Row = (r: R2Row) => ({
@@ -845,27 +933,23 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         const { store, part: bucket } = storeFor("r2", requireR2(msg.bucket));
         const key = str(msg.key);
         const bytes = new TextEncoder().encode(str(msg.body));
-        const etag = createHash("sha256").update(bytes).digest("hex");
-        const uploaded = new Date().toISOString();
-        r2WriteBlob(store, bucket, key, bytes);
-        store
-          .query(
-            "INSERT INTO r2 (bucket, key, size, etag, uploaded, http_json, custom_json) VALUES (?1,?2,?3,?4,?5,?6,?7) " +
-              "ON CONFLICT (bucket, key) DO UPDATE SET size=?3, etag=?4, uploaded=?5, http_json=?6, custom_json=?7",
-          )
-          .run(
-            bucket,
-            key,
-            bytes.byteLength,
-            etag,
-            uploaded,
-            JSON.stringify(msg.httpMetadata ?? {}),
-            JSON.stringify(msg.customMetadata ?? {}),
-          );
-        return { ok: true, object: { key, size: bytes.byteLength, etag, uploaded } };
+        return {
+          ok: true,
+          object: r2Row(
+            putR2(
+              store,
+              bucket,
+              key,
+              bytes,
+              JSON.stringify(msg.httpMetadata ?? {}),
+              JSON.stringify(msg.customMetadata ?? {}),
+            ),
+          ),
+        };
       }
       case "r2.multipart.create": {
         const { store, part: bucket } = storeFor("r2", requireR2(msg.bucket));
+        cleanupExpiredMultipart(store);
         const key = str(msg.key);
         const uploadId = str(msg.uploadId) || newId();
         const uploaded = new Date().toISOString();
@@ -905,15 +989,19 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         const key = str(msg.key);
         const row = store.query<R2Row, [string, string]>("SELECT * FROM r2 WHERE bucket = ? AND key = ?").get(bucket, key);
         if (!row) return { ok: true, found: false };
-        const body =
-          msg.op === "r2.get" ? new TextDecoder().decode(r2ReadBlob(store, bucket, key) ?? new Uint8Array(0)) : undefined;
+        const body = msg.op === "r2.get"
+          ? new TextDecoder().decode(r2ReadBlob(store, bucket, key, row.blob_id) ?? new Uint8Array(0))
+          : undefined;
         return { ok: true, found: true, object: r2Row(row), body };
       }
       case "r2.delete": {
         const { store, part: bucket } = storeFor("r2", requireR2(msg.bucket));
         const key = str(msg.key);
+        const row = store
+          .query<Pick<R2Row, "blob_id">, [string, string]>("SELECT blob_id FROM r2 WHERE bucket = ? AND key = ?")
+          .get(bucket, key);
         store.query("DELETE FROM r2 WHERE bucket = ? AND key = ?").run(bucket, key);
-        r2DeleteBlob(store, bucket, key);
+        if (row) r2DeleteBlob(store, bucket, key, row.blob_id);
         return { ok: true };
       }
       case "r2.list": {
@@ -1100,24 +1188,15 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       // second full-object copy through the database's own page cache.
       const { store, part: bucket } = storeFor("r2", requireR2(msg.bucket));
       const key = str(msg.key);
-      const etag = createHash("sha256").update(binary).digest("hex");
-      const uploaded = new Date().toISOString();
-      r2WriteBlob(store, bucket, key, binary);
-      store
-        .query(
-          "INSERT INTO r2 (bucket, key, size, etag, uploaded, http_json, custom_json) VALUES (?1,?2,?3,?4,?5,?6,?7) " +
-            "ON CONFLICT (bucket, key) DO UPDATE SET size=?3, etag=?4, uploaded=?5, http_json=?6, custom_json=?7",
-        )
-        .run(
-          bucket,
-          key,
-          binary.byteLength,
-          etag,
-          uploaded,
-          JSON.stringify(msg.httpMetadata ?? {}),
-          JSON.stringify(msg.customMetadata ?? {}),
-        );
-      return { reply: { ok: true, object: { key, size: binary.byteLength, etag, uploaded } } };
+      const row = putR2(
+        store,
+        bucket,
+        key,
+        binary,
+        JSON.stringify(msg.httpMetadata ?? {}),
+        JSON.stringify(msg.customMetadata ?? {}),
+      );
+      return { reply: { ok: true, object: r2Row(row) } };
     }
 
     if (msg.op === "r2.multipart.put") {
@@ -1145,7 +1224,10 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       const key = str(msg.key);
       const row = store.query<R2Row, [string, string]>("SELECT * FROM r2 WHERE bucket = ? AND key = ?").get(bucket, key);
       if (!row) return { reply: { ok: true, found: false } };
-      return { reply: { ok: true, found: true, object: r2Row(row) }, bytes: r2ReadBlob(store, bucket, key) ?? new Uint8Array(0) };
+      return {
+        reply: { ok: true, found: true, object: r2Row(row) },
+        bytes: r2ReadBlob(store, bucket, key, row.blob_id) ?? new Uint8Array(0),
+      };
     }
 
     if (msg.op === "assets.get") {

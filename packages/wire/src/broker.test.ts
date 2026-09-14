@@ -240,6 +240,30 @@ test("R2 multipart: binary parts complete without joining the full object in the
   }
 });
 
+test("R2 overwrite keeps the committed generation visible when metadata update fails", async () => {
+  const root = mkdtempSync(join(tmpdir(), "sb-broker-r2-atomic-"));
+  try {
+    const databasePath = join(root, "state.sqlite");
+    const b = make({ db: databasePath, bindings: { r2: ["UPLOADS"] } });
+    await b.dispatch({ op: "r2.put", bucket: "UPLOADS", key: "object", body: "old-bytes" });
+    const control = new Database(databasePath);
+    control.exec(
+      "CREATE TRIGGER fail_r2_metadata BEFORE UPDATE ON r2 BEGIN SELECT RAISE(ABORT, 'forced metadata failure'); END",
+    );
+    await expect(
+      b.dispatch({ op: "r2.put", bucket: "UPLOADS", key: "object", body: "new-and-longer-bytes" }),
+    ).rejects.toThrow("forced metadata failure");
+    expect(await b.dispatch({ op: "r2.get", bucket: "UPLOADS", key: "object" })).toMatchObject({
+      found: true,
+      body: "old-bytes",
+      object: { size: 9 },
+    });
+    control.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Durable Object storage: get / put / delete / list / deleteAll scoped to (class, id)", async () => {
   const b = make({ bindings: { do: [{ binding: "COUNTER", className: "Counter" }] } });
   expect(await b.dispatch({ op: "do.storage.get", cls: "Counter", id: "a", key: "n" })).toMatchObject({ found: false });

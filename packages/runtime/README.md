@@ -63,3 +63,12 @@ the finished object through a fixed 64 KiB native buffer, so final object size
 does not determine peak Porffor heap use. A single `put()` still buffers its
 whole value; use multipart for larger objects. Call `abort()` to remove an
 unfinished upload and its parts.
+
+Completed objects use immutable, etag-addressed blob generations. The metadata
+row switches to a fully written generation before the previous file is
+removed. If a metadata update fails, readers continue seeing the previous
+generation with its matching size and etag.
+
+Unfinished uploads expire after seven days. The broker removes expired parts
+when another multipart upload starts; a standalone binary removes them when it
+initializes its embedded store.
