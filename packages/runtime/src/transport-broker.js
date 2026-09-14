@@ -19,6 +19,13 @@
 
 // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
 Porffor.c`
+// baronunread/sproutboat#176 — defined in render.js, alongside
+// porf_native_fetch_read_value (which every inline-C block below already
+// calls with no forward declaration of its own — that one gets one from
+// Porffor's own generated prototypes, this one doesn't, since it's a local
+// patch addition, not something Porffor knows to prototype early).
+extern int porf_native_fetch_read_raw_bytes(jsval value, const char** out_buf, size_t* out_len);
+
 static int sb_io_all(int fd, unsigned char* buf, size_t len, int writing) {
   size_t done = 0;
   while (done < len) {
@@ -237,8 +244,15 @@ function __sbCallBin(reqJson, body) {
   Porffor.c`
     const char* __j; size_t __jl; char* __jo = 0;
     porf_native_fetch_read_value(reqJson, &__j, &__jl, &__jo);
+    // baronunread/sproutboat#184 -- the only real (non-empty) body this ever
+    // carries today is an R2 put(); read raw, not through read_value's
+    // bytestring branch, which always UTF-8-encodes (right for text, wrong
+    // for opaque bytes off a raw HTTP upload). A genuine multi-byte JS string
+    // isn't a bytestring, so it falls back to the encoding path unaffected.
     const char* __b; size_t __bl; char* __bo = 0;
-    porf_native_fetch_read_value(body, &__b, &__bl, &__bo);
+    if (porf_native_fetch_read_raw_bytes(body, &__b, &__bl) != 0) {
+      porf_native_fetch_read_value(body, &__b, &__bl, &__bo);
+    }
     char* __resp = 0; size_t __resplen = 0;
     int __rc = sb_broker_roundtrip_v1(__j, __jl, __b, __bl, &__resp, &__resplen);
     if (__jo) free(__jo);
