@@ -1104,11 +1104,18 @@ function __sbR2Object(meta, body) {
   };
   if (body != null) {
     obj.body = body;
+    // #184 — `body` is raw bytes (a bytestring), not decoded text: `.text()`
+    // returning it verbatim produced mojibake for any object holding real
+    // UTF-8 content, the same gap __sbRawBodyResponse already closed for
+    // assets/fetch/service-binding responses. Same fix here: decode lazily,
+    // once, on first read.
+    let decoded = null;
     obj.text = function () {
-      return body;
+      if (decoded === null) decoded = __sbFromUtf8(body);
+      return decoded;
     };
     obj.json = function () {
-      return JSON.parse(body);
+      return JSON.parse(obj.text());
     };
   }
   return obj;
