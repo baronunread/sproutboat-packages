@@ -19,7 +19,7 @@
  */
 import { Database, type Statement } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, normalize, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { resolveAssetKey, type AssetManifest } from "@sproutboat/assets";
@@ -116,6 +116,13 @@ type R2Row = {
   http_json: string;
   custom_json: string;
 };
+type R2UploadRow = {
+  key: string;
+  uploaded: string;
+  http_json: string;
+  custom_json: string;
+};
+type R2PartRow = { part_number: number; size: number; etag: string };
 const isNumber = (v: JsonValue | undefined): v is number => Number.isFinite(v);
 const sqlParams = (v: JsonValue | undefined): SqlParam[] => {
   if (!Array.isArray(v)) return [];
@@ -242,6 +249,16 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       "CREATE TABLE IF NOT EXISTS r2 (bucket TEXT NOT NULL, key TEXT NOT NULL, size INTEGER NOT NULL, " +
         "etag TEXT NOT NULL, uploaded TEXT NOT NULL, http_json TEXT NOT NULL DEFAULT '{}', custom_json TEXT NOT NULL DEFAULT '{}', " +
         "PRIMARY KEY (bucket, key))",
+    );
+    conn.exec(
+      "CREATE TABLE IF NOT EXISTS r2_upload (bucket TEXT NOT NULL, key TEXT NOT NULL, upload_id TEXT NOT NULL, " +
+        "uploaded TEXT NOT NULL, http_json TEXT NOT NULL DEFAULT '{}', custom_json TEXT NOT NULL DEFAULT '{}', " +
+        "PRIMARY KEY (bucket, key, upload_id))",
+    );
+    conn.exec(
+      "CREATE TABLE IF NOT EXISTS r2_part (bucket TEXT NOT NULL, key TEXT NOT NULL, upload_id TEXT NOT NULL, " +
+        "part_number INTEGER NOT NULL, size INTEGER NOT NULL, etag TEXT NOT NULL, " +
+        "PRIMARY KEY (bucket, key, upload_id, part_number))",
     );
     conn.exec(
       "CREATE TABLE IF NOT EXISTS mq (queue TEXT NOT NULL, id TEXT PRIMARY KEY, body TEXT NOT NULL, " +
@@ -428,6 +445,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
    * `:memory:` stores (tests, `db: ":memory:"`) fall back to an in-memory map.
    */
   const r2MemBlobs = new Map<string, Uint8Array>();
+  const r2MemParts = new Map<string, Uint8Array>();
   const r2BlobId = (bucketPart: string, key: string): string =>
     createHash("sha256").update(`${bucketPart}\0${key}`).digest("hex");
   const r2BlobDir = (store: Database): string | null => {
@@ -459,6 +477,177 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       return;
     }
     if (existsSync(path)) rmSync(path);
+  };
+  const r2PartId = (bucketPart: string, key: string, uploadId: string, partNumber: number): string =>
+    createHash("sha256").update(`${bucketPart}\0${key}\0${uploadId}\0${partNumber}`).digest("hex");
+  const r2PartPath = (
+    store: Database,
+    bucketPart: string,
+    key: string,
+    uploadId: string,
+    partNumber: number,
+  ): string | null => {
+    const file = store.filename;
+    if (!file || file === ":memory:") return null;
+    return join(dirname(resolve(file)), "r2-parts", `${r2PartId(bucketPart, key, uploadId, partNumber)}.part`);
+  };
+  const r2PartMemKey = (bucketPart: string, key: string, uploadId: string, partNumber: number): string =>
+    `${bucketPart}\0${key}\0${uploadId}\0${partNumber}`;
+  const r2WritePart = (
+    store: Database,
+    bucketPart: string,
+    key: string,
+    uploadId: string,
+    partNumber: number,
+    bytes: Uint8Array,
+  ): void => {
+    const path = r2PartPath(store, bucketPart, key, uploadId, partNumber);
+    if (!path) {
+      r2MemParts.set(r2PartMemKey(bucketPart, key, uploadId, partNumber), bytes);
+      return;
+    }
+    mkdirSync(dirname(path), { recursive: true });
+    const temporary = `${path}.tmp`;
+    writeFileSync(temporary, bytes);
+    renameSync(temporary, path);
+  };
+  const r2ReadPart = (
+    store: Database,
+    bucketPart: string,
+    key: string,
+    uploadId: string,
+    partNumber: number,
+  ): Uint8Array | null => {
+    const path = r2PartPath(store, bucketPart, key, uploadId, partNumber);
+    if (!path) return r2MemParts.get(r2PartMemKey(bucketPart, key, uploadId, partNumber)) ?? null;
+    return existsSync(path) ? readFileSync(path) : null;
+  };
+  const r2DeletePart = (
+    store: Database,
+    bucketPart: string,
+    key: string,
+    uploadId: string,
+    partNumber: number,
+  ): void => {
+    const path = r2PartPath(store, bucketPart, key, uploadId, partNumber);
+    if (!path) {
+      r2MemParts.delete(r2PartMemKey(bucketPart, key, uploadId, partNumber));
+      return;
+    }
+    if (existsSync(path)) rmSync(path);
+  };
+
+  const requireMultipart = (store: Database, bucket: string, key: string, uploadId: string): R2UploadRow => {
+    const row = store
+      .query<R2UploadRow, [string, string, string]>(
+        "SELECT key, uploaded, http_json, custom_json FROM r2_upload WHERE bucket = ? AND key = ? AND upload_id = ?",
+      )
+      .get(bucket, key, uploadId);
+    if (!row) throw new Error("multipart upload not found");
+    return row;
+  };
+
+  const multipartParts = (store: Database, bucket: string, key: string, uploadId: string): R2PartRow[] =>
+    store
+      .query<R2PartRow, [string, string, string]>(
+        "SELECT part_number, size, etag FROM r2_part WHERE bucket = ? AND key = ? AND upload_id = ? ORDER BY part_number",
+      )
+      .all(bucket, key, uploadId);
+
+  const requestedParts = (value: JsonValue | undefined): Array<{ partNumber: number; etag: string }> => {
+    if (!Array.isArray(value) || value.length === 0) throw new Error("complete requires at least one uploaded part");
+    return value.map((part) => {
+      const parsed = jsonObject(part);
+      const partNumber = Number(parsed?.partNumber);
+      const etag = isString(parsed?.etag) ? parsed.etag : "";
+      if (!Number.isSafeInteger(partNumber) || partNumber < 1 || partNumber > 10000 || !etag) {
+        throw new Error("invalid uploaded part");
+      }
+      return { partNumber, etag };
+    });
+  };
+
+  const validateCompletedParts = (stored: R2PartRow[], requested: Array<{ partNumber: number; etag: string }>): void => {
+    if (stored.length !== requested.length) throw new Error("uploaded parts do not match");
+    for (let index = 0; index < stored.length; index++) {
+      const actual = stored[index];
+      const expected = requested[index];
+      if (actual.part_number !== expected.partNumber || actual.etag !== expected.etag) {
+        throw new Error("uploaded parts do not match");
+      }
+      if (index > 0 && expected.partNumber <= requested[index - 1].partNumber) {
+        throw new Error("uploaded parts must be ordered by partNumber");
+      }
+      if (index < stored.length - 1 && actual.size !== stored[0].size) {
+        throw new Error("all multipart parts except the last must have the same size");
+      }
+      if (index === stored.length - 1 && stored.length > 1 && actual.size > stored[0].size) {
+        throw new Error("the last multipart part cannot be larger than the others");
+      }
+    }
+  };
+
+  const deleteMultipart = (store: Database, bucket: string, key: string, uploadId: string): void => {
+    for (const part of multipartParts(store, bucket, key, uploadId)) {
+      r2DeletePart(store, bucket, key, uploadId, part.part_number);
+    }
+    store.query("DELETE FROM r2_part WHERE bucket = ? AND key = ? AND upload_id = ?").run(bucket, key, uploadId);
+    store.query("DELETE FROM r2_upload WHERE bucket = ? AND key = ? AND upload_id = ?").run(bucket, key, uploadId);
+  };
+
+  const completeMultipart = (
+    store: Database,
+    bucket: string,
+    key: string,
+    uploadId: string,
+    requested: Array<{ partNumber: number; etag: string }>,
+  ): ReturnType<typeof r2Row> => {
+    const upload = requireMultipart(store, bucket, key, uploadId);
+    const parts = multipartParts(store, bucket, key, uploadId);
+    validateCompletedParts(parts, requested);
+
+    const hash = createHash("sha256");
+    let size = 0;
+    const destination = r2BlobPath(store, bucket, key);
+    if (destination) {
+      mkdirSync(dirname(destination), { recursive: true });
+      const temporary = `${destination}.${uploadId}.tmp`;
+      writeFileSync(temporary, new Uint8Array(0));
+      try {
+        for (const part of parts) {
+          const bytes = r2ReadPart(store, bucket, key, uploadId, part.part_number);
+          if (!bytes || bytes.byteLength !== part.size) throw new Error(`multipart part ${part.part_number} is missing`);
+          appendFileSync(temporary, bytes);
+          hash.update(bytes);
+          size += bytes.byteLength;
+        }
+        renameSync(temporary, destination);
+      } catch (error) {
+        if (existsSync(temporary)) rmSync(temporary);
+        throw error;
+      }
+    } else {
+      const chunks: Uint8Array[] = [];
+      for (const part of parts) {
+        const bytes = r2ReadPart(store, bucket, key, uploadId, part.part_number);
+        if (!bytes || bytes.byteLength !== part.size) throw new Error(`multipart part ${part.part_number} is missing`);
+        chunks.push(bytes);
+        hash.update(bytes);
+        size += bytes.byteLength;
+      }
+      r2WriteBlob(store, bucket, key, Buffer.concat(chunks));
+    }
+
+    const etag = hash.digest("hex");
+    const uploaded = new Date().toISOString();
+    store
+      .query(
+        "INSERT INTO r2 (bucket, key, size, etag, uploaded, http_json, custom_json) VALUES (?1,?2,?3,?4,?5,?6,?7) " +
+          "ON CONFLICT (bucket, key) DO UPDATE SET size=?3, etag=?4, uploaded=?5, http_json=?6, custom_json=?7",
+      )
+      .run(bucket, key, size, etag, uploaded, upload.http_json, upload.custom_json);
+    deleteMultipart(store, bucket, key, uploadId);
+    return r2Row({ key, size, etag, uploaded, http_json: upload.http_json, custom_json: upload.custom_json });
   };
 
   const r2Row = (r: R2Row) => ({
@@ -674,6 +863,41 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
             JSON.stringify(msg.customMetadata ?? {}),
           );
         return { ok: true, object: { key, size: bytes.byteLength, etag, uploaded } };
+      }
+      case "r2.multipart.create": {
+        const { store, part: bucket } = storeFor("r2", requireR2(msg.bucket));
+        const key = str(msg.key);
+        const uploadId = str(msg.uploadId) || newId();
+        const uploaded = new Date().toISOString();
+        store
+          .query(
+            "INSERT INTO r2_upload (bucket, key, upload_id, uploaded, http_json, custom_json) VALUES (?1,?2,?3,?4,?5,?6) " +
+              "ON CONFLICT (bucket, key, upload_id) DO NOTHING",
+          )
+          .run(
+            bucket,
+            key,
+            uploadId,
+            uploaded,
+            JSON.stringify(msg.httpMetadata ?? {}),
+            JSON.stringify(msg.customMetadata ?? {}),
+          );
+        return { ok: true, key, uploadId };
+      }
+      case "r2.multipart.complete": {
+        const { store, part: bucket } = storeFor("r2", requireR2(msg.bucket));
+        const key = str(msg.key);
+        const uploadId = str(msg.uploadId);
+        const object = completeMultipart(store, bucket, key, uploadId, requestedParts(msg.parts));
+        return { ok: true, object };
+      }
+      case "r2.multipart.abort": {
+        const { store, part: bucket } = storeFor("r2", requireR2(msg.bucket));
+        const key = str(msg.key);
+        const uploadId = str(msg.uploadId);
+        requireMultipart(store, bucket, key, uploadId);
+        deleteMultipart(store, bucket, key, uploadId);
+        return { ok: true };
       }
       case "r2.get":
       case "r2.head": {
@@ -896,6 +1120,26 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       return { reply: { ok: true, object: { key, size: binary.byteLength, etag, uploaded } } };
     }
 
+    if (msg.op === "r2.multipart.put") {
+      const { store, part: bucket } = storeFor("r2", requireR2(msg.bucket));
+      const key = str(msg.key);
+      const uploadId = str(msg.uploadId);
+      const partNumber = Number(msg.partNumber);
+      if (!Number.isSafeInteger(partNumber) || partNumber < 1 || partNumber > 10000) {
+        throw new Error("partNumber must be an integer between 1 and 10000");
+      }
+      requireMultipart(store, bucket, key, uploadId);
+      const etag = createHash("sha256").update(binary).digest("hex");
+      r2WritePart(store, bucket, key, uploadId, partNumber, binary);
+      store
+        .query(
+          "INSERT INTO r2_part (bucket, key, upload_id, part_number, size, etag) VALUES (?1,?2,?3,?4,?5,?6) " +
+            "ON CONFLICT (bucket, key, upload_id, part_number) DO UPDATE SET size=?5, etag=?6",
+        )
+        .run(bucket, key, uploadId, partNumber, binary.byteLength, etag);
+      return { reply: { ok: true, part: { partNumber, etag } } };
+    }
+
     if (msg.op === "r2.get") {
       const { store, part: bucket } = storeFor("r2", requireR2(msg.bucket));
       const key = str(msg.key);
@@ -939,7 +1183,14 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       if (!msg) throw new Error("request frame was not a JSON object");
       if (token && str(msg.token) !== token) return frameOf(encodeV1({ ok: false, error: "unauthorized" }));
       const binary = new Uint8Array(payload.subarray(5 + jsonLen));
+      const id = isSafeInteger(msg.id) ? msg.id : null;
+      const replayKey = id === null ? null : `${str(msg.op)}:${id}`;
+      if (replayKey && REPLAYABLE.has(str(msg.op))) {
+        const seen = replayed.get(replayKey);
+        if (seen) return frameOf(encodeV1(seen));
+      }
       const { reply, bytes } = await dispatchBinary(msg, binary);
+      if (replayKey && REPLAYABLE.has(str(msg.op))) rememberReplay(replayKey, reply);
       return frameOf(encodeV1(reply, bytes));
     } catch (e) {
       return frameOf(encodeV1({ ok: false, error: e instanceof Error ? e.message : String(e) }));
@@ -966,6 +1217,10 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     "d1.backup",
     "ratelimit.check",
     "r2.put",
+    "r2.multipart.create",
+    "r2.multipart.put",
+    "r2.multipart.complete",
+    "r2.multipart.abort",
     "r2.delete",
     "do.storage.put",
     "do.storage.delete",
@@ -979,6 +1234,14 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
    *  milliseconds, so this only has to outlive a reconnect, not a session. */
   const REPLAY_WINDOW = 256;
 
+  const rememberReplay = (key: string, reply: Frame): void => {
+    replayed.set(key, reply);
+    if (replayed.size > REPLAY_WINDOW) {
+      const oldest = replayed.keys().next().value;
+      if (oldest !== undefined) replayed.delete(oldest);
+    }
+  };
+
   /**
    * Run `msg`, or replay what it answered last time. Keyed by the id the sprout
    * put on the request; a request without one is always run.
@@ -991,12 +1254,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     const seen = replayed.get(key);
     if (seen) return seen;
     const reply = await dispatch(msg);
-    replayed.set(key, reply);
-    // Insertion-ordered, so the oldest key is the first one out.
-    if (replayed.size > REPLAY_WINDOW) {
-      const oldest = replayed.keys().next().value;
-      if (oldest !== undefined) replayed.delete(oldest);
-    }
+    rememberReplay(key, reply);
     return reply;
   }
 

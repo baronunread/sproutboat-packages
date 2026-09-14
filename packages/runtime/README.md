@@ -31,3 +31,35 @@ The prelude shims the Web API surface handlers expect (URL, Response,
 crypto random values, binding shims, trigger dispatch) and is identical
 for both transports, which is what lets one conformance suite hold them
 honest.
+
+## R2 multipart uploads
+
+R2 bindings implement the Cloudflare multipart method shape for objects that
+are larger than one safe request body:
+
+```js
+const upload = env.FILES.createMultipartUpload("archive.tar", {
+  httpMetadata: { contentType: "application/x-tar" },
+  customMetadata: { source: "backup" },
+});
+
+const parts = [];
+parts.push(await upload.uploadPart(1, firstChunk));
+
+const resumed = env.FILES.resumeMultipartUpload(upload.key, upload.uploadId);
+parts.push(await resumed.uploadPart(2, finalChunk));
+
+const object = await resumed.complete(parts);
+```
+
+Part numbers must be between 1 and 10,000. Parts must be supplied to
+`complete()` in ascending order. Every part except the last must have the same
+size, and the last cannot be larger. Sproutboat permits parts smaller than
+Cloudflare R2's 5 MiB minimum so the default 1 MiB request-body limit remains
+useful. Keep each part below the configured request-body limit.
+
+Each part is persisted independently. Standalone completion copies parts into
+the finished object through a fixed 64 KiB native buffer, so final object size
+does not determine peak Porffor heap use. A single `put()` still buffers its
+whole value; use multipart for larger objects. Call `abort()` to remove an
+unfinished upload and its parts.

@@ -169,6 +169,77 @@ test("R2: list paginates with a cursor", async () => {
   expect(arr(p2.objects).map((o) => obj(o).key)).toEqual(["k2", "k3"]);
 });
 
+test("R2 multipart: binary parts complete without joining the full object in the broker heap", async () => {
+  const root = mkdtempSync(join(tmpdir(), "sb-broker-r2-multipart-"));
+  try {
+    const b = make({ db: join(root, "state.sqlite"), bindings: { r2: ["UPLOADS"] }, token: "tok" });
+    const created = await b.handleFrame(
+      encodeV1({
+        v: 1,
+        id: 1,
+        token: "tok",
+        op: "r2.multipart.create",
+        bucket: "UPLOADS",
+        key: "archive.bin",
+        customMetadata: { source: "test" },
+      }),
+    );
+    const uploadId = String(decodeV1Frame(created).json.uploadId);
+    const first = new Uint8Array([0, 1, 2, 255]);
+    const second = new Uint8Array([4, 5]);
+    const part1 = decodeV1Frame(
+      await b.handleFrame(
+        encodeV1(
+          {
+            v: 1,
+            id: 2,
+            token: "tok",
+            op: "r2.multipart.put",
+            bucket: "UPLOADS",
+            key: "archive.bin",
+            uploadId,
+            partNumber: 1,
+          },
+          first,
+        ),
+      ),
+    ).json;
+    const part2 = decodeV1Frame(
+      await b.handleFrame(
+        encodeV1(
+          {
+            v: 1,
+            id: 3,
+            token: "tok",
+            op: "r2.multipart.put",
+            bucket: "UPLOADS",
+            key: "archive.bin",
+            uploadId,
+            partNumber: 2,
+          },
+          second,
+        ),
+      ),
+    ).json;
+    const completed = await b.dispatch({
+      op: "r2.multipart.complete",
+      bucket: "UPLOADS",
+      key: "archive.bin",
+      uploadId,
+      parts: [obj(part1.part), obj(part2.part)],
+    });
+    expect(obj(completed.object)).toMatchObject({ key: "archive.bin", size: 6, customMetadata: { source: "test" } });
+
+    const got = decodeV1Frame(
+      await b.handleFrame(encodeV1({ v: 1, token: "tok", op: "r2.get", bucket: "UPLOADS", key: "archive.bin" })),
+    );
+    expect(Buffer.from(got.bytes).equals(Buffer.from([...first, ...second]))).toBe(true);
+    expect(existsSync(join(root, "r2-blobs"))).toBe(true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Durable Object storage: get / put / delete / list / deleteAll scoped to (class, id)", async () => {
   const b = make({ bindings: { do: [{ binding: "COUNTER", className: "Counter" }] } });
   expect(await b.dispatch({ op: "do.storage.get", cls: "Counter", id: "a", key: "n" })).toMatchObject({ found: false });
@@ -711,6 +782,19 @@ async function v1(
   return {
     json: obj(parseJsonValue(all.subarray(9, 9 + jsonLen).toString("utf8"))),
     bytes: new Uint8Array(all.subarray(9 + jsonLen)),
+  };
+}
+
+type V1Reply = { json: JsonObject; bytes: Uint8Array };
+
+function decodeV1Frame(frame: Buffer): V1Reply {
+  const payloadLength = frame.readUInt32LE(0);
+  const payload = frame.subarray(4, 4 + payloadLength);
+  expect(payload[0]).toBe(1);
+  const jsonLength = payload.readUInt32LE(1);
+  return {
+    json: obj(parseJsonValue(payload.subarray(5, 5 + jsonLength).toString("utf8"))),
+    bytes: new Uint8Array(payload.subarray(5 + jsonLength)),
   };
 }
 
