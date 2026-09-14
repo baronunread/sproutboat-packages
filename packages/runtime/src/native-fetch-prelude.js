@@ -1703,15 +1703,31 @@ async function __sbDrainAll(pending) {
 // one *this* async function creates, not a `.then()` derived from someone
 // else's — see the note below on why that distinction matters here.
 async function __sbFetchWithDrain(res, tasks) {
-  const r = res && __sbIsFn(res.then) ? await res : res;
+  let r;
+  try {
+    r = res && __sbIsFn(res.then) ? await res : res;
+  } catch {
+    // #179 — a rejected handler promise must not take the process down with it.
+    r = __sbErrorResponse();
+  }
   await __sbDrainWaitUntil(tasks);
   return r;
+}
+
+// #179 — turn an uncaught handler exception into a 500 instead of letting it
+// propagate past __sbEntry and crash the whole server.
+function __sbErrorResponse() {
+  return new Response("Internal Server Error", { status: 500 });
 }
 
 // Shared by alarm and scheduled: both reply with an empty 204 once their
 // handler (and anything it queued via `waitUntil`) has settled.
 async function __sb204WithDrain(res, tasks) {
-  if (res && __sbIsFn(res.then)) await res;
+  try {
+    if (res && __sbIsFn(res.then)) await res;
+  } catch {
+    // #179 — same rule as fetch: a rejected scheduled/alarm promise must not crash the process.
+  }
   await __sbDrainWaitUntil(tasks);
   return new Response("", { status: 204 });
 }
@@ -1746,7 +1762,14 @@ globalThis.__sbEntry = function (handlers, request) {
         if (p && __sbIsFn(p.then)) __sbTasks.push(p);
       },
     };
-    const __res = handlers.fetch(request, ctx);
+    let __res;
+    try {
+      __res = handlers.fetch(request, ctx);
+    } catch {
+      // #179 — a synchronous throw anywhere in the handler must not take the
+      // whole process (and every other in-flight request) down with it.
+      return __sbErrorResponse();
+    }
     // Same promise-identity rule as above applies to `__sbFetchWithDrain`'s
     // own return, which is why it's tail-called rather than chained on here.
     if (__sbTasks.length || (__res && __sbIsFn(__res.then))) return __sbFetchWithDrain(__res, __sbTasks);
@@ -1766,10 +1789,16 @@ globalThis.__sbEntry = function (handlers, request) {
         if (p && __sbIsFn(p.then)) __sbTasks.push(p);
       },
     };
-    const __sres = handlers.scheduled(
-      { cron: body.cron || "", scheduledTime: body.scheduledTime || Date.now(), noRetry() {} },
-      ctx,
-    );
+    let __sres;
+    try {
+      __sres = handlers.scheduled(
+        { cron: body.cron || "", scheduledTime: body.scheduledTime || Date.now(), noRetry() {} },
+        ctx,
+      );
+    } catch {
+      // #179 — same rule as fetch: don't let a throw here crash the process.
+      return new Response("", { status: 204 });
+    }
     if (__sbTasks.length || (__sres && __sbIsFn(__sres.then))) return __sb204WithDrain(__sres, __sbTasks);
     return new Response("", { status: 204 });
   }
@@ -1797,7 +1826,13 @@ globalThis.__sbEntry = function (handlers, request) {
     const body = __sbReadJson(request);
     const inst = __sbGetDOInstance(String(body.cls || ""), String(body.id || ""));
     if (!__sbIsFn(inst.alarm)) return new Response("no alarm handler", { status: 404 });
-    const __ares = inst.alarm();
+    let __ares;
+    try {
+      __ares = inst.alarm();
+    } catch {
+      // #179 — same rule as fetch: don't let a throw here crash the process.
+      return new Response("", { status: 204 });
+    }
     // Was fire-and-forget before: an async `alarm()` and any `state.waitUntil()`
     // it queued were both dropped the moment 204 went out. Await both.
     if (inst.__sbTasks.length || (__ares && __sbIsFn(__ares.then))) return __sb204WithDrain(__ares, inst.__sbTasks);
@@ -1845,11 +1880,18 @@ async function __sbRunQueueBatch(handlers, body, ctx) {
       for (let i = 0; i < messages.length; i++) messages[i].retry();
     },
   };
-  const __qres = handlers.queue(batch, ctx);
-  // Was fire-and-forget: an async `queue()` had this default-ack pass run (and
-  // the response go out) before its own `await`s did, so any ack()/retry()
-  // past the first one never counted.
-  if (__qres && __sbIsFn(__qres.then)) await __qres;
+  try {
+    const __qres = handlers.queue(batch, ctx);
+    // Was fire-and-forget: an async `queue()` had this default-ack pass run (and
+    // the response go out) before its own `await`s did, so any ack()/retry()
+    // past the first one never counted.
+    if (__qres && __sbIsFn(__qres.then)) await __qres;
+  } catch {
+    // #179 — a throw here must not crash the process. Whatever ack()/retry()
+    // calls the handler made before throwing still count; anything it never
+    // touched falls through to the default-ack pass below, same as a handler
+    // that returns without calling ack()/retry() on every message.
+  }
   // default: any message neither acked nor retried is treated as acked
   for (let i = 0; i < messages.length; i++) {
     if (acked.indexOf(messages[i].id) === -1 && retried.indexOf(messages[i].id) === -1) acked.push(messages[i].id);
