@@ -10,12 +10,13 @@ import { fileURLToPath } from "node:url";
 const src = readFileSync(fileURLToPath(new URL("./native-fetch-prelude.js", import.meta.url)), "utf8");
 const isStrStart = src.indexOf("function __sbIsStr(");
 const isStrEnd = src.indexOf("function __sbIsFn(");
-const start = src.indexOf("function __sbToBytes(");
+// Starts at the window constant, not the function: __sbToBytes closes over it.
+const start = src.indexOf("const __SB_BYTES_WINDOW");
 const end = src.indexOf("function __sbBufFrom(");
 const hexStart = src.indexOf("function __sbHexOrBytes(");
 const hexEnd = src.indexOf("\nif (globalThis.crypto.subtle");
 if (isStrStart === -1 || isStrEnd === -1 || start === -1 || end === -1 || end < start) {
-  throw new Error("__sbToBytes (or __sbIsStr) block not found in prelude");
+  throw new Error("__sbToBytes (or __sbIsStr / __SB_BYTES_WINDOW) block not found in prelude");
 }
 if (hexStart === -1 || hexEnd === -1 || hexEnd < hexStart) throw new Error("__sbHexOrBytes block not found in prelude");
 
@@ -88,6 +89,31 @@ test("a long high-byte typed array round-trips byte for byte", () => {
   const bytes = new Uint8Array(50000);
   for (let i = 0; i < bytes.length; i++) bytes[i] = (i * 37 + 0x80) & 0xff;
   expect(bytesOf(__sbToBytes(bytes))).toEqual([...bytes]);
+});
+
+// sproutboat#181: 0.6.4 encoded every size through one array-push-then-join
+// path, which cost a real app 64% of its throughput on the ~150-byte inputs
+// crypto.subtle sees per request. The encoder now only reaches for an array
+// once a 512-byte window fills, so these sizes exercise both sides of that
+// boundary and the seam between them. Correctness only; the performance claim
+// lives in the benchmark, not here.
+test("inputs either side of the window boundary encode byte-identically", () => {
+  for (const n of [0, 1, 150, 511, 512, 513, 1024, 1025]) {
+    const text = "a".repeat(n);
+    expect(bytesOf(__sbToBytes(text))).toEqual([...new TextEncoder().encode(text)]);
+    const bytes = new Uint8Array(n);
+    for (let i = 0; i < n; i++) bytes[i] = (i * 37 + 0x80) & 0xff;
+    expect(bytesOf(__sbToBytes(bytes))).toEqual([...bytes]);
+  }
+});
+
+test("a surrogate pair straddling the window boundary is not split", () => {
+  // Land the 4-byte sequence so its bytes would cross a 512-byte flush if the
+  // encoder ever flushed mid-character.
+  for (let pad = 508; pad <= 515; pad++) {
+    const text = "a".repeat(pad) + "🌱" + "b".repeat(4);
+    expect(bytesOf(__sbToBytes(text))).toEqual([...new TextEncoder().encode(text)]);
+  }
 });
 
 // __sbHexOrBytes had the same O(n^2) shape on a third path (it backs the

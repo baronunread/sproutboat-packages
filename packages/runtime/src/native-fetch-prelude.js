@@ -171,14 +171,12 @@ class __SproutboatURLSearchParams {
     return this._keys.length;
   }
   toString() {
-    // Array + one join("&"), not `out +=` in a loop: see __sbToBytes. A query
-    // string is usually short, but a params object built from a large form or
-    // a paginated cursor list is not, and the fix costs nothing.
-    const out = [];
+    let out = "";
     for (let i = 0; i < this._keys.length; i++) {
-      out.push(encodeURIComponent(this._keys[i]) + "=" + encodeURIComponent(this._vals[i]));
+      if (i > 0) out += "&";
+      out += encodeURIComponent(this._keys[i]) + "=" + encodeURIComponent(this._vals[i]);
     }
-    return out.join("&");
+    return out;
   }
 }
 
@@ -293,41 +291,73 @@ function __sbHashBits(algo) {
   if (n === "SHA-512" || n === "SHA512") return "512";
   return "";
 }
+// Where __sbToBytes stops growing one string and starts a new window. 512 is
+// where the two costs cross on a `porf native` build; the curve is flat either
+// side of it, so this is a plateau, not a tuned constant.
+const __SB_BYTES_WINDOW = 512;
 // -> a latin1 string, one char per byte. Strings are UTF-8 encoded (matching
 // TextEncoder); ArrayBuffer / typed-array input is copied byte for byte.
 function __sbToBytes(input) {
   if (input == null) return "";
-  // Collected into an array and joined once at the end, not built with
-  // repeated `out +=` -- Porffor's strings have no rope/cons optimization, so
-  // `+=` in a loop copies the whole accumulated string on every append,
-  // making the naive version O(n^2). Same fix as __sbFromUtf8 above, on the
-  // encode side (sits behind every crypto.subtle call).
+  // Windowed accumulation (#180, then #181). Plain `s +=` in a loop is O(n^2)
+  // here, since Porffor's strings have no rope/cons optimization and every
+  // append copies the whole accumulated string -- that's #180, a 43KB body
+  // taking ~52ms to encode. But 0.6.4's unconditional array-push-then-join
+  // regressed the common case badly: a real app hashing ~150-byte inputs per
+  // request lost 64% of its throughput and gained 41% RSS (#181), far more
+  // than the per-call cost of the array ops measures in isolation.
+  //
+  // So: append into a window, and only once a window fills does an array come
+  // into existence to hold it. An input below __SB_BYTES_WINDOW allocates no
+  // array at all and runs exactly like the pre-#180 code; a large one caps the
+  // quadratic copy at one window and joins the windows once. Measured on a
+  // `porf native` build, this ties `+=` at 100-512 bytes and ties array+join
+  // at 8-43KB, with no threshold branch to keep in sync.
+  //
+  // Both branches flush only on a complete character, never mid-sequence, so a
+  // surrogate pair can't be split across two windows.
   if (__sbIsStr(input)) {
-    const out = [];
+    let out = null;
+    let s = "";
     for (let i = 0; i < input.length; i++) {
       const c = input.charCodeAt(i);
-      if (c < 0x80) out.push(String.fromCharCode(c));
-      else if (c < 0x800) out.push(String.fromCharCode(0xc0 | (c >> 6)) + String.fromCharCode(0x80 | (c & 0x3f)));
+      if (c < 0x80) s += String.fromCharCode(c);
+      else if (c < 0x800) s += String.fromCharCode(0xc0 | (c >> 6)) + String.fromCharCode(0x80 | (c & 0x3f));
       else if (c >= 0xd800 && c < 0xdc00 && i + 1 < input.length) {
         const cp = 0x10000 + ((c - 0xd800) << 10) + (input.charCodeAt(++i) - 0xdc00);
-        out.push(
+        s +=
           String.fromCharCode(0xf0 | (cp >> 18)) +
-            String.fromCharCode(0x80 | ((cp >> 12) & 0x3f)) +
-            String.fromCharCode(0x80 | ((cp >> 6) & 0x3f)) +
-            String.fromCharCode(0x80 | (cp & 0x3f))
-        );
+          String.fromCharCode(0x80 | ((cp >> 12) & 0x3f)) +
+          String.fromCharCode(0x80 | ((cp >> 6) & 0x3f)) +
+          String.fromCharCode(0x80 | (cp & 0x3f));
       } else
-        out.push(
+        s +=
           String.fromCharCode(0xe0 | (c >> 12)) +
-            String.fromCharCode(0x80 | ((c >> 6) & 0x3f)) +
-            String.fromCharCode(0x80 | (c & 0x3f))
-        );
+          String.fromCharCode(0x80 | ((c >> 6) & 0x3f)) +
+          String.fromCharCode(0x80 | (c & 0x3f));
+      if (s.length >= __SB_BYTES_WINDOW) {
+        if (out === null) out = [];
+        out.push(s);
+        s = "";
+      }
     }
+    if (out === null) return s;
+    if (s.length > 0) out.push(s);
     return out.join("");
   }
   const view = input.length !== undefined && input.buffer !== undefined ? input : new Uint8Array(input);
-  const out = [];
-  for (let i = 0; i < view.length; i++) out.push(String.fromCharCode(view[i] & 0xff));
+  let out = null;
+  let s = "";
+  for (let i = 0; i < view.length; i++) {
+    s += String.fromCharCode(view[i] & 0xff);
+    if (s.length >= __SB_BYTES_WINDOW) {
+      if (out === null) out = [];
+      out.push(s);
+      s = "";
+    }
+  }
+  if (out === null) return s;
+  if (s.length > 0) out.push(s);
   return out.join("");
 }
 function __sbBufFrom(latin1) {
@@ -443,20 +473,23 @@ function __sbEqCt(a, b) {
 // An even-length all-hex string -> its bytes; anything else -> its raw bytes.
 function __sbHexOrBytes(value) {
   if (__sbIsStr(value) && value.length > 0 && value.length % 2 === 0) {
-    // Array-and-join for the same reason as __sbToBytes above; the old version
-    // was worse than a plain `+=` loop, since rewriting the last char with
-    // `out.slice(0, -1) + ...` copied the whole string a second time per byte.
-    // The high nibble is held in a local until its pair arrives instead.
-    const out = [];
+    // The high nibble waits in a local until its pair arrives, instead of the
+    // old `out = out.slice(0, -1) + ...` rewrite, which copied the whole
+    // accumulated string a second time per byte. Deliberately still `+=` and
+    // not __sbToBytes' windowing: this decodes an HMAC signature, which is
+    // tens of bytes, and #181 showed array allocation is the expensive part at
+    // that size. ponytail: O(n^2) above a few KB, window it like __sbToBytes
+    // if a caller ever passes something that big.
+    let out = "";
     let hi = 0;
     for (let i = 0; i < value.length; i++) {
       const c = value.charCodeAt(i);
       const d = c >= 48 && c <= 57 ? c - 48 : c >= 97 && c <= 102 ? c - 87 : c >= 65 && c <= 70 ? c - 55 : -1;
       if (d < 0) return __sbToBytes(value);
       if (i % 2 === 0) hi = d << 4;
-      else out.push(String.fromCharCode(hi | d));
+      else out += String.fromCharCode(hi | d);
     }
-    return out.join("");
+    return out;
   }
   return __sbToBytes(value);
 }
