@@ -171,12 +171,14 @@ class __SproutboatURLSearchParams {
     return this._keys.length;
   }
   toString() {
-    let out = "";
+    // Array + one join("&"), not `out +=` in a loop: see __sbToBytes. A query
+    // string is usually short, but a params object built from a large form or
+    // a paginated cursor list is not, and the fix costs nothing.
+    const out = [];
     for (let i = 0; i < this._keys.length; i++) {
-      if (i > 0) out += "&";
-      out += encodeURIComponent(this._keys[i]) + "=" + encodeURIComponent(this._vals[i]);
+      out.push(encodeURIComponent(this._keys[i]) + "=" + encodeURIComponent(this._vals[i]));
     }
-    return out;
+    return out.join("&");
   }
 }
 
@@ -295,31 +297,38 @@ function __sbHashBits(algo) {
 // TextEncoder); ArrayBuffer / typed-array input is copied byte for byte.
 function __sbToBytes(input) {
   if (input == null) return "";
+  // Collected into an array and joined once at the end, not built with
+  // repeated `out +=` -- Porffor's strings have no rope/cons optimization, so
+  // `+=` in a loop copies the whole accumulated string on every append,
+  // making the naive version O(n^2). Same fix as __sbFromUtf8 above, on the
+  // encode side (sits behind every crypto.subtle call).
   if (__sbIsStr(input)) {
-    let s = "";
+    const out = [];
     for (let i = 0; i < input.length; i++) {
       const c = input.charCodeAt(i);
-      if (c < 0x80) s += String.fromCharCode(c);
-      else if (c < 0x800) s += String.fromCharCode(0xc0 | (c >> 6)) + String.fromCharCode(0x80 | (c & 0x3f));
+      if (c < 0x80) out.push(String.fromCharCode(c));
+      else if (c < 0x800) out.push(String.fromCharCode(0xc0 | (c >> 6)) + String.fromCharCode(0x80 | (c & 0x3f)));
       else if (c >= 0xd800 && c < 0xdc00 && i + 1 < input.length) {
         const cp = 0x10000 + ((c - 0xd800) << 10) + (input.charCodeAt(++i) - 0xdc00);
-        s +=
+        out.push(
           String.fromCharCode(0xf0 | (cp >> 18)) +
-          String.fromCharCode(0x80 | ((cp >> 12) & 0x3f)) +
-          String.fromCharCode(0x80 | ((cp >> 6) & 0x3f)) +
-          String.fromCharCode(0x80 | (cp & 0x3f));
+            String.fromCharCode(0x80 | ((cp >> 12) & 0x3f)) +
+            String.fromCharCode(0x80 | ((cp >> 6) & 0x3f)) +
+            String.fromCharCode(0x80 | (cp & 0x3f))
+        );
       } else
-        s +=
+        out.push(
           String.fromCharCode(0xe0 | (c >> 12)) +
-          String.fromCharCode(0x80 | ((c >> 6) & 0x3f)) +
-          String.fromCharCode(0x80 | (c & 0x3f));
+            String.fromCharCode(0x80 | ((c >> 6) & 0x3f)) +
+            String.fromCharCode(0x80 | (c & 0x3f))
+        );
     }
-    return s;
+    return out.join("");
   }
   const view = input.length !== undefined && input.buffer !== undefined ? input : new Uint8Array(input);
-  let s = "";
-  for (let i = 0; i < view.length; i++) s += String.fromCharCode(view[i] & 0xff);
-  return s;
+  const out = [];
+  for (let i = 0; i < view.length; i++) out.push(String.fromCharCode(view[i] & 0xff));
+  return out.join("");
 }
 function __sbBufFrom(latin1) {
   const b = new Uint8Array(latin1.length);
@@ -434,15 +443,20 @@ function __sbEqCt(a, b) {
 // An even-length all-hex string -> its bytes; anything else -> its raw bytes.
 function __sbHexOrBytes(value) {
   if (__sbIsStr(value) && value.length > 0 && value.length % 2 === 0) {
-    let out = "";
+    // Array-and-join for the same reason as __sbToBytes above; the old version
+    // was worse than a plain `+=` loop, since rewriting the last char with
+    // `out.slice(0, -1) + ...` copied the whole string a second time per byte.
+    // The high nibble is held in a local until its pair arrives instead.
+    const out = [];
+    let hi = 0;
     for (let i = 0; i < value.length; i++) {
       const c = value.charCodeAt(i);
       const d = c >= 48 && c <= 57 ? c - 48 : c >= 97 && c <= 102 ? c - 87 : c >= 65 && c <= 70 ? c - 55 : -1;
       if (d < 0) return __sbToBytes(value);
-      if (i % 2 === 0) out += String.fromCharCode(d << 4);
-      else out = out.slice(0, -1) + String.fromCharCode(out.charCodeAt(out.length - 1) | d);
+      if (i % 2 === 0) hi = d << 4;
+      else out.push(String.fromCharCode(hi | d));
     }
-    return out;
+    return out.join("");
   }
   return __sbToBytes(value);
 }

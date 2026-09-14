@@ -1191,13 +1191,13 @@ function __sbEnsureSchema() {
 }
 
 function __sbHex(n) {
-  let out = "";
+  const out = [];
   const bytes = __sbRandomBytes(String(n));
   for (let i = 0; i < bytes.length; i++) {
     const h = bytes.charCodeAt(i).toString(16);
-    out += h.length === 1 ? "0" + h : h;
+    out.push(h.length === 1 ? "0" + h : h);
   }
-  return out;
+  return out.join("");
 }
 
 function __sbEmbeddedDispatch(msg) {
@@ -1279,14 +1279,15 @@ function __sbEmbeddedDispatch(msg) {
     if (!tls && url.protocol !== "http:") throw new Error("unsupported protocol: " + url.protocol);
     const allow = bindingsOutbound();
     if (allow.indexOf(url.host) === -1) throw new Error("host not in outbound allowlist: " + url.host);
-    let headerText = "";
+    const headerParts = [];
     const pairs = msg.headers || [];
     for (let i = 0; i < pairs.length; i++) {
       const key = String(pairs[i][0]).toLowerCase();
       // Host, Connection and Content-Length are ours to set.
       if (key === "host" || key === "connection" || key === "content-length") continue;
-      headerText += pairs[i][0] + ": " + pairs[i][1] + "\r\n";
+      headerParts.push(pairs[i][0] + ": " + pairs[i][1] + "\r\n");
     }
+    const headerText = headerParts.join("");
     const port = url.port ? url.port : tls ? "443" : "80";
     const reply = JSON.parse(
       __sbHttpRaw(
