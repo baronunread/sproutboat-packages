@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -327,6 +327,87 @@ test("resource-backed KV persists across brokers and is shared by id", async () 
       value: "1",
     });
     second.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// #56 — object bytes live in their own file next to the store's own SQLite
+// file, not inside it, so a resource-bound bucket's blobs persist across a
+// redeploy exactly like its metadata does, and a bare-string binding's blobs
+// live beside its per-deployment db.
+test("R2 blobs are file-backed and persist across brokers for a resource-bound bucket", async () => {
+  const root = mkdtempSync(join(tmpdir(), "sb-broker-r2-res-"));
+  try {
+    const resourceDir = join(root, "resources");
+    const bucketId = "r2_0123456789abcdef01234567";
+    mkdirSync(join(root, "dep-a"), { recursive: true });
+    mkdirSync(join(root, "dep-b"), { recursive: true });
+
+    const first = createBroker({
+      db: join(root, "dep-a", "state.sqlite"),
+      resourceDir,
+      bindings: { r2: ["UPLOADS"], resources: { UPLOADS: { kind: "r2", id: bucketId } } },
+    });
+    await first.dispatch({ op: "r2.put", bucket: "UPLOADS", key: "a.txt", body: "hello" });
+    first.close();
+    // metadata in the per-resource file, bytes in their own file beside it —
+    // never inline in the sqlite row.
+    const dbFile = join(resourceDir, `${bucketId}.sqlite`);
+    expect(existsSync(dbFile)).toBe(true);
+    expect(readFileSync(dbFile, "utf8")).not.toContain("hello");
+    expect(existsSync(join(resourceDir, "r2-blobs"))).toBe(true);
+
+    const second = createBroker({
+      db: join(root, "dep-b", "state.sqlite"),
+      resourceDir,
+      bindings: { r2: ["FILES"], resources: { FILES: { kind: "r2", id: bucketId } } },
+    });
+    expect(await second.dispatch({ op: "r2.get", bucket: "FILES", key: "a.txt" })).toMatchObject({
+      ok: true,
+      found: true,
+      body: "hello",
+    });
+    second.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a bare-string R2 binding stores blobs beside the per-deployment db, not resourceDir", async () => {
+  const root = mkdtempSync(join(tmpdir(), "sb-broker-r2-bare-"));
+  try {
+    const resourceDir = join(root, "resources");
+    mkdirSync(join(root, "dep"), { recursive: true });
+    const b = createBroker({ db: join(root, "dep", "state.sqlite"), resourceDir, bindings: { r2: ["UPLOADS"] } });
+    const put = await b.dispatch({ op: "r2.put", bucket: "UPLOADS", key: "k", body: "bytes" });
+    b.close();
+    expect(existsSync(resourceDir)).toBe(false);
+    expect(existsSync(join(root, "dep", "r2-blobs"))).toBe(true);
+    expect(obj(put.object)).toMatchObject({ size: 5 });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// Binary round trip against a real file-backed store (not `:memory:`), the
+// v1 path a live sprout actually uses (#63).
+test("R2 v1 binary put/get round-trips through a file-backed blob", async () => {
+  const root = mkdtempSync(join(tmpdir(), "sb-broker-r2-v1-"));
+  try {
+    const b = createBroker({ db: join(root, "state.sqlite"), bindings: { r2: ["UPLOADS"] }, token: "tok" });
+    const server = listen(b, "127.0.0.1", 0);
+    try {
+      const body = new Uint8Array([0, 1, 2, 0x80, 0xff, 254, 253]);
+      const put = await v1(server, { v: 1, token: "tok", op: "r2.put", bucket: "UPLOADS", key: "k" }, body);
+      expect(obj(put.json.object)).toMatchObject({ size: body.length });
+      expect(existsSync(join(root, "r2-blobs"))).toBe(true);
+      const got = await v1(server, { v: 1, token: "tok", op: "r2.get", bucket: "UPLOADS", key: "k" });
+      expect(Buffer.from(got.bytes).equals(Buffer.from(body))).toBe(true);
+    } finally {
+      server.stop();
+      b.close();
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
