@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { patchRenderJs, patchUwebsockets } from "./patch";
+import { patchPromiseTs, patchRenderJs, patchUwebsockets } from "./patch";
 
 // The parts of Porffor's compiler/render.js the patch anchors to.
 const RENDER = `void porf_native_fetch_runtime_init(void) {
@@ -236,6 +236,59 @@ test("#165: render.js routes console output to stderr, unbuffered, idempotently"
 
     await patchRenderJs(root);
     expect(await readFile(join(root, "compiler/render.js"), "utf8")).toBe(once);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// The part of Porffor's compiler/builtins/promise.ts the #168 patch anchors to.
+const PROMISE_TS = `export const __Porffor_promise_resolve = (value: any, promise: any): void => {
+  if (Porffor.type(value) == Porffor.TYPES.object) {
+    // cheap prototype-chain probe for 'then' before the expensive Get below, does not invoke getters
+    const thenHash: i32 = __Porffor_object_hash('then');
+    let probe: any = value;
+    while (Porffor.type(probe) == Porffor.TYPES.object) {
+      if (Porffor.object.lookup(probe, 'then', thenHash) != 0) break;
+      probe = __Porffor_object_getPrototype(probe);
+    }
+    if (Porffor.type(probe) != Porffor.TYPES.object) {
+      __ecma262_FulfillPromise(promise, value);
+      return;
+    }
+  }
+};
+`;
+
+test("#168: promise-resolve's then-probe gets a fixed-point guard, idempotently", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sb-patch-promise-"));
+  try {
+    await mkdir(join(root, "compiler/builtins"), { recursive: true });
+    await writeFile(join(root, "compiler/builtins/promise.ts"), PROMISE_TS);
+    await patchPromiseTs(root);
+    const once = await readFile(join(root, "compiler/builtins/promise.ts"), "utf8");
+
+    expect(once).toContain("sproutboat #168");
+    expect(once).toContain("let probeFound: boolean = false;");
+    expect(once).toContain("if (Porffor.object.lookup(probe, 'then', thenHash) != 0) { probeFound = true; break; }");
+    // The fixed-point guard mirrors _internal_object.ts's lastProto idiom.
+    expect(once).toContain("Porffor.fastOr(probe == null, Porffor.IR.ptr(probe) == Porffor.IR.ptr(lastProto))");
+    expect(once).toContain("if (!probeFound) {");
+    // The old type-check-only exit condition is gone.
+    expect(once).not.toContain("if (Porffor.type(probe) != Porffor.TYPES.object) {");
+
+    await patchPromiseTs(root);
+    expect(await readFile(join(root, "compiler/builtins/promise.ts"), "utf8")).toBe(once);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("#168: a drifted promise builtin fails loudly instead of silently no-op'ing", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sb-patch-promise-drift-"));
+  try {
+    await mkdir(join(root, "compiler/builtins"), { recursive: true });
+    await writeFile(join(root, "compiler/builtins/promise.ts"), "// nothing the patch recognizes\n");
+    await expect(patchPromiseTs(root)).rejects.toThrow(/anchor not found/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
