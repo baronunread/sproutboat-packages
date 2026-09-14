@@ -1117,6 +1117,21 @@ function __sbR2Object(meta, body) {
     obj.json = function () {
       return JSON.parse(obj.text());
     };
+    // #177 — `new Response(obj.body)` UTF-8-re-encodes the raw bytes (they're
+    // a bytestring, same ambiguity #172/#176 exist to resolve): any byte
+    // 0x80-0xFF doubles into two bytes, corrupting binary content on the way
+    // out. `toResponse()` is the fix already used for assets/fetch/service
+    // bindings (`__sbRawBodyResponse`, below) — same reserved x-sb-raw-body
+    // marker, applied here too.
+    obj.toResponse = function (init) {
+      const opts = init || {};
+      const headers = new Headers(opts.headers || {});
+      headers.set("x-sb-raw-body", "1");
+      if (!headers.has("content-type") && obj.httpMetadata.contentType)
+        headers.set("content-type", obj.httpMetadata.contentType);
+      if (!headers.has("etag")) headers.set("etag", obj.httpEtag);
+      return __sbRawBodyResponse(body, { status: opts.status, headers });
+    };
   }
   return obj;
 }
