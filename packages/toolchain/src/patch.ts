@@ -410,6 +410,75 @@ const WRITE_RESPONSE_INJECT =
   "}";
 const WRITE_RESPONSE_MARKER = "porf_native_fetch_read_raw_bytes(body_value";
 
+/**
+ * baronunread/sproutboat#168 — `__Porffor_promise_resolve`'s duck-typing probe
+ * for `.then` walks a value's prototype chain with no termination guard. Under
+ * certain allocator conditions `__Porffor_object_getPrototype` returns a stale
+ * "object" jsval instead of the `null`/`undefined` that should end the chain,
+ * so the walk never bottoms out — a true infinite spin (100% CPU, no error, no
+ * log line) that wedges the whole process, since native-fetch serves one
+ * request at a time on a single event loop. Hits any handler whose `fetch`
+ * resolves a promise with a plain object — the common shape for a JSON
+ * response — so this is not a rare pattern; onset is nondeterministic
+ * (allocator/pool reuse), typically after a handful of requests.
+ *
+ * `_internal_object.ts`'s own prototype-chain walks already guard against
+ * exactly this failure mode: track the previous prototype and stop once the
+ * "next" pointer stops advancing (a fixed point reads the same as reaching the
+ * end). This probe has no such guard. Mirror the same idiom here: an explicit
+ * `probeFound` flag (so a fixed-point break reads as "no `.then` found",
+ * matching how a legitimate null-terminated chain is read) plus the
+ * `lastProto` pointer comparison used everywhere else in the runtime.
+ *
+ * A hard iteration cap rides alongside the fixed-point check, not instead of
+ * it: the lldb trace showed the *same* stale pointer on every sample, which
+ * the fixed-point check alone catches on its very next iteration, but that's
+ * one observed corruption shape, not a guarantee about every allocator state
+ * that can produce this bug. A cap makes termination unconditional regardless
+ * of whether some other corrupted state instead drifts (a different bad
+ * pointer each time) or cycles across more than one node — real prototype
+ * chains are a handful of links deep, so 64 iterations is generous headroom
+ * with no risk of cutting off a legitimate lookup.
+ */
+const THEN_PROBE_ANCHOR =
+  "    const thenHash: i32 = __Porffor_object_hash('then');\n" +
+  "    let probe: any = value;\n" +
+  "    while (Porffor.type(probe) == Porffor.TYPES.object) {\n" +
+  "      if (Porffor.object.lookup(probe, 'then', thenHash) != 0) break;\n" +
+  "      probe = __Porffor_object_getPrototype(probe);\n" +
+  "    }\n" +
+  "    if (Porffor.type(probe) != Porffor.TYPES.object) {\n";
+const THEN_PROBE_INJECT =
+  "    const thenHash: i32 = __Porffor_object_hash('then');\n" +
+  "    let probe: any = value;\n" +
+  "    let lastProto: any = probe;\n" +
+  "    let probeFound: boolean = false; // sproutboat #168: fixed-point chain reads as \"not found\", not a spin\n" +
+  "    let probeSteps: i32 = 0; // sproutboat #168: hard cap, belt-and-suspenders alongside the fixed-point check\n" +
+  "    while (Porffor.type(probe) == Porffor.TYPES.object) {\n" +
+  "      if (Porffor.object.lookup(probe, 'then', thenHash) != 0) { probeFound = true; break; }\n" +
+  "      probe = __Porffor_object_getPrototype(probe);\n" +
+  "      if (Porffor.fastOr(probe == null, Porffor.IR.ptr(probe) == Porffor.IR.ptr(lastProto))) break;\n" +
+  "      lastProto = probe;\n" +
+  "      probeSteps++;\n" +
+  "      if (probeSteps > 64) break;\n" +
+  "    }\n" +
+  "    if (!probeFound) {\n";
+const THEN_PROBE_MARKER = "sproutboat #168";
+
+/** The promise builtin: the #168 `.then`-probe livelock fix. Exported for tests. */
+export async function patchPromiseTs(root: string): Promise<void> {
+  const file = resolve(root, "compiler/builtins/promise.ts");
+  let src = await readFile(file, "utf8");
+  if (src.includes(THEN_PROBE_MARKER)) return;
+  if (!src.includes(THEN_PROBE_ANCHOR)) {
+    throw new Error(
+      "could not patch Porffor's promise-resolve then-probe (#168): anchor not found in " +
+        `${file}. Porffor's promise builtin changed — check patches/UPSTREAM.md.`,
+    );
+  }
+  await writeFile(file, src.replace(THEN_PROBE_ANCHOR, THEN_PROBE_INJECT));
+}
+
 const done = new Set<string>();
 
 /** Edits to Porffor's uWebSockets shim: `[marker, anchor, inject, what]`. */
@@ -520,5 +589,6 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchCompilerArgs(root);
   await patchUwebsockets(root);
   await patchRenderJs(root);
+  await patchPromiseTs(root);
   done.add(root);
 }

@@ -94,6 +94,21 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "\n" +
       "  if (body_owned) free(body_owned);\n" +
       "}\n",
+    "compiler/builtins/promise.ts":
+      "export const __Porffor_promise_resolve = (value: any, promise: any): void => {\n" +
+      "  if (Porffor.type(value) == Porffor.TYPES.object) {\n" +
+      "    const thenHash: i32 = __Porffor_object_hash('then');\n" +
+      "    let probe: any = value;\n" +
+      "    while (Porffor.type(probe) == Porffor.TYPES.object) {\n" +
+      "      if (Porffor.object.lookup(probe, 'then', thenHash) != 0) break;\n" +
+      "      probe = __Porffor_object_getPrototype(probe);\n" +
+      "    }\n" +
+      "    if (Porffor.type(probe) != Porffor.TYPES.object) {\n" +
+      "      __ecma262_FulfillPromise(promise, value);\n" +
+      "      return;\n" +
+      "    }\n" +
+      "  }\n" +
+      "};\n",
   };
   for (const [file, contents] of Object.entries(files)) {
     const path = join(source, file);
