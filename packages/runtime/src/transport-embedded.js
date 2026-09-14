@@ -240,11 +240,14 @@ static int sb_bind_params(sqlite3_stmt* st, const char* json) {
   return 0;
 }
 
-// --- R2 bodies, without the JSON detour -------------------------------------
-// An object's bytes never enter a JSON frame: they arrive as their own string
-// parameter and go straight into a BLOB column. That matters for size as much
-// as correctness — escaping a binary body inflates it several times over, and
-// the arena grows to fit the biggest thing it ever had to hold.
+// --- R2 bodies, without the JSON detour or the SQLite detour ----------------
+// An object's bytes never enter a JSON frame (they arrive as their own string
+// parameter) and never enter SQLite either (baronunread/sproutboat#56): they
+// go straight to their own file under "<data-dir>/r2-blobs/", named by a hash
+// of bucket+key so unicode keys and directory traversal are both non-issues.
+// Doubling every object through SQLite's own page cache on top of the buffer
+// it already arrived in was the real cost behind #56's "large uploads make
+// memory skyrocket" complaint, not just the JSON-escaping #63 already fixed.
 
 static void sb_hex32(const unsigned char* in, char* out) {
   static const char* d = "0123456789abcdef";
@@ -269,7 +272,24 @@ static void sb_iso_now(char* out, size_t cap) {
   strftime(out, cap, "%Y-%m-%dT%H:%M:%S.000Z", &g);
 }
 
-// Returns malloc'd JSON metadata; the body itself is never serialised.
+// "<dir-of-store_path>/r2-blobs/<sha256(bucket 0x1e key)>.blob" — deterministic,
+// so no extra column is needed to find an object's file back.
+static void sb_r2_blob_path(char* out, size_t cap, const char* store_path, const char* bucket, const char* key) {
+  const char* slash = strrchr(store_path, '/');
+  int dirlen = slash ? (int)(slash - store_path) : 0;
+  br_sha256_context ctx;
+  br_sha256_init(&ctx);
+  br_sha256_update(&ctx, bucket, strlen(bucket));
+  br_sha256_update(&ctx, "\x1e", 1); // separator: a bucket/key split never collides across it
+  br_sha256_update(&ctx, key, strlen(key));
+  unsigned char digest[32];
+  br_sha256_out(&ctx, digest);
+  char hex[65];
+  sb_hex32(digest, hex);
+  snprintf(out, cap, "%.*s/r2-blobs/%s.blob", dirlen, store_path, hex);
+}
+
+// Returns malloc'd JSON metadata; the body itself is never serialised into it.
 static char* sb_r2_put_c(const char* path, const char* bucket, const char* key, const char* body, size_t bodylen,
                          const char* http_json, const char* custom_json) {
   sb_buf out = { 0, 0, 0 };
@@ -282,10 +302,19 @@ static char* sb_r2_put_c(const char* path, const char* bucket, const char* key, 
   char uploaded[40];
   sb_iso_now(uploaded, sizeof(uploaded));
 
+  char blobpath[1024];
+  sb_r2_blob_path(blobpath, sizeof(blobpath), path, bucket, key);
+  sb_mkdirs(blobpath);
+  FILE* f = fopen(blobpath, "wb");
+  if (!f) { sb_puts(&out, "{\"ok\":false,\"error\":\"cannot write object\"}"); return out.p; }
+  size_t written = bodylen ? fwrite(body, 1, bodylen, f) : 0;
+  fclose(f);
+  if (written != bodylen) { sb_puts(&out, "{\"ok\":false,\"error\":\"short write\"}"); return out.p; }
+
   sqlite3_stmt* st = 0;
   const char* sql =
-    "INSERT INTO r2 (bucket, key, body, size, etag, uploaded, http_json, custom_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) "
-    "ON CONFLICT (bucket, key) DO UPDATE SET body=?3, size=?4, etag=?5, uploaded=?6, http_json=?7, custom_json=?8";
+    "INSERT INTO r2 (bucket, key, size, etag, uploaded, http_json, custom_json) VALUES (?1,?2,?3,?4,?5,?6,?7) "
+    "ON CONFLICT (bucket, key) DO UPDATE SET size=?3, etag=?4, uploaded=?5, http_json=?6, custom_json=?7";
   if (sqlite3_prepare_v2(db, sql, -1, &st, 0) != 0 || !st) {
     sb_puts(&out, "{\"ok\":false,\"error\":");
     const char* m = sqlite3_errmsg(db);
@@ -295,12 +324,11 @@ static char* sb_r2_put_c(const char* path, const char* bucket, const char* key, 
   }
   sqlite3_bind_text(st, 1, bucket, -1, SB_SQLITE_TRANSIENT);
   sqlite3_bind_text(st, 2, key, -1, SB_SQLITE_TRANSIENT);
-  sqlite3_bind_blob(st, 3, body, (int)bodylen, SB_SQLITE_STATIC);
-  sqlite3_bind_int64(st, 4, (int64_t)bodylen);
-  sqlite3_bind_text(st, 5, etag, -1, SB_SQLITE_TRANSIENT);
-  sqlite3_bind_text(st, 6, uploaded, -1, SB_SQLITE_TRANSIENT);
-  sqlite3_bind_text(st, 7, http_json && *http_json ? http_json : "{}", -1, SB_SQLITE_TRANSIENT);
-  sqlite3_bind_text(st, 8, custom_json && *custom_json ? custom_json : "{}", -1, SB_SQLITE_TRANSIENT);
+  sqlite3_bind_int64(st, 3, (int64_t)bodylen);
+  sqlite3_bind_text(st, 4, etag, -1, SB_SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 5, uploaded, -1, SB_SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 6, http_json && *http_json ? http_json : "{}", -1, SB_SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 7, custom_json && *custom_json ? custom_json : "{}", -1, SB_SQLITE_TRANSIENT);
   int rc = sqlite3_step(st);
   sqlite3_finalize(st);
   if (rc != SB_SQLITE_DONE) { sb_puts(&out, "{\"ok\":false,\"error\":\"r2 put failed\"}"); return out.p; }
@@ -311,28 +339,48 @@ static char* sb_r2_put_c(const char* path, const char* bucket, const char* key, 
   return out.p;
 }
 
-// Body bytes straight into a Porffor bytestring.
-//
-// The allocation happens while the statement is still open, so sqlite's own
-// buffer is the source and there is no intermediate copy: one 8 MB object means
-// one 8 MB allocation, not two. Returns the bytestring pointer, or 0.
+// Reads the object's file into a Porffor bytestring. One malloc (the file
+// read) plus the bytestring's own allocation — no SQLite page-cache copy on
+// top, and no growing single database file holding every object ever put.
+// Returns the bytestring pointer, or 0.
 static u32 sb_r2_get_c(const char* path, const char* bucket, const char* key, int* found) {
   *found = 0;
   int idx = sb_db_for(path);
   if (idx < 0) return 0;
   sqlite3_stmt* st = 0;
-  if (sqlite3_prepare_v2(sb_dbs[idx], "SELECT body FROM r2 WHERE bucket = ? AND key = ?", -1, &st, 0) != 0 || !st) return 0;
+  if (sqlite3_prepare_v2(sb_dbs[idx], "SELECT 1 FROM r2 WHERE bucket = ? AND key = ?", -1, &st, 0) != 0 || !st) return 0;
   sqlite3_bind_text(st, 1, bucket, -1, SB_SQLITE_TRANSIENT);
   sqlite3_bind_text(st, 2, key, -1, SB_SQLITE_TRANSIENT);
-  u32 out = 0;
-  if (sqlite3_step(st) == SB_SQLITE_ROW) {
-    int n = sqlite3_column_bytes(st, 0);
-    const void* blob = sqlite3_column_blob(st, 0);
-    out = porf_native_fetch_alloc_bytestring((const char*)(blob ? blob : ""), (size_t)(n > 0 ? n : 0));
-    *found = 1;
-  }
+  int has_row = sqlite3_step(st) == SB_SQLITE_ROW;
   sqlite3_finalize(st);
+  if (!has_row) return 0;
+
+  char blobpath[1024];
+  sb_r2_blob_path(blobpath, sizeof(blobpath), path, bucket, key);
+  FILE* f = fopen(blobpath, "rb");
+  // A metadata row with no blob file (deleted out from under it, disk issue)
+  // reads as not-found rather than crashing.
+  if (!f) return 0;
+  fseek(f, 0, SEEK_END);
+  long size = ftell(f);
+  rewind(f);
+  if (size < 0) { fclose(f); return 0; }
+  char* buf = (char*)malloc((size_t)size > 0 ? (size_t)size : 1);
+  size_t rd = size > 0 ? fread(buf, 1, (size_t)size, f) : 0;
+  fclose(f);
+  if (!buf || rd != (size_t)size) { free(buf); return 0; }
+  u32 out = porf_native_fetch_alloc_bytestring(buf, (size_t)size);
+  free(buf);
+  *found = 1;
   return out;
+}
+
+// Best-effort: a metadata row deleted with no blob file (or vice versa) is
+// still a correct end state, so a missing file here is not an error.
+static void sb_r2_delete_blob(const char* path, const char* bucket, const char* key) {
+  char blobpath[1024];
+  sb_r2_blob_path(blobpath, sizeof(blobpath), path, bucket, key);
+  unlink(blobpath);
 }
 
 // Run a script: one or more statements separated by semicolons. sqlite3_exec
@@ -929,8 +977,8 @@ function __sbR2PutRaw(path, bucket, key, body, httpJson, customJson) {
     char* __custom = (char*)malloc(__cl + 1); memcpy(__custom, __c, __cl); __custom[__cl] = 0;
     if (__co) free(__co);
 
-    // The body is read in place and handed straight to sqlite3_bind_blob: no
-    // copy beyond what the binding needs, and no escaping at all.
+    // The body is read in place and handed straight to fwrite (#56): no
+    // escaping, and no SQLite copy on top of the buffer it already arrived in.
     const char* __b; size_t __bl; char* __bo = 0;
     porf_native_fetch_read_value(body, &__b, &__bl, &__bo);
     char* __out = sb_r2_put_c(__path, __bucket, __key, __b, __bl, __http, __custom);
@@ -972,6 +1020,32 @@ function __sbR2GetRaw(path, bucket, key) {
     if (__found) res = porf_box((f64)__bs, 195);
   `;
   return res;
+}
+
+// R2 delete: also removes the object's own file, not just the metadata row
+// (#56 — sb_r2_delete_blob is best-effort, a missing file is not an error).
+// oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
+function __sbR2DeleteRaw(path, bucket, key) {
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    const char* __p; size_t __pl; char* __po = 0;
+    porf_native_fetch_read_value(path, &__p, &__pl, &__po);
+    char* __path = (char*)malloc(__pl + 1); memcpy(__path, __p, __pl); __path[__pl] = 0;
+    if (__po) free(__po);
+
+    const char* __bk; size_t __bkl; char* __bko = 0;
+    porf_native_fetch_read_value(bucket, &__bk, &__bkl, &__bko);
+    char* __bucket = (char*)malloc(__bkl + 1); memcpy(__bucket, __bk, __bkl); __bucket[__bkl] = 0;
+    if (__bko) free(__bko);
+
+    const char* __k; size_t __kl; char* __ko = 0;
+    porf_native_fetch_read_value(key, &__k, &__kl, &__ko);
+    char* __key = (char*)malloc(__kl + 1); memcpy(__key, __k, __kl); __key[__kl] = 0;
+    if (__ko) free(__ko);
+
+    sb_r2_delete_blob(__path, __bucket, __key);
+    free(__path); free(__bucket); free(__key);
+  `;
 }
 
 // Multi-statement exec. Same string-param pattern as __sbSqlRaw.
@@ -1158,9 +1232,11 @@ function __sbEnsureSchema() {
     s,
     "CREATE TABLE IF NOT EXISTS kv (ns TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (ns, key))",
   );
+  // #56 — no `body` column: an object's bytes live in their own file under
+  // "<data-dir>/r2-blobs/" (sb_r2_put_c/sb_r2_get_c), never in the sqlite row.
   __sbSql(
     s,
-    "CREATE TABLE IF NOT EXISTS r2 (bucket TEXT NOT NULL, key TEXT NOT NULL, body TEXT NOT NULL, size INTEGER NOT NULL, " +
+    "CREATE TABLE IF NOT EXISTS r2 (bucket TEXT NOT NULL, key TEXT NOT NULL, size INTEGER NOT NULL, " +
       "etag TEXT NOT NULL, uploaded TEXT NOT NULL, http_json TEXT NOT NULL DEFAULT '{}', custom_json TEXT NOT NULL DEFAULT '{}', " +
       "PRIMARY KEY (bucket, key))",
   );
@@ -1350,38 +1426,33 @@ function __sbEmbeddedDispatch(msg) {
     return { ok: true, path: dest, bytes: reply.bytes };
   }
 
+  // r2.put/get route through the same raw C path (__sbR2PutRaw/__sbR2GetRaw,
+  // sb_r2_put_c/sb_r2_get_c) the R2 binding's own put()/get() use — reachable
+  // separately only via a raw `__sbCall(op:"r2.put"/"r2.get")`, which nothing
+  // in this codebase does today, but broker.ts's dispatch() answers the same
+  // two ops, so the contract stays identical on both backends either way
+  // (#56: neither one keeps object bytes in SQLite any more).
   if (op === "r2.put") {
-    const body = String(msg.body == null ? "" : msg.body);
-    const etag = __sbHex(16);
-    __sbSql(
-      store,
-      "INSERT INTO r2 (bucket, key, body, size, etag, uploaded, http_json, custom_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) " +
-        "ON CONFLICT (bucket, key) DO UPDATE SET body=?3, size=?4, etag=?5, uploaded=?6, http_json=?7, custom_json=?8",
-      [
-        msg.bucket,
-        msg.key,
-        body,
-        body.length,
-        etag,
-        new Date().toISOString(),
+    const reply = JSON.parse(
+      __sbR2PutRaw(
+        store,
+        String(msg.bucket),
+        String(msg.key),
+        String(msg.body == null ? "" : msg.body),
         JSON.stringify(msg.httpMetadata || {}),
         JSON.stringify(msg.customMetadata || {}),
-      ],
+      ),
     );
-    return {
-      ok: true,
-      object: { key: msg.key, size: body.length, etag, uploaded: new Date().toISOString() },
-    };
+    if (reply.ok === false) throw new Error("r2 put: " + reply.error);
+    return { ok: true, object: { key: msg.key, size: reply.size, etag: reply.etag, uploaded: reply.uploaded } };
   }
   if (op === "r2.get" || op === "r2.head") {
-    // head must not select `body`: reading an 8 MB blob only to drop it costs
-    // the read, the text conversion, and a full JSON escape of the row.
+    // head must not read the blob file: reading an 8 MB object only to drop
+    // it costs the read and a full JSON escape for nothing.
     const wantsBody = op === "r2.get";
     const r = __sbSql(
       store,
-      wantsBody
-        ? "SELECT body, size, etag, uploaded, http_json, custom_json FROM r2 WHERE bucket = ? AND key = ?"
-        : "SELECT '', size, etag, uploaded, http_json, custom_json FROM r2 WHERE bucket = ? AND key = ?",
+      "SELECT size, etag, uploaded, http_json, custom_json FROM r2 WHERE bucket = ? AND key = ?",
       [msg.bucket, msg.key],
     );
     if (!r.rows.length) return { ok: true, found: false };
@@ -1392,17 +1463,18 @@ function __sbEmbeddedDispatch(msg) {
       found: true,
       object: {
         key: msg.key,
-        size: Number(row[1]),
-        etag: row[2],
-        uploaded: row[3],
-        httpMetadata: JSON.parse(row[4] || "{}"),
-        customMetadata: JSON.parse(row[5] || "{}"),
+        size: Number(row[0]),
+        etag: row[1],
+        uploaded: row[2],
+        httpMetadata: JSON.parse(row[3] || "{}"),
+        customMetadata: JSON.parse(row[4] || "{}"),
       },
-      body: wantsBody ? row[0] : undefined,
+      body: wantsBody ? __sbR2GetRaw(store, String(msg.bucket), String(msg.key)) : undefined,
     };
   }
   if (op === "r2.delete") {
     __sbSql(store, "DELETE FROM r2 WHERE bucket = ? AND key = ?", [msg.bucket, msg.key]);
+    __sbR2DeleteRaw(store, String(msg.bucket), String(msg.key));
     return { ok: true };
   }
   if (op === "r2.list") {

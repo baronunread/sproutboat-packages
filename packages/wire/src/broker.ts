@@ -19,7 +19,7 @@
  */
 import { Database, type Statement } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, normalize, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { resolveAssetKey, type AssetManifest } from "@sproutboat/assets";
@@ -110,8 +110,6 @@ type D1Result = {
 };
 type R2Row = {
   key: string;
-  /** TEXT from a v0 write, BLOB from a v1 one; sqlite hands each back as-is. */
-  body: string | Uint8Array;
   size: number;
   etag: string;
   uploaded: string;
@@ -234,8 +232,14 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     conn.exec(
       "CREATE TABLE IF NOT EXISTS kv (ns TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (ns, key))",
     );
+    // #56 — no `body` column: an object's bytes live in their own file under
+    // `r2Dir` (or an in-memory map for `:memory:`), never in the SQLite row.
+    // Doubling every object through SQLite's own page cache on top of the
+    // buffer it already arrived in was the real cost driving #56's "large
+    // uploads make memory skyrocket" complaint, not just the JSON-escaping
+    // #63 already fixed.
     conn.exec(
-      "CREATE TABLE IF NOT EXISTS r2 (bucket TEXT NOT NULL, key TEXT NOT NULL, body TEXT NOT NULL, size INTEGER NOT NULL, " +
+      "CREATE TABLE IF NOT EXISTS r2 (bucket TEXT NOT NULL, key TEXT NOT NULL, size INTEGER NOT NULL, " +
         "etag TEXT NOT NULL, uploaded TEXT NOT NULL, http_json TEXT NOT NULL DEFAULT '{}', custom_json TEXT NOT NULL DEFAULT '{}', " +
         "PRIMARY KEY (bucket, key))",
     );
@@ -414,15 +418,48 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     return { path: dest, bytes: statSync(dest).size };
   };
 
-  /** An object body as bytes, whichever storage class it came back in. */
-  const r2Bytes = (body: string | Uint8Array): Uint8Array =>
-    body instanceof Uint8Array ? body : new TextEncoder().encode(body);
-
-  /** An object body as text, for the v0 reply shape that carries it in JSON.
-   *  A binary object stored by a v1 client cannot survive this, which is why
-   *  v1 exists — but returning a decoded string beats returning `{"0":...}`. */
-  const r2Text = (body: string | Uint8Array): string =>
-    body instanceof Uint8Array ? new TextDecoder().decode(body) : body;
+  /**
+   * #56 — an object's bytes never enter SQLite; they live in their own file,
+   * named by a hash of bucket+key (so unicode keys and directory traversal
+   * are both non-issues), colocated with whichever store file holds that
+   * bucket's metadata — the main `db` for a bare-string binding, the
+   * resource's own file under `resourceDir` for an account-level one (#74) —
+   * so blobs persist across a redeploy exactly when that metadata does.
+   * `:memory:` stores (tests, `db: ":memory:"`) fall back to an in-memory map.
+   */
+  const r2MemBlobs = new Map<string, Uint8Array>();
+  const r2BlobId = (bucketPart: string, key: string): string =>
+    createHash("sha256").update(`${bucketPart}\0${key}`).digest("hex");
+  const r2BlobDir = (store: Database): string | null => {
+    const file = store.filename;
+    return file && file !== ":memory:" ? join(dirname(resolve(file)), "r2-blobs") : null;
+  };
+  const r2BlobPath = (store: Database, bucketPart: string, key: string): string | null => {
+    const dir = r2BlobDir(store);
+    return dir ? join(dir, `${r2BlobId(bucketPart, key)}.blob`) : null;
+  };
+  const r2WriteBlob = (store: Database, bucketPart: string, key: string, bytes: Uint8Array): void => {
+    const path = r2BlobPath(store, bucketPart, key);
+    if (!path) {
+      r2MemBlobs.set(`${bucketPart}\0${key}`, bytes);
+      return;
+    }
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, bytes);
+  };
+  const r2ReadBlob = (store: Database, bucketPart: string, key: string): Uint8Array | null => {
+    const path = r2BlobPath(store, bucketPart, key);
+    if (!path) return r2MemBlobs.get(`${bucketPart}\0${key}`) ?? null;
+    return existsSync(path) ? readFileSync(path) : null;
+  };
+  const r2DeleteBlob = (store: Database, bucketPart: string, key: string): void => {
+    const path = r2BlobPath(store, bucketPart, key);
+    if (!path) {
+      r2MemBlobs.delete(`${bucketPart}\0${key}`);
+      return;
+    }
+    if (existsSync(path)) rmSync(path);
+  };
 
   const r2Row = (r: R2Row) => ({
     key: r.key,
@@ -617,40 +654,42 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
 
       case "r2.put": {
         const { store, part: bucket } = storeFor("r2", requireR2(msg.bucket));
-        const body = str(msg.body);
-        const etag = createHash("sha256").update(body).digest("hex");
+        const key = str(msg.key);
+        const bytes = new TextEncoder().encode(str(msg.body));
+        const etag = createHash("sha256").update(bytes).digest("hex");
+        const uploaded = new Date().toISOString();
+        r2WriteBlob(store, bucket, key, bytes);
         store
           .query(
-            "INSERT INTO r2 (bucket, key, body, size, etag, uploaded, http_json, custom_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) " +
-              "ON CONFLICT (bucket, key) DO UPDATE SET body=?3, size=?4, etag=?5, uploaded=?6, http_json=?7, custom_json=?8",
+            "INSERT INTO r2 (bucket, key, size, etag, uploaded, http_json, custom_json) VALUES (?1,?2,?3,?4,?5,?6,?7) " +
+              "ON CONFLICT (bucket, key) DO UPDATE SET size=?3, etag=?4, uploaded=?5, http_json=?6, custom_json=?7",
           )
           .run(
             bucket,
-            str(msg.key),
-            body,
-            Buffer.byteLength(body),
+            key,
+            bytes.byteLength,
             etag,
-            new Date().toISOString(),
+            uploaded,
             JSON.stringify(msg.httpMetadata ?? {}),
             JSON.stringify(msg.customMetadata ?? {}),
           );
-        return {
-          ok: true,
-          object: { key: str(msg.key), size: Buffer.byteLength(body), etag, uploaded: new Date().toISOString() },
-        };
+        return { ok: true, object: { key, size: bytes.byteLength, etag, uploaded } };
       }
       case "r2.get":
       case "r2.head": {
         const { store, part: bucket } = storeFor("r2", requireR2(msg.bucket));
-        const row = store
-          .query<R2Row, [string, string]>("SELECT * FROM r2 WHERE bucket = ? AND key = ?")
-          .get(bucket, str(msg.key));
+        const key = str(msg.key);
+        const row = store.query<R2Row, [string, string]>("SELECT * FROM r2 WHERE bucket = ? AND key = ?").get(bucket, key);
         if (!row) return { ok: true, found: false };
-        return { ok: true, found: true, object: r2Row(row), body: msg.op === "r2.get" ? r2Text(row.body) : undefined };
+        const body =
+          msg.op === "r2.get" ? new TextDecoder().decode(r2ReadBlob(store, bucket, key) ?? new Uint8Array(0)) : undefined;
+        return { ok: true, found: true, object: r2Row(row), body };
       }
       case "r2.delete": {
         const { store, part: bucket } = storeFor("r2", requireR2(msg.bucket));
-        store.query("DELETE FROM r2 WHERE bucket = ? AND key = ?").run(bucket, str(msg.key));
+        const key = str(msg.key);
+        store.query("DELETE FROM r2 WHERE bucket = ? AND key = ?").run(bucket, key);
+        r2DeleteBlob(store, bucket, key);
         return { ok: true };
       }
       case "r2.list": {
@@ -832,38 +871,37 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
    */
   async function dispatchBinary(msg: Frame, binary: Uint8Array): Promise<{ reply: Frame; bytes?: Uint8Array }> {
     if (msg.op === "r2.put") {
-      // The body arrived as bytes; store it as a blob rather than a string, so
-      // a put costs one copy instead of an escape, a parse and a re-encode.
+      // The body arrived as bytes; write it straight to its own file rather
+      // than into SQLite (#56) — no escape, no parse, no re-encode, and no
+      // second full-object copy through the database's own page cache.
       const { store, part: bucket } = storeFor("r2", requireR2(msg.bucket));
+      const key = str(msg.key);
       const etag = createHash("sha256").update(binary).digest("hex");
       const uploaded = new Date().toISOString();
+      r2WriteBlob(store, bucket, key, binary);
       store
         .query(
-          "INSERT INTO r2 (bucket, key, body, size, etag, uploaded, http_json, custom_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) " +
-            "ON CONFLICT (bucket, key) DO UPDATE SET body=?3, size=?4, etag=?5, uploaded=?6, http_json=?7, custom_json=?8",
+          "INSERT INTO r2 (bucket, key, size, etag, uploaded, http_json, custom_json) VALUES (?1,?2,?3,?4,?5,?6,?7) " +
+            "ON CONFLICT (bucket, key) DO UPDATE SET size=?3, etag=?4, uploaded=?5, http_json=?6, custom_json=?7",
         )
         .run(
           bucket,
-          str(msg.key),
-          binary,
+          key,
           binary.byteLength,
           etag,
           uploaded,
           JSON.stringify(msg.httpMetadata ?? {}),
           JSON.stringify(msg.customMetadata ?? {}),
         );
-      return {
-        reply: { ok: true, object: { key: str(msg.key), size: binary.byteLength, etag, uploaded } },
-      };
+      return { reply: { ok: true, object: { key, size: binary.byteLength, etag, uploaded } } };
     }
 
     if (msg.op === "r2.get") {
       const { store, part: bucket } = storeFor("r2", requireR2(msg.bucket));
-      const row = store
-        .query<R2Row, [string, string]>("SELECT * FROM r2 WHERE bucket = ? AND key = ?")
-        .get(bucket, str(msg.key));
+      const key = str(msg.key);
+      const row = store.query<R2Row, [string, string]>("SELECT * FROM r2 WHERE bucket = ? AND key = ?").get(bucket, key);
       if (!row) return { reply: { ok: true, found: false } };
-      return { reply: { ok: true, found: true, object: r2Row(row) }, bytes: r2Bytes(row.body) };
+      return { reply: { ok: true, found: true, object: r2Row(row) }, bytes: r2ReadBlob(store, bucket, key) ?? new Uint8Array(0) };
     }
 
     if (msg.op === "assets.get") {
