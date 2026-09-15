@@ -1231,6 +1231,30 @@ globalThis.__sbInstallBindings = function (target, bindings) {
       resumeMultipartUpload(key, uploadId) {
         return __sbR2Multipart(name, String(key), String(uploadId));
       },
+      createUploadUrl(key, options) {
+        const o = options || {};
+        const r = __sbRpc("r2.transfer.create", {
+          bucket: name,
+          key: String(key),
+          method: "upload",
+          maxBytes: o.maxBytes,
+          expiresIn: o.expiresIn,
+          sha256: o.sha256,
+          httpMetadata: o.httpMetadata || {},
+          customMetadata: o.customMetadata || {},
+        });
+        return { url: r.url, expiresAt: r.expiresAt };
+      },
+      createDownloadUrl(key, options) {
+        const o = options || {};
+        const r = __sbRpc("r2.transfer.create", {
+          bucket: name,
+          key: String(key),
+          method: "download",
+          expiresIn: o.expiresIn,
+        });
+        return { url: r.url, expiresAt: r.expiresAt };
+      },
       get(key) {
         // #56 — bytes come back out of band on a transport that supports it, so
         // an object body is never JSON-escaped into a frame.

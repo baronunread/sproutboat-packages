@@ -9,6 +9,7 @@ import {
   encodeFrame,
   encodeV1,
   listen,
+  listenTransfers,
   type Broker,
   type Frame,
   type FetchLike,
@@ -159,6 +160,180 @@ test("R2: put / get / head / list / delete on a bound bucket", async () => {
   await expect(b.dispatch({ op: "r2.put", bucket: "NOPE", key: "x", body: "y" })).rejects.toThrow("not bound");
 });
 
+test("R2 direct transfer: streamed upload, metadata, one-use ticket and ranged download", async () => {
+  const root = mkdtempSync(join(tmpdir(), "sb-r2-transfer-"));
+  try {
+    const b = make({ db: join(root, "state.sqlite"), bindings: { r2: ["UPLOADS"] } });
+    const upload = await b.dispatch({
+      op: "r2.transfer.create", bucket: "UPLOADS", key: "large.bin", method: "upload",
+      maxBytes: 100, sha256: createHash("sha256").update("abcdef").digest("hex"),
+      httpMetadata: { contentType: "application/octet-stream" },
+    });
+    const url = `http://127.0.0.1${upload.url}`;
+    const bytes = new TextEncoder().encode("abcdef");
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) { controller.enqueue(bytes.subarray(0, 3)); controller.enqueue(bytes.subarray(3)); controller.close(); },
+    });
+    // SAFETY: Bun accepts duplex for streamed bodies; the bundled DOM type omits this runtime field.
+    const put = await b.transfer(new Request(url, { method: "PUT", body, duplex: "half" } as RequestInit));
+    expect(put.status).toBe(201);
+    expect(await b.transfer(new Request(url, { method: "PUT", body: "again" }))).toMatchObject({ status: 410 });
+    const head = await b.dispatch({ op: "r2.head", bucket: "UPLOADS", key: "large.bin" });
+    expect(obj(head.object).size).toBe(6);
+
+    const download = await b.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "large.bin", method: "download" });
+    const get = await b.transfer(new Request(`http://127.0.0.1${download.url}`, { headers: { range: "bytes=2-4" } }));
+    expect(get.status).toBe(206);
+    expect(get.headers.get("content-range")).toBe("bytes 2-4/6");
+    expect(get.headers.get("content-type")).toBe("application/octet-stream");
+    expect(await get.text()).toBe("cde");
+    expect((await b.transfer(new Request(`http://127.0.0.1${download.url}`))).status).toBe(410);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("R2 direct transfer: invalid ranges and oversized bodies never replace an object", async () => {
+  const root = mkdtempSync(join(tmpdir(), "sb-r2-transfer-errors-"));
+  try {
+    const b = make({ db: join(root, "state.sqlite"), bindings: { r2: ["UPLOADS"] } });
+    await b.dispatch({ op: "r2.put", bucket: "UPLOADS", key: "k", body: "old" });
+    const upload = await b.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "k", method: "upload", maxBytes: 2 });
+    const url = `http://127.0.0.1${upload.url}`;
+    expect((await b.transfer(new Request(url, { method: "PUT", body: "large" }))).status).toBe(413);
+    expect((await b.transfer(new Request(url, { method: "PUT", body: "ok" }))).status).toBe(410);
+    const retry = await b.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "k", method: "upload", maxBytes: 2 });
+    expect((await b.transfer(new Request(`http://127.0.0.1${retry.url}`, { method: "PUT", body: "ok" }))).status).toBe(201);
+    const after = await b.dispatch({ op: "r2.get", bucket: "UPLOADS", key: "k" });
+    expect(after.body).toBe("ok");
+    const dl = await b.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "k", method: "download" });
+    expect((await b.transfer(new Request(`http://127.0.0.1${dl.url}`, { headers: { range: "bytes=1-0" } }))).status).toBe(416);
+    expect((await b.transfer(new Request(`http://127.0.0.1${dl.url}`))).status).toBe(200);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("R2 direct transfer: account quota includes objects and shared in-flight reservations", async () => {
+  const root = mkdtempSync(join(tmpdir(), "sb-r2-quota-"));
+  try {
+    const resourceDir = join(root, "resources");
+    const bindings = {
+      r2: ["UPLOADS"],
+      resources: { UPLOADS: { kind: "r2" as const, id: "uploads" } },
+    };
+    const config = {
+      resourceDir,
+      ownerId: "owner-1",
+      r2QuotaBytes: 12,
+      r2ResourceIds: ["uploads"],
+      bindings,
+    };
+    const first = make({ ...config, db: join(root, "first.sqlite") });
+    const second = make({ ...config, db: join(root, "second.sqlite") });
+
+    await first.dispatch({ op: "r2.put", bucket: "UPLOADS", key: "existing", body: "four" });
+    const resource = new Database(join(resourceDir, "uploads.sqlite"));
+    try {
+      resource.query("INSERT INTO r2_part (bucket, key, upload_id, part_number, size, etag) VALUES (?1, ?2, ?3, 1, 2, ?4)")
+        .run("uploads", "partial", "upload-1", "part");
+    } finally {
+      resource.close();
+    }
+    await expect(first.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "large", method: "upload", maxBytes: 7 }))
+      .rejects.toThrow("quota");
+    const ticket = await first.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "large", method: "upload", maxBytes: 6 });
+    await expect(second.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "other", method: "upload", maxBytes: 1 }))
+      .rejects.toThrow("quota");
+
+    expect((await first.transfer(new Request(`http://127.0.0.1${ticket.url}`, { method: "PUT", body: "five!" }))).status).toBe(201);
+    const replacement = await second.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "other", method: "upload", maxBytes: 1 });
+    expect(replacement.ok).toBe(true);
+    const ledger = new Database(join(resourceDir, "r2-quota.sqlite"), { readonly: true });
+    try {
+      expect(ledger.query<{ tickets_issued: number; rejected_quota: number }, [string]>(
+        "SELECT tickets_issued, rejected_quota FROM r2_transfer_metric WHERE owner = ?",
+      ).get("owner-1")).toEqual({ tickets_issued: 2, rejected_quota: 2 });
+    } finally {
+      ledger.close();
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("R2 direct transfer: failed uploads release their reservation and retain the disk floor", async () => {
+  const root = mkdtempSync(join(tmpdir(), "sb-r2-quota-release-"));
+  try {
+    const config = {
+      db: join(root, "state.sqlite"),
+      resourceDir: join(root, "resources"),
+      ownerId: "owner-1",
+      r2QuotaBytes: 5,
+      r2ResourceIds: ["uploads"],
+      bindings: { r2: ["UPLOADS"], resources: { UPLOADS: { kind: "r2" as const, id: "uploads" } } },
+    };
+    const b = make(config);
+    const ticket = await b.dispatch({
+      op: "r2.transfer.create", bucket: "UPLOADS", key: "bad", method: "upload", maxBytes: 5,
+      sha256: createHash("sha256").update("expected").digest("hex"),
+    });
+    expect((await b.transfer(new Request(`http://127.0.0.1${ticket.url}`, { method: "PUT", body: "wrong" }))).status).toBe(422);
+    expect((await b.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "retry", method: "upload", maxBytes: 5 })).ok).toBe(true);
+
+    const floor = make({ ...config, db: join(root, "floor.sqlite"), r2QuotaBytes: 100, r2MinFreeBytes: 10, freeBytes: () => 11 });
+    await expect(floor.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "no-space", method: "upload", maxBytes: 2 }))
+      .rejects.toThrow("temporarily unavailable");
+
+    let freeBytes = 20;
+    const duringUpload = make({
+      ...config,
+      db: join(root, "during-upload.sqlite"),
+      r2QuotaBytes: 100,
+      r2MinFreeBytes: 10,
+      freeBytes: () => freeBytes,
+    });
+    const unknownLength = await duringUpload.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "during", method: "upload", maxBytes: 5 });
+    freeBytes = 10;
+    expect((await duringUpload.transfer(new Request(`http://127.0.0.1${unknownLength.url}`, { method: "PUT", body: "x" }))).status).toBe(507);
+
+    const abandoned = join(config.resourceDir, "r2-blobs", "a".repeat(24) + ".upload.tmp");
+    mkdirSync(join(config.resourceDir, "r2-blobs"), { recursive: true });
+    writeFileSync(abandoned, "partial");
+    await expect(b.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "quota-full", method: "upload", maxBytes: 1 }))
+      .rejects.toThrow("quota");
+    expect(existsSync(abandoned)).toBe(false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("R2 direct transfer: live HTTP listener accepts a chunked binary PUT", async () => {
+  const root = mkdtempSync(join(tmpdir(), "sb-r2-transfer-http-"));
+  const b = make({ db: join(root, "state.sqlite"), bindings: { r2: ["UPLOADS"] } });
+  const server = listenTransfers(b, "127.0.0.1", 0);
+  try {
+    const ticket = await b.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "stream.bin", method: "upload", maxBytes: 2 * 1024 * 1024 });
+    let chunks = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (chunks++ < 16) controller.enqueue(new Uint8Array(64 * 1024).fill(chunks));
+        else controller.close();
+      },
+    });
+    // SAFETY: Bun accepts duplex for streamed bodies; the bundled DOM type omits this runtime field.
+    const uploaded = await fetch(`http://127.0.0.1:${server.port}${ticket.url}`, { method: "PUT", body, duplex: "half" } as RequestInit);
+    expect(uploaded.status).toBe(201);
+    const download = await b.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "stream.bin", method: "download" });
+    const response = await fetch(`http://127.0.0.1:${server.port}${download.url}`, { headers: { range: "bytes=65535-65537" } });
+    expect(response.status).toBe(206);
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(new Uint8Array([1, 2, 2]));
+  } finally {
+    server.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("R2: list paginates with a cursor", async () => {
   const b = make({ bindings: { r2: ["ASSETS"] } });
   for (let i = 0; i < 5; i++) await b.dispatch({ op: "r2.put", bucket: "ASSETS", key: `k${i}`, body: "x" });
@@ -258,6 +433,24 @@ test("R2 overwrite keeps the committed generation visible when metadata update f
       body: "old-bytes",
       object: { size: 9 },
     });
+    control.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("R2 direct overwrite also preserves the old generation on metadata failure", async () => {
+  const root = mkdtempSync(join(tmpdir(), "sb-r2-transfer-atomic-"));
+  try {
+    const databasePath = join(root, "state.sqlite");
+    const b = make({ db: databasePath, bindings: { r2: ["UPLOADS"] } });
+    await b.dispatch({ op: "r2.put", bucket: "UPLOADS", key: "object", body: "old" });
+    const control = new Database(databasePath);
+    control.exec("CREATE TRIGGER fail_r2_metadata BEFORE UPDATE ON r2 BEGIN SELECT RAISE(ABORT, 'forced metadata failure'); END");
+    const ticket = await b.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "object", method: "upload" });
+    await expect(b.transfer(new Request(`http://127.0.0.1${ticket.url}`, { method: "PUT", body: "new" })))
+      .rejects.toThrow("forced metadata failure");
+    expect(await b.dispatch({ op: "r2.get", bucket: "UPLOADS", key: "object" })).toMatchObject({ found: true, body: "old" });
     control.close();
   } finally {
     rmSync(root, { recursive: true, force: true });
