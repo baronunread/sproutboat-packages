@@ -375,14 +375,12 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     if (!quotaDirectory) return 0;
     let used = 0;
     for (const id of opts.r2ResourceIds ?? []) {
-      const path = join(quotaDirectory, `${id}.sqlite`);
-      if (!existsSync(path)) continue;
-      const store = new Database(path, { readonly: true });
-      try {
-        used += store.query<{ bytes: number }, []>("SELECT COALESCE(SUM(size), 0) AS bytes FROM r2").get()?.bytes ?? 0;
-      } finally {
-        store.close();
-      }
+      // Open through resourceDb so older resource files gain the multipart
+      // tables before the aggregate is queried.
+      const store = resourceDb(id);
+      used += store.query<{ bytes: number }, []>(
+        "SELECT (SELECT COALESCE(SUM(size), 0) FROM r2) + (SELECT COALESCE(SUM(size), 0) FROM r2_part) AS bytes",
+      ).get()?.bytes ?? 0;
     }
     return used;
   };

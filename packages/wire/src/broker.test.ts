@@ -225,7 +225,7 @@ test("R2 direct transfer: account quota includes objects and shared in-flight re
     const config = {
       resourceDir,
       ownerId: "owner-1",
-      r2QuotaBytes: 10,
+      r2QuotaBytes: 12,
       r2ResourceIds: ["uploads"],
       bindings,
     };
@@ -233,6 +233,13 @@ test("R2 direct transfer: account quota includes objects and shared in-flight re
     const second = make({ ...config, db: join(root, "second.sqlite") });
 
     await first.dispatch({ op: "r2.put", bucket: "UPLOADS", key: "existing", body: "four" });
+    const resource = new Database(join(resourceDir, "uploads.sqlite"));
+    try {
+      resource.query("INSERT INTO r2_part (bucket, key, upload_id, part_number, size, etag) VALUES (?1, ?2, ?3, 1, 2, ?4)")
+        .run("uploads", "partial", "upload-1", "part");
+    } finally {
+      resource.close();
+    }
     await expect(first.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "large", method: "upload", maxBytes: 7 }))
       .rejects.toThrow("quota");
     const ticket = await first.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "large", method: "upload", maxBytes: 6 });
