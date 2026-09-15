@@ -24,9 +24,30 @@ if (process.argv[3] === "server") {
   const broker = createBroker({ db: join(directory, "state.sqlite"), bindings: { r2: ["UPLOADS"] } });
   const listener = listenTransfers(broker, "127.0.0.1", 0);
   const ticket = await broker.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "large.bin", method: "upload", maxBytes: size });
+  if (mode.startsWith("download")) {
+    const download = await broker.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "large.bin", method: "download" });
+    let uploadUrl = `http://127.0.0.1:${listener.port}${ticket.url}`;
+    let downloadUrl = `http://127.0.0.1:${listener.port}${download.url}`;
+    if (mode === "download-proxy") {
+      const directUploadUrl = uploadUrl;
+      const directDownloadUrl = downloadUrl;
+      const proxy = Bun.serve({ hostname: "127.0.0.1", port: 0, maxRequestBodySize: 5 * 1024 * 1024 * 1024, fetch(request, server) {
+        server.timeout(request, 255);
+        const target = new URL(request.url);
+        const upstream = target.pathname === "/download" ? directDownloadUrl : directUploadUrl;
+        // SAFETY: Bun supports duplex for streamed request bodies; the bundled DOM type omits the field.
+        return fetch(upstream, { method: request.method, body: request.body, duplex: "half" } as RequestInit);
+      } });
+      uploadUrl = `http://127.0.0.1:${proxy.port}/upload`;
+      downloadUrl = `http://127.0.0.1:${proxy.port}/download`;
+    }
+    console.log(JSON.stringify({ uploadUrl, downloadUrl }));
+    await new Promise(() => undefined);
+  }
   if (mode === "proxy") {
     const upstream = `http://127.0.0.1:${listener.port}${ticket.url}`;
-    const proxy = Bun.serve({ hostname: "127.0.0.1", port: 0, maxRequestBodySize: 5 * 1024 * 1024 * 1024, fetch(request) {
+    const proxy = Bun.serve({ hostname: "127.0.0.1", port: 0, maxRequestBodySize: 5 * 1024 * 1024 * 1024, fetch(request, server) {
+      server.timeout(request, 255);
       // SAFETY: Bun supports duplex for streamed request bodies; the bundled DOM type omits the field.
       return fetch(upstream, { method: request.method, body: request.body, duplex: "half" } as RequestInit);
     } });
@@ -46,7 +67,10 @@ if (process.argv[3] === "server") {
       if (part.done) throw new Error("broker exited before printing its URL");
       line += new TextDecoder().decode(part.value);
     }
-    const url = line.trim();
+    const ready = line.trim();
+    // SAFETY: the child prints a JSON pair only in a download benchmark mode.
+    const downloadUrls = ready.startsWith("{") ? JSON.parse(ready) as { uploadUrl: string; downloadUrl: string } : null;
+    const url = downloadUrls?.uploadUrl ?? ready;
     const rss = (): number => {
       const result = Bun.spawnSync(["ps", "-o", "rss=", "-p", String(child.pid)]);
       return Number(new TextDecoder().decode(result.stdout).trim()) * 1024;
@@ -68,9 +92,25 @@ if (process.argv[3] === "server") {
       const response = await fetch(url, { method: "PUT", body, duplex: "half" } as RequestInit);
       const resultText = await response.text();
       peak = Math.max(peak, rss());
-      console.log(JSON.stringify({ status: response.status, error: response.status === 201 ? undefined : resultText, sizeMiB: size / 1024 / 1024,
+      console.log(JSON.stringify({ status: response.status, error: response.status === 201 ? undefined : resultText.slice(0, 200), sizeMiB: size / 1024 / 1024,
         baselineMiB: baseline / 1024 / 1024, peakMiB: peak / 1024 / 1024,
         settledMiB: rss() / 1024 / 1024 }));
+      if (downloadUrls && response.status === 201) {
+        const beforeDownload = rss();
+        let downloadPeak = beforeDownload;
+        const downloadMonitor = setInterval(() => { downloadPeak = Math.max(downloadPeak, rss()); }, 20);
+        try {
+          const got = await fetch(downloadUrls.downloadUrl);
+          let downloaded = 0;
+          if (got.body) for await (const chunk of got.body) downloaded += chunk.byteLength;
+          downloadPeak = Math.max(downloadPeak, rss());
+          console.log(JSON.stringify({ downloadStatus: got.status, downloadedMiB: downloaded / 1024 / 1024,
+            beforeDownloadMiB: beforeDownload / 1024 / 1024,
+            downloadPeakMiB: downloadPeak / 1024 / 1024 }));
+        } finally {
+          clearInterval(downloadMonitor);
+        }
+      }
     } finally {
       clearInterval(monitor);
     }

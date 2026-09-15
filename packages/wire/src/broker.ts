@@ -1805,7 +1805,10 @@ export function listen(broker: Broker, hostname: string, port: number): BrokerSe
 export function listenTransfers(broker: Broker, hostname: string, port: number): BrokerServer {
   const configured = Number(process.env.SB_R2_TRANSFER_MAX_BYTES);
   const maxRequestBodySize = Number.isSafeInteger(configured) && configured > 0 ? configured : 5 * 1024 * 1024 * 1024;
-  const server = Bun.serve({ hostname, port, maxRequestBodySize, fetch: (request) => broker.transfer(request) });
+  const server = Bun.serve({ hostname, port, maxRequestBodySize, fetch(request, server) {
+    server.timeout(request, 255);
+    return broker.transfer(request);
+  } });
   return { port: server.port ?? port, stop: () => server.stop(true) };
 }
 
