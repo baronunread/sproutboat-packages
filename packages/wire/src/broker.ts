@@ -18,8 +18,9 @@
  * the only SSRF control today.
  */
 import { Database, type Statement } from "bun:sqlite";
-import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { open } from "node:fs/promises";
 import { dirname, join, normalize, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { resolveAssetKey, type AssetManifest } from "@sproutboat/assets";
@@ -125,6 +126,17 @@ type R2UploadRow = {
 };
 type R2PartRow = { part_number: number; size: number; etag: string };
 type R2UploadIdentity = { bucket: string; key: string; upload_id: string };
+type R2TransferRow = {
+  bucket: string;
+  key: string;
+  method: string;
+  expires: number;
+  max_bytes: number;
+  expected_sha256: string;
+  http_json: string;
+  custom_json: string;
+  used: number;
+};
 const MULTIPART_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000;
 const isNumber = (v: JsonValue | undefined): v is number => Number.isFinite(v);
 const sqlParams = (v: JsonValue | undefined): SqlParam[] => {
@@ -154,6 +166,8 @@ export type Broker = {
    * negotiation.
    */
   handleFrame(payload: Buffer): Promise<Buffer>;
+  /** Serve one reserved direct R2 upload or download request. */
+  transfer(request: Request): Promise<Response>;
   close(): void;
 };
 
@@ -265,6 +279,11 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       "CREATE TABLE IF NOT EXISTS r2_part (bucket TEXT NOT NULL, key TEXT NOT NULL, upload_id TEXT NOT NULL, " +
         "part_number INTEGER NOT NULL, size INTEGER NOT NULL, etag TEXT NOT NULL, " +
         "PRIMARY KEY (bucket, key, upload_id, part_number))",
+    );
+    conn.exec(
+      "CREATE TABLE IF NOT EXISTS r2_transfer (token TEXT PRIMARY KEY, bucket TEXT NOT NULL, key TEXT NOT NULL, " +
+        "method TEXT NOT NULL, expires INTEGER NOT NULL, max_bytes INTEGER NOT NULL, expected_sha256 TEXT NOT NULL DEFAULT '', " +
+        "http_json TEXT NOT NULL DEFAULT '{}', custom_json TEXT NOT NULL DEFAULT '{}', used INTEGER NOT NULL DEFAULT 0)",
     );
     conn.exec(
       "CREATE TABLE IF NOT EXISTS mq (queue TEXT NOT NULL, id TEXT PRIMARY KEY, body TEXT NOT NULL, " +
@@ -674,6 +693,176 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     return row;
   };
 
+  const transferLimit = (): number => {
+    const configured = Number(process.env.SB_R2_TRANSFER_MAX_BYTES);
+    return Number.isSafeInteger(configured) && configured > 0 ? configured : 5 * 1024 * 1024 * 1024;
+  };
+  let activeUploads = 0;
+  const maxActiveUploads = 4;
+
+  const cleanupTransferTemps = (store: Database): void => {
+    const directory = r2BlobDir(store);
+    if (!directory || !existsSync(directory)) return;
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    for (const name of readdirSync(directory)) {
+      if (!/^[0-9a-f]{24}\.upload\.tmp$/.test(name)) continue;
+      const path = join(directory, name);
+      try {
+        if (statSync(path).mtimeMs < cutoff) rmSync(path);
+      } catch (error) {
+        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+      }
+    }
+  };
+
+  const transferPath = (binding: string, tokenValue: string): string =>
+    `/__sb/r2/transfer/${encodeURIComponent(binding)}/${tokenValue}`;
+
+  const parseRange = (header: string | null, size: number): { start: number; end: number } | null => {
+    if (!header) return { start: 0, end: Math.max(0, size - 1) };
+    const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+    if (!match || size === 0) return null;
+    if (!match[1]) {
+      const suffix = Number(match[2]);
+      if (!Number.isSafeInteger(suffix) || suffix <= 0) return null;
+      return { start: Math.max(0, size - suffix), end: size - 1 };
+    }
+    const start = Number(match[1]);
+    const requestedEnd = match[2] ? Number(match[2]) : size - 1;
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(requestedEnd) || start < 0 || start >= size || requestedEnd < start) return null;
+    return { start, end: Math.min(requestedEnd, size - 1) };
+  };
+
+  const transfer = async (request: Request): Promise<Response> => {
+    const url = new URL(request.url);
+    const match = /^\/__sb\/r2\/transfer\/([A-Z][A-Z0-9_]*)\/([0-9a-f]{24})$/.exec(url.pathname);
+    if (!match) return new Response("not found", { status: 404 });
+    let store: Database;
+    let bucket: string;
+    try {
+      ({ store, part: bucket } = storeFor("r2", requireR2(match[1])));
+    } catch {
+      return new Response("not found", { status: 404 });
+    }
+    const tokenValue = match[2];
+    const ticket = store
+      .query<R2TransferRow, [string]>(
+        "SELECT bucket, key, method, expires, max_bytes, expected_sha256, http_json, custom_json, used " +
+          "FROM r2_transfer WHERE token = ?",
+      )
+      .get(tokenValue);
+    const method = request.method.toUpperCase();
+    const allowedMethod = ticket?.method === "upload" ? "PUT" : ticket?.method === "download" ? "GET, HEAD" : "";
+    if (!ticket || ticket.bucket !== bucket || ticket.used || ticket.expires < Date.now()) {
+      return new Response("transfer ticket expired or already used", { status: 410 });
+    }
+    if ((ticket.method === "upload" && method !== "PUT") || (ticket.method === "download" && method !== "GET" && method !== "HEAD")) {
+      return new Response("method not allowed", { status: 405, headers: { allow: allowedMethod } });
+    }
+    if (ticket.method === "download") {
+      const row = store.query<R2Row, [string, string]>("SELECT * FROM r2 WHERE bucket = ? AND key = ?").get(bucket, ticket.key);
+      if (!row) return new Response("not found", { status: 404 });
+      const etag = `"${row.etag}"`;
+      if (request.headers.get("if-none-match") === etag) return new Response(null, { status: 304, headers: { etag } });
+      const rangeHeader = request.headers.get("range");
+      const range = parseRange(rangeHeader, row.size);
+      if (!range) {
+        return new Response(null, { status: 416, headers: { "content-range": `bytes */${row.size}`, etag } });
+      }
+      const path = r2BlobPath(store, bucket, ticket.key, row.blob_id);
+      if (!path || !existsSync(path)) return new Response("not found", { status: 404 });
+      const claimed = store.query("UPDATE r2_transfer SET used = 1 WHERE token = ? AND used = 0").run(tokenValue);
+      if (claimed.changes !== 1) return new Response("transfer ticket already used", { status: 410 });
+      const length = row.size === 0 ? 0 : range.end - range.start + 1;
+      const metadata = jsonObject(parseJsonValue(row.http_json));
+      const headers = new Headers({
+        "accept-ranges": "bytes",
+        "content-length": String(length),
+        etag,
+      });
+      if (isString(metadata?.contentType)) headers.set("content-type", metadata.contentType);
+      if (rangeHeader) headers.set("content-range", `bytes ${range.start}-${range.end}/${row.size}`);
+      const body = method === "HEAD" ? null : Bun.file(path).slice(range.start, range.start + length);
+      return new Response(body, { status: rangeHeader ? 206 : 200, headers });
+    }
+
+    const declared = request.headers.has("content-length") ? Number(request.headers.get("content-length")) : NaN;
+    if (request.headers.has("content-length") && (!Number.isSafeInteger(declared) || declared < 0)) {
+      return new Response("invalid content length", { status: 400 });
+    }
+    if (Number.isFinite(declared) && declared > ticket.max_bytes) return new Response("upload too large", { status: 413 });
+    const directory = r2BlobDir(store);
+    if (!directory) return new Response("direct transfers require a file-backed store", { status: 503 });
+    if (activeUploads >= maxActiveUploads) {
+      return new Response("too many active uploads", { status: 503, headers: { "retry-after": "5" } });
+    }
+    const claimed = store.query("UPDATE r2_transfer SET used = 1 WHERE token = ? AND used = 0").run(tokenValue);
+    if (claimed.changes !== 1) return new Response("transfer ticket already used", { status: 410 });
+    activeUploads++;
+    const temporary = join(directory, `${tokenValue}.upload.tmp`);
+    await (async () => {
+      mkdirSync(directory, { recursive: true });
+      const reservation = await open(temporary, "wx");
+      await reservation.close();
+    })().catch((error) => {
+      activeUploads--;
+      throw error;
+    });
+    const writer = Bun.file(temporary).writer({ highWaterMark: 64 * 1024 });
+    const hash = createHash("sha256");
+    let size = 0;
+    try {
+      if (request.body) {
+        for await (const chunk of request.body) {
+          size += chunk.byteLength;
+          if (size > ticket.max_bytes) throw new RangeError("upload too large");
+          hash.update(chunk);
+          const written = await writer.write(chunk);
+          if (written !== chunk.byteLength) throw new Error("upload write was incomplete");
+        }
+      }
+      await writer.end();
+      const persisted = await open(temporary, "r");
+      try {
+        await persisted.sync();
+      } finally {
+        await persisted.close();
+      }
+      const etag = hash.digest("hex");
+      if (ticket.expected_sha256 && ticket.expected_sha256 !== etag) {
+        rmSync(temporary);
+        return Response.json({ error: "sha256 mismatch", actual: etag }, { status: 422 });
+      }
+      const destination = r2BlobPath(store, bucket, ticket.key, etag)!;
+      renameSync(temporary, destination);
+      const previous = store
+        .query<Pick<R2Row, "blob_id">, [string, string]>("SELECT blob_id FROM r2 WHERE bucket = ? AND key = ?")
+        .get(bucket, ticket.key);
+      const row: R2Row = {
+        key: ticket.key,
+        size,
+        etag,
+        uploaded: new Date().toISOString(),
+        http_json: ticket.http_json,
+        custom_json: ticket.custom_json,
+        blob_id: etag,
+      };
+      commitR2Metadata(store, bucket, row, previous);
+      return Response.json({ object: r2Row(row) }, { status: 201, headers: { etag: `"${etag}"` } });
+    } catch (error) {
+      try {
+        await writer.end();
+      } catch {
+        // Preserve the original upload failure while releasing the file sink.
+      }
+      if (existsSync(temporary)) rmSync(temporary);
+      if (error instanceof RangeError) return new Response(error.message, { status: 413 });
+      throw error;
+    } finally {
+      activeUploads--;
+    }
+  };
+
   const completeMultipart = (
     store: Database,
     bucket: string,
@@ -967,6 +1156,43 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
             JSON.stringify(msg.customMetadata ?? {}),
           );
         return { ok: true, key, uploadId };
+      }
+      case "r2.transfer.create": {
+        const binding = requireR2(msg.bucket);
+        const { store, part: bucket } = storeFor("r2", binding);
+        const key = str(msg.key);
+        const method = msg.method === "download" ? "download" : msg.method === "upload" ? "upload" : "";
+        if (!method) throw new Error("transfer method must be upload or download");
+        const expiresIn = Math.min(Math.max(Number(msg.expiresIn) || 900, 30), 3600);
+        const expires = Date.now() + expiresIn * 1000;
+        const maxBytes =
+          method === "upload"
+            ? Math.min(Math.max(Number(msg.maxBytes) || 100 * 1024 * 1024, 1), transferLimit())
+            : 0;
+        const expectedSha256 = str(msg.sha256).toLowerCase();
+        if (expectedSha256 && !/^[0-9a-f]{64}$/.test(expectedSha256)) {
+          throw new Error("sha256 must be 64 hexadecimal characters");
+        }
+        store.query("DELETE FROM r2_transfer WHERE expires < ? OR used = 1").run(Date.now());
+        cleanupTransferTemps(store);
+        const tokenValue = randomBytes(12).toString("hex");
+        store
+          .query(
+            "INSERT INTO r2_transfer (token, bucket, key, method, expires, max_bytes, expected_sha256, http_json, custom_json) " +
+              "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+          )
+          .run(
+            tokenValue,
+            bucket,
+            key,
+            method,
+            expires,
+            maxBytes,
+            expectedSha256,
+            JSON.stringify(msg.httpMetadata ?? {}),
+            JSON.stringify(msg.customMetadata ?? {}),
+          );
+        return { ok: true, url: transferPath(binding, tokenValue), expiresAt: new Date(expires).toISOString() };
       }
       case "r2.multipart.complete": {
         const { store, part: bucket } = storeFor("r2", requireR2(msg.bucket));
@@ -1303,6 +1529,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     "r2.multipart.put",
     "r2.multipart.complete",
     "r2.multipart.abort",
+    "r2.transfer.create",
     "r2.delete",
     "do.storage.put",
     "do.storage.delete",
@@ -1483,6 +1710,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     dispatch,
     handlePayload,
     handleFrame,
+    transfer,
     close: () => {
       for (const t of timers) clearInterval(t);
       for (const conn of d1Conns.values()) conn.close();
@@ -1570,13 +1798,22 @@ export function listen(broker: Broker, hostname: string, port: number): BrokerSe
       },
     },
   });
-  return { port: server.port, stop: () => server.stop(true) };
+  return { port: server.port ?? port, stop: () => server.stop(true) };
+}
+
+/** Start the HTTP listener that serves short-lived direct R2 transfer tickets. */
+export function listenTransfers(broker: Broker, hostname: string, port: number): BrokerServer {
+  const configured = Number(process.env.SB_R2_TRANSFER_MAX_BYTES);
+  const maxRequestBodySize = Number.isSafeInteger(configured) && configured > 0 ? configured : 5 * 1024 * 1024 * 1024;
+  const server = Bun.serve({ hostname, port, maxRequestBodySize, fetch: (request) => broker.transfer(request) });
+  return { port: server.port ?? port, stop: () => server.stop(true) };
 }
 
 if (import.meta.main) {
   const { values } = parseArgs({
     options: {
       port: { type: "string" },
+      "transfer-port": { type: "string" },
       token: { type: "string" },
       db: { type: "string" },
       "data-dir": { type: "string" },
@@ -1639,7 +1876,9 @@ if (import.meta.main) {
     dispatchEnabled: () => dispatchEnabled,
   });
   const { port } = listen(broker, "127.0.0.1", Number(values.port ?? process.env.SB_BROKER_PORT ?? 0));
+  const transferPort = Number(values["transfer-port"] ?? process.env.SB_R2_TRANSFER_PORT ?? 0);
+  const transferServer = transferPort > 0 ? listenTransfers(broker, "127.0.0.1", transferPort) : null;
   console.log(
-    `sproutboat broker: 127.0.0.1:${port} db=${values.db ?? ":memory:"} sprout=${values["sprout-url"] ?? process.env.SB_SPROUT_URL ?? "(none)"} dispatch=${dispatchEnabled ? "enabled" : "disabled"}`,
+    `sproutboat broker: 127.0.0.1:${port} transfer=${transferServer?.port ?? "off"} db=${values.db ?? ":memory:"} sprout=${values["sprout-url"] ?? process.env.SB_SPROUT_URL ?? "(none)"} dispatch=${dispatchEnabled ? "enabled" : "disabled"}`,
   );
 }
