@@ -285,6 +285,18 @@ test("R2 direct transfer: failed uploads release their reservation and retain th
     await expect(floor.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "no-space", method: "upload", maxBytes: 2 }))
       .rejects.toThrow("temporarily unavailable");
 
+    let freeBytes = 20;
+    const duringUpload = make({
+      ...config,
+      db: join(root, "during-upload.sqlite"),
+      r2QuotaBytes: 100,
+      r2MinFreeBytes: 10,
+      freeBytes: () => freeBytes,
+    });
+    const unknownLength = await duringUpload.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "during", method: "upload", maxBytes: 5 });
+    freeBytes = 10;
+    expect((await duringUpload.transfer(new Request(`http://127.0.0.1${unknownLength.url}`, { method: "PUT", body: "x" }))).status).toBe(507);
+
     const abandoned = join(config.resourceDir, "r2-blobs", "a".repeat(24) + ".upload.tmp");
     mkdirSync(join(config.resourceDir, "r2-blobs"), { recursive: true });
     writeFileSync(abandoned, "partial");

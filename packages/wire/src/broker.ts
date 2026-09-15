@@ -944,6 +944,12 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         for await (const chunk of request.body) {
           size += chunk.byteLength;
           if (size > ticket.max_bytes) throw new RangeError("upload too large");
+          const floor = Math.max(opts.r2MinFreeBytes ?? 0, 0);
+          if (floor > 0 && availableBytes() < chunk.byteLength + floor) {
+            const error = new Error("R2 storage is temporarily unavailable");
+            Object.assign(error, { code: "SB_R2_DISK_FLOOR" });
+            throw error;
+          }
           hash.update(chunk);
           const written = await writer.write(chunk);
           if (written !== chunk.byteLength) throw new Error("upload write was incomplete");
@@ -991,7 +997,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         recordR2TransferMetric("rejected_size");
         return new Response(error.message, { status: 413 });
       }
-      if (error instanceof Error && "code" in error && error.code === "ENOSPC") {
+      if (error instanceof Error && "code" in error && (error.code === "ENOSPC" || error.code === "SB_R2_DISK_FLOOR")) {
         recordR2TransferMetric("rejected_disk");
         return new Response("R2 storage is temporarily unavailable", { status: 507 });
       }
