@@ -1136,6 +1136,26 @@ function __sbR2Object(meta, body) {
   return obj;
 }
 
+function __sbR2Multipart(bucket, key, uploadId) {
+  return {
+    key,
+    uploadId,
+    uploadPart(partNumber, value) {
+      const number = Number(partNumber);
+      if (!Number.isInteger(number) || number < 1 || number > 10000)
+        throw new TypeError("partNumber must be an integer between 1 and 10000");
+      return __sbR2MultipartPut(bucket, key, uploadId, number, value == null ? "" : String(value)).part;
+    },
+    complete(parts) {
+      const r = __sbRpc("r2.multipart.complete", { bucket, key, uploadId, parts: parts || [] });
+      return __sbR2Object(r.object, null);
+    },
+    abort() {
+      __sbRpc("r2.multipart.abort", { bucket, key, uploadId });
+    },
+  };
+}
+
 // Installed only when the project declares bindings. `env` is the module-scoped
 // object from compile.ts (a `const`, but mutable); we add the binding accessors
 // to it in place. compile.ts emits `__sbInstallBindings(env, {...})` right after
@@ -1196,6 +1216,20 @@ globalThis.__sbInstallBindings = function (target, bindings) {
           o.httpMetadata || {},
           o.customMetadata || {},
         ).object;
+      },
+      createMultipartUpload(key, options) {
+        const objectKey = String(key);
+        const o = options || {};
+        const r = __sbRpc("r2.multipart.create", {
+          bucket: name,
+          key: objectKey,
+          httpMetadata: o.httpMetadata || {},
+          customMetadata: o.customMetadata || {},
+        });
+        return __sbR2Multipart(name, objectKey, r.uploadId);
+      },
+      resumeMultipartUpload(key, uploadId) {
+        return __sbR2Multipart(name, String(key), String(uploadId));
       },
       get(key) {
         // #56 — bytes come back out of band on a transport that supports it, so

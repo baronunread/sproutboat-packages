@@ -24,9 +24,21 @@ if (r2Start === -1 || r2End === -1 || r2End < r2Start) throw new Error("__sbR2Ob
 
 // oxlint-disable-next-line no-function-constructor -- lifting pure blocks out of the text-only prelude for test
 const load = new Function(
-  `${src.slice(utf8Start, utf8End)}\n${src.slice(rawStart, rawEnd)}\n${src.slice(r2Start, r2End)}\nreturn { __sbR2Object };`,
+  "__sbRpc",
+  "__sbR2MultipartPut",
+  `${src.slice(utf8Start, utf8End)}\n${src.slice(rawStart, rawEnd)}\n${src.slice(r2Start, r2End)}\nreturn { __sbR2Object, __sbR2Multipart };`,
 );
-const { __sbR2Object } = load();
+const calls = [];
+const rpc = (op, value) => {
+  calls.push({ op, value });
+  if (op === "r2.multipart.complete") return { object: meta };
+  return { ok: true };
+};
+const putPart = (bucket, key, uploadId, partNumber, body) => {
+  calls.push({ op: "r2.multipart.put", value: { bucket, key, uploadId, partNumber, body } });
+  return { part: { partNumber, etag: `part-${partNumber}` } };
+};
+const { __sbR2Object, __sbR2Multipart } = load(rpc, putPart);
 
 const meta = { key: "f.bin", size: 3, etag: "abc123", uploaded: "2026-09-14T00:00:00.000Z" };
 
@@ -62,4 +74,18 @@ test("toResponse() on an empty body still returns bytes, not the string \"\"", a
   const resp = obj.toResponse();
   const buf = new Uint8Array(await resp.arrayBuffer());
   expect(buf.length).toBe(0);
+});
+
+test("multipart uploads expose the Cloudflare-shaped uploadPart, complete, and abort methods", () => {
+  calls.length = 0;
+  const upload = __sbR2Multipart("FILES", "archive.bin", "upload-1");
+  expect(upload).toMatchObject({ key: "archive.bin", uploadId: "upload-1" });
+  expect(upload.uploadPart(1, "first")).toEqual({ partNumber: 1, etag: "part-1" });
+  expect(upload.complete([{ partNumber: 1, etag: "part-1" }])).toMatchObject(meta);
+  upload.abort();
+  expect(calls.map((call) => call.op)).toEqual([
+    "r2.multipart.put",
+    "r2.multipart.complete",
+    "r2.multipart.abort",
+  ]);
 });

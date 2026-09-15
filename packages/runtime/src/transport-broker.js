@@ -303,6 +303,27 @@ globalThis.__sbR2Get = function (bucket, key) {
   return { found: true, object: reply.object, body: __sbTakeBin() };
 };
 
+globalThis.__sbR2MultipartPut = function (bucket, key, uploadId, partNumber, body) {
+  const token = __sbEnv("SB_BROKER_TOKEN");
+  const reply = JSON.parse(
+    __sbCallBin(
+      JSON.stringify({
+        v: 1,
+        id: ++__sbReqId,
+        token,
+        op: "r2.multipart.put",
+        bucket,
+        key,
+        uploadId,
+        partNumber,
+      }),
+      body == null ? "" : String(body),
+    ),
+  );
+  if (reply.ok === false) throw new Error("sproutboat r2.multipart.put: " + (reply.error || "failed"));
+  return reply;
+};
+
 /** Static asset metadata stays JSON; the response body uses the v1 byte tail. */
 globalThis.__sbAssetsGet = function (path) {
   const token = __sbEnv("SB_BROKER_TOKEN");

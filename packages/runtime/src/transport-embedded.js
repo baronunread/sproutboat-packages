@@ -41,6 +41,8 @@ extern int sqlite3_column_type(sqlite3_stmt*, int);
 extern const unsigned char* sqlite3_column_text(sqlite3_stmt*, int);
 extern int sqlite3_column_bytes(sqlite3_stmt*, int);
 extern double sqlite3_column_double(sqlite3_stmt*, int);
+extern int sqlite3_column_int(sqlite3_stmt*, int);
+extern int64_t sqlite3_column_int64(sqlite3_stmt*, int);
 extern const char* sqlite3_column_name(sqlite3_stmt*, int);
 extern int sqlite3_bind_null(sqlite3_stmt*, int);
 extern int sqlite3_bind_double(sqlite3_stmt*, int, double);
@@ -281,7 +283,8 @@ static void sb_iso_now(char* out, size_t cap) {
 
 // "<dir-of-store_path>/r2-blobs/<sha256(bucket 0x1e key)>.blob" — deterministic,
 // so no extra column is needed to find an object's file back.
-static void sb_r2_blob_path(char* out, size_t cap, const char* store_path, const char* bucket, const char* key) {
+static void sb_r2_blob_path(char* out, size_t cap, const char* store_path, const char* bucket, const char* key,
+                            const char* generation) {
   const char* slash = strrchr(store_path, '/');
   int dirlen = slash ? (int)(slash - store_path) : 0;
   br_sha256_context ctx;
@@ -289,11 +292,158 @@ static void sb_r2_blob_path(char* out, size_t cap, const char* store_path, const
   br_sha256_update(&ctx, bucket, strlen(bucket));
   br_sha256_update(&ctx, "\x1e", 1); // separator: a bucket/key split never collides across it
   br_sha256_update(&ctx, key, strlen(key));
+  if (generation && *generation) {
+    br_sha256_update(&ctx, "\x1e", 1);
+    br_sha256_update(&ctx, generation, strlen(generation));
+  }
   unsigned char digest[32];
   br_sha256_out(&ctx, digest);
   char hex[65];
   sb_hex32(digest, hex);
   snprintf(out, cap, "%.*s/r2-blobs/%s.blob", dirlen, store_path, hex);
+}
+
+static void sb_r2_part_path(char* out, size_t cap, const char* store_path, const char* bucket, const char* key,
+                            const char* upload_id, int part_number) {
+  const char* slash = strrchr(store_path, '/');
+  int dirlen = slash ? (int)(slash - store_path) : 0;
+  br_sha256_context ctx;
+  br_sha256_init(&ctx);
+  br_sha256_update(&ctx, bucket, strlen(bucket));
+  br_sha256_update(&ctx, "\x1e", 1);
+  br_sha256_update(&ctx, key, strlen(key));
+  br_sha256_update(&ctx, "\x1e", 1);
+  br_sha256_update(&ctx, upload_id, strlen(upload_id));
+  br_sha256_update(&ctx, "\x1e", 1);
+  char number[16];
+  int number_len = snprintf(number, sizeof(number), "%d", part_number);
+  br_sha256_update(&ctx, number, (size_t)number_len);
+  unsigned char digest[32];
+  br_sha256_out(&ctx, digest);
+  char hex[65];
+  sb_hex32(digest, hex);
+  snprintf(out, cap, "%.*s/r2-parts/%s.part", dirlen, store_path, hex);
+}
+
+static char* sb_r2_part_put_c(const char* path, const char* bucket, const char* key, const char* upload_id,
+                              int part_number, const char* body, size_t bodylen) {
+  sb_buf out = { 0, 0, 0 };
+  char partpath[1024];
+  sb_r2_part_path(partpath, sizeof(partpath), path, bucket, key, upload_id, part_number);
+  sb_mkdirs(partpath);
+  char temporary[1100];
+  snprintf(temporary, sizeof(temporary), "%s.tmp", partpath);
+  FILE* f = fopen(temporary, "wb");
+  if (!f) { sb_puts(&out, "{\"ok\":false,\"error\":\"cannot write multipart part\"}"); return out.p; }
+  size_t written = bodylen ? fwrite(body, 1, bodylen, f) : 0;
+  int close_rc = fclose(f);
+  if (written != bodylen || close_rc != 0 || rename(temporary, partpath) != 0) {
+    unlink(temporary);
+    sb_puts(&out, "{\"ok\":false,\"error\":\"multipart part write failed\"}");
+    return out.p;
+  }
+  char etag[65];
+  sb_sha256_hex(body, bodylen, etag);
+  char result[160];
+  int n = snprintf(result, sizeof(result), "{\"ok\":true,\"etag\":\"%s\",\"size\":%zu}", etag, bodylen);
+  sb_put(&out, result, (size_t)n);
+  return out.p;
+}
+
+static char* sb_r2_multipart_complete_c(const char* path, const char* bucket, const char* key, const char* upload_id) {
+  sb_buf out = { 0, 0, 0 };
+  int idx = sb_db_for(path);
+  if (idx < 0) { sb_puts(&out, "{\"ok\":false,\"error\":\"cannot open database\"}"); return out.p; }
+
+  char blobpath[1024];
+  sb_r2_blob_path(blobpath, sizeof(blobpath), path, bucket, key, "");
+  sb_mkdirs(blobpath);
+  char temporary[1100];
+  snprintf(temporary, sizeof(temporary), "%s.%s.tmp", blobpath, upload_id);
+  FILE* destination = fopen(temporary, "wb");
+  if (!destination) { sb_puts(&out, "{\"ok\":false,\"error\":\"cannot write object\"}"); return out.p; }
+
+  sqlite3_stmt* st = 0;
+  const char* sql =
+    "SELECT part_number, size FROM r2_part WHERE bucket = ?1 AND key = ?2 AND upload_id = ?3 ORDER BY part_number";
+  if (sqlite3_prepare_v2(sb_dbs[idx], sql, -1, &st, 0) != 0 || !st) {
+    fclose(destination); unlink(temporary);
+    sb_puts(&out, "{\"ok\":false,\"error\":\"cannot read multipart parts\"}");
+    return out.p;
+  }
+  sqlite3_bind_text(st, 1, bucket, -1, SB_SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 2, key, -1, SB_SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 3, upload_id, -1, SB_SQLITE_TRANSIENT);
+
+  br_sha256_context hash;
+  br_sha256_init(&hash);
+  size_t total = 0;
+  int failed = 0;
+  unsigned char chunk[65536];
+  while (!failed && sqlite3_step(st) == SB_SQLITE_ROW) {
+    int part_number = sqlite3_column_int(st, 0);
+    size_t expected = (size_t)sqlite3_column_int64(st, 1);
+    char partpath[1024];
+    sb_r2_part_path(partpath, sizeof(partpath), path, bucket, key, upload_id, part_number);
+    FILE* part = fopen(partpath, "rb");
+    if (!part) { failed = 1; break; }
+    size_t part_size = 0;
+    for (;;) {
+      size_t read_count = fread(chunk, 1, sizeof(chunk), part);
+      if (read_count) {
+        if (fwrite(chunk, 1, read_count, destination) != read_count) { failed = 1; break; }
+        br_sha256_update(&hash, chunk, read_count);
+        part_size += read_count;
+        total += read_count;
+      }
+      if (read_count < sizeof(chunk)) {
+        if (ferror(part)) failed = 1;
+        break;
+      }
+    }
+    fclose(part);
+    if (part_size != expected) failed = 1;
+  }
+  sqlite3_finalize(st);
+  if (fclose(destination) != 0) failed = 1;
+  if (failed) {
+    unlink(temporary);
+    sb_puts(&out, "{\"ok\":false,\"error\":\"multipart completion failed\"}");
+    return out.p;
+  }
+
+  unsigned char digest[32];
+  br_sha256_out(&hash, digest);
+  char etag[65];
+  sb_hex32(digest, etag);
+  char generation_path[1024];
+  sb_r2_blob_path(generation_path, sizeof(generation_path), path, bucket, key, etag);
+  if (rename(temporary, generation_path) != 0) {
+    unlink(temporary);
+    sb_puts(&out, "{\"ok\":false,\"error\":\"multipart completion failed\"}");
+    return out.p;
+  }
+  char result[160];
+  int n = snprintf(result, sizeof(result), "{\"ok\":true,\"etag\":\"%s\",\"size\":%zu}", etag, total);
+  sb_put(&out, result, (size_t)n);
+  return out.p;
+}
+
+static void sb_r2_multipart_delete_parts_c(const char* path, const char* bucket, const char* key, const char* upload_id) {
+  int idx = sb_db_for(path);
+  if (idx < 0) return;
+  sqlite3_stmt* st = 0;
+  const char* sql = "SELECT part_number FROM r2_part WHERE bucket = ?1 AND key = ?2 AND upload_id = ?3";
+  if (sqlite3_prepare_v2(sb_dbs[idx], sql, -1, &st, 0) != 0 || !st) return;
+  sqlite3_bind_text(st, 1, bucket, -1, SB_SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 2, key, -1, SB_SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 3, upload_id, -1, SB_SQLITE_TRANSIENT);
+  while (sqlite3_step(st) == SB_SQLITE_ROW) {
+    char partpath[1024];
+    sb_r2_part_path(partpath, sizeof(partpath), path, bucket, key, upload_id, sqlite3_column_int(st, 0));
+    unlink(partpath);
+  }
+  sqlite3_finalize(st);
 }
 
 // Returns malloc'd JSON metadata; the body itself is never serialised into it.
@@ -309,20 +459,40 @@ static char* sb_r2_put_c(const char* path, const char* bucket, const char* key, 
   char uploaded[40];
   sb_iso_now(uploaded, sizeof(uploaded));
 
+  char previous[65];
+  previous[0] = 0;
+  sqlite3_stmt* old = 0;
+  if (sqlite3_prepare_v2(db, "SELECT blob_id FROM r2 WHERE bucket = ?1 AND key = ?2", -1, &old, 0) == 0 && old) {
+    sqlite3_bind_text(old, 1, bucket, -1, SB_SQLITE_TRANSIENT);
+    sqlite3_bind_text(old, 2, key, -1, SB_SQLITE_TRANSIENT);
+    if (sqlite3_step(old) == SB_SQLITE_ROW) {
+      const unsigned char* value = sqlite3_column_text(old, 0);
+      if (value) snprintf(previous, sizeof(previous), "%s", (const char*)value);
+    }
+    sqlite3_finalize(old);
+  }
+
   char blobpath[1024];
-  sb_r2_blob_path(blobpath, sizeof(blobpath), path, bucket, key);
+  sb_r2_blob_path(blobpath, sizeof(blobpath), path, bucket, key, etag);
   sb_mkdirs(blobpath);
-  FILE* f = fopen(blobpath, "wb");
+  char temporary[1100];
+  snprintf(temporary, sizeof(temporary), "%s.tmp", blobpath);
+  FILE* f = fopen(temporary, "wb");
   if (!f) { sb_puts(&out, "{\"ok\":false,\"error\":\"cannot write object\"}"); return out.p; }
   size_t written = bodylen ? fwrite(body, 1, bodylen, f) : 0;
-  fclose(f);
-  if (written != bodylen) { sb_puts(&out, "{\"ok\":false,\"error\":\"short write\"}"); return out.p; }
+  int close_rc = fclose(f);
+  if (written != bodylen || close_rc != 0 || rename(temporary, blobpath) != 0) {
+    unlink(temporary);
+    sb_puts(&out, "{\"ok\":false,\"error\":\"object write failed\"}");
+    return out.p;
+  }
 
   sqlite3_stmt* st = 0;
   const char* sql =
-    "INSERT INTO r2 (bucket, key, size, etag, uploaded, http_json, custom_json) VALUES (?1,?2,?3,?4,?5,?6,?7) "
-    "ON CONFLICT (bucket, key) DO UPDATE SET size=?3, etag=?4, uploaded=?5, http_json=?6, custom_json=?7";
+    "INSERT INTO r2 (bucket, key, size, etag, uploaded, http_json, custom_json, blob_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) "
+    "ON CONFLICT (bucket, key) DO UPDATE SET size=?3, etag=?4, uploaded=?5, http_json=?6, custom_json=?7, blob_id=?8";
   if (sqlite3_prepare_v2(db, sql, -1, &st, 0) != 0 || !st) {
+    if (strcmp(previous, etag) != 0) unlink(blobpath);
     sb_puts(&out, "{\"ok\":false,\"error\":");
     const char* m = sqlite3_errmsg(db);
     sb_putjson(&out, m, strlen(m));
@@ -336,9 +506,23 @@ static char* sb_r2_put_c(const char* path, const char* bucket, const char* key, 
   sqlite3_bind_text(st, 5, uploaded, -1, SB_SQLITE_TRANSIENT);
   sqlite3_bind_text(st, 6, http_json && *http_json ? http_json : "{}", -1, SB_SQLITE_TRANSIENT);
   sqlite3_bind_text(st, 7, custom_json && *custom_json ? custom_json : "{}", -1, SB_SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 8, etag, -1, SB_SQLITE_TRANSIENT);
   int rc = sqlite3_step(st);
   sqlite3_finalize(st);
-  if (rc != SB_SQLITE_DONE) { sb_puts(&out, "{\"ok\":false,\"error\":\"r2 put failed\"}"); return out.p; }
+  if (rc != SB_SQLITE_DONE) {
+    if (strcmp(previous, etag) != 0) unlink(blobpath);
+    sb_puts(&out, "{\"ok\":false,\"error\":\"r2 put failed\"}");
+    return out.p;
+  }
+  if (previous[0] && strcmp(previous, etag) != 0) {
+    char oldpath[1024];
+    sb_r2_blob_path(oldpath, sizeof(oldpath), path, bucket, key, previous);
+    unlink(oldpath);
+  } else if (!previous[0]) {
+    char legacy[1024];
+    sb_r2_blob_path(legacy, sizeof(legacy), path, bucket, key, "");
+    if (strcmp(legacy, blobpath) != 0) unlink(legacy);
+  }
 
   char head[256];
   int k = snprintf(head, sizeof(head), "{\"ok\":true,\"etag\":\"%s\",\"size\":%zu,\"uploaded\":\"%s\"}", etag, bodylen, uploaded);
@@ -350,7 +534,7 @@ static char* sb_r2_put_c(const char* path, const char* bucket, const char* key, 
 // read) plus the bytestring's own allocation — no SQLite page-cache copy on
 // top, and no growing single database file holding every object ever put.
 // Returns the bytestring pointer, or 0.
-static u32 sb_r2_get_c(const char* path, const char* bucket, const char* key, int* found) {
+static u32 sb_r2_get_c(const char* path, const char* bucket, const char* key, const char* generation, int* found) {
   *found = 0;
   int idx = sb_db_for(path);
   if (idx < 0) return 0;
@@ -363,7 +547,7 @@ static u32 sb_r2_get_c(const char* path, const char* bucket, const char* key, in
   if (!has_row) return 0;
 
   char blobpath[1024];
-  sb_r2_blob_path(blobpath, sizeof(blobpath), path, bucket, key);
+  sb_r2_blob_path(blobpath, sizeof(blobpath), path, bucket, key, generation);
   FILE* f = fopen(blobpath, "rb");
   // A metadata row with no blob file (deleted out from under it, disk issue)
   // reads as not-found rather than crashing.
@@ -384,9 +568,9 @@ static u32 sb_r2_get_c(const char* path, const char* bucket, const char* key, in
 
 // Best-effort: a metadata row deleted with no blob file (or vice versa) is
 // still a correct end state, so a missing file here is not an error.
-static void sb_r2_delete_blob(const char* path, const char* bucket, const char* key) {
+static void sb_r2_delete_blob(const char* path, const char* bucket, const char* key, const char* generation) {
   char blobpath[1024];
-  sb_r2_blob_path(blobpath, sizeof(blobpath), path, bucket, key);
+  sb_r2_blob_path(blobpath, sizeof(blobpath), path, bucket, key, generation);
   unlink(blobpath);
 }
 
@@ -1008,9 +1192,10 @@ function __sbR2PutRaw(path, bucket, key, body, httpJson, customJson) {
   return res;
 }
 
-// R2 get: the bytes come back as a bytestring, not inside a reply frame.
+// Multipart parts are persisted individually. Completion streams them through
+// a fixed 64 KiB C buffer, so the standalone heap never holds the whole object.
 // oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
-function __sbR2GetRaw(path, bucket, key) {
+function __sbR2MultipartPutRaw(path, bucket, key, uploadId, partNumberText, body) {
   let res = "";
   // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
   Porffor.c`
@@ -1029,18 +1214,93 @@ function __sbR2GetRaw(path, bucket, key) {
     char* __key = (char*)malloc(__kl + 1); memcpy(__key, __k, __kl); __key[__kl] = 0;
     if (__ko) free(__ko);
 
-    int __found = 0;
-    u32 __bs = sb_r2_get_c(__path, __bucket, __key, &__found);
-    free(__path); free(__bucket); free(__key);
-    if (__found) res = porf_box((f64)__bs, 195);
+    const char* __u; size_t __ul; char* __uo = 0;
+    porf_native_fetch_read_value(uploadId, &__u, &__ul, &__uo);
+    char* __upload = (char*)malloc(__ul + 1); memcpy(__upload, __u, __ul); __upload[__ul] = 0;
+    if (__uo) free(__uo);
+
+    const char* __pn; size_t __pnl; char* __pno = 0;
+    porf_native_fetch_read_value(partNumberText, &__pn, &__pnl, &__pno);
+    char __partbuf[16];
+    size_t __partlen = __pnl < sizeof(__partbuf) - 1 ? __pnl : sizeof(__partbuf) - 1;
+    memcpy(__partbuf, __pn, __partlen); __partbuf[__partlen] = 0;
+    if (__pno) free(__pno);
+
+    const char* __b; size_t __bl; char* __bo = 0;
+    if (porf_native_fetch_read_raw_bytes(body, &__b, &__bl) != 0) {
+      porf_native_fetch_read_value(body, &__b, &__bl, &__bo);
+    }
+    char* __out = sb_r2_part_put_c(__path, __bucket, __key, __upload, atoi(__partbuf), __b, __bl);
+    if (__bo) free(__bo);
+    free(__path); free(__bucket); free(__key); free(__upload);
+    if (__out) {
+      res = porf_box((f64)porf_native_fetch_alloc_bytestring(__out, strlen(__out)), 195);
+      free(__out);
+    }
   `;
   return res;
 }
 
-// R2 delete: also removes the object's own file, not just the metadata row
-// (#56 — sb_r2_delete_blob is best-effort, a missing file is not an error).
 // oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
-function __sbR2DeleteRaw(path, bucket, key) {
+function __sbR2MultipartCompleteRaw(path, bucket, key, uploadId) {
+  let res = "";
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    const char* __p; size_t __pl; char* __po = 0;
+    porf_native_fetch_read_value(path, &__p, &__pl, &__po);
+    char* __path = (char*)malloc(__pl + 1); memcpy(__path, __p, __pl); __path[__pl] = 0;
+    if (__po) free(__po);
+    const char* __bk; size_t __bkl; char* __bko = 0;
+    porf_native_fetch_read_value(bucket, &__bk, &__bkl, &__bko);
+    char* __bucket = (char*)malloc(__bkl + 1); memcpy(__bucket, __bk, __bkl); __bucket[__bkl] = 0;
+    if (__bko) free(__bko);
+    const char* __k; size_t __kl; char* __ko = 0;
+    porf_native_fetch_read_value(key, &__k, &__kl, &__ko);
+    char* __key = (char*)malloc(__kl + 1); memcpy(__key, __k, __kl); __key[__kl] = 0;
+    if (__ko) free(__ko);
+    const char* __u; size_t __ul; char* __uo = 0;
+    porf_native_fetch_read_value(uploadId, &__u, &__ul, &__uo);
+    char* __upload = (char*)malloc(__ul + 1); memcpy(__upload, __u, __ul); __upload[__ul] = 0;
+    if (__uo) free(__uo);
+    char* __out = sb_r2_multipart_complete_c(__path, __bucket, __key, __upload);
+    free(__path); free(__bucket); free(__key); free(__upload);
+    if (__out) {
+      res = porf_box((f64)porf_native_fetch_alloc_bytestring(__out, strlen(__out)), 195);
+      free(__out);
+    }
+  `;
+  return res;
+}
+
+// oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
+function __sbR2MultipartDeleteRaw(path, bucket, key, uploadId) {
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    const char* __p; size_t __pl; char* __po = 0;
+    porf_native_fetch_read_value(path, &__p, &__pl, &__po);
+    char* __path = (char*)malloc(__pl + 1); memcpy(__path, __p, __pl); __path[__pl] = 0;
+    if (__po) free(__po);
+    const char* __bk; size_t __bkl; char* __bko = 0;
+    porf_native_fetch_read_value(bucket, &__bk, &__bkl, &__bko);
+    char* __bucket = (char*)malloc(__bkl + 1); memcpy(__bucket, __bk, __bkl); __bucket[__bkl] = 0;
+    if (__bko) free(__bko);
+    const char* __k; size_t __kl; char* __ko = 0;
+    porf_native_fetch_read_value(key, &__k, &__kl, &__ko);
+    char* __key = (char*)malloc(__kl + 1); memcpy(__key, __k, __kl); __key[__kl] = 0;
+    if (__ko) free(__ko);
+    const char* __u; size_t __ul; char* __uo = 0;
+    porf_native_fetch_read_value(uploadId, &__u, &__ul, &__uo);
+    char* __upload = (char*)malloc(__ul + 1); memcpy(__upload, __u, __ul); __upload[__ul] = 0;
+    if (__uo) free(__uo);
+    sb_r2_multipart_delete_parts_c(__path, __bucket, __key, __upload);
+    free(__path); free(__bucket); free(__key); free(__upload);
+  `;
+}
+
+// R2 get: the bytes come back as a bytestring, not inside a reply frame.
+// oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
+function __sbR2GetRaw(path, bucket, key, blobId) {
+  let res = "";
   // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
   Porffor.c`
     const char* __p; size_t __pl; char* __po = 0;
@@ -1058,8 +1318,47 @@ function __sbR2DeleteRaw(path, bucket, key) {
     char* __key = (char*)malloc(__kl + 1); memcpy(__key, __k, __kl); __key[__kl] = 0;
     if (__ko) free(__ko);
 
-    sb_r2_delete_blob(__path, __bucket, __key);
-    free(__path); free(__bucket); free(__key);
+    const char* __g; size_t __gl; char* __go = 0;
+    porf_native_fetch_read_value(blobId, &__g, &__gl, &__go);
+    char* __generation = (char*)malloc(__gl + 1); memcpy(__generation, __g, __gl); __generation[__gl] = 0;
+    if (__go) free(__go);
+
+    int __found = 0;
+    u32 __bs = sb_r2_get_c(__path, __bucket, __key, __generation, &__found);
+    free(__path); free(__bucket); free(__key); free(__generation);
+    if (__found) res = porf_box((f64)__bs, 195);
+  `;
+  return res;
+}
+
+// R2 delete: also removes the object's own file, not just the metadata row
+// (#56 — sb_r2_delete_blob is best-effort, a missing file is not an error).
+// oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
+function __sbR2DeleteRaw(path, bucket, key, blobId) {
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    const char* __p; size_t __pl; char* __po = 0;
+    porf_native_fetch_read_value(path, &__p, &__pl, &__po);
+    char* __path = (char*)malloc(__pl + 1); memcpy(__path, __p, __pl); __path[__pl] = 0;
+    if (__po) free(__po);
+
+    const char* __bk; size_t __bkl; char* __bko = 0;
+    porf_native_fetch_read_value(bucket, &__bk, &__bkl, &__bko);
+    char* __bucket = (char*)malloc(__bkl + 1); memcpy(__bucket, __bk, __bkl); __bucket[__bkl] = 0;
+    if (__bko) free(__bko);
+
+    const char* __k; size_t __kl; char* __ko = 0;
+    porf_native_fetch_read_value(key, &__k, &__kl, &__ko);
+    char* __key = (char*)malloc(__kl + 1); memcpy(__key, __k, __kl); __key[__kl] = 0;
+    if (__ko) free(__ko);
+
+    const char* __g; size_t __gl; char* __go = 0;
+    porf_native_fetch_read_value(blobId, &__g, &__gl, &__go);
+    char* __generation = (char*)malloc(__gl + 1); memcpy(__generation, __g, __gl); __generation[__gl] = 0;
+    if (__go) free(__go);
+
+    sb_r2_delete_blob(__path, __bucket, __key, __generation);
+    free(__path); free(__bucket); free(__key); free(__generation);
   `;
 }
 
@@ -1253,8 +1552,33 @@ function __sbEnsureSchema() {
     s,
     "CREATE TABLE IF NOT EXISTS r2 (bucket TEXT NOT NULL, key TEXT NOT NULL, size INTEGER NOT NULL, " +
       "etag TEXT NOT NULL, uploaded TEXT NOT NULL, http_json TEXT NOT NULL DEFAULT '{}', custom_json TEXT NOT NULL DEFAULT '{}', " +
+      "blob_id TEXT, " +
       "PRIMARY KEY (bucket, key))",
   );
+  const r2Columns = __sbSql(s, "PRAGMA table_info(r2)", []).rows;
+  let hasBlobId = false;
+  for (let i = 0; i < r2Columns.length; i++) if (r2Columns[i][1] === "blob_id") hasBlobId = true;
+  if (!hasBlobId) __sbSql(s, "ALTER TABLE r2 ADD COLUMN blob_id TEXT", []);
+  __sbSql(
+    s,
+    "CREATE TABLE IF NOT EXISTS r2_upload (bucket TEXT NOT NULL, key TEXT NOT NULL, upload_id TEXT NOT NULL, " +
+      "uploaded TEXT NOT NULL, http_json TEXT NOT NULL DEFAULT '{}', custom_json TEXT NOT NULL DEFAULT '{}', " +
+      "PRIMARY KEY (bucket, key, upload_id))",
+  );
+  __sbSql(
+    s,
+    "CREATE TABLE IF NOT EXISTS r2_part (bucket TEXT NOT NULL, key TEXT NOT NULL, upload_id TEXT NOT NULL, " +
+      "part_number INTEGER NOT NULL, size INTEGER NOT NULL, etag TEXT NOT NULL, " +
+      "PRIMARY KEY (bucket, key, upload_id, part_number))",
+  );
+  const expired = __sbSql(s, "SELECT bucket, key, upload_id FROM r2_upload WHERE uploaded < ?", [
+    new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString(),
+  ]).rows;
+  for (let i = 0; i < expired.length; i++) {
+    __sbR2MultipartDeleteRaw(s, String(expired[i][0]), String(expired[i][1]), String(expired[i][2]));
+    __sbSql(s, "DELETE FROM r2_part WHERE bucket = ? AND key = ? AND upload_id = ?", expired[i]);
+    __sbSql(s, "DELETE FROM r2_upload WHERE bucket = ? AND key = ? AND upload_id = ?", expired[i]);
+  }
   __sbSql(
     s,
     "CREATE TABLE IF NOT EXISTS mq (queue TEXT NOT NULL, id TEXT PRIMARY KEY, body TEXT NOT NULL, " +
@@ -1461,13 +1785,121 @@ function __sbEmbeddedDispatch(msg) {
     if (reply.ok === false) throw new Error("r2 put: " + reply.error);
     return { ok: true, object: { key: msg.key, size: reply.size, etag: reply.etag, uploaded: reply.uploaded } };
   }
+  if (op === "r2.multipart.create") {
+    const uploadId = String(msg.uploadId || __sbHex(16));
+    __sbSql(
+      store,
+      "INSERT INTO r2_upload (bucket, key, upload_id, uploaded, http_json, custom_json) VALUES (?1,?2,?3,?4,?5,?6) " +
+        "ON CONFLICT (bucket, key, upload_id) DO NOTHING",
+      [
+        msg.bucket,
+        msg.key,
+        uploadId,
+        new Date().toISOString(),
+        JSON.stringify(msg.httpMetadata || {}),
+        JSON.stringify(msg.customMetadata || {}),
+      ],
+    );
+    return { ok: true, key: msg.key, uploadId };
+  }
+  if (op === "r2.multipart.complete") {
+    const upload = __sbSql(
+      store,
+      "SELECT http_json, custom_json FROM r2_upload WHERE bucket = ? AND key = ? AND upload_id = ?",
+      [msg.bucket, msg.key, msg.uploadId],
+    );
+    if (!upload.rows.length) throw new Error("multipart upload not found");
+    const stored = __sbSql(
+      store,
+      "SELECT part_number, size, etag FROM r2_part WHERE bucket = ? AND key = ? AND upload_id = ? ORDER BY part_number",
+      [msg.bucket, msg.key, msg.uploadId],
+    ).rows;
+    const requested = msg.parts || [];
+    if (!requested.length) throw new Error("complete requires at least one uploaded part");
+    if (requested.length !== stored.length) throw new Error("uploaded parts do not match");
+    for (let i = 0; i < stored.length; i++) {
+      const part = requested[i] || {};
+      const partNumber = Number(part.partNumber);
+      if (partNumber !== Number(stored[i][0]) || String(part.etag || "") !== String(stored[i][2]))
+        throw new Error("uploaded parts do not match");
+      if (i > 0 && partNumber <= Number(requested[i - 1].partNumber))
+        throw new Error("uploaded parts must be ordered by partNumber");
+      if (i < stored.length - 1 && Number(stored[i][1]) !== Number(stored[0][1]))
+        throw new Error("all multipart parts except the last must have the same size");
+      if (i === stored.length - 1 && stored.length > 1 && Number(stored[i][1]) > Number(stored[0][1]))
+        throw new Error("the last multipart part cannot be larger than the others");
+    }
+    const previous = __sbSql(store, "SELECT blob_id FROM r2 WHERE bucket = ? AND key = ?", [msg.bucket, msg.key]);
+    const completed = JSON.parse(
+      __sbR2MultipartCompleteRaw(store, String(msg.bucket), String(msg.key), String(msg.uploadId)),
+    );
+    if (completed.ok === false) throw new Error("r2 multipart complete: " + completed.error);
+    const uploaded = new Date().toISOString();
+    try {
+      __sbSql(
+        store,
+        "INSERT INTO r2 (bucket, key, size, etag, uploaded, http_json, custom_json, blob_id) " +
+          "VALUES (?1,?2,?3,?4,?5,?6,?7,?8) " +
+          "ON CONFLICT (bucket, key) DO UPDATE SET size=?3, etag=?4, uploaded=?5, http_json=?6, custom_json=?7, blob_id=?8",
+        [msg.bucket, msg.key, completed.size, completed.etag, uploaded, upload.rows[0][0], upload.rows[0][1], completed.etag],
+      );
+    } catch (error) {
+      if (!previous.rows.length || String(previous.rows[0][0] || "") !== String(completed.etag))
+        __sbR2DeleteRaw(store, String(msg.bucket), String(msg.key), String(completed.etag));
+      throw error;
+    }
+    if (previous.rows.length && String(previous.rows[0][0] || "") !== String(completed.etag))
+      __sbR2DeleteRaw(store, String(msg.bucket), String(msg.key), String(previous.rows[0][0] || ""));
+    __sbR2MultipartDeleteRaw(store, String(msg.bucket), String(msg.key), String(msg.uploadId));
+    __sbSql(store, "DELETE FROM r2_part WHERE bucket = ? AND key = ? AND upload_id = ?", [
+      msg.bucket,
+      msg.key,
+      msg.uploadId,
+    ]);
+    __sbSql(store, "DELETE FROM r2_upload WHERE bucket = ? AND key = ? AND upload_id = ?", [
+      msg.bucket,
+      msg.key,
+      msg.uploadId,
+    ]);
+    return {
+      ok: true,
+      object: {
+        key: msg.key,
+        size: completed.size,
+        etag: completed.etag,
+        uploaded,
+        httpMetadata: JSON.parse(upload.rows[0][0] || "{}"),
+        customMetadata: JSON.parse(upload.rows[0][1] || "{}"),
+      },
+    };
+  }
+  if (op === "r2.multipart.abort") {
+    const upload = __sbSql(
+      store,
+      "SELECT 1 FROM r2_upload WHERE bucket = ? AND key = ? AND upload_id = ?",
+      [msg.bucket, msg.key, msg.uploadId],
+    );
+    if (!upload.rows.length) throw new Error("multipart upload not found");
+    __sbR2MultipartDeleteRaw(store, String(msg.bucket), String(msg.key), String(msg.uploadId));
+    __sbSql(store, "DELETE FROM r2_part WHERE bucket = ? AND key = ? AND upload_id = ?", [
+      msg.bucket,
+      msg.key,
+      msg.uploadId,
+    ]);
+    __sbSql(store, "DELETE FROM r2_upload WHERE bucket = ? AND key = ? AND upload_id = ?", [
+      msg.bucket,
+      msg.key,
+      msg.uploadId,
+    ]);
+    return { ok: true };
+  }
   if (op === "r2.get" || op === "r2.head") {
     // head must not read the blob file: reading an 8 MB object only to drop
     // it costs the read and a full JSON escape for nothing.
     const wantsBody = op === "r2.get";
     const r = __sbSql(
       store,
-      "SELECT size, etag, uploaded, http_json, custom_json FROM r2 WHERE bucket = ? AND key = ?",
+      "SELECT size, etag, uploaded, http_json, custom_json, blob_id FROM r2 WHERE bucket = ? AND key = ?",
       [msg.bucket, msg.key],
     );
     if (!r.rows.length) return { ok: true, found: false };
@@ -1484,12 +1916,15 @@ function __sbEmbeddedDispatch(msg) {
         httpMetadata: JSON.parse(row[3] || "{}"),
         customMetadata: JSON.parse(row[4] || "{}"),
       },
-      body: wantsBody ? __sbR2GetRaw(store, String(msg.bucket), String(msg.key)) : undefined,
+      blobId: row[5] || "",
+      body: wantsBody ? __sbR2GetRaw(store, String(msg.bucket), String(msg.key), String(row[5] || "")) : undefined,
     };
   }
   if (op === "r2.delete") {
+    const existing = __sbSql(store, "SELECT blob_id FROM r2 WHERE bucket = ? AND key = ?", [msg.bucket, msg.key]);
     __sbSql(store, "DELETE FROM r2 WHERE bucket = ? AND key = ?", [msg.bucket, msg.key]);
-    __sbR2DeleteRaw(store, String(msg.bucket), String(msg.key));
+    if (existing.rows.length)
+      __sbR2DeleteRaw(store, String(msg.bucket), String(msg.key), String(existing.rows[0][0] || ""));
     return { ok: true };
   }
   if (op === "r2.list") {
@@ -1671,7 +2106,33 @@ globalThis.__sbR2Get = function (bucket, key) {
   // Metadata through the normal path (small), bytes through their own.
   const meta = __sbEmbeddedDispatch({ op: "r2.head", bucket, key });
   if (!meta.found) return { found: false };
-  return { found: true, object: meta.object, body: __sbR2GetRaw(__sbStore(), String(bucket), String(key)) };
+  return {
+    found: true,
+    object: meta.object,
+    body: __sbR2GetRaw(__sbStore(), String(bucket), String(key), String(meta.blobId || "")),
+  };
+};
+
+globalThis.__sbR2MultipartPut = function (bucket, key, uploadId, partNumber, body) {
+  __sbEnsureSchema();
+  const store = __sbStore();
+  const upload = __sbSql(
+    store,
+    "SELECT 1 FROM r2_upload WHERE bucket = ? AND key = ? AND upload_id = ?",
+    [bucket, key, uploadId],
+  );
+  if (!upload.rows.length) throw new Error("sproutboat r2.multipart.put: multipart upload not found");
+  const reply = JSON.parse(
+    __sbR2MultipartPutRaw(store, String(bucket), String(key), String(uploadId), String(partNumber), body),
+  );
+  if (reply.ok === false) throw new Error("sproutboat r2.multipart.put: " + reply.error);
+  __sbSql(
+    store,
+    "INSERT INTO r2_part (bucket, key, upload_id, part_number, size, etag) VALUES (?1,?2,?3,?4,?5,?6) " +
+      "ON CONFLICT (bucket, key, upload_id, part_number) DO UPDATE SET size=?5, etag=?6",
+    [bucket, key, uploadId, partNumber, reply.size, reply.etag],
+  );
+  return { ok: true, part: { partNumber, etag: reply.etag } };
 };
 
 globalThis.__sbAssetsGet = function (path) {
