@@ -1,5 +1,33 @@
 # @sproutboat/wire
 
+## 0.7.0
+
+### Minor Changes
+
+- 493e4e3: Add short-lived R2 direct-transfer tickets for broker-backed sprouts. A
+  loopback HTTP listener streams PUT bodies to file-backed R2 storage, and serves
+  GET and HEAD requests with single-range support without placing object bytes
+  in a binding frame.
+  
+  Tickets are random bearer capabilities with a byte limit, expiry, one-use
+  claim, and optional SHA-256 verification. Native standalone direct transfers
+  remain unavailable until the native HTTP ingress can stream request bodies.
+  
+  For broker deployments, ticket issuance now reserves account-level capacity
+  across every R2 resource. Reservations survive redeploys, expired and orphaned
+  temporary uploads are reclaimed, and the broker retains a configurable free
+  disk floor with capacity and rejected-transfer counters for the dashboard.
+- 5acb93c: Add Cloudflare-shaped resumable R2 multipart uploads. Parts are persisted
+  independently, and standalone completion assembles the final object through a
+  fixed 64 KiB native buffer to keep memory bounded by part size rather than total
+  object size.
+  
+  Unfinished multipart uploads expire after seven days and their persisted part
+  files are removed automatically.
+  
+  Store completed objects as immutable blob generations so a failed overwrite
+  cannot expose new bytes under the previous metadata.
+
 ## 0.6.0
 
 ### Minor Changes
