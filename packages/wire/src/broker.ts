@@ -19,7 +19,7 @@
  */
 import { Database, type Statement } from "bun:sqlite";
 import { createHash, randomBytes } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statfsSync, statSync, writeFileSync } from "node:fs";
 import { open } from "node:fs/promises";
 import { dirname, join, normalize, resolve } from "node:path";
 import { parseArgs } from "node:util";
@@ -85,6 +85,16 @@ export type BrokerOptions = {
    * data outlives a redeploy.
    */
   resourceDir?: string;
+  /** Account whose R2 resources this broker may mutate. */
+  ownerId?: string;
+  /** Account-wide R2 byte ceiling. Zero disables the ceiling for local development. */
+  r2QuotaBytes?: number;
+  /** Resource ids belonging to ownerId, used to seed the shared R2 usage ledger. */
+  r2ResourceIds?: string[];
+  /** Free disk capacity retained while direct R2 uploads are accepted. */
+  r2MinFreeBytes?: number;
+  /** Test hook for checking the filesystem capacity available to temporary uploads. */
+  freeBytes?: (path: string) => number;
   token?: string;
   bindings?: Partial<Bindings>;
   secrets?: Record<string, string>;
@@ -330,6 +340,123 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       resourceDbs.set(id, conn);
     }
     return conn;
+  };
+
+  const quotaOwner = opts.ownerId;
+  const quotaBytes = opts.r2QuotaBytes && opts.r2QuotaBytes > 0 ? opts.r2QuotaBytes : null;
+  const quotaDirectory = resourceDir;
+  if (quotaOwner && quotaDirectory && quotaBytes) mkdirSync(quotaDirectory, { recursive: true });
+  // One ledger for every account, shared by the brokers of all its deployments.
+  // Ticket reservations are recorded before an upload begins, so four accepted
+  // requests cannot each independently decide that the same remaining bytes fit.
+  const quotaDb = quotaOwner && quotaDirectory && quotaBytes
+    ? new Database(join(quotaDirectory, "r2-quota.sqlite"), { create: true })
+    : null;
+  if (quotaDb) {
+    const owner = quotaOwner!;
+    quotaDb.exec("PRAGMA journal_mode = WAL");
+    quotaDb.exec(
+      "CREATE TABLE IF NOT EXISTS r2_account_quota (owner TEXT PRIMARY KEY, used_bytes INTEGER NOT NULL, reserved_bytes INTEGER NOT NULL)",
+    );
+    quotaDb.exec(
+      "CREATE TABLE IF NOT EXISTS r2_quota_reservation (token TEXT PRIMARY KEY, owner TEXT NOT NULL, bytes INTEGER NOT NULL, expires INTEGER NOT NULL)",
+    );
+    quotaDb.exec(
+      "CREATE TABLE IF NOT EXISTS r2_transfer_metric (owner TEXT PRIMARY KEY, tickets_issued INTEGER NOT NULL DEFAULT 0, rejected_quota INTEGER NOT NULL DEFAULT 0, rejected_disk INTEGER NOT NULL DEFAULT 0, rejected_size INTEGER NOT NULL DEFAULT 0)",
+    );
+    const existing = quotaDb.query<{ owner: string }, [string]>("SELECT owner FROM r2_account_quota WHERE owner = ?").get(owner);
+    if (!existing) {
+      quotaDb.query("INSERT INTO r2_account_quota (owner, used_bytes, reserved_bytes) VALUES (?1, 0, 0)").run(owner);
+    }
+    quotaDb.query("INSERT OR IGNORE INTO r2_transfer_metric (owner) VALUES (?)").run(owner);
+  }
+
+  const committedR2Bytes = (): number => {
+    if (!quotaDirectory) return 0;
+    let used = 0;
+    for (const id of opts.r2ResourceIds ?? []) {
+      const path = join(quotaDirectory, `${id}.sqlite`);
+      if (!existsSync(path)) continue;
+      const store = new Database(path, { readonly: true });
+      try {
+        used += store.query<{ bytes: number }, []>("SELECT COALESCE(SUM(size), 0) AS bytes FROM r2").get()?.bytes ?? 0;
+      } finally {
+        store.close();
+      }
+    }
+    return used;
+  };
+
+  const availableBytes = (): number => {
+    if (!quotaDirectory) return Number.POSITIVE_INFINITY;
+    if (opts.freeBytes) return opts.freeBytes(quotaDirectory);
+    const stats = statfsSync(quotaDirectory);
+    return Number(stats.bavail) * Number(stats.bsize);
+  };
+
+  const releaseExpiredR2Reservations = (now = Date.now()): void => {
+    if (!quotaDb || !quotaOwner) return;
+    quotaDb.query("DELETE FROM r2_quota_reservation WHERE owner = ?1 AND expires < ?2").run(quotaOwner, now);
+    const reserved = quotaDb.query<{ bytes: number }, [string]>(
+      "SELECT COALESCE(SUM(bytes), 0) AS bytes FROM r2_quota_reservation WHERE owner = ?",
+    ).get(quotaOwner)?.bytes ?? 0;
+    quotaDb.query("UPDATE r2_account_quota SET reserved_bytes = ?1 WHERE owner = ?2").run(reserved, quotaOwner);
+  };
+
+  const reserveR2 = (token: string, bytes: number, expires: number): "ok" | "quota" | "disk" => {
+    if (!quotaDb || !quotaOwner || !quotaBytes) return "ok";
+    quotaDb.exec("BEGIN IMMEDIATE");
+    try {
+      releaseExpiredR2Reservations();
+      const used = committedR2Bytes();
+      const reserved = quotaDb.query<{ bytes: number }, [string]>(
+        "SELECT COALESCE(SUM(bytes), 0) AS bytes FROM r2_quota_reservation WHERE owner = ?",
+      ).get(quotaOwner)?.bytes ?? 0;
+      quotaDb.query("UPDATE r2_account_quota SET used_bytes = ?1, reserved_bytes = ?2 WHERE owner = ?3").run(used, reserved, quotaOwner);
+      if (used + reserved + bytes > quotaBytes) {
+        quotaDb.exec("ROLLBACK");
+        return "quota";
+      }
+      const floor = Math.max(opts.r2MinFreeBytes ?? 0, 0);
+      if (availableBytes() < bytes + floor) {
+        quotaDb.exec("ROLLBACK");
+        return "disk";
+      }
+      quotaDb.query("INSERT INTO r2_quota_reservation (token, owner, bytes, expires) VALUES (?1, ?2, ?3, ?4)").run(token, quotaOwner, bytes, expires);
+      quotaDb.query("UPDATE r2_account_quota SET reserved_bytes = ?1 WHERE owner = ?2").run(reserved + bytes, quotaOwner);
+      quotaDb.exec("COMMIT");
+      return "ok";
+    } catch (error) {
+      quotaDb.exec("ROLLBACK");
+      throw error;
+    }
+  };
+
+  const settleR2 = (token: string): void => {
+    if (!quotaDb || !quotaOwner) return;
+    quotaDb.exec("BEGIN IMMEDIATE");
+    try {
+      const reservation = quotaDb.query<{ bytes: number }, [string]>("SELECT bytes FROM r2_quota_reservation WHERE token = ?").get(token);
+      if (!reservation) {
+        quotaDb.exec("COMMIT");
+        return;
+      }
+      quotaDb.query("DELETE FROM r2_quota_reservation WHERE token = ?").run(token);
+      const used = committedR2Bytes();
+      const reserved = quotaDb.query<{ bytes: number }, [string]>(
+        "SELECT COALESCE(SUM(bytes), 0) AS bytes FROM r2_quota_reservation WHERE owner = ?",
+      ).get(quotaOwner)?.bytes ?? 0;
+      quotaDb.query("UPDATE r2_account_quota SET used_bytes = ?1, reserved_bytes = ?2 WHERE owner = ?3").run(used, reserved, quotaOwner);
+      quotaDb.exec("COMMIT");
+    } catch (error) {
+      quotaDb.exec("ROLLBACK");
+      throw error;
+    }
+  };
+
+  const recordR2TransferMetric = (field: "tickets_issued" | "rejected_quota" | "rejected_disk" | "rejected_size"): void => {
+    if (!quotaDb || !quotaOwner) return;
+    quotaDb.query(`UPDATE r2_transfer_metric SET ${field} = ${field} + 1 WHERE owner = ?`).run(quotaOwner);
   };
 
   /**
@@ -703,12 +830,15 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   const cleanupTransferTemps = (store: Database): void => {
     const directory = r2BlobDir(store);
     if (!directory || !existsSync(directory)) return;
+    const now = Date.now();
     const cutoff = Date.now() - 24 * 60 * 60 * 1000;
     for (const name of readdirSync(directory)) {
       if (!/^[0-9a-f]{24}\.upload\.tmp$/.test(name)) continue;
       const path = join(directory, name);
       try {
-        if (statSync(path).mtimeMs < cutoff) rmSync(path);
+        const tokenValue = name.slice(0, 24);
+        const ticket = store.query<{ expires: number }, [string]>("SELECT expires FROM r2_transfer WHERE token = ?").get(tokenValue);
+        if (!ticket || ticket.expires < now || statSync(path).mtimeMs < cutoff) rmSync(path);
       } catch (error) {
         if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
       }
@@ -831,12 +961,13 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       const etag = hash.digest("hex");
       if (ticket.expected_sha256 && ticket.expected_sha256 !== etag) {
         rmSync(temporary);
+        settleR2(tokenValue);
         return Response.json({ error: "sha256 mismatch", actual: etag }, { status: 422 });
       }
       const destination = r2BlobPath(store, bucket, ticket.key, etag)!;
       renameSync(temporary, destination);
       const previous = store
-        .query<Pick<R2Row, "blob_id">, [string, string]>("SELECT blob_id FROM r2 WHERE bucket = ? AND key = ?")
+        .query<Pick<R2Row, "blob_id" | "size">, [string, string]>("SELECT blob_id, size FROM r2 WHERE bucket = ? AND key = ?")
         .get(bucket, ticket.key);
       const row: R2Row = {
         key: ticket.key,
@@ -848,6 +979,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         blob_id: etag,
       };
       commitR2Metadata(store, bucket, row, previous);
+      settleR2(tokenValue);
       return Response.json({ object: r2Row(row) }, { status: 201, headers: { etag: `"${etag}"` } });
     } catch (error) {
       try {
@@ -856,7 +988,15 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         // Preserve the original upload failure while releasing the file sink.
       }
       if (existsSync(temporary)) rmSync(temporary);
-      if (error instanceof RangeError) return new Response(error.message, { status: 413 });
+      settleR2(tokenValue);
+      if (error instanceof RangeError) {
+        recordR2TransferMetric("rejected_size");
+        return new Response(error.message, { status: 413 });
+      }
+      if (error instanceof Error && "code" in error && error.code === "ENOSPC") {
+        recordR2TransferMetric("rejected_disk");
+        return new Response("R2 storage is temporarily unavailable", { status: 507 });
+      }
       throw error;
     } finally {
       activeUploads--;
@@ -1176,22 +1316,37 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         store.query("DELETE FROM r2_transfer WHERE expires < ? OR used = 1").run(Date.now());
         cleanupTransferTemps(store);
         const tokenValue = randomBytes(12).toString("hex");
-        store
-          .query(
-            "INSERT INTO r2_transfer (token, bucket, key, method, expires, max_bytes, expected_sha256, http_json, custom_json) " +
-              "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-          )
-          .run(
-            tokenValue,
-            bucket,
-            key,
-            method,
-            expires,
-            maxBytes,
-            expectedSha256,
-            JSON.stringify(msg.httpMetadata ?? {}),
-            JSON.stringify(msg.customMetadata ?? {}),
-          );
+        const reservation = method === "upload" ? reserveR2(tokenValue, maxBytes, expires) : "ok";
+        if (reservation === "quota") {
+          recordR2TransferMetric("rejected_quota");
+          throw new Error("R2 account quota would be exceeded");
+        }
+        if (reservation === "disk") {
+          recordR2TransferMetric("rejected_disk");
+          throw new Error("R2 storage is temporarily unavailable");
+        }
+        try {
+          store
+            .query(
+              "INSERT INTO r2_transfer (token, bucket, key, method, expires, max_bytes, expected_sha256, http_json, custom_json) " +
+                "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            )
+            .run(
+              tokenValue,
+              bucket,
+              key,
+              method,
+              expires,
+              maxBytes,
+              expectedSha256,
+              JSON.stringify(msg.httpMetadata ?? {}),
+              JSON.stringify(msg.customMetadata ?? {}),
+            );
+        } catch (error) {
+          if (reservation === "ok" && method === "upload") settleR2(tokenValue);
+          throw error;
+        }
+        recordR2TransferMetric("tickets_issued");
         return { ok: true, url: transferPath(binding, tokenValue), expiresAt: new Date(expires).toISOString() };
       }
       case "r2.multipart.complete": {
@@ -1821,6 +1976,10 @@ if (import.meta.main) {
       db: { type: "string" },
       "data-dir": { type: "string" },
       "resource-dir": { type: "string" },
+      "owner-id": { type: "string" },
+      "r2-quota-bytes": { type: "string" },
+      "r2-resource-ids": { type: "string" },
+      "r2-min-free-bytes": { type: "string" },
       bindings: { type: "string" },
       secrets: { type: "string" },
       "sprout-url": { type: "string" },
@@ -1869,6 +2028,10 @@ if (import.meta.main) {
     db: values.db,
     dataDir: values["data-dir"],
     resourceDir: values["resource-dir"],
+    ownerId: values["owner-id"],
+    r2QuotaBytes: Number(values["r2-quota-bytes"] ?? process.env.SPROUTBOAT_R2_QUOTA_BYTES) || undefined,
+    r2ResourceIds: values["r2-resource-ids"] ? String(values["r2-resource-ids"]).split(",").filter(Boolean) : undefined,
+    r2MinFreeBytes: Number(values["r2-min-free-bytes"] ?? process.env.SPROUTBOAT_R2_MIN_FREE_BYTES) || undefined,
     token: values.token ?? process.env.SB_BROKER_TOKEN,
     bindings,
     secrets,

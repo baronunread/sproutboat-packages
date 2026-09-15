@@ -214,6 +214,81 @@ test("R2 direct transfer: invalid ranges and oversized bodies never replace an o
   }
 });
 
+test("R2 direct transfer: account quota includes objects and shared in-flight reservations", async () => {
+  const root = mkdtempSync(join(tmpdir(), "sb-r2-quota-"));
+  try {
+    const resourceDir = join(root, "resources");
+    const bindings = {
+      r2: ["UPLOADS"],
+      resources: { UPLOADS: { kind: "r2" as const, id: "uploads" } },
+    };
+    const config = {
+      resourceDir,
+      ownerId: "owner-1",
+      r2QuotaBytes: 10,
+      r2ResourceIds: ["uploads"],
+      bindings,
+    };
+    const first = make({ ...config, db: join(root, "first.sqlite") });
+    const second = make({ ...config, db: join(root, "second.sqlite") });
+
+    await first.dispatch({ op: "r2.put", bucket: "UPLOADS", key: "existing", body: "four" });
+    await expect(first.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "large", method: "upload", maxBytes: 7 }))
+      .rejects.toThrow("quota");
+    const ticket = await first.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "large", method: "upload", maxBytes: 6 });
+    await expect(second.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "other", method: "upload", maxBytes: 1 }))
+      .rejects.toThrow("quota");
+
+    expect((await first.transfer(new Request(`http://127.0.0.1${ticket.url}`, { method: "PUT", body: "five!" }))).status).toBe(201);
+    const replacement = await second.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "other", method: "upload", maxBytes: 1 });
+    expect(replacement.ok).toBe(true);
+    const ledger = new Database(join(resourceDir, "r2-quota.sqlite"), { readonly: true });
+    try {
+      expect(ledger.query<{ tickets_issued: number; rejected_quota: number }, [string]>(
+        "SELECT tickets_issued, rejected_quota FROM r2_transfer_metric WHERE owner = ?",
+      ).get("owner-1")).toEqual({ tickets_issued: 2, rejected_quota: 2 });
+    } finally {
+      ledger.close();
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("R2 direct transfer: failed uploads release their reservation and retain the disk floor", async () => {
+  const root = mkdtempSync(join(tmpdir(), "sb-r2-quota-release-"));
+  try {
+    const config = {
+      db: join(root, "state.sqlite"),
+      resourceDir: join(root, "resources"),
+      ownerId: "owner-1",
+      r2QuotaBytes: 5,
+      r2ResourceIds: ["uploads"],
+      bindings: { r2: ["UPLOADS"], resources: { UPLOADS: { kind: "r2" as const, id: "uploads" } } },
+    };
+    const b = make(config);
+    const ticket = await b.dispatch({
+      op: "r2.transfer.create", bucket: "UPLOADS", key: "bad", method: "upload", maxBytes: 5,
+      sha256: createHash("sha256").update("expected").digest("hex"),
+    });
+    expect((await b.transfer(new Request(`http://127.0.0.1${ticket.url}`, { method: "PUT", body: "wrong" }))).status).toBe(422);
+    expect((await b.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "retry", method: "upload", maxBytes: 5 })).ok).toBe(true);
+
+    const floor = make({ ...config, db: join(root, "floor.sqlite"), r2QuotaBytes: 100, r2MinFreeBytes: 10, freeBytes: () => 11 });
+    await expect(floor.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "no-space", method: "upload", maxBytes: 2 }))
+      .rejects.toThrow("temporarily unavailable");
+
+    const abandoned = join(config.resourceDir, "r2-blobs", "a".repeat(24) + ".upload.tmp");
+    mkdirSync(join(config.resourceDir, "r2-blobs"), { recursive: true });
+    writeFileSync(abandoned, "partial");
+    await expect(b.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "quota-full", method: "upload", maxBytes: 1 }))
+      .rejects.toThrow("quota");
+    expect(existsSync(abandoned)).toBe(false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("R2 direct transfer: live HTTP listener accepts a chunked binary PUT", async () => {
   const root = mkdtempSync(join(tmpdir(), "sb-r2-transfer-http-"));
   const b = make({ db: join(root, "state.sqlite"), bindings: { r2: ["UPLOADS"] } });
