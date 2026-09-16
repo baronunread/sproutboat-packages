@@ -76,6 +76,11 @@ static i32 collect_headers(uWS::HttpRequest* req) {
 }
 
 static void on_request(uWS::HttpResponse<false>* res, uWS::HttpRequest* req) {
+  const std::string_view method = req->getCaseSensitiveMethod();
+  const i32 method_ptr = get_method_ptr(method);
+  if (method_ptr == 0) return;
+  __porffor_js_enter();
+  const i32 url_ptr = alloc_request_url(req);
   const i32 headers_ptr = collect_headers(req);
 }
 
@@ -159,6 +164,11 @@ test("#156: status-line fallback synthesizes a line for unlisted codes, idempote
     expect(once.match(/case 302: return "302 Found";/g)).toHaveLength(1);
     // Body-limit edit still rides along.
     expect(once).toContain("sb_request_body_max");
+    // #195: a valid transfer ticket is intercepted before JS request roots and
+    // the ordinary PendingRequest body allocation path.
+    expect(once).toContain("sb_r2_transfer_open");
+    expect(once).toContain("sb_r2_transfer_write");
+    expect(once).toContain("try_handle_r2_transfer(res, req, method)");
 
     // #163: collect_headers takes res, drops a client-sent x-sb-remote-addr, and
     // appends the real peer; the call site passes res through.

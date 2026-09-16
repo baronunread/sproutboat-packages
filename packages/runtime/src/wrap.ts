@@ -24,7 +24,10 @@ export const preludePath = new URL("./native-fetch-prelude.js", import.meta.url)
  */
 export type Transport = "broker" | "embedded";
 export const transportPath = (transport: Transport): URL =>
-  new URL(transport === "embedded" ? "./transport-embedded.js" : "./transport-broker.js", import.meta.url);
+  new URL(
+    transport === "embedded" ? "./transport-embedded.js" : "./transport-broker.js",
+    import.meta.url,
+  );
 
 /** Where the prelude expects its transport spliced in. */
 export const TRANSPORT_MARKER =
@@ -188,24 +191,37 @@ export function wrapNativeFetchHandler(
     // #15 — and enforces the outbound allowlist itself, with no broker to do it.
     `globalThis.__sbOutbound = ${JSON.stringify(bindings.outbound)};\n` +
     (assets ? `globalThis.__sbAssets = ${JSON.stringify(assets)};\n` : "");
-  const wire = hasBindings(bindings) ? `__sbInstallBindings(env, ${JSON.stringify(bindings)});\n` : "";
+  // The native transfer hook runs before JavaScript receives its Request, so
+  // it needs the same default data-directory name as the embedded transport.
+  const nativeAppName = `Porffor.c\`const char* sb_standalone_app_name(void) { return ${JSON.stringify(appName)}; }\`;\n`;
+  const wire = hasBindings(bindings)
+    ? `__sbInstallBindings(env, ${JSON.stringify(bindings)});\n`
+    : "";
   const registerDO = bindings.do.length
     ? `__sbRegisterDO({ ${bindings.do.map((d) => `${d.className}: ${d.className}`).join(", ")} });\n`
     : "";
   // Cron / queue / alarm timers, for a transport that has no broker to deliver
   // them. The broker transport defines this as a no-op, so the emitted module
   // is the same either way.
-  const triggers = hasBindings(bindings) ? `__sbStartLocalTriggers(__sbHandlers, ${JSON.stringify(bindings)});\n` : "";
+  const triggers = hasBindings(bindings)
+    ? `__sbStartLocalTriggers(__sbHandlers, ${JSON.stringify(bindings)});\n`
+    : "";
 
   return (
-    `${prelude}\n${compat}${env}${wire}` +
+    `${prelude}\n${nativeAppName}${compat}${env}${wire}` +
     `${neutralised}\n` +
     `${registerDO}${triggers}` +
     `export default {\n  port: ${port},\n  fetch(request) { return __sbEntry(__sbHandlers, request); }\n};\n`
   );
 }
 
-type VarsJson = string | number | boolean | null | { readonly [key: string]: VarsJson } | VarsJson[];
+type VarsJson =
+  | string
+  | number
+  | boolean
+  | null
+  | { readonly [key: string]: VarsJson }
+  | VarsJson[];
 function isVarsObject(value: VarsJson): value is { readonly [key: string]: VarsJson } {
   return value !== null && Object(value) === value && !Array.isArray(value);
 }
@@ -260,7 +276,12 @@ export function readBindingsFromEnv(): Bindings {
   const ratelimiters: Array<{ binding: string; limit: number; period: number }> = [];
   if (Array.isArray(parsed.ratelimiters)) {
     for (const entry of parsed.ratelimiters) {
-      if (isVarsObject(entry) && isVarsString(entry.binding) && isCount(entry.limit) && isCount(entry.period)) {
+      if (
+        isVarsObject(entry) &&
+        isVarsString(entry.binding) &&
+        isCount(entry.limit) &&
+        isCount(entry.period)
+      ) {
         ratelimiters.push({ binding: entry.binding, limit: entry.limit, period: entry.period });
       }
     }

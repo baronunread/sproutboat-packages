@@ -413,6 +413,69 @@ const WRITE_RESPONSE_INJECT =
   "}";
 const WRITE_RESPONSE_MARKER = "porf_native_fetch_read_raw_bytes(body_value";
 
+// #195: reserve a direct-transfer ticket before native-fetch allocates the
+// ordinary in-memory PendingRequest. uWS then gives each wire chunk directly
+// to the runtime C ABI, which owns the temporary object file.
+const R2_TRANSFER_ANCHOR = "static void on_request(uWS::HttpResponse<false>* res, uWS::HttpRequest* req) {\n";
+const R2_TRANSFER_INJECT = `extern "C" {
+  struct sb_r2_transfer_ctx;
+  int sb_r2_transfer_open(const char*, const char*, size_t, sb_r2_transfer_ctx**);
+  int sb_r2_transfer_write(sb_r2_transfer_ctx*, const char*, size_t);
+  int sb_r2_transfer_finish(sb_r2_transfer_ctx*);
+  void sb_r2_transfer_abort(sb_r2_transfer_ctx*);
+}
+static bool sb_r2_transfer_path(std::string_view path, std::string* bucket, std::string* token) {
+  static constexpr std::string_view prefix = "/__sb/r2/transfer/";
+  if (path.size() < prefix.size() || path.substr(0, prefix.size()) != prefix) return false;
+  const std::string_view rest = path.substr(prefix.size());
+  const size_t slash = rest.find('/');
+  if (slash == std::string_view::npos || slash == 0 || slash > 255 || rest.find('/', slash + 1) != std::string_view::npos) return false;
+  const std::string_view b = rest.substr(0, slash), t = rest.substr(slash + 1);
+  if (t.size() != 24) return false;
+  for (char c : b) if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')) return false;
+  for (char c : t) if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+  *bucket = std::string(b); *token = std::string(t); return true;
+}
+static std::string sb_r2_transfer_status(int status) {
+  switch (status) {
+    case 201: return "201 Created"; case 404: return "404 Not Found"; case 410: return "410 Gone";
+    case 413: return "413 Payload Too Large"; case 422: return "422 Unprocessable Content";
+    case 503: return "503 Service Unavailable"; case 507: return "507 Insufficient Storage";
+    default: return "500 Internal Server Error";
+  }
+}
+static bool try_handle_r2_transfer(uWS::HttpResponse<false>* res, uWS::HttpRequest* req, std::string_view method) {
+  std::string bucket, token;
+  if (!sb_r2_transfer_path(req->getUrl(), &bucket, &token)) return false;
+  if (method != "PUT") { respond_with_error(res, "405 Method Not Allowed", "R2 transfer requires PUT", true); return true; }
+  size_t declared = 0;
+  const std::string_view content_length = req->getHeader("content-length");
+  if (!content_length.empty() && !parse_content_length(content_length, &declared)) { respond_with_error(res, "400 Bad Request", "invalid content-length", true); return true; }
+  sb_r2_transfer_ctx* opened = nullptr;
+  const int open_status = sb_r2_transfer_open(bucket.c_str(), token.c_str(), declared, &opened);
+  if (open_status != 0 || !opened) { respond_with_error(res, sb_r2_transfer_status(open_status), "R2 transfer unavailable", true); return true; }
+  auto ctx = std::make_shared<sb_r2_transfer_ctx*>(opened);
+  res->onAborted([ctx]() { if (*ctx) { sb_r2_transfer_abort(*ctx); *ctx = nullptr; } });
+  res->onData([res, ctx](std::string_view chunk, bool is_last) {
+    if (!*ctx) return;
+    const int write_status = sb_r2_transfer_write(*ctx, chunk.data(), chunk.size());
+    if (write_status != 0) { sb_r2_transfer_abort(*ctx); *ctx = nullptr; respond_with_error(res, sb_r2_transfer_status(write_status), "R2 transfer failed", true); return; }
+    if (is_last) {
+      const int finish_status = sb_r2_transfer_finish(*ctx); *ctx = nullptr;
+      if (finish_status == 201) { res->writeStatus("201 Created"); res->end(); }
+      else respond_with_error(res, sb_r2_transfer_status(finish_status), "R2 transfer failed", true);
+    }
+  });
+  return true;
+}
+static void on_request(uWS::HttpResponse<false>* res, uWS::HttpRequest* req) {
+`;
+const R2_TRANSFER_MARKER = "sb_r2_transfer_path(std::string_view path";
+const R2_TRANSFER_CALL_ANCHOR = "  __porffor_js_enter();\n  const i32 url_ptr = alloc_request_url(req);";
+const R2_TRANSFER_CALL_INJECT =
+  "  if (try_handle_r2_transfer(res, req, method)) return;\n" + R2_TRANSFER_CALL_ANCHOR;
+const R2_TRANSFER_CALL_MARKER = "try_handle_r2_transfer(res, req, method)";
+
 const done = new Set<string>();
 
 /** Edits to Porffor's uWebSockets shim: `[marker, anchor, inject, what]`. */
@@ -444,6 +507,8 @@ const UWS_EDITS = [
     WRITE_RESPONSE_INJECT,
     "detect x-sb-raw-body, steer the body read (#176)",
   ],
+  [R2_TRANSFER_MARKER, R2_TRANSFER_ANCHOR, R2_TRANSFER_INJECT, "native direct R2 transfer ingress (#195)"],
+  [R2_TRANSFER_CALL_MARKER, R2_TRANSFER_CALL_ANCHOR, R2_TRANSFER_CALL_INJECT, "direct R2 transfer dispatch (#195)"],
 ] as const;
 
 /** The uWebSockets shim source: body limit + the #156 status-line fix. Exported for tests. */

@@ -574,6 +574,178 @@ static void sb_r2_delete_blob(const char* path, const char* bucket, const char* 
   unlink(blobpath);
 }
 
+// The native-fetch C++ shim calls this narrow ABI for a reserved R2 transfer
+// path before it allocates a PendingRequest body. The context owns only a file
+// descriptor and small metadata buffers; object bytes stay in the kernel page
+// cache until the final fixed-size digest pass.
+typedef struct sb_r2_transfer_ctx {
+  FILE* file;
+  sqlite3* db;
+  char store[1024], bucket[256], key[512], token[32], expected[65], http[1024], custom[1024], temporary[1200];
+  size_t size, max_bytes;
+} sb_r2_transfer_ctx;
+
+extern const char* sb_standalone_app_name(void);
+
+static void sb_r2_transfer_store_path(char* out, size_t cap) {
+  const char* dir = getenv("SB_DATA_DIR");
+  if (!dir || !*dir) dir = getenv("SPROUTBOAT_DATA");
+  if (!dir || !*dir) {
+    const char* app = sb_standalone_app_name();
+    snprintf(out, cap, "%s.data/store.sqlite", app && *app ? app : "app");
+    return;
+  }
+  snprintf(out, cap, "%s/store.sqlite", dir);
+}
+
+// Return HTTP status, or 0 when a one-use upload ticket was claimed.
+int sb_r2_transfer_open(const char* bucket, const char* token, size_t declared, sb_r2_transfer_ctx** out) {
+  *out = 0;
+  if (!bucket || !token || strlen(bucket) >= 256 || strlen(token) != 24) return 404;
+  sb_r2_transfer_ctx* ctx = (sb_r2_transfer_ctx*)calloc(1, sizeof(*ctx));
+  if (!ctx) return 503;
+  sb_r2_transfer_store_path(ctx->store, sizeof(ctx->store));
+  int index = sb_db_for(ctx->store);
+  if (index < 0) { free(ctx); return 503; }
+  ctx->db = sb_dbs[index];
+  sqlite3_stmt* st = 0;
+  const char* sql = "SELECT key, max_bytes, expected_sha256, http_json, custom_json FROM r2_transfer "
+                    "WHERE token=?1 AND bucket=?2 AND method='upload' AND used=0 AND expires>=?3";
+  if (sqlite3_prepare_v2(ctx->db, sql, -1, &st, 0) != 0 || !st) { free(ctx); return 503; }
+  sqlite3_bind_text(st, 1, token, -1, SB_SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 2, bucket, -1, SB_SQLITE_TRANSIENT);
+  sqlite3_bind_int64(st, 3, (int64_t)time(0) * 1000);
+  if (sqlite3_step(st) != SB_SQLITE_ROW) { sqlite3_finalize(st); free(ctx); return 410; }
+  const char* key = (const char*)sqlite3_column_text(st, 0);
+  ctx->max_bytes = (size_t)sqlite3_column_int64(st, 1);
+  const char* expected = (const char*)sqlite3_column_text(st, 2);
+  const char* http = (const char*)sqlite3_column_text(st, 3);
+  const char* custom = (const char*)sqlite3_column_text(st, 4);
+  if ((key && strlen(key) >= sizeof(ctx->key)) ||
+      (expected && strlen(expected) >= sizeof(ctx->expected)) ||
+      (http && strlen(http) >= sizeof(ctx->http)) ||
+      (custom && strlen(custom) >= sizeof(ctx->custom))) {
+    sqlite3_finalize(st); free(ctx); return 413;
+  }
+  snprintf(ctx->bucket, sizeof(ctx->bucket), "%s", bucket);
+  snprintf(ctx->key, sizeof(ctx->key), "%s", key ? key : "");
+  snprintf(ctx->token, sizeof(ctx->token), "%s", token);
+  snprintf(ctx->expected, sizeof(ctx->expected), "%s", expected ? expected : "");
+  snprintf(ctx->http, sizeof(ctx->http), "%s", http ? http : "{}");
+  snprintf(ctx->custom, sizeof(ctx->custom), "%s", custom ? custom : "{}");
+  sqlite3_finalize(st);
+  if (declared > ctx->max_bytes) { free(ctx); return 413; }
+  st = 0;
+  if (sqlite3_prepare_v2(ctx->db, "UPDATE r2_transfer SET used=1 WHERE token=?1 AND used=0", -1, &st, 0) != 0 || !st) { free(ctx); return 503; }
+  sqlite3_bind_text(st, 1, token, -1, SB_SQLITE_TRANSIENT);
+  int claimed = sqlite3_step(st) == SB_SQLITE_DONE && sqlite3_changes(ctx->db) == 1;
+  sqlite3_finalize(st);
+  if (!claimed) { free(ctx); return 410; }
+  const char* slash = strrchr(ctx->store, '/');
+  if (!slash) { free(ctx); return 500; }
+  char blobdir[1024];
+  sb_r2_blob_path(blobdir, sizeof(blobdir), ctx->store, ctx->bucket, ctx->key, "");
+  sb_mkdirs(blobdir);
+  if (snprintf(ctx->temporary, sizeof(ctx->temporary), "%.*s/r2-blobs/%s.upload.tmp", (int)(slash - ctx->store), ctx->store, token) >= (int)sizeof(ctx->temporary)) { free(ctx); return 507; }
+  ctx->file = fopen(ctx->temporary, "wb");
+  if (!ctx->file) { free(ctx); return 507; }
+  *out = ctx;
+  return 0;
+}
+
+int sb_r2_transfer_write(sb_r2_transfer_ctx* ctx, const char* bytes, size_t length) {
+  if (!ctx || !ctx->file || length > ctx->max_bytes - ctx->size) return 413;
+  if (length && fwrite(bytes, 1, length, ctx->file) != length) return 507;
+  ctx->size += length;
+  return 0;
+}
+
+// Finish the native direct-upload path. The digest is deliberately computed
+// from the temporary file in fixed-size chunks so neither validation nor the
+// immutable-generation commit ever materialises the object in process memory.
+int sb_r2_transfer_finish(sb_r2_transfer_ctx* ctx) {
+  if (!ctx || !ctx->file) return 500;
+  if (fclose(ctx->file) != 0) { ctx->file = 0; unlink(ctx->temporary); free(ctx); return 507; }
+  ctx->file = 0;
+
+  FILE* source = fopen(ctx->temporary, "rb");
+  if (!source) { unlink(ctx->temporary); free(ctx); return 500; }
+  br_sha256_context hash;
+  br_sha256_init(&hash);
+  unsigned char chunk[65536];
+  for (;;) {
+    size_t count = fread(chunk, 1, sizeof(chunk), source);
+    if (count) br_sha256_update(&hash, chunk, count);
+    if (count < sizeof(chunk)) {
+      if (ferror(source)) { fclose(source); unlink(ctx->temporary); free(ctx); return 500; }
+      break;
+    }
+  }
+  fclose(source);
+  unsigned char digest[32];
+  char etag[65];
+  br_sha256_out(&hash, digest);
+  sb_hex32(digest, etag);
+  if (ctx->expected[0] && strcmp(ctx->expected, etag) != 0) {
+    unlink(ctx->temporary); free(ctx); return 422;
+  }
+
+  char previous[65] = { 0 };
+  sqlite3_stmt* old = 0;
+  if (sqlite3_prepare_v2(ctx->db, "SELECT blob_id FROM r2 WHERE bucket=?1 AND key=?2", -1, &old, 0) == 0 && old) {
+    sqlite3_bind_text(old, 1, ctx->bucket, -1, SB_SQLITE_TRANSIENT);
+    sqlite3_bind_text(old, 2, ctx->key, -1, SB_SQLITE_TRANSIENT);
+    if (sqlite3_step(old) == SB_SQLITE_ROW) {
+      const unsigned char* value = sqlite3_column_text(old, 0);
+      if (value) snprintf(previous, sizeof(previous), "%s", (const char*)value);
+    }
+    sqlite3_finalize(old);
+  }
+  char blobpath[1024];
+  sb_r2_blob_path(blobpath, sizeof(blobpath), ctx->store, ctx->bucket, ctx->key, etag);
+  sb_mkdirs(blobpath);
+  if (rename(ctx->temporary, blobpath) != 0) { unlink(ctx->temporary); free(ctx); return 507; }
+
+  char uploaded[40];
+  sb_iso_now(uploaded, sizeof(uploaded));
+  sqlite3_stmt* st = 0;
+  const char* sql =
+    "INSERT INTO r2 (bucket,key,size,etag,uploaded,http_json,custom_json,blob_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) "
+    "ON CONFLICT(bucket,key) DO UPDATE SET size=?3,etag=?4,uploaded=?5,http_json=?6,custom_json=?7,blob_id=?8";
+  if (sqlite3_prepare_v2(ctx->db, sql, -1, &st, 0) != 0 || !st) {
+    if (strcmp(previous, etag) != 0) unlink(blobpath);
+    free(ctx); return 500;
+  }
+  sqlite3_bind_text(st, 1, ctx->bucket, -1, SB_SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 2, ctx->key, -1, SB_SQLITE_TRANSIENT);
+  sqlite3_bind_int64(st, 3, (int64_t)ctx->size);
+  sqlite3_bind_text(st, 4, etag, -1, SB_SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 5, uploaded, -1, SB_SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 6, ctx->http[0] ? ctx->http : "{}", -1, SB_SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 7, ctx->custom[0] ? ctx->custom : "{}", -1, SB_SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 8, etag, -1, SB_SQLITE_TRANSIENT);
+  int rc = sqlite3_step(st);
+  sqlite3_finalize(st);
+  if (rc != SB_SQLITE_DONE) {
+    if (strcmp(previous, etag) != 0) unlink(blobpath);
+    free(ctx); return 500;
+  }
+  if (previous[0] && strcmp(previous, etag) != 0) {
+    char oldpath[1024];
+    sb_r2_blob_path(oldpath, sizeof(oldpath), ctx->store, ctx->bucket, ctx->key, previous);
+    unlink(oldpath);
+  }
+  free(ctx);
+  return 201;
+}
+
+void sb_r2_transfer_abort(sb_r2_transfer_ctx* ctx) {
+  if (!ctx) return;
+  if (ctx->file) fclose(ctx->file);
+  if (ctx->temporary[0]) unlink(ctx->temporary);
+  free(ctx);
+}
+
 // Run a script: one or more statements separated by semicolons. sqlite3_exec
 // handles the whole string, which prepare/step does not — it compiles the first
 // statement and silently ignores the rest, so a schema built from one exec call
@@ -1520,7 +1692,10 @@ function __sbDir() {
   // Porffor's runtime init calls porf_init(0, NULL). Resolved once — the answer
   // cannot change mid-run.
   if (!__sbDataDir) {
-    __sbDataDir = __sbEnv("SB_DATA_DIR") || __sbEnv("SPROUTBOAT_DATA") || (globalThis.__sbAppName || "app") + ".data";
+    __sbDataDir =
+      __sbEnv("SB_DATA_DIR") ||
+      __sbEnv("SPROUTBOAT_DATA") ||
+      (globalThis.__sbAppName || "app") + ".data";
   }
   return __sbDataDir;
 }
@@ -1571,11 +1746,22 @@ function __sbEnsureSchema() {
       "part_number INTEGER NOT NULL, size INTEGER NOT NULL, etag TEXT NOT NULL, " +
       "PRIMARY KEY (bucket, key, upload_id, part_number))",
   );
+  __sbSql(
+    s,
+    "CREATE TABLE IF NOT EXISTS r2_transfer (token TEXT PRIMARY KEY, bucket TEXT NOT NULL, key TEXT NOT NULL, " +
+      "method TEXT NOT NULL, expires INTEGER NOT NULL, max_bytes INTEGER NOT NULL, expected_sha256 TEXT NOT NULL DEFAULT '', " +
+      "http_json TEXT NOT NULL DEFAULT '{}', custom_json TEXT NOT NULL DEFAULT '{}', used INTEGER NOT NULL DEFAULT 0)",
+  );
   const expired = __sbSql(s, "SELECT bucket, key, upload_id FROM r2_upload WHERE uploaded < ?", [
     new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString(),
   ]).rows;
   for (let i = 0; i < expired.length; i++) {
-    __sbR2MultipartDeleteRaw(s, String(expired[i][0]), String(expired[i][1]), String(expired[i][2]));
+    __sbR2MultipartDeleteRaw(
+      s,
+      String(expired[i][0]),
+      String(expired[i][1]),
+      String(expired[i][2]),
+    );
     __sbSql(s, "DELETE FROM r2_part WHERE bucket = ? AND key = ? AND upload_id = ?", expired[i]);
     __sbSql(s, "DELETE FROM r2_upload WHERE bucket = ? AND key = ? AND upload_id = ?", expired[i]);
   }
@@ -1624,14 +1810,16 @@ function __sbEmbeddedDispatch(msg) {
 
   if (op === "kv.get") {
     const r = __sbSql(store, "SELECT value FROM kv WHERE ns = ? AND key = ?", [msg.ns, msg.key]);
-    return r.rows.length ? { ok: true, found: true, value: r.rows[0][0] } : { ok: true, found: false, value: null };
+    return r.rows.length
+      ? { ok: true, found: true, value: r.rows[0][0] }
+      : { ok: true, found: false, value: null };
   }
   if (op === "kv.put") {
-    __sbSql(store, "INSERT INTO kv (ns, key, value) VALUES (?1,?2,?3) ON CONFLICT (ns, key) DO UPDATE SET value = ?3", [
-      msg.ns,
-      msg.key,
-      msg.value,
-    ]);
+    __sbSql(
+      store,
+      "INSERT INTO kv (ns, key, value) VALUES (?1,?2,?3) ON CONFLICT (ns, key) DO UPDATE SET value = ?3",
+      [msg.ns, msg.key, msg.value],
+    );
     return { ok: true };
   }
   if (op === "kv.delete") {
@@ -1674,12 +1862,26 @@ function __sbEmbeddedDispatch(msg) {
     }
     if (key != null) {
       const info = meta[key] || {};
-      return { ok: true, found: true, status: 200, type: info.type, hash: info.hash, body: files[key] };
+      return {
+        ok: true,
+        found: true,
+        status: 200,
+        type: info.type,
+        hash: info.hash,
+        body: files[key],
+      };
     }
     const nfh = (bundle.manifest && bundle.manifest.notFound) || "none";
     if (nfh === "single-page-application" && files["/index.html"] != null) {
       const info = meta["/index.html"] || {};
-      return { ok: true, found: true, status: 200, type: info.type, hash: info.hash, body: files["/index.html"] };
+      return {
+        ok: true,
+        found: true,
+        status: 200,
+        type: info.type,
+        hash: info.hash,
+        body: files["/index.html"],
+      };
     }
     if (nfh === "404-page" && files["/404.html"] != null) {
       const info = meta["/404.html"] || {};
@@ -1693,7 +1895,8 @@ function __sbEmbeddedDispatch(msg) {
     const tls = url.protocol === "https:";
     if (!tls && url.protocol !== "http:") throw new Error("unsupported protocol: " + url.protocol);
     const allow = bindingsOutbound();
-    if (allow.indexOf(url.host) === -1) throw new Error("host not in outbound allowlist: " + url.host);
+    if (allow.indexOf(url.host) === -1)
+      throw new Error("host not in outbound allowlist: " + url.host);
     let headerText = "";
     const pairs = msg.headers || [];
     for (let i = 0; i < pairs.length; i++) {
@@ -1744,7 +1947,8 @@ function __sbEmbeddedDispatch(msg) {
     if (op === "d1.batch") {
       const results = [];
       const list = msg.statements || [];
-      for (let i = 0; i < list.length; i++) results.push(__sbD1Run(path, list[i].sql, list[i].params));
+      for (let i = 0; i < list.length; i++)
+        results.push(__sbD1Run(path, list[i].sql, list[i].params));
       return { ok: true, results };
     }
     const one = __sbD1Run(path, msg.sql, msg.params);
@@ -1783,7 +1987,46 @@ function __sbEmbeddedDispatch(msg) {
       ),
     );
     if (reply.ok === false) throw new Error("r2 put: " + reply.error);
-    return { ok: true, object: { key: msg.key, size: reply.size, etag: reply.etag, uploaded: reply.uploaded } };
+    return {
+      ok: true,
+      object: { key: msg.key, size: reply.size, etag: reply.etag, uploaded: reply.uploaded },
+    };
+  }
+  if (op === "r2.transfer.create") {
+    const method = msg.method === "upload" || msg.method === "download" ? msg.method : "";
+    if (!method) throw new Error("transfer method must be upload or download");
+    const expiresIn = Math.min(Math.max(Number(msg.expiresIn) || 900, 30), 3600);
+    const maxBytes =
+      method === "upload"
+        ? Math.min(Math.max(Number(msg.maxBytes) || 100 * 1024 * 1024, 1), 5 * 1024 * 1024 * 1024)
+        : 0;
+    const expectedSha256 = String(msg.sha256 || "").toLowerCase();
+    if (expectedSha256 && !/^[0-9a-f]{64}$/.test(expectedSha256))
+      throw new Error("sha256 must be 64 hexadecimal characters");
+    const expires = Date.now() + expiresIn * 1000;
+    __sbSql(store, "DELETE FROM r2_transfer WHERE expires < ? OR used = 1", [Date.now()]);
+    const token = __sbHex(12);
+    __sbSql(
+      store,
+      "INSERT INTO r2_transfer (token, bucket, key, method, expires, max_bytes, expected_sha256, http_json, custom_json) " +
+        "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+      [
+        token,
+        msg.bucket,
+        msg.key,
+        method,
+        expires,
+        maxBytes,
+        expectedSha256,
+        JSON.stringify(msg.httpMetadata || {}),
+        JSON.stringify(msg.customMetadata || {}),
+      ],
+    );
+    return {
+      ok: true,
+      url: "/__sb/r2/transfer/" + encodeURIComponent(String(msg.bucket)) + "/" + token,
+      expiresAt: new Date(expires).toISOString(),
+    };
   }
   if (op === "r2.multipart.create") {
     const uploadId = String(msg.uploadId || __sbHex(16));
@@ -1826,10 +2069,17 @@ function __sbEmbeddedDispatch(msg) {
         throw new Error("uploaded parts must be ordered by partNumber");
       if (i < stored.length - 1 && Number(stored[i][1]) !== Number(stored[0][1]))
         throw new Error("all multipart parts except the last must have the same size");
-      if (i === stored.length - 1 && stored.length > 1 && Number(stored[i][1]) > Number(stored[0][1]))
+      if (
+        i === stored.length - 1 &&
+        stored.length > 1 &&
+        Number(stored[i][1]) > Number(stored[0][1])
+      )
         throw new Error("the last multipart part cannot be larger than the others");
     }
-    const previous = __sbSql(store, "SELECT blob_id FROM r2 WHERE bucket = ? AND key = ?", [msg.bucket, msg.key]);
+    const previous = __sbSql(store, "SELECT blob_id FROM r2 WHERE bucket = ? AND key = ?", [
+      msg.bucket,
+      msg.key,
+    ]);
     const completed = JSON.parse(
       __sbR2MultipartCompleteRaw(store, String(msg.bucket), String(msg.key), String(msg.uploadId)),
     );
@@ -1841,7 +2091,16 @@ function __sbEmbeddedDispatch(msg) {
         "INSERT INTO r2 (bucket, key, size, etag, uploaded, http_json, custom_json, blob_id) " +
           "VALUES (?1,?2,?3,?4,?5,?6,?7,?8) " +
           "ON CONFLICT (bucket, key) DO UPDATE SET size=?3, etag=?4, uploaded=?5, http_json=?6, custom_json=?7, blob_id=?8",
-        [msg.bucket, msg.key, completed.size, completed.etag, uploaded, upload.rows[0][0], upload.rows[0][1], completed.etag],
+        [
+          msg.bucket,
+          msg.key,
+          completed.size,
+          completed.etag,
+          uploaded,
+          upload.rows[0][0],
+          upload.rows[0][1],
+          completed.etag,
+        ],
       );
     } catch (error) {
       if (!previous.rows.length || String(previous.rows[0][0] || "") !== String(completed.etag))
@@ -1849,7 +2108,12 @@ function __sbEmbeddedDispatch(msg) {
       throw error;
     }
     if (previous.rows.length && String(previous.rows[0][0] || "") !== String(completed.etag))
-      __sbR2DeleteRaw(store, String(msg.bucket), String(msg.key), String(previous.rows[0][0] || ""));
+      __sbR2DeleteRaw(
+        store,
+        String(msg.bucket),
+        String(msg.key),
+        String(previous.rows[0][0] || ""),
+      );
     __sbR2MultipartDeleteRaw(store, String(msg.bucket), String(msg.key), String(msg.uploadId));
     __sbSql(store, "DELETE FROM r2_part WHERE bucket = ? AND key = ? AND upload_id = ?", [
       msg.bucket,
@@ -1917,14 +2181,24 @@ function __sbEmbeddedDispatch(msg) {
         customMetadata: JSON.parse(row[4] || "{}"),
       },
       blobId: row[5] || "",
-      body: wantsBody ? __sbR2GetRaw(store, String(msg.bucket), String(msg.key), String(row[5] || "")) : undefined,
+      body: wantsBody
+        ? __sbR2GetRaw(store, String(msg.bucket), String(msg.key), String(row[5] || ""))
+        : undefined,
     };
   }
   if (op === "r2.delete") {
-    const existing = __sbSql(store, "SELECT blob_id FROM r2 WHERE bucket = ? AND key = ?", [msg.bucket, msg.key]);
+    const existing = __sbSql(store, "SELECT blob_id FROM r2 WHERE bucket = ? AND key = ?", [
+      msg.bucket,
+      msg.key,
+    ]);
     __sbSql(store, "DELETE FROM r2 WHERE bucket = ? AND key = ?", [msg.bucket, msg.key]);
     if (existing.rows.length)
-      __sbR2DeleteRaw(store, String(msg.bucket), String(msg.key), String(existing.rows[0][0] || ""));
+      __sbR2DeleteRaw(
+        store,
+        String(msg.bucket),
+        String(msg.key),
+        String(existing.rows[0][0] || ""),
+      );
     return { ok: true };
   }
   if (op === "r2.list") {
@@ -1950,12 +2224,11 @@ function __sbEmbeddedDispatch(msg) {
   if (op === "queue.send" || op === "queue.send_batch") {
     const items = op === "queue.send" ? [msg.body] : msg.messages || [];
     for (let i = 0; i < items.length; i++) {
-      __sbSql(store, "INSERT INTO mq (queue, id, body, visible_at, attempts, dead) VALUES (?1,?2,?3,?4,0,0)", [
-        msg.queue,
-        __sbHex(12),
-        String(items[i]),
-        Date.now(),
-      ]);
+      __sbSql(
+        store,
+        "INSERT INTO mq (queue, id, body, visible_at, attempts, dead) VALUES (?1,?2,?3,?4,0,0)",
+        [msg.queue, __sbHex(12), String(items[i]), Date.now()],
+      );
     }
     return { ok: true };
   }
@@ -1966,7 +2239,9 @@ function __sbEmbeddedDispatch(msg) {
       msg.id,
       msg.key,
     ]);
-    return r.rows.length ? { ok: true, found: true, value: r.rows[0][0] } : { ok: true, found: false };
+    return r.rows.length
+      ? { ok: true, found: true, value: r.rows[0][0] }
+      : { ok: true, found: false };
   }
   if (op === "do.storage.put") {
     __sbSql(
@@ -1977,7 +2252,11 @@ function __sbEmbeddedDispatch(msg) {
     return { ok: true };
   }
   if (op === "do.storage.delete") {
-    const r = __sbSql(store, "DELETE FROM do_storage WHERE cls = ? AND id = ? AND key = ?", [msg.cls, msg.id, msg.key]);
+    const r = __sbSql(store, "DELETE FROM do_storage WHERE cls = ? AND id = ? AND key = ?", [
+      msg.cls,
+      msg.id,
+      msg.key,
+    ]);
     return { ok: true, deleted: r.changes > 0 };
   }
   if (op === "do.storage.delete_all") {
@@ -2014,13 +2293,17 @@ function __sbEmbeddedDispatch(msg) {
   }
 
   if (op === "ae.write") {
-    __sbSql(store, "INSERT INTO ae (dataset, ts, indexes_json, blobs_json, doubles_json) VALUES (?1,?2,?3,?4,?5)", [
-      msg.dataset,
-      Date.now(),
-      JSON.stringify(msg.indexes || []),
-      JSON.stringify(msg.blobs || []),
-      JSON.stringify(msg.doubles || []),
-    ]);
+    __sbSql(
+      store,
+      "INSERT INTO ae (dataset, ts, indexes_json, blobs_json, doubles_json) VALUES (?1,?2,?3,?4,?5)",
+      [
+        msg.dataset,
+        Date.now(),
+        JSON.stringify(msg.indexes || []),
+        JSON.stringify(msg.blobs || []),
+        JSON.stringify(msg.doubles || []),
+      ],
+    );
     return { ok: true };
   }
   if (op === "ae.query") {
@@ -2099,7 +2382,9 @@ globalThis.__sbR2Put = function (bucket, key, body, httpMetadata, customMetadata
     ),
   );
   if (reply.ok === false) throw new Error("sproutboat r2.put: " + reply.error);
-  return { object: { key: String(key), size: reply.size, etag: reply.etag, uploaded: reply.uploaded } };
+  return {
+    object: { key: String(key), size: reply.size, etag: reply.etag, uploaded: reply.uploaded },
+  };
 };
 
 globalThis.__sbR2Get = function (bucket, key) {
@@ -2121,9 +2406,17 @@ globalThis.__sbR2MultipartPut = function (bucket, key, uploadId, partNumber, bod
     "SELECT 1 FROM r2_upload WHERE bucket = ? AND key = ? AND upload_id = ?",
     [bucket, key, uploadId],
   );
-  if (!upload.rows.length) throw new Error("sproutboat r2.multipart.put: multipart upload not found");
+  if (!upload.rows.length)
+    throw new Error("sproutboat r2.multipart.put: multipart upload not found");
   const reply = JSON.parse(
-    __sbR2MultipartPutRaw(store, String(bucket), String(key), String(uploadId), String(partNumber), body),
+    __sbR2MultipartPutRaw(
+      store,
+      String(bucket),
+      String(key),
+      String(uploadId),
+      String(partNumber),
+      body,
+    ),
   );
   if (reply.ok === false) throw new Error("sproutboat r2.multipart.put: " + reply.error);
   __sbSql(
@@ -2240,7 +2533,10 @@ globalThis.__sbStartLocalTriggers = function (handlers, bindings) {
               if (p && __sbIsFn(p.then)) __sbTasks.push(p);
             },
           };
-          const res = handlers.scheduled({ cron: crons[i], scheduledTime: now.getTime(), noRetry() {} }, ctx);
+          const res = handlers.scheduled(
+            { cron: crons[i], scheduledTime: now.getTime(), noRetry() {} },
+            ctx,
+          );
           if (res && __sbIsFn(res.then)) await res;
           if (__sbTasks.length) await __sbDrainWaitUntil(__sbTasks);
         }
@@ -2298,9 +2594,11 @@ globalThis.__sbStartLocalTriggers = function (handlers, bindings) {
     setInterval(async function () {
       __sbEnsureSchema();
       const now = Date.now();
-      const due = __sbSql(store, "SELECT cls, id, at, attempts FROM do_alarm WHERE at <= ? ORDER BY at LIMIT 10", [
-        now,
-      ]);
+      const due = __sbSql(
+        store,
+        "SELECT cls, id, at, attempts FROM do_alarm WHERE at <= ? ORDER BY at LIMIT 10",
+        [now],
+      );
       for (let i = 0; i < due.rows.length; i++) {
         const cls = due.rows[i][0];
         const id = due.rows[i][1];

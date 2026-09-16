@@ -40,6 +40,10 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "  i32 slot = 0;\n  for (auto [key, value] : *req) {\n    slot++;\n  }\n" +
       "  *((i32*)(porf_mem + headers_ptr)) = slot;\n\n  return headers_ptr;\n}\n" +
       "static void on_request(uWS::HttpResponse<false>* res, uWS::HttpRequest* req) {\n" +
+      "  const std::string_view method = req->getCaseSensitiveMethod();\n" +
+      "  const i32 method_ptr = get_method_ptr(method);\n" +
+      "  if (method_ptr == 0) return;\n" +
+      "  __porffor_js_enter();\n  const i32 url_ptr = alloc_request_url(req);\n" +
       "  const i32 headers_ptr = collect_headers(req);\n}\n" +
       "static bool is_forbidden_response_header(std::string_view key) {\n" +
       '  return key == "connection" ||\n' +
