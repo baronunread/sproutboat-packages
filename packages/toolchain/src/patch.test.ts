@@ -169,6 +169,8 @@ test("#156: status-line fallback synthesizes a line for unlisted codes, idempote
     expect(once).toContain("sb_r2_transfer_open");
     expect(once).toContain("sb_r2_transfer_write");
     expect(once).toContain("try_handle_r2_transfer(res, req, method)");
+    expect(once).toContain("sb_r2_transfer_download_open");
+    expect(once).toContain("sb_r2_transfer_download_v1");
 
     // #163: collect_headers takes res, drops a client-sent x-sb-remote-addr, and
     // appends the real peer; the call site passes res through.

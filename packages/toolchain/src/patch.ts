@@ -423,6 +423,10 @@ const R2_TRANSFER_INJECT = `extern "C" {
   int sb_r2_transfer_write(sb_r2_transfer_ctx*, const char*, size_t);
   int sb_r2_transfer_finish(sb_r2_transfer_ctx*);
   void sb_r2_transfer_abort(sb_r2_transfer_ctx*);
+  int sb_r2_transfer_download_open(const char*, const char*, sb_r2_transfer_ctx**);
+  size_t sb_r2_transfer_download_size(sb_r2_transfer_ctx*);
+  size_t sb_r2_transfer_download_read(sb_r2_transfer_ctx*, size_t, char*, size_t);
+  void sb_r2_transfer_download_close(sb_r2_transfer_ctx*);
 }
 static bool sb_r2_transfer_path(std::string_view path, std::string* bucket, std::string* token) {
   static constexpr std::string_view prefix = "/__sb/r2/transfer/";
@@ -447,7 +451,30 @@ static std::string sb_r2_transfer_status(int status) {
 static bool try_handle_r2_transfer(uWS::HttpResponse<false>* res, uWS::HttpRequest* req, std::string_view method) {
   std::string bucket, token;
   if (!sb_r2_transfer_path(req->getUrl(), &bucket, &token)) return false;
-  if (method != "PUT") { respond_with_error(res, "405 Method Not Allowed", "R2 transfer requires PUT", true); return true; }
+  // sb_r2_transfer_download_v1
+  if (method == "GET") {
+    sb_r2_transfer_ctx* download = nullptr;
+    const int open_status = sb_r2_transfer_download_open(bucket.c_str(), token.c_str(), &download);
+    if (open_status != 0 || !download) { respond_with_error(res, sb_r2_transfer_status(open_status), "R2 transfer unavailable", true); return true; }
+    struct Download { sb_r2_transfer_ctx* ctx; uintmax_t size; bool closed = false; };
+    auto state = std::make_shared<Download>(Download{download, sb_r2_transfer_download_size(download)});
+    auto pump = std::make_shared<std::function<bool()>>();
+    *pump = [res, state, pump]() {
+      if (state->closed) return false;
+      const uintmax_t offset = res->getWriteOffset();
+      char chunk[65536];
+      const size_t bytes = sb_r2_transfer_download_read(state->ctx, (size_t)offset, chunk, sizeof(chunk));
+      const auto result = res->tryEnd(std::string_view(chunk, bytes), state->size);
+      if (result.second) { sb_r2_transfer_download_close(state->ctx); state->closed = true; return false; }
+      if (!result.first) res->onWritable([pump](uintmax_t) { return (*pump)(); });
+      return false;
+    };
+    res->writeHeader("Content-Type", "application/octet-stream");
+    res->onAborted([state]() { if (!state->closed) { sb_r2_transfer_download_close(state->ctx); state->closed = true; } });
+    (*pump)();
+    return true;
+  }
+  if (method != "PUT") { respond_with_error(res, "405 Method Not Allowed", "R2 transfer requires GET or PUT", true); return true; }
   size_t declared = 0;
   const std::string_view content_length = req->getHeader("content-length");
   if (!content_length.empty() && !parse_content_length(content_length, &declared)) { respond_with_error(res, "400 Bad Request", "invalid content-length", true); return true; }
@@ -475,6 +502,38 @@ const R2_TRANSFER_CALL_ANCHOR = "  __porffor_js_enter();\n  const i32 url_ptr = 
 const R2_TRANSFER_CALL_INJECT =
   "  if (try_handle_r2_transfer(res, req, method)) return;\n" + R2_TRANSFER_CALL_ANCHOR;
 const R2_TRANSFER_CALL_MARKER = "try_handle_r2_transfer(res, req, method)";
+const R2_DOWNLOAD_CACHE_MARKER = "sb_r2_transfer_download_v1";
+const R2_DOWNLOAD_DECL_ANCHOR = "  void sb_r2_transfer_abort(sb_r2_transfer_ctx*);\n}";
+const R2_DOWNLOAD_DECL_INJECT =
+  "  void sb_r2_transfer_abort(sb_r2_transfer_ctx*);\n" +
+  "  int sb_r2_transfer_download_open(const char*, const char*, sb_r2_transfer_ctx**);\n" +
+  "  size_t sb_r2_transfer_download_size(sb_r2_transfer_ctx*);\n" +
+  "  size_t sb_r2_transfer_download_read(sb_r2_transfer_ctx*, size_t, char*, size_t);\n" +
+  "  void sb_r2_transfer_download_close(sb_r2_transfer_ctx*);\n}";
+const R2_DOWNLOAD_BRANCH_ANCHOR = '  if (method != "PUT") { respond_with_error(res, "405 Method Not Allowed", "R2 transfer requires PUT", true); return true; }';
+const R2_DOWNLOAD_BRANCH_INJECT = `  // sb_r2_transfer_download_v1
+  if (method == "GET") {
+    sb_r2_transfer_ctx* download = nullptr;
+    const int status = sb_r2_transfer_download_open(bucket.c_str(), token.c_str(), &download);
+    if (status != 0 || !download) { respond_with_error(res, sb_r2_transfer_status(status), "R2 transfer unavailable", true); return true; }
+    struct Download { sb_r2_transfer_ctx* ctx; uintmax_t size; bool closed = false; };
+    auto state = std::make_shared<Download>(Download{download, sb_r2_transfer_download_size(download)});
+    auto pump = std::make_shared<std::function<bool()>>();
+    *pump = [res, state, pump]() {
+      if (state->closed) return false;
+      const uintmax_t offset = res->getWriteOffset(); char chunk[65536];
+      const size_t bytes = sb_r2_transfer_download_read(state->ctx, (size_t)offset, chunk, sizeof(chunk));
+      const auto result = res->tryEnd(std::string_view(chunk, bytes), state->size);
+      if (result.second) { sb_r2_transfer_download_close(state->ctx); state->closed = true; return false; }
+      if (!result.first) res->onWritable([pump](uintmax_t) { return (*pump)(); });
+      return false;
+    };
+    res->writeHeader("Content-Type", "application/octet-stream");
+    res->onAborted([state]() { if (!state->closed) { sb_r2_transfer_download_close(state->ctx); state->closed = true; } });
+    (*pump)();
+    return true;
+  }
+  if (method != "PUT") { respond_with_error(res, "405 Method Not Allowed", "R2 transfer requires GET or PUT", true); return true; }`;
 
 const done = new Set<string>();
 
@@ -516,6 +575,16 @@ export async function patchUwebsockets(root: string): Promise<void> {
   const file = resolve(root, "compiler/uwebsockets.js");
   let src = await readFile(file, "utf8");
   let changed = false;
+  // Upgrade already-patched caches from the initial upload-only bridge. New
+  // caches receive the full bridge below; old ones need declarations plus the
+  // GET dispatch grafted onto their existing transfer handler.
+  if (src.includes(R2_TRANSFER_MARKER) && !src.includes(R2_DOWNLOAD_CACHE_MARKER)) {
+    if (!src.includes(R2_DOWNLOAD_DECL_ANCHOR) || !src.includes(R2_DOWNLOAD_BRANCH_ANCHOR))
+      throw new Error(`could not upgrade Porffor's direct R2 transfer bridge: anchor not found in ${file}.`);
+    src = src.replace(R2_DOWNLOAD_DECL_ANCHOR, R2_DOWNLOAD_DECL_INJECT);
+    src = src.replace(R2_DOWNLOAD_BRANCH_ANCHOR, R2_DOWNLOAD_BRANCH_INJECT);
+    changed = true;
+  }
   for (const [marker, anchor, inject, what] of UWS_EDITS) {
     if (src.includes(marker)) continue;
     if (!src.includes(anchor)) {

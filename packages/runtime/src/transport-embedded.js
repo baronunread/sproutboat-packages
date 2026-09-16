@@ -746,6 +746,62 @@ void sb_r2_transfer_abort(sb_r2_transfer_ctx* ctx) {
   free(ctx);
 }
 
+// Claims a download ticket and opens its immutable blob generation. The C++
+// socket shim reads this handle at its current write offset, so no object-sized
+// buffer is ever allocated in either the JS or C++ heap.
+int sb_r2_transfer_download_open(const char* bucket, const char* token, sb_r2_transfer_ctx** out) {
+  *out = 0;
+  if (!bucket || !token || strlen(bucket) >= 256 || strlen(token) != 24) return 404;
+  sb_r2_transfer_ctx* ctx = (sb_r2_transfer_ctx*)calloc(1, sizeof(*ctx));
+  if (!ctx) return 503;
+  sb_r2_transfer_store_path(ctx->store, sizeof(ctx->store));
+  int index = sb_db_for(ctx->store);
+  if (index < 0) { free(ctx); return 503; }
+  ctx->db = sb_dbs[index];
+  sqlite3_stmt* st = 0;
+  const char* ticket_sql = "SELECT key FROM r2_transfer WHERE token=?1 AND bucket=?2 AND method='download' AND used=0 AND expires>=?3";
+  if (sqlite3_prepare_v2(ctx->db, ticket_sql, -1, &st, 0) != 0 || !st) { free(ctx); return 503; }
+  sqlite3_bind_text(st, 1, token, -1, SB_SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 2, bucket, -1, SB_SQLITE_TRANSIENT);
+  sqlite3_bind_int64(st, 3, (int64_t)time(0) * 1000);
+  if (sqlite3_step(st) != SB_SQLITE_ROW) { sqlite3_finalize(st); free(ctx); return 410; }
+  const char* key = (const char*)sqlite3_column_text(st, 0);
+  if (!key || strlen(key) >= sizeof(ctx->key)) { sqlite3_finalize(st); free(ctx); return 404; }
+  snprintf(ctx->bucket, sizeof(ctx->bucket), "%s", bucket);
+  snprintf(ctx->key, sizeof(ctx->key), "%s", key);
+  sqlite3_finalize(st);
+  st = 0;
+  if (sqlite3_prepare_v2(ctx->db, "SELECT blob_id FROM r2 WHERE bucket=?1 AND key=?2", -1, &st, 0) != 0 || !st) { free(ctx); return 503; }
+  sqlite3_bind_text(st, 1, bucket, -1, SB_SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 2, ctx->key, -1, SB_SQLITE_TRANSIENT);
+  if (sqlite3_step(st) != SB_SQLITE_ROW) { sqlite3_finalize(st); free(ctx); return 404; }
+  const char* generation = (const char*)sqlite3_column_text(st, 0);
+  char blobpath[1024];
+  sb_r2_blob_path(blobpath, sizeof(blobpath), ctx->store, bucket, ctx->key, generation ? generation : "");
+  sqlite3_finalize(st);
+  ctx->file = fopen(blobpath, "rb");
+  if (!ctx->file) { free(ctx); return 404; }
+  fseek(ctx->file, 0, SEEK_END); long length = ftell(ctx->file); rewind(ctx->file);
+  if (length < 0) { fclose(ctx->file); free(ctx); return 500; }
+  ctx->size = (size_t)length;
+  st = 0;
+  if (sqlite3_prepare_v2(ctx->db, "UPDATE r2_transfer SET used=1 WHERE token=?1 AND used=0", -1, &st, 0) != 0 || !st) { fclose(ctx->file); free(ctx); return 503; }
+  sqlite3_bind_text(st, 1, token, -1, SB_SQLITE_TRANSIENT);
+  int claimed = sqlite3_step(st) == SB_SQLITE_DONE && sqlite3_changes(ctx->db) == 1;
+  sqlite3_finalize(st);
+  if (!claimed) { fclose(ctx->file); free(ctx); return 410; }
+  *out = ctx;
+  return 0;
+}
+
+size_t sb_r2_transfer_download_size(sb_r2_transfer_ctx* ctx) { return ctx ? ctx->size : 0; }
+size_t sb_r2_transfer_download_read(sb_r2_transfer_ctx* ctx, size_t offset, char* out, size_t cap) {
+  if (!ctx || !ctx->file || offset >= ctx->size || fseek(ctx->file, (long)offset, SEEK_SET) != 0) return 0;
+  size_t wanted = ctx->size - offset < cap ? ctx->size - offset : cap;
+  return fread(out, 1, wanted, ctx->file);
+}
+void sb_r2_transfer_download_close(sb_r2_transfer_ctx* ctx) { if (ctx) { if (ctx->file) fclose(ctx->file); free(ctx); } }
+
 // Run a script: one or more statements separated by semicolons. sqlite3_exec
 // handles the whole string, which prepare/step does not — it compiles the first
 // statement and silently ignores the rest, so a schema built from one exec call
