@@ -1,5 +1,11 @@
 # @sproutboat/runtime
 
+## 0.9.4
+
+### Patch Changes
+
+- 38db17d: Fix broker-backed native-fetch builds after the direct R2 download ABI gained an ETag accessor.
+
 ## 0.9.3
 
 ### Patch Changes
