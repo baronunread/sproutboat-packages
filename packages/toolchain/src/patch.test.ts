@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { EMPTY_BINDINGS, wrapNativeFetchHandler } from "../../runtime/src/wrap";
 import { patchRenderJs, patchUwebsockets } from "./patch";
 
 // The parts of Porffor's compiler/render.js the patch anchors to.
@@ -225,6 +226,34 @@ test("a drifted shim fails loudly instead of silently no-op'ing", async () => {
     await mkdir(join(root, "compiler"), { recursive: true });
     await writeFile(join(root, "compiler/uwebsockets.js"), "// nothing the patch recognizes\n");
     await expect(patchUwebsockets(root)).rejects.toThrow(/anchor not found/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("broker transport defines every direct R2 transfer symbol the patched shim calls", async () => {
+  const root = await shimDir();
+  try {
+    await patchUwebsockets(root);
+    const shim = await readFile(join(root, "compiler/uwebsockets.js"), "utf8");
+    const abi = shim.match(/extern "C" \{([\s\S]*?)\n\}/)?.[1];
+    if (abi === undefined) throw new Error("patched shim did not contain the R2 transfer ABI");
+    const required = [...abi.matchAll(/\b(sb_r2_transfer_[a-z_]+)\s*\(/g)].map((match) => match[1]);
+    const wrapped = wrapNativeFetchHandler(
+      "export default { fetch() { return new Response('ok'); } }",
+      "",
+      {},
+      EMPTY_BINDINGS,
+      8080,
+      "2026-08-26",
+      "test",
+      undefined,
+      "broker",
+    );
+
+    for (const symbol of new Set(required)) {
+      expect(wrapped).toMatch(new RegExp(`\\b${symbol}\\s*\\([^)]*\\)\\s*\\{`));
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }
