@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 // @ts-expect-error Bun's file loader supplies a path; see the pinned-commit
 // check below for why this is safe to trust unconditionally.
-import vendoredPorfforArchive from "../vendor/porffor-1f4ae4a.tar.gz" with { type: "file" };
+import vendoredPorfforArchive from "../vendor/porffor-038f415.tar.gz" with { type: "file" };
 import { ensurePorfforPatched } from "./patch";
 import { PORFFOR_ARCHIVE_SHA256, PORFFOR_ARCHIVE_URL, PORFFOR_COMMIT_FULL } from "./pin";
 
@@ -26,7 +26,12 @@ type AcquireOptions = {
   timeoutMs?: number;
 };
 
-const required = ["runtime/index.js", "compiler/render.js", "compiler/index.js", "compiler/uwebsockets.js"];
+const required = [
+  "runtime/index.js",
+  "compiler/render.js",
+  "compiler/index.js",
+  "compiler/uwebsockets.js",
+];
 async function digest(path: string): Promise<string> {
   return createHash("sha256")
     .update(await readFile(path))
@@ -42,9 +47,11 @@ async function complete(dir: string, expectedArchive = PORFFOR_ARCHIVE_SHA256): 
       archiveSha256?: string;
       files?: Record<string, string>;
     };
-    if (manifest.commit !== PORFFOR_COMMIT_FULL || manifest.archiveSha256 !== expectedArchive) return false;
+    if (manifest.commit !== PORFFOR_COMMIT_FULL || manifest.archiveSha256 !== expectedArchive)
+      return false;
     for (const file of required)
-      if (!manifest.files?.[file] || (await digest(resolve(dir, file))) !== manifest.files[file]) return false;
+      if (!manifest.files?.[file] || (await digest(resolve(dir, file))) !== manifest.files[file])
+        return false;
     return true;
   } catch {
     return false;
@@ -81,10 +88,16 @@ async function extract(archive: string, stage: string): Promise<void> {
   });
   const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
   if (code !== 0)
-    throw new PorfforToolchainError("archive", `could not extract pinned Porffor archive: ${stderr.trim()}`);
+    throw new PorfforToolchainError(
+      "archive",
+      `could not extract pinned Porffor archive: ${stderr.trim()}`,
+    );
   for (const file of required)
     if (!existsSync(resolve(stage, file)))
-      throw new PorfforToolchainError("archive", `Porffor archive is missing required file ${file}`);
+      throw new PorfforToolchainError(
+        "archive",
+        `Porffor archive is missing required file ${file}`,
+      );
 }
 
 async function waitForPublisher(dir: string, lock: string): Promise<string | null> {
@@ -113,7 +126,9 @@ export async function ensurePorffor(options: AcquireOptions = {}): Promise<strin
     return dir;
   }
   const root = resolve(
-    options.cacheRoot ?? process.env.SPROUTBOAT_TOOLCHAIN_CACHE ?? resolve(homedir(), ".cache/sproutboat"),
+    options.cacheRoot ??
+      process.env.SPROUTBOAT_TOOLCHAIN_CACHE ??
+      resolve(homedir(), ".cache/sproutboat"),
   );
   const dir = resolve(root, `porffor-${PORFFOR_COMMIT_FULL}`);
   const expected = options.expectedSha256 ?? PORFFOR_ARCHIVE_SHA256;
@@ -127,7 +142,10 @@ export async function ensurePorffor(options: AcquireOptions = {}): Promise<strin
     if (published) return published;
     return ensurePorffor(options);
   }
-  const stage = resolve(root, `.porffor-${PORFFOR_COMMIT_FULL}-${process.pid}-${crypto.randomUUID()}`);
+  const stage = resolve(
+    root,
+    `.porffor-${PORFFOR_COMMIT_FULL}-${process.pid}-${crypto.randomUUID()}`,
+  );
   try {
     if (await complete(dir, expected)) return dir;
     await rm(dir, { recursive: true, force: true });
@@ -139,9 +157,18 @@ export async function ensurePorffor(options: AcquireOptions = {}): Promise<strin
     // left stale by a pin bump (checksum below still catches a wrong file
     // rather than silently accepting it).
     const noOverride = options.url === undefined && options.expectedSha256 === undefined;
-    const vendored = noOverride && existsSync(vendoredPorfforArchive) && (await digest(vendoredPorfforArchive)) === expected;
+    const vendored =
+      noOverride &&
+      existsSync(vendoredPorfforArchive) &&
+      (await digest(vendoredPorfforArchive)) === expected;
     if (vendored) await writeFile(archive, await readFile(vendoredPorfforArchive));
-    else await download(options.url ?? PORFFOR_ARCHIVE_URL, archive, options.fetcher ?? fetch, options.timeoutMs ?? 30_000);
+    else
+      await download(
+        options.url ?? PORFFOR_ARCHIVE_URL,
+        archive,
+        options.fetcher ?? fetch,
+        options.timeoutMs ?? 30_000,
+      );
     const actual = await digest(archive);
     if (actual !== expected)
       throw new PorfforToolchainError(
@@ -152,7 +179,9 @@ export async function ensurePorffor(options: AcquireOptions = {}): Promise<strin
     await rm(archive, { force: true });
     await ensurePorfforPatched(stage);
     const files = Object.fromEntries(
-      await Promise.all(required.map(async (file) => [file, await digest(resolve(stage, file))] as const)),
+      await Promise.all(
+        required.map(async (file) => [file, await digest(resolve(stage, file))] as const),
+      ),
     );
     await writeFile(
       resolve(stage, ".sproutboat-complete"),

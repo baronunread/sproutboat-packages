@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { patchPromiseTs, patchRenderJs, patchUwebsockets } from "./patch";
+import { patchRenderJs, patchUwebsockets } from "./patch";
 
 // The parts of Porffor's compiler/render.js the patch anchors to.
 const RENDER = `void porf_native_fetch_runtime_init(void) {
@@ -162,7 +162,9 @@ test("#156: status-line fallback synthesizes a line for unlisted codes, idempote
 
     // #163: collect_headers takes res, drops a client-sent x-sb-remote-addr, and
     // appends the real peer; the call site passes res through.
-    expect(once).toContain("static i32 collect_headers(uWS::HttpRequest* req, uWS::HttpResponse<false>* res) {");
+    expect(once).toContain(
+      "static i32 collect_headers(uWS::HttpRequest* req, uWS::HttpResponse<false>* res) {",
+    );
     expect(once).toContain("const i32 headers_ptr = collect_headers(req, res);");
     expect(once).toContain('if (key == "x-sb-remote-addr") continue;');
     expect(once).toContain("res->getRemoteAddressAsText()");
@@ -179,12 +181,22 @@ test("#156: status-line fallback synthesizes a line for unlisted codes, idempote
     );
     expect(once).toContain('key == "x-sb-raw-body"');
     expect(once).toContain("bool raw_body = false;");
-    expect(once).toContain('if (std::string_view(scan_buf, scan_bytes) == "x-sb-raw-body") raw_body = true;');
-    expect(once).toContain("if (raw_body) porf_native_fetch_read_raw_bytes(body_value, &body_buf, &body_len);");
-    expect(once).toContain("else porf_native_fetch_read_value(body_value, &body_buf, &body_len, &body_owned);");
+    expect(once).toContain(
+      'if (std::string_view(scan_buf, scan_bytes) == "x-sb-raw-body") raw_body = true;',
+    );
+    expect(once).toContain(
+      "if (raw_body) porf_native_fetch_read_raw_bytes(body_value, &body_buf, &body_len);",
+    );
+    expect(once).toContain(
+      "else porf_native_fetch_read_value(body_value, &body_buf, &body_len, &body_owned);",
+    );
     // Header reads are the original 4-arg call, unchanged.
-    expect(once).toContain("porf_native_fetch_read_value(name_value, &name_buf, &name_len, &name_owned);");
-    expect(once).toContain("porf_native_fetch_read_value(value_value, &value_buf, &value_len, &value_owned);");
+    expect(once).toContain(
+      "porf_native_fetch_read_value(name_value, &name_buf, &name_len, &name_owned);",
+    );
+    expect(once).toContain(
+      "porf_native_fetch_read_value(value_value, &value_buf, &value_len, &value_owned);",
+    );
 
     await patchUwebsockets(root);
     expect(await readFile(join(root, "compiler/uwebsockets.js"), "utf8")).toBe(once);
@@ -236,63 +248,6 @@ test("#165: render.js routes console output to stderr, unbuffered, idempotently"
 
     await patchRenderJs(root);
     expect(await readFile(join(root, "compiler/render.js"), "utf8")).toBe(once);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-// The part of Porffor's compiler/builtins/promise.ts the #168 patch anchors to.
-const PROMISE_TS = `export const __Porffor_promise_resolve = (value: any, promise: any): void => {
-  if (Porffor.type(value) == Porffor.TYPES.object) {
-    // cheap prototype-chain probe for 'then' before the expensive Get below, does not invoke getters
-    const thenHash: i32 = __Porffor_object_hash('then');
-    let probe: any = value;
-    while (Porffor.type(probe) == Porffor.TYPES.object) {
-      if (Porffor.object.lookup(probe, 'then', thenHash) != 0) break;
-      probe = __Porffor_object_getPrototype(probe);
-    }
-    if (Porffor.type(probe) != Porffor.TYPES.object) {
-      __ecma262_FulfillPromise(promise, value);
-      return;
-    }
-  }
-};
-`;
-
-test("#168: promise-resolve's then-probe gets a fixed-point guard, idempotently", async () => {
-  const root = await mkdtemp(join(tmpdir(), "sb-patch-promise-"));
-  try {
-    await mkdir(join(root, "compiler/builtins"), { recursive: true });
-    await writeFile(join(root, "compiler/builtins/promise.ts"), PROMISE_TS);
-    await patchPromiseTs(root);
-    const once = await readFile(join(root, "compiler/builtins/promise.ts"), "utf8");
-
-    expect(once).toContain("sproutboat #168");
-    expect(once).toContain("let probeFound: boolean = false;");
-    expect(once).toContain("if (Porffor.object.lookup(probe, 'then', thenHash) != 0) { probeFound = true; break; }");
-    // The fixed-point guard mirrors _internal_object.ts's lastProto idiom.
-    expect(once).toContain("Porffor.fastOr(probe == null, Porffor.IR.ptr(probe) == Porffor.IR.ptr(lastProto))");
-    expect(once).toContain("if (!probeFound) {");
-    // Belt-and-suspenders: a hard iteration cap terminates the loop even if
-    // some other corruption shape (a drifting pointer, a longer cycle) defeats
-    // the fixed-point check above.
-    expect(once).toContain("if (probeSteps > 64) break;");
-    // The old type-check-only exit condition is gone.
-    expect(once).not.toContain("if (Porffor.type(probe) != Porffor.TYPES.object) {");
-
-    await patchPromiseTs(root);
-    expect(await readFile(join(root, "compiler/builtins/promise.ts"), "utf8")).toBe(once);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test("#168: a drifted promise builtin fails loudly instead of silently no-op'ing", async () => {
-  const root = await mkdtemp(join(tmpdir(), "sb-patch-promise-drift-"));
-  try {
-    await mkdir(join(root, "compiler/builtins"), { recursive: true });
-    await writeFile(join(root, "compiler/builtins/promise.ts"), "// nothing the patch recognizes\n");
-    await expect(patchPromiseTs(root)).rejects.toThrow(/anchor not found/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

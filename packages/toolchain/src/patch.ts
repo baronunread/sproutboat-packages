@@ -108,7 +108,8 @@ const BYTESTRING_MARKER = "sproutboat #172";
  * below) calls it, gated on the reserved `x-sb-raw-body` response header the
  * assets binding sets. Every existing call site is untouched.
  */
-const READ_RAW_ANCHOR = "int porf_native_fetch_read_value(jsval value, const char** out_buf, size_t* out_len, char** out_owned) {";
+const READ_RAW_ANCHOR =
+  "int porf_native_fetch_read_value(jsval value, const char** out_buf, size_t* out_len, char** out_owned) {";
 const READ_RAW_INJECT =
   "// sproutboat #176: zero-copy passthrough for a bytestring that is already-\n" +
   "// finished bytes (an asset read off disk), never a string to UTF-8 encode.\n" +
@@ -208,7 +209,8 @@ const STATUS_SIG_MARKER = "static std::string lookup_status_line(i32 status) {";
 // 303 is the one this was reported for (POST-redirect-GET); give it the real
 // reason phrase. Everything else unlisted rides the synthesized fallback below.
 const STATUS_303_ANCHOR = '    case 302: return "302 Found";\n';
-const STATUS_303_INJECT = '    case 302: return "302 Found";\n    case 303: return "303 See Other";\n';
+const STATUS_303_INJECT =
+  '    case 302: return "302 Found";\n    case 303: return "303 See Other";\n';
 const STATUS_303_MARKER = 'case 303: return "303 See Other";';
 const STATUS_DEFAULT_ANCHOR = "    default: return {};";
 const STATUS_DEFAULT_INJECT = '    default: return std::to_string(status) + " Status";';
@@ -225,7 +227,8 @@ const STATUS_DEFAULT_MARKER = 'std::to_string(status) + " Status"';
  * `request.cf.clientIp` and resolves it against `SB_TRUSTED_PROXIES` if set.
  */
 const HDR_SIG_ANCHOR = "static i32 collect_headers(uWS::HttpRequest* req) {\n";
-const HDR_SIG_INJECT = "static i32 collect_headers(uWS::HttpRequest* req, uWS::HttpResponse<false>* res) {\n";
+const HDR_SIG_INJECT =
+  "static i32 collect_headers(uWS::HttpRequest* req, uWS::HttpResponse<false>* res) {\n";
 const HDR_SIG_MARKER = "collect_headers(uWS::HttpRequest* req, uWS::HttpResponse";
 
 const HDR_CALL_ANCHOR = "const i32 headers_ptr = collect_headers(req);";
@@ -361,7 +364,7 @@ const WRITE_RESPONSE_INJECT =
   "      size_t scan_bytes = 0;\n" +
   "      char* scan_owned = nullptr;\n" +
   "      porf_native_fetch_read_value(scan_name, &scan_buf, &scan_bytes, &scan_owned);\n" +
-  "      if (std::string_view(scan_buf, scan_bytes) == \"x-sb-raw-body\") raw_body = true;\n" +
+  '      if (std::string_view(scan_buf, scan_bytes) == "x-sb-raw-body") raw_body = true;\n' +
   "      if (scan_owned) free(scan_owned);\n" +
   "    }\n" +
   "  }\n" +
@@ -410,75 +413,6 @@ const WRITE_RESPONSE_INJECT =
   "}";
 const WRITE_RESPONSE_MARKER = "porf_native_fetch_read_raw_bytes(body_value";
 
-/**
- * baronunread/sproutboat#168 — `__Porffor_promise_resolve`'s duck-typing probe
- * for `.then` walks a value's prototype chain with no termination guard. Under
- * certain allocator conditions `__Porffor_object_getPrototype` returns a stale
- * "object" jsval instead of the `null`/`undefined` that should end the chain,
- * so the walk never bottoms out — a true infinite spin (100% CPU, no error, no
- * log line) that wedges the whole process, since native-fetch serves one
- * request at a time on a single event loop. Hits any handler whose `fetch`
- * resolves a promise with a plain object — the common shape for a JSON
- * response — so this is not a rare pattern; onset is nondeterministic
- * (allocator/pool reuse), typically after a handful of requests.
- *
- * `_internal_object.ts`'s own prototype-chain walks already guard against
- * exactly this failure mode: track the previous prototype and stop once the
- * "next" pointer stops advancing (a fixed point reads the same as reaching the
- * end). This probe has no such guard. Mirror the same idiom here: an explicit
- * `probeFound` flag (so a fixed-point break reads as "no `.then` found",
- * matching how a legitimate null-terminated chain is read) plus the
- * `lastProto` pointer comparison used everywhere else in the runtime.
- *
- * A hard iteration cap rides alongside the fixed-point check, not instead of
- * it: the lldb trace showed the *same* stale pointer on every sample, which
- * the fixed-point check alone catches on its very next iteration, but that's
- * one observed corruption shape, not a guarantee about every allocator state
- * that can produce this bug. A cap makes termination unconditional regardless
- * of whether some other corrupted state instead drifts (a different bad
- * pointer each time) or cycles across more than one node — real prototype
- * chains are a handful of links deep, so 64 iterations is generous headroom
- * with no risk of cutting off a legitimate lookup.
- */
-const THEN_PROBE_ANCHOR =
-  "    const thenHash: i32 = __Porffor_object_hash('then');\n" +
-  "    let probe: any = value;\n" +
-  "    while (Porffor.type(probe) == Porffor.TYPES.object) {\n" +
-  "      if (Porffor.object.lookup(probe, 'then', thenHash) != 0) break;\n" +
-  "      probe = __Porffor_object_getPrototype(probe);\n" +
-  "    }\n" +
-  "    if (Porffor.type(probe) != Porffor.TYPES.object) {\n";
-const THEN_PROBE_INJECT =
-  "    const thenHash: i32 = __Porffor_object_hash('then');\n" +
-  "    let probe: any = value;\n" +
-  "    let lastProto: any = probe;\n" +
-  "    let probeFound: boolean = false; // sproutboat #168: fixed-point chain reads as \"not found\", not a spin\n" +
-  "    let probeSteps: i32 = 0; // sproutboat #168: hard cap, belt-and-suspenders alongside the fixed-point check\n" +
-  "    while (Porffor.type(probe) == Porffor.TYPES.object) {\n" +
-  "      if (Porffor.object.lookup(probe, 'then', thenHash) != 0) { probeFound = true; break; }\n" +
-  "      probe = __Porffor_object_getPrototype(probe);\n" +
-  "      if (Porffor.fastOr(probe == null, Porffor.IR.ptr(probe) == Porffor.IR.ptr(lastProto))) break;\n" +
-  "      lastProto = probe;\n" +
-  "      probeSteps++;\n" +
-  "      if (probeSteps > 64) break;\n" +
-  "    }\n" +
-  "    if (!probeFound) {\n";
-const THEN_PROBE_MARKER = "sproutboat #168";
-
-/** The promise builtin: the #168 `.then`-probe livelock fix. Exported for tests. */
-export async function patchPromiseTs(root: string): Promise<void> {
-  const file = resolve(root, "compiler/builtins/promise.ts");
-  let src = await readFile(file, "utf8");
-  if (src.includes(THEN_PROBE_MARKER)) return;
-  if (!src.includes(THEN_PROBE_ANCHOR)) {
-    throw new Error(
-      "could not patch Porffor's promise-resolve then-probe (#168): anchor not found in " +
-        `${file}. Porffor's promise builtin changed — check patches/UPSTREAM.md.`,
-    );
-  }
-  await writeFile(file, src.replace(THEN_PROBE_ANCHOR, THEN_PROBE_INJECT));
-}
-
 const done = new Set<string>();
 
 /** Edits to Porffor's uWebSockets shim: `[marker, anchor, inject, what]`. */
@@ -486,15 +420,30 @@ const UWS_EDITS = [
   [BODY_MARKER, BODY_ANCHOR, BODY_INJECT, "request body limit"],
   [STATUS_SIG_MARKER, STATUS_SIG_ANCHOR, STATUS_SIG_INJECT, "status-line return type (#156)"],
   [STATUS_303_MARKER, STATUS_303_ANCHOR, STATUS_303_INJECT, "status-line 303 case (#156)"],
-  [STATUS_DEFAULT_MARKER, STATUS_DEFAULT_ANCHOR, STATUS_DEFAULT_INJECT, "status-line fallback (#156)"],
+  [
+    STATUS_DEFAULT_MARKER,
+    STATUS_DEFAULT_ANCHOR,
+    STATUS_DEFAULT_INJECT,
+    "status-line fallback (#156)",
+  ],
   [HDR_SIG_MARKER, HDR_SIG_ANCHOR, HDR_SIG_INJECT, "collect_headers res arg (#163)"],
   [HDR_CALL_MARKER, HDR_CALL_ANCHOR, HDR_CALL_INJECT, "collect_headers call site (#163)"],
   [HDR_CAP_MARKER, HDR_CAP_ANCHOR, HDR_CAP_INJECT, "remote-addr header capacity (#163)"],
   [HDR_SKIP_MARKER, HDR_SKIP_ANCHOR, HDR_SKIP_INJECT, "drop client-sent x-sb-remote-addr (#163)"],
   [HDR_APPEND_MARKER, HDR_APPEND_ANCHOR, HDR_APPEND_INJECT, "append x-sb-remote-addr (#163)"],
   [READ_RAW_DECL_MARKER, READ_RAW_DECL_ANCHOR, READ_RAW_DECL_INJECT, "read_raw_bytes decl (#176)"],
-  [FORBIDDEN_HDR_MARKER, FORBIDDEN_HDR_ANCHOR, FORBIDDEN_HDR_INJECT, "drop x-sb-raw-body from the wire (#176)"],
-  [WRITE_RESPONSE_MARKER, WRITE_RESPONSE_ANCHOR, WRITE_RESPONSE_INJECT, "detect x-sb-raw-body, steer the body read (#176)"],
+  [
+    FORBIDDEN_HDR_MARKER,
+    FORBIDDEN_HDR_ANCHOR,
+    FORBIDDEN_HDR_INJECT,
+    "drop x-sb-raw-body from the wire (#176)",
+  ],
+  [
+    WRITE_RESPONSE_MARKER,
+    WRITE_RESPONSE_ANCHOR,
+    WRITE_RESPONSE_INJECT,
+    "detect x-sb-raw-body, steer the body read (#176)",
+  ],
 ] as const;
 
 /** The uWebSockets shim source: body limit + the #156 status-line fix. Exported for tests. */
@@ -589,6 +538,5 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchCompilerArgs(root);
   await patchUwebsockets(root);
   await patchRenderJs(root);
-  await patchPromiseTs(root);
   done.add(root);
 }
