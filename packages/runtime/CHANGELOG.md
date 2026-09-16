@@ -1,5 +1,11 @@
 # @sproutboat/runtime
 
+## 0.9.3
+
+### Patch Changes
+
+- 5ee065c: Stream standalone direct R2 byte ranges safely and support ETag conditionals.
+
 ## 0.9.2
 
 ### Patch Changes
