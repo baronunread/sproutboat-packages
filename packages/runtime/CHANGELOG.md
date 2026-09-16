@@ -1,5 +1,13 @@
 # @sproutboat/runtime
 
+## 0.9.1
+
+### Patch Changes
+
+- e0944a4: Provide the native direct-transfer ABI in broker builds so the shared
+  uWebSockets patch does not introduce unresolved symbols outside standalone
+  mode.
+
 ## 0.9.0
 
 ### Minor Changes
