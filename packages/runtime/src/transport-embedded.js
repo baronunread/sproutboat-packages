@@ -581,7 +581,7 @@ static void sb_r2_delete_blob(const char* path, const char* bucket, const char* 
 typedef struct sb_r2_transfer_ctx {
   FILE* file;
   sqlite3* db;
-  char store[1024], bucket[256], key[512], token[32], expected[65], http[1024], custom[1024], temporary[1200];
+  char store[1024], bucket[256], key[512], token[32], expected[65], etag[65], http[1024], custom[1024], temporary[1200];
   size_t size, max_bytes;
 } sb_r2_transfer_ctx;
 
@@ -771,11 +771,14 @@ int sb_r2_transfer_download_open(const char* bucket, const char* token, sb_r2_tr
   snprintf(ctx->key, sizeof(ctx->key), "%s", key);
   sqlite3_finalize(st);
   st = 0;
-  if (sqlite3_prepare_v2(ctx->db, "SELECT blob_id FROM r2 WHERE bucket=?1 AND key=?2", -1, &st, 0) != 0 || !st) { free(ctx); return 503; }
+  if (sqlite3_prepare_v2(ctx->db, "SELECT blob_id, etag FROM r2 WHERE bucket=?1 AND key=?2", -1, &st, 0) != 0 || !st) { free(ctx); return 503; }
   sqlite3_bind_text(st, 1, bucket, -1, SB_SQLITE_TRANSIENT);
   sqlite3_bind_text(st, 2, ctx->key, -1, SB_SQLITE_TRANSIENT);
   if (sqlite3_step(st) != SB_SQLITE_ROW) { sqlite3_finalize(st); free(ctx); return 404; }
   const char* generation = (const char*)sqlite3_column_text(st, 0);
+  const char* etag = (const char*)sqlite3_column_text(st, 1);
+  if (!etag || strlen(etag) >= sizeof(ctx->etag)) { sqlite3_finalize(st); free(ctx); return 404; }
+  snprintf(ctx->etag, sizeof(ctx->etag), "%s", etag);
   char blobpath[1024];
   sb_r2_blob_path(blobpath, sizeof(blobpath), ctx->store, bucket, ctx->key, generation ? generation : "");
   sqlite3_finalize(st);
@@ -795,6 +798,7 @@ int sb_r2_transfer_download_open(const char* bucket, const char* token, sb_r2_tr
 }
 
 size_t sb_r2_transfer_download_size(sb_r2_transfer_ctx* ctx) { return ctx ? ctx->size : 0; }
+const char* sb_r2_transfer_download_etag(sb_r2_transfer_ctx* ctx) { return ctx ? ctx->etag : ""; }
 size_t sb_r2_transfer_download_read(sb_r2_transfer_ctx* ctx, size_t offset, char* out, size_t cap) {
   if (!ctx || !ctx->file || offset >= ctx->size || fseek(ctx->file, (long)offset, SEEK_SET) != 0) return 0;
   size_t wanted = ctx->size - offset < cap ? ctx->size - offset : cap;

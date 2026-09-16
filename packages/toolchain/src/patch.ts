@@ -425,6 +425,7 @@ const R2_TRANSFER_INJECT = `extern "C" {
   void sb_r2_transfer_abort(sb_r2_transfer_ctx*);
   int sb_r2_transfer_download_open(const char*, const char*, sb_r2_transfer_ctx**);
   size_t sb_r2_transfer_download_size(sb_r2_transfer_ctx*);
+  const char* sb_r2_transfer_download_etag(sb_r2_transfer_ctx*);
   size_t sb_r2_transfer_download_read(sb_r2_transfer_ctx*, size_t, char*, size_t);
   void sb_r2_transfer_download_close(sb_r2_transfer_ctx*);
 }
@@ -452,22 +453,58 @@ static bool try_handle_r2_transfer(uWS::HttpResponse<false>* res, uWS::HttpReque
   std::string bucket, token;
   if (!sb_r2_transfer_path(req->getUrl(), &bucket, &token)) return false;
   // sb_r2_transfer_download_v1
+  // sb_r2_transfer_range_v1
+  // sb_r2_transfer_range_header_v2
+  // sb_r2_transfer_conditional_v1
+  // sb_r2_transfer_streaming_v2
   if (method == "GET") {
     sb_r2_transfer_ctx* download = nullptr;
     const int open_status = sb_r2_transfer_download_open(bucket.c_str(), token.c_str(), &download);
     if (open_status != 0 || !download) { respond_with_error(res, sb_r2_transfer_status(open_status), "R2 transfer unavailable", true); return true; }
-    struct Download { sb_r2_transfer_ctx* ctx; uintmax_t size; bool closed = false; };
-    auto state = std::make_shared<Download>(Download{download, sb_r2_transfer_download_size(download)});
+    const std::string etag = sb_r2_transfer_download_etag(download);
+    const std::string_view if_none_match = req->getHeader("if-none-match");
+    if (if_none_match == "*" || if_none_match == etag || (if_none_match.size() == etag.size() + 2 && if_none_match.front() == '"' && if_none_match.back() == '"' && if_none_match.substr(1, etag.size()) == etag)) {
+      sb_r2_transfer_download_close(download); res->writeStatus("304 Not Modified"); res->writeHeader("ETag", etag); res->end(); return true;
+    }
+    const uintmax_t full_size = sb_r2_transfer_download_size(download);
+    uintmax_t first = 0, last = full_size ? full_size - 1 : 0;
+    std::string_view range = req->getHeader("range"); if (range.empty()) range = req->getHeader("Range");
+    if (!range.empty()) {
+      if (range.substr(0, 6) != "bytes=") { sb_r2_transfer_download_close(download); respond_with_error(res, "416 Range Not Satisfiable", "invalid range", true); return true; }
+      const std::string_view spec = range.substr(6); const size_t dash = spec.find('-');
+      if (dash == std::string_view::npos || dash == 0) { sb_r2_transfer_download_close(download); respond_with_error(res, "416 Range Not Satisfiable", "invalid range", true); return true; }
+      first = 0; for (char c : spec.substr(0, dash)) { if (c < '0' || c > '9') { sb_r2_transfer_download_close(download); respond_with_error(res, "416 Range Not Satisfiable", "invalid range", true); return true; } first = first * 10 + (c - '0'); }
+      if (dash + 1 < spec.size()) { last = 0; for (char c : spec.substr(dash + 1)) { if (c < '0' || c > '9') { sb_r2_transfer_download_close(download); respond_with_error(res, "416 Range Not Satisfiable", "invalid range", true); return true; } last = last * 10 + (c - '0'); } }
+      if (first >= full_size || last < first) { sb_r2_transfer_download_close(download); respond_with_error(res, "416 Range Not Satisfiable", "range outside object", true); return true; }
+      if (last >= full_size) last = full_size - 1;
+      char content_range[96]; snprintf(content_range, sizeof(content_range), "bytes %llu-%llu/%llu", (unsigned long long)first, (unsigned long long)last, (unsigned long long)full_size);
+      res->writeStatus("206 Partial Content"); res->writeHeader("Content-Range", content_range);
+    }
+    res->writeHeader("ETag", etag); res->writeHeader("Accept-Ranges", "bytes");
+    struct Download { sb_r2_transfer_ctx* ctx; uintmax_t base; uintmax_t size; uintmax_t sent = 0; bool closed = false; char chunk[65536]; };
+    auto state = std::make_shared<Download>(Download{download, first, last - first + 1});
     auto pump = std::make_shared<std::function<bool()>>();
     *pump = [res, state, pump]() {
       if (state->closed) return false;
-      const uintmax_t offset = res->getWriteOffset();
-      char chunk[65536];
-      const size_t bytes = sb_r2_transfer_download_read(state->ctx, (size_t)offset, chunk, sizeof(chunk));
-      const auto result = res->tryEnd(std::string_view(chunk, bytes), state->size);
-      if (result.second) { sb_r2_transfer_download_close(state->ctx); state->closed = true; return false; }
-      if (!result.first) res->onWritable([pump](uintmax_t) { return (*pump)(); });
-      return false;
+      for (;;) {
+        const size_t want = state->size - state->sent < sizeof(state->chunk) ? (size_t)(state->size - state->sent) : sizeof(state->chunk);
+        const size_t bytes = sb_r2_transfer_download_read(state->ctx, (size_t)(state->base + state->sent), state->chunk, want);
+        const auto result = res->tryEnd(std::string_view(state->chunk, bytes), state->size);
+        if (result.second || bytes == 0) { sb_r2_transfer_download_close(state->ctx); state->closed = true; return false; }
+        if (!result.first) {
+          res->onWritable([res, state](uintmax_t offset) {
+            if (state->closed) return true;
+            const size_t want = state->size - offset < sizeof(state->chunk) ? (size_t)(state->size - offset) : sizeof(state->chunk);
+            const size_t bytes = sb_r2_transfer_download_read(state->ctx, (size_t)(state->base + offset), state->chunk, want);
+            const auto resumed = res->tryEnd(std::string_view(state->chunk, bytes), state->size);
+            if (resumed.second || bytes == 0) { sb_r2_transfer_download_close(state->ctx); state->closed = true; return true; }
+            return resumed.first;
+          });
+          return false;
+        }
+        state->sent += bytes;
+        if (state->sent == state->size) { sb_r2_transfer_download_close(state->ctx); state->closed = true; return false; }
+      }
     };
     res->writeHeader("Content-Type", "application/octet-stream");
     res->onAborted([state]() { if (!state->closed) { sb_r2_transfer_download_close(state->ctx); state->closed = true; } });
@@ -503,30 +540,72 @@ const R2_TRANSFER_CALL_INJECT =
   "  if (try_handle_r2_transfer(res, req, method)) return;\n" + R2_TRANSFER_CALL_ANCHOR;
 const R2_TRANSFER_CALL_MARKER = "try_handle_r2_transfer(res, req, method)";
 const R2_DOWNLOAD_CACHE_MARKER = "sb_r2_transfer_download_v1";
+const R2_RANGE_CACHE_MARKER = "sb_r2_transfer_range_v1";
+const R2_CONDITIONAL_CACHE_MARKER = "sb_r2_transfer_conditional_v1";
+const R2_STREAMING_CACHE_MARKER = "sb_r2_transfer_streaming_v2";
+const R2_RANGE_HEADER_CACHE_MARKER = "sb_r2_transfer_range_header_v2";
 const R2_DOWNLOAD_DECL_ANCHOR = "  void sb_r2_transfer_abort(sb_r2_transfer_ctx*);\n}";
 const R2_DOWNLOAD_DECL_INJECT =
   "  void sb_r2_transfer_abort(sb_r2_transfer_ctx*);\n" +
   "  int sb_r2_transfer_download_open(const char*, const char*, sb_r2_transfer_ctx**);\n" +
   "  size_t sb_r2_transfer_download_size(sb_r2_transfer_ctx*);\n" +
+  "  const char* sb_r2_transfer_download_etag(sb_r2_transfer_ctx*);\n" +
   "  size_t sb_r2_transfer_download_read(sb_r2_transfer_ctx*, size_t, char*, size_t);\n" +
   "  void sb_r2_transfer_download_close(sb_r2_transfer_ctx*);\n}";
 const R2_DOWNLOAD_BRANCH_ANCHOR = '  if (method != "PUT") { respond_with_error(res, "405 Method Not Allowed", "R2 transfer requires PUT", true); return true; }';
 const R2_DOWNLOAD_BRANCH_INJECT = `  // sb_r2_transfer_download_v1
+  // sb_r2_transfer_range_v1
+  // sb_r2_transfer_range_header_v2
+  // sb_r2_transfer_conditional_v1
+  // sb_r2_transfer_streaming_v2
   if (method == "GET") {
     sb_r2_transfer_ctx* download = nullptr;
     const int status = sb_r2_transfer_download_open(bucket.c_str(), token.c_str(), &download);
     if (status != 0 || !download) { respond_with_error(res, sb_r2_transfer_status(status), "R2 transfer unavailable", true); return true; }
-    struct Download { sb_r2_transfer_ctx* ctx; uintmax_t size; bool closed = false; };
-    auto state = std::make_shared<Download>(Download{download, sb_r2_transfer_download_size(download)});
+    const std::string etag = sb_r2_transfer_download_etag(download);
+    const std::string_view if_none_match = req->getHeader("if-none-match");
+    if (if_none_match == "*" || if_none_match == etag || (if_none_match.size() == etag.size() + 2 && if_none_match.front() == '"' && if_none_match.back() == '"' && if_none_match.substr(1, etag.size()) == etag)) {
+      sb_r2_transfer_download_close(download); res->writeStatus("304 Not Modified"); res->writeHeader("ETag", etag); res->end(); return true;
+    }
+    const uintmax_t full_size = sb_r2_transfer_download_size(download);
+    uintmax_t first = 0, last = full_size ? full_size - 1 : 0;
+    std::string_view range = req->getHeader("range"); if (range.empty()) range = req->getHeader("Range");
+    if (!range.empty()) {
+      if (range.substr(0, 6) != "bytes=") { sb_r2_transfer_download_close(download); respond_with_error(res, "416 Range Not Satisfiable", "invalid range", true); return true; }
+      const std::string_view spec = range.substr(6); const size_t dash = spec.find('-');
+      if (dash == std::string_view::npos || dash == 0) { sb_r2_transfer_download_close(download); respond_with_error(res, "416 Range Not Satisfiable", "invalid range", true); return true; }
+      first = 0; for (char c : spec.substr(0, dash)) { if (c < '0' || c > '9') { sb_r2_transfer_download_close(download); respond_with_error(res, "416 Range Not Satisfiable", "invalid range", true); return true; } first = first * 10 + (c - '0'); }
+      if (dash + 1 < spec.size()) { last = 0; for (char c : spec.substr(dash + 1)) { if (c < '0' || c > '9') { sb_r2_transfer_download_close(download); respond_with_error(res, "416 Range Not Satisfiable", "invalid range", true); return true; } last = last * 10 + (c - '0'); } }
+      if (first >= full_size || last < first) { sb_r2_transfer_download_close(download); respond_with_error(res, "416 Range Not Satisfiable", "range outside object", true); return true; }
+      if (last >= full_size) last = full_size - 1;
+      char content_range[96]; snprintf(content_range, sizeof(content_range), "bytes %llu-%llu/%llu", (unsigned long long)first, (unsigned long long)last, (unsigned long long)full_size);
+      res->writeStatus("206 Partial Content"); res->writeHeader("Content-Range", content_range);
+    }
+    res->writeHeader("ETag", etag); res->writeHeader("Accept-Ranges", "bytes");
+    struct Download { sb_r2_transfer_ctx* ctx; uintmax_t base; uintmax_t size; uintmax_t sent = 0; bool closed = false; char chunk[65536]; };
+    auto state = std::make_shared<Download>(Download{download, first, last - first + 1});
     auto pump = std::make_shared<std::function<bool()>>();
     *pump = [res, state, pump]() {
       if (state->closed) return false;
-      const uintmax_t offset = res->getWriteOffset(); char chunk[65536];
-      const size_t bytes = sb_r2_transfer_download_read(state->ctx, (size_t)offset, chunk, sizeof(chunk));
-      const auto result = res->tryEnd(std::string_view(chunk, bytes), state->size);
-      if (result.second) { sb_r2_transfer_download_close(state->ctx); state->closed = true; return false; }
-      if (!result.first) res->onWritable([pump](uintmax_t) { return (*pump)(); });
-      return false;
+      for (;;) {
+        const size_t want = state->size - state->sent < sizeof(state->chunk) ? (size_t)(state->size - state->sent) : sizeof(state->chunk);
+        const size_t bytes = sb_r2_transfer_download_read(state->ctx, (size_t)(state->base + state->sent), state->chunk, want);
+        const auto result = res->tryEnd(std::string_view(state->chunk, bytes), state->size);
+        if (result.second || bytes == 0) { sb_r2_transfer_download_close(state->ctx); state->closed = true; return false; }
+        if (!result.first) {
+          res->onWritable([res, state](uintmax_t offset) {
+            if (state->closed) return true;
+            const size_t want = state->size - offset < sizeof(state->chunk) ? (size_t)(state->size - offset) : sizeof(state->chunk);
+            const size_t bytes = sb_r2_transfer_download_read(state->ctx, (size_t)(state->base + offset), state->chunk, want);
+            const auto resumed = res->tryEnd(std::string_view(state->chunk, bytes), state->size);
+            if (resumed.second || bytes == 0) { sb_r2_transfer_download_close(state->ctx); state->closed = true; return true; }
+            return resumed.first;
+          });
+          return false;
+        }
+        state->sent += bytes;
+        if (state->sent == state->size) { sb_r2_transfer_download_close(state->ctx); state->closed = true; return false; }
+      }
     };
     res->writeHeader("Content-Type", "application/octet-stream");
     res->onAborted([state]() { if (!state->closed) { sb_r2_transfer_download_close(state->ctx); state->closed = true; } });
@@ -583,6 +662,131 @@ export async function patchUwebsockets(root: string): Promise<void> {
       throw new Error(`could not upgrade Porffor's direct R2 transfer bridge: anchor not found in ${file}.`);
     src = src.replace(R2_DOWNLOAD_DECL_ANCHOR, R2_DOWNLOAD_DECL_INJECT);
     src = src.replace(R2_DOWNLOAD_BRANCH_ANCHOR, R2_DOWNLOAD_BRANCH_INJECT);
+    changed = true;
+  }
+  if (src.includes(R2_DOWNLOAD_CACHE_MARKER) && !src.includes(R2_RANGE_CACHE_MARKER)) {
+    const stateAnchor = "    struct Download { sb_r2_transfer_ctx* ctx; uintmax_t size; bool closed = false; };\n    auto state = std::make_shared<Download>(Download{download, sb_r2_transfer_download_size(download)});";
+    const range = `    const uintmax_t full_size = sb_r2_transfer_download_size(download);
+    uintmax_t first = 0, last = full_size ? full_size - 1 : 0;
+    const std::string_view range = req->getHeader("range");
+    if (!range.empty()) {
+      if (range.substr(0, 6) != "bytes=") { sb_r2_transfer_download_close(download); respond_with_error(res, "416 Range Not Satisfiable", "invalid range", true); return true; }
+      const std::string_view spec = range.substr(6); const size_t dash = spec.find('-');
+      if (dash == std::string_view::npos || dash == 0) { sb_r2_transfer_download_close(download); respond_with_error(res, "416 Range Not Satisfiable", "invalid range", true); return true; }
+      first = 0; for (char c : spec.substr(0, dash)) { if (c < '0' || c > '9') { sb_r2_transfer_download_close(download); respond_with_error(res, "416 Range Not Satisfiable", "invalid range", true); return true; } first = first * 10 + (c - '0'); }
+      if (dash + 1 < spec.size()) { last = 0; for (char c : spec.substr(dash + 1)) { if (c < '0' || c > '9') { sb_r2_transfer_download_close(download); respond_with_error(res, "416 Range Not Satisfiable", "invalid range", true); return true; } last = last * 10 + (c - '0'); } }
+      if (first >= full_size || last < first) { sb_r2_transfer_download_close(download); respond_with_error(res, "416 Range Not Satisfiable", "range outside object", true); return true; }
+      if (last >= full_size) last = full_size - 1;
+      char content_range[96]; snprintf(content_range, sizeof(content_range), "bytes %llu-%llu/%llu", (unsigned long long)first, (unsigned long long)last, (unsigned long long)full_size);
+      res->writeStatus("206 Partial Content"); res->writeHeader("Content-Range", content_range);
+    }
+`;
+    const state = "    struct Download { sb_r2_transfer_ctx* ctx; uintmax_t base; uintmax_t size; bool closed = false; };\n    auto state = std::make_shared<Download>(Download{download, first, last - first + 1});";
+    if (!src.includes(stateAnchor)) throw new Error(`could not upgrade Porffor's direct R2 range bridge: anchor not found in ${file}.`);
+    src = src.replace("  // sb_r2_transfer_download_v1\n", "  // sb_r2_transfer_download_v1\n  // sb_r2_transfer_range_v1\n");
+    src = src.replace(stateAnchor, range + state);
+    src = src.replace("sb_r2_transfer_download_read(state->ctx, (size_t)offset, chunk, sizeof(chunk))", "sb_r2_transfer_download_read(state->ctx, (size_t)(state->base + offset), chunk, sizeof(chunk))");
+    changed = true;
+  }
+  if (src.includes(R2_RANGE_CACHE_MARKER) && !src.includes(R2_CONDITIONAL_CACHE_MARKER)) {
+    const declaration = "  size_t sb_r2_transfer_download_size(sb_r2_transfer_ctx*);\n";
+    const declarationReplacement = declaration + "  const char* sb_r2_transfer_download_etag(sb_r2_transfer_ctx*);\n";
+    const anchor = "    const uintmax_t full_size = sb_r2_transfer_download_size(download);\n";
+    const inject = `    // sb_r2_transfer_conditional_v1
+    const std::string etag = sb_r2_transfer_download_etag(download);
+    res->writeHeader("ETag", etag); res->writeHeader("Accept-Ranges", "bytes");
+    const std::string_view if_none_match = req->getHeader("if-none-match");
+    if (if_none_match == "*" || if_none_match == etag || (if_none_match.size() == etag.size() + 2 && if_none_match.front() == '"' && if_none_match.back() == '"' && if_none_match.substr(1, etag.size()) == etag)) {
+      sb_r2_transfer_download_close(download); res->writeStatus("304 Not Modified"); res->end(); return true;
+    }
+` + anchor;
+    if (!src.includes(declaration) || !src.includes(anchor)) throw new Error(`could not upgrade Porffor's direct R2 conditional bridge: anchor not found in ${file}.`);
+    src = src.replace(declaration, declarationReplacement).replace(anchor, inject);
+    changed = true;
+  }
+  if (src.includes(R2_CONDITIONAL_CACHE_MARKER) && !src.includes(R2_STREAMING_CACHE_MARKER)) {
+    const oldPump = `      const uintmax_t offset = res->getWriteOffset();
+      char chunk[65536];
+      const size_t bytes = sb_r2_transfer_download_read(state->ctx, (size_t)(state->base + offset), chunk, sizeof(chunk));
+      const auto result = res->tryEnd(std::string_view(chunk, bytes), state->size);
+      if (result.second) { sb_r2_transfer_download_close(state->ctx); state->closed = true; return false; }
+      if (!result.first) res->onWritable([pump](uintmax_t) { return (*pump)(); });
+      return false;`;
+    const newPump = `      for (;;) {
+        const uintmax_t offset = res->getWriteOffset(); char chunk[65536];
+        const size_t bytes = sb_r2_transfer_download_read(state->ctx, (size_t)(state->base + offset), chunk, sizeof(chunk));
+        const auto result = res->tryEnd(std::string_view(chunk, bytes), state->size);
+        if (result.second) { sb_r2_transfer_download_close(state->ctx); state->closed = true; return false; }
+        if (!result.first) { res->onWritable([pump](uintmax_t) { return (*pump)(); }); return false; }
+      }`;
+    if (!src.includes(oldPump)) throw new Error(`could not upgrade Porffor's direct R2 streaming bridge: anchor not found in ${file}.`);
+    src = src.replace("  // sb_r2_transfer_conditional_v1\n", "  // sb_r2_transfer_conditional_v1\n  // sb_r2_transfer_streaming_v2\n").replace(oldPump, newPump);
+    changed = true;
+  }
+  // A short-lived v2 cache marker was written before its pump fix. Repair
+  // those caches as well as applying the current form to future upgrades.
+  if (src.includes("state->base + offset") && src.includes("uintmax_t size; bool closed = false;")) {
+    const oldState = "struct Download { sb_r2_transfer_ctx* ctx; uintmax_t base; uintmax_t size; bool closed = false; };";
+    const newState = "struct Download { sb_r2_transfer_ctx* ctx; uintmax_t base; uintmax_t size; uintmax_t sent = 0; bool closed = false; };";
+    const oldPump = `      const uintmax_t offset = res->getWriteOffset(); char chunk[65536];
+        const size_t bytes = sb_r2_transfer_download_read(state->ctx, (size_t)(state->base + offset), chunk, sizeof(chunk));
+        const auto result = res->tryEnd(std::string_view(chunk, bytes), state->size);
+        if (result.second) { sb_r2_transfer_download_close(state->ctx); state->closed = true; return false; }
+        if (!result.first) { res->onWritable([pump](uintmax_t) { return (*pump)(); }); return false; }
+      }`;
+    const newPump = `      char chunk[65536];
+        const size_t bytes = sb_r2_transfer_download_read(state->ctx, (size_t)(state->base + state->sent), chunk, sizeof(chunk));
+        const auto result = res->tryEnd(std::string_view(chunk, bytes), state->size);
+        if (result.second) { sb_r2_transfer_download_close(state->ctx); state->closed = true; return false; }
+        if (!result.first) { res->onWritable([pump, state](uintmax_t offset) { state->sent = offset; return (*pump)(); }); return false; }
+        state->sent += bytes;
+      }`;
+    if (!src.includes(oldState) || !src.includes(oldPump)) throw new Error(`could not repair Porffor's direct R2 streaming bridge: anchor not found in ${file}.`);
+    src = src.replace(oldState, newState).replace(oldPump, newPump);
+    changed = true;
+  }
+  const duplicatePump = "      for (;;) {\n        char chunk[65536];\n      for (;;) {\n";
+  if (src.includes(duplicatePump)) {
+    src = src.replace(duplicatePump, "      for (;;) {\n        char chunk[65536];\n");
+    changed = true;
+  }
+  const unclosedPump = "        state->sent += bytes;\n    };\n";
+  if (src.includes(unclosedPump)) {
+    src = src.replace(unclosedPump, "        state->sent += bytes;\n      }\n    };\n");
+    changed = true;
+  }
+  if (src.includes(R2_STREAMING_CACHE_MARKER) && !src.includes(R2_RANGE_HEADER_CACHE_MARKER)) {
+    const rangeHeader = "    const std::string_view range = req->getHeader(\"range\");\n";
+    if (!src.includes(rangeHeader)) throw new Error(`could not upgrade Porffor's direct R2 range-header bridge: anchor not found in ${file}.`);
+    src = src.replace("  // sb_r2_transfer_range_v1\n", "  // sb_r2_transfer_range_v1\n  // sb_r2_transfer_range_header_v2\n");
+    src = src.replace(rangeHeader, "    std::string_view range = req->getHeader(\"range\"); if (range.empty()) range = req->getHeader(\"Range\");\n");
+    changed = true;
+  }
+  const earlyConditionalHeaders = "    res->writeHeader(\"ETag\", etag); res->writeHeader(\"Accept-Ranges\", \"bytes\");\n";
+  if (src.includes(earlyConditionalHeaders) && src.indexOf(earlyConditionalHeaders) < src.indexOf("    const uintmax_t full_size = sb_r2_transfer_download_size(download);")) {
+    const old304 = "      sb_r2_transfer_download_close(download); res->writeStatus(\"304 Not Modified\"); res->end(); return true;";
+    const new304 = "      sb_r2_transfer_download_close(download); res->writeStatus(\"304 Not Modified\"); res->writeHeader(\"ETag\", etag); res->end(); return true;";
+    const rangeEnd = "      res->writeStatus(\"206 Partial Content\"); res->writeHeader(\"Content-Range\", content_range);\n    }\n";
+    if (!src.includes(old304) || !src.includes(rangeEnd)) throw new Error(`could not repair Porffor's direct R2 response ordering: anchor not found in ${file}.`);
+    src = src.replace(earlyConditionalHeaders, "").replace(old304, new304).replace(rangeEnd, rangeEnd + "    res->writeHeader(\"ETag\", etag); res->writeHeader(\"Accept-Ranges\", \"bytes\");\n");
+    changed = true;
+  }
+  if (src.includes("state->sent") && src.includes(R2_DOWNLOAD_CACHE_MARKER)) {
+    const stateStart = src.indexOf("    struct Download {", src.indexOf(R2_DOWNLOAD_CACHE_MARKER));
+    const stateEnd = src.indexOf("    res->writeHeader(\"Content-Type\"", stateStart);
+    const freshStart = R2_DOWNLOAD_BRANCH_INJECT.indexOf("    struct Download {");
+    const freshEnd = R2_DOWNLOAD_BRANCH_INJECT.indexOf("    res->writeHeader(\"Content-Type\"", freshStart);
+    if (stateStart < 0 || stateEnd < 0 || freshStart < 0 || freshEnd < 0) throw new Error(`could not replace Porffor's direct R2 stream pump: anchor not found in ${file}.`);
+    src = src.slice(0, stateStart) + R2_DOWNLOAD_BRANCH_INJECT.slice(freshStart, freshEnd) + src.slice(stateEnd);
+    changed = true;
+  }
+  if (src.includes("writable_offset") && src.includes(R2_DOWNLOAD_CACHE_MARKER)) {
+    const stateStart = src.indexOf("    struct Download {", src.indexOf(R2_DOWNLOAD_CACHE_MARKER));
+    const stateEnd = src.indexOf("    res->writeHeader(\"Content-Type\"", stateStart);
+    const freshStart = R2_TRANSFER_INJECT.indexOf("    struct Download {");
+    const freshEnd = R2_TRANSFER_INJECT.indexOf("    res->writeHeader(\"Content-Type\"", freshStart);
+    if (stateStart < 0 || stateEnd < 0 || freshStart < 0 || freshEnd < 0) throw new Error(`could not restore Porffor's direct R2 stream pump: anchor not found in ${file}.`);
+    src = src.slice(0, stateStart) + R2_TRANSFER_INJECT.slice(freshStart, freshEnd) + src.slice(stateEnd);
     changed = true;
   }
   for (const [marker, anchor, inject, what] of UWS_EDITS) {
