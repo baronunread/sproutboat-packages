@@ -1,5 +1,12 @@
 # @sproutboat/runtime
 
+## 0.9.2
+
+### Patch Changes
+
+- d8b7877: Add native standalone R2 direct-download tickets with bounded, backpressure-aware
+  file reads, including upgrades for existing patched Porffor caches.
+
 ## 0.9.1
 
 ### Patch Changes
