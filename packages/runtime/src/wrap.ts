@@ -175,6 +175,8 @@ export function wrapNativeFetchHandler(
   appName: string = "app",
   /** #15 — assets baked into the module for a binary that has no files beside it. */
   assets?: { manifest: unknown; files: Record<string, string> },
+  /** The selected transport determines whether the direct-transfer C ABI is real or stubbed. */
+  transport: Transport = "broker",
 ): string {
   const neutralised = neutraliseExports(source);
   if (neutralised === null || !/\bfetch\s*\(/.test(source)) {
@@ -191,9 +193,14 @@ export function wrapNativeFetchHandler(
     // #15 — and enforces the outbound allowlist itself, with no broker to do it.
     `globalThis.__sbOutbound = ${JSON.stringify(bindings.outbound)};\n` +
     (assets ? `globalThis.__sbAssets = ${JSON.stringify(assets)};\n` : "");
-  // The native transfer hook runs before JavaScript receives its Request, so
-  // it needs the same default data-directory name as the embedded transport.
-  const nativeAppName = `Porffor.c\`const char* sb_standalone_app_name(void) { return ${JSON.stringify(appName)}; }\`;\n`;
+  // The native transfer hook runs before JavaScript receives its Request. It
+  // has a real file-backed implementation only in embedded builds. The broker
+  // transport supplies ABI-compatible stubs because its separate transfer
+  // listener owns these URLs, while the shared uWebSockets patch is global.
+  const nativeTransferAbi =
+    transport === "embedded"
+      ? `Porffor.c\`const char* sb_standalone_app_name(void) { return ${JSON.stringify(appName)}; }\`;\n`
+      : "Porffor.c`typedef struct sb_r2_transfer_ctx { int unused; } sb_r2_transfer_ctx; int sb_r2_transfer_open(const char* a, const char* b, size_t c, sb_r2_transfer_ctx** d) { if (d) *d = 0; return 404; } int sb_r2_transfer_write(sb_r2_transfer_ctx* a, const char* b, size_t c) { return 404; } int sb_r2_transfer_finish(sb_r2_transfer_ctx* a) { return 404; } void sb_r2_transfer_abort(sb_r2_transfer_ctx* a) {}`;\n";
   const wire = hasBindings(bindings)
     ? `__sbInstallBindings(env, ${JSON.stringify(bindings)});\n`
     : "";
@@ -208,7 +215,7 @@ export function wrapNativeFetchHandler(
     : "";
 
   return (
-    `${prelude}\n${nativeAppName}${compat}${env}${wire}` +
+    `${prelude}\n${nativeTransferAbi}${compat}${env}${wire}` +
     `${neutralised}\n` +
     `${registerDO}${triggers}` +
     `export default {\n  port: ${port},\n  fetch(request) { return __sbEntry(__sbHandlers, request); }\n};\n`
