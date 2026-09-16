@@ -1,5 +1,11 @@
 # @sproutboat/toolchain
 
+## 0.4.2
+
+### Patch Changes
+
+- fa09d90: Update the pinned Porffor compiler to alpha 6 and remove the superseded local promise-resolution workaround.
+
 ## 0.4.1
 
 ### Patch Changes
