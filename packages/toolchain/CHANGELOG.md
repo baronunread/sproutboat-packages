@@ -1,5 +1,11 @@
 # @sproutboat/toolchain
 
+## 0.4.5
+
+### Patch Changes
+
+- 5ee065c: Stream standalone direct R2 byte ranges safely and support ETag conditionals.
+
 ## 0.4.4
 
 ### Patch Changes
