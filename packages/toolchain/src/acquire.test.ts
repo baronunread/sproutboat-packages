@@ -28,7 +28,9 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "  }\n" +
       "  return -1;\n" +
       "}\n",
-    "compiler/index.js": "          '-xc', '-', '-c',\n          uSocketsArchive,\n          '-lm'\n",
+    "compiler/index.js":
+      "          '-xc', '-', '-c',\n          uSocketsArchive,\n          '-lm'\n" +
+      "          '-I', `${uwsDir}/uSockets/src`,\n",
     "compiler/uwebsockets.js":
       "static const size_t REQUEST_BODY_MAX_BYTES = 1024u * 1024u;\n" +
       "int porf_native_fetch_read_value(struct jsval value, const char** out_buf, size_t* out_len, char** out_owned);\n" +
