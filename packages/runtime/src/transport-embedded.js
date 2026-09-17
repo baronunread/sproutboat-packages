@@ -578,7 +578,6 @@ static void sb_r2_delete_blob(const char* path, const char* bucket, const char* 
 // path before it allocates a PendingRequest body. The context owns only a file
 // descriptor and small metadata buffers; object bytes stay in the kernel page
 // cache until the final fixed-size digest pass.
-#ifdef SB_R2_TRANSFER
 typedef struct sb_r2_transfer_ctx {
   FILE* file;
   sqlite3* db;
@@ -806,7 +805,6 @@ size_t sb_r2_transfer_download_read(sb_r2_transfer_ctx* ctx, size_t offset, char
   return fread(out, 1, wanted, ctx->file);
 }
 void sb_r2_transfer_download_close(sb_r2_transfer_ctx* ctx) { if (ctx) { if (ctx->file) fclose(ctx->file); free(ctx); } }
-#endif
 
 // Run a script: one or more statements separated by semicolons. sqlite3_exec
 // handles the whole string, which prepare/step does not — it compiles the first

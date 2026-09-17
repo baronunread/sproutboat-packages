@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EMPTY_BINDINGS, wrapNativeFetchHandler } from "../../runtime/src/wrap";
-import { patchCompilerArgs, patchRenderJs, patchUwebsockets } from "./patch";
+import { patchRenderJs, patchUwebsockets } from "./patch";
 
 // The parts of Porffor's compiler/render.js the patch anchors to.
 const RENDER = `void porf_native_fetch_runtime_init(void) {
@@ -35,16 +35,6 @@ int porf_native_fetch_read_value(jsval value, const char** out_buf, size_t* out_
 
   return -1;
 }
-`;
-
-const COMPILER_INDEX = `const compileArgs = [
-          '-xc', '-', '-c',
-];
-const linkArgs = [
-          '-I', \`${"${uwsDir}"}/uSockets/src\`,
-          uSocketsArchive,
-          '-lm'
-];
 `;
 
 // Porffor's compiler/uwebsockets.js, trimmed to the parts the patch touches:
@@ -241,23 +231,7 @@ test("a drifted shim fails loudly instead of silently no-op'ing", async () => {
   }
 });
 
-test("native capability flags reach both the generated C and socket-shim C++ compiles", async () => {
-  const root = await mkdtemp(join(tmpdir(), "sb-patch-compiler-"));
-  try {
-    await mkdir(join(root, "compiler"), { recursive: true });
-    await writeFile(join(root, "compiler/index.js"), COMPILER_INDEX);
-    await patchCompilerArgs(root);
-    const once = await readFile(join(root, "compiler/index.js"), "utf8");
-    expect(once.match(/SB_EXTRA_CFLAGS/g)).toHaveLength(4);
-    expect(once).toContain("SB_UWS_EXTRA_CFLAGS");
-    await patchCompilerArgs(root);
-    expect(await readFile(join(root, "compiler/index.js"), "utf8")).toBe(once);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test("R2 builds define every direct transfer symbol the gated socket shim calls", async () => {
+test("broker transport defines every direct R2 transfer symbol the patched shim calls", async () => {
   const root = await shimDir();
   try {
     await patchUwebsockets(root);
@@ -269,7 +243,7 @@ test("R2 builds define every direct transfer symbol the gated socket shim calls"
       "export default { fetch() { return new Response('ok'); } }",
       "",
       {},
-      { ...EMPTY_BINDINGS, r2: ["OBJECTS"] },
+      EMPTY_BINDINGS,
       8080,
       "2026-08-26",
       "test",
@@ -280,42 +254,6 @@ test("R2 builds define every direct transfer symbol the gated socket shim calls"
     for (const symbol of new Set(required)) {
       expect(wrapped).toMatch(new RegExp(`\\b${symbol}\\s*\\([^)]*\\)\\s*\\{`));
     }
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test("the direct R2 socket path is excluded unless the compiler enables it", async () => {
-  const root = await shimDir();
-  try {
-    await patchUwebsockets(root);
-    const shim = await readFile(join(root, "compiler/uwebsockets.js"), "utf8");
-    expect(shim).toContain("#ifdef SB_R2_TRANSFER");
-    expect(shim).toContain("#endif\n  __porffor_js_enter();");
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test("an existing compiler cache upgrades to the gated R2 socket path", async () => {
-  const root = await shimDir();
-  try {
-    await patchUwebsockets(root);
-    const file = join(root, "compiler/uwebsockets.js");
-    const current = await readFile(file, "utf8");
-    const legacy = current
-      .replace('#ifdef SB_R2_TRANSFER\nextern "C" {', 'extern "C" {')
-      .replace("\n#endif\nstatic void on_request", "\nstatic void on_request")
-      .replace(
-        "#ifdef SB_R2_TRANSFER\n  if (try_handle_r2_transfer(res, req, method)) return;\n#endif\n",
-        "  if (try_handle_r2_transfer(res, req, method)) return;\n",
-      );
-    await writeFile(file, legacy);
-
-    await patchUwebsockets(root);
-    const upgraded = await readFile(file, "utf8");
-    expect(upgraded).toContain('#ifdef SB_R2_TRANSFER\nextern "C" {');
-    expect(upgraded).toContain("#endif\n  __porffor_js_enter();");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
