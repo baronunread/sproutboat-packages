@@ -1,5 +1,11 @@
 # @sproutboat/toolchain
 
+## 0.4.7
+
+### Patch Changes
+
+- ba5a6a0: Keep the normal native-fetch request handler outside the optional direct R2 transfer compiler guard.
+
 ## 0.4.6
 
 ### Patch Changes
