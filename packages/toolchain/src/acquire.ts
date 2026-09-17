@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 // @ts-expect-error Bun's file loader supplies a path; see the pinned-commit
 // check below for why this is safe to trust unconditionally.
-import vendoredPorfforArchive from "../vendor/porffor-038f415.tar.gz" with { type: "file" };
+import vendoredPorfforArchive from "../vendor/porffor-8f01541.tar.gz" with { type: "file" };
 import { ensurePorfforPatched } from "./patch";
 import { PORFFOR_ARCHIVE_SHA256, PORFFOR_ARCHIVE_URL, PORFFOR_COMMIT_FULL } from "./pin";
 
