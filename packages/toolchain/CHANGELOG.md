@@ -1,5 +1,11 @@
 # @sproutboat/toolchain
 
+## 0.4.8
+
+### Patch Changes
+
+- Republish under a new version: npm registry stuck 0.4.7 in a conflicted staged state after an interrupted OIDC trusted-publish attempt. No code changes from 0.4.7.
+
 ## 0.4.7
 
 ### Patch Changes
