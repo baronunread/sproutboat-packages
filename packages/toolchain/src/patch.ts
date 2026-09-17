@@ -542,8 +542,8 @@ static bool try_handle_r2_transfer(uWS::HttpResponse<false>* res, uWS::HttpReque
   });
   return true;
 }
-static void on_request(uWS::HttpResponse<false>* res, uWS::HttpRequest* req) {
 #endif
+static void on_request(uWS::HttpResponse<false>* res, uWS::HttpRequest* req) {
 `;
 const R2_TRANSFER_MARKER = "sb_r2_transfer_path(std::string_view path";
 const R2_TRANSFER_CALL_ANCHOR =
