@@ -1,5 +1,11 @@
 # @sproutboat/runtime
 
+## 0.9.5
+
+### Patch Changes
+
+- a357b91: Compile direct R2 transfer support only into artifacts that declare an R2 binding.
+
 ## 0.9.4
 
 ### Patch Changes

@@ -1,5 +1,11 @@
 # @sproutboat/toolchain
 
+## 0.4.6
+
+### Patch Changes
+
+- a357b91: Compile direct R2 transfer support only into artifacts that declare an R2 binding.
+
 ## 0.4.5
 
 ### Patch Changes
