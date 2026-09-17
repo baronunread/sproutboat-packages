@@ -1,8 +1,9 @@
 /**
  * The single pinned Porffor identity for the whole platform — the CLI and the
- * monorepo both read it from here. The `alpha-*` git tags ship no package.json,
- * so there is no npm dep to resolve; `ensurePorffor` fetches the commit tarball
- * and verifies it against `PORFFOR_ARCHIVE_SHA256`.
+ * monorepo both read it from here. Porffor's npm package ships only a prebuilt
+ * native binary (no compiler source), and sproutboat needs patchable source
+ * (see `patch.ts`), so `ensurePorffor` fetches the commit's git-archive tarball
+ * instead and verifies it against `PORFFOR_ARCHIVE_SHA256`.
  *
  * To move the pin: bump all four constants below (the sha is
  * `shasum -a 256` of the archive at `PORFFOR_ARCHIVE_URL`), check whether the
