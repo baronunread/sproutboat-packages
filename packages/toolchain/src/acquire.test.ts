@@ -202,6 +202,35 @@ test("a corrupted warm cache is replaced from the verified archive", async () =>
   expect(await readFile(join(root, "compiler/render.js"), "utf8")).toContain('getenv("PORT")');
 });
 
+test("a cache built by an older toolchain version is rebuilt, not silently reused", async () => {
+  const { archive, sha256 } = await fixture();
+  const cacheRoot = await mkdtemp(join(tmpdir(), "sb-porffor-stale-toolchain-"));
+  temporary.push(cacheRoot);
+  let requests = 0;
+  const options = {
+    cacheRoot,
+    url: "fixture",
+    expectedSha256: sha256,
+    fetcher: async () => {
+      requests += 1;
+      return new Response(Bun.file(archive));
+    },
+  };
+  const root = await ensurePorffor(options);
+  const manifestPath = join(root, ".sproutboat-complete");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  expect(manifest.toolchainVersion).toBeTruthy();
+  // Simulate a cache left behind by an older @sproutboat/toolchain publish
+  // (baronunread/sproutboat#205): a patch.ts fix landing in a new version used
+  // to sit unused because the cache key only tracked the upstream commit.
+  await rm(manifestPath);
+  await writeFile(manifestPath, JSON.stringify({ ...manifest, toolchainVersion: "0.0.0-stale" }));
+  await ensurePorffor(options);
+  expect(requests).toBe(2);
+  const rebuilt = JSON.parse(await readFile(manifestPath, "utf8"));
+  expect(rebuilt.toolchainVersion).toBe(manifest.toolchainVersion);
+});
+
 test("an interrupted stale lock is recovered", async () => {
   const { archive, sha256 } = await fixture();
   const cacheRoot = await mkdtemp(join(tmpdir(), "sb-porffor-interrupted-"));

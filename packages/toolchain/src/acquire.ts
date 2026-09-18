@@ -8,6 +8,12 @@ import { resolve } from "node:path";
 import vendoredPorfforArchive from "../vendor/porffor-8f01541.tar.gz" with { type: "file" };
 import { ensurePorfforPatched } from "./patch";
 import { PORFFOR_ARCHIVE_SHA256, PORFFOR_ARCHIVE_URL, PORFFOR_COMMIT_FULL } from "./pin";
+// Folded into the cache manifest below so a toolchain release that changes
+// patch.ts's output invalidates every machine's cache automatically
+// (baronunread/sproutboat#205 — a patch fix published as a new version used
+// to sit unused behind a still-"complete" cache keyed only on the upstream
+// Porffor commit).
+import { version as TOOLCHAIN_VERSION } from "../package.json" with { type: "json" };
 
 export class PorfforToolchainError extends Error {
   constructor(
@@ -45,9 +51,14 @@ async function complete(dir: string, expectedArchive = PORFFOR_ARCHIVE_SHA256): 
     const manifest = JSON.parse(await readFile(resolve(dir, ".sproutboat-complete"), "utf8")) as {
       commit?: string;
       archiveSha256?: string;
+      toolchainVersion?: string;
       files?: Record<string, string>;
     };
-    if (manifest.commit !== PORFFOR_COMMIT_FULL || manifest.archiveSha256 !== expectedArchive)
+    if (
+      manifest.commit !== PORFFOR_COMMIT_FULL ||
+      manifest.archiveSha256 !== expectedArchive ||
+      manifest.toolchainVersion !== TOOLCHAIN_VERSION
+    )
       return false;
     for (const file of required)
       if (!manifest.files?.[file] || (await digest(resolve(dir, file))) !== manifest.files[file])
@@ -185,7 +196,7 @@ export async function ensurePorffor(options: AcquireOptions = {}): Promise<strin
     );
     await writeFile(
       resolve(stage, ".sproutboat-complete"),
-      JSON.stringify({ commit: PORFFOR_COMMIT_FULL, archiveSha256: actual, files }),
+      JSON.stringify({ commit: PORFFOR_COMMIT_FULL, archiveSha256: actual, toolchainVersion: TOOLCHAIN_VERSION, files }),
       { mode: 0o444 },
     );
     await rename(stage, dir);
