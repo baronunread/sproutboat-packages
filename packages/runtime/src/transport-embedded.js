@@ -1886,11 +1886,12 @@ function __sbEmbeddedDispatch(msg) {
   if (op === "kv.put") {
     // #58 — CF rejects expirationTtl under 60 seconds; matched here.
     let expiresAt = null;
-    if (typeof msg.expirationTtl === "number") {
-      if (msg.expirationTtl < 60) throw new Error("expirationTtl must be at least 60 seconds");
-      expiresAt = Date.now() + msg.expirationTtl * 1000;
-    } else if (typeof msg.expiration === "number") {
-      expiresAt = msg.expiration * 1000;
+    if (msg.expirationTtl != null) {
+      const ttl = Number(msg.expirationTtl);
+      if (!(ttl >= 60)) throw new Error("expirationTtl must be at least 60 seconds");
+      expiresAt = Date.now() + ttl * 1000;
+    } else if (msg.expiration != null) {
+      expiresAt = Number(msg.expiration) * 1000;
     }
     __sbSql(
       store,
