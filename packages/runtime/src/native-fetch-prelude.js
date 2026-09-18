@@ -1739,6 +1739,17 @@ function __sbClientIp(request) {
   }
   return peer;
 }
+// #128 — httpProtocol/tlsVersion/tlsCipher: only a trusted front proxy can set
+// these (an untrusted direct peer could otherwise fake any value), so this
+// reuses the same SB_TRUSTED_PROXIES chain #163 already resolves clientIp
+// against. Undefined when no trusted proxy is configured or it sent nothing —
+// omitted, not faked, matching how clientIp itself falls back to the raw peer.
+function __sbTrustedProxyHeader(request, name) {
+  const peer = __sbNormalizeIp(request.headers.get("x-sb-remote-addr") || "");
+  const trusted = __sbSplitList(__sbEnv("SB_TRUSTED_PROXIES"));
+  if (!trusted.length || !__sbIpTrusted(peer, trusted)) return undefined;
+  return request.headers.get(name) || undefined;
+}
 
 // #57 — ctx.waitUntil: work that must run before the turn completes but must
 // not block the response the handler already built. `waitUntil(p)` just
@@ -1824,9 +1835,18 @@ async function __sbQueueWithDrain(result, tasks) {
 globalThis.__sbEntry = function (handlers, request) {
   const trigger = request.headers.get("x-sb-trigger");
   if (!trigger) {
-    // #163 — expose the resolved client IP the Workers way, before the handler runs.
+    // #163/#128 — expose the request metadata the edge already has, the
+    // Workers way, before the handler runs. httpProtocol/tlsVersion/tlsCipher
+    // are only set when a trusted front proxy forwarded them; colo, ASN and
+    // geo fields stay absent everywhere (#128 explicitly rejects faking them).
     const __cf = request.cf || {};
     __cf.clientIp = __sbClientIp(request);
+    const __httpProtocol = __sbTrustedProxyHeader(request, "x-sb-http-protocol");
+    if (__httpProtocol) __cf.httpProtocol = __httpProtocol;
+    const __tlsVersion = __sbTrustedProxyHeader(request, "x-sb-tls-version");
+    if (__tlsVersion) __cf.tlsVersion = __tlsVersion;
+    const __tlsCipher = __sbTrustedProxyHeader(request, "x-sb-tls-cipher");
+    if (__tlsCipher) __cf.tlsCipher = __tlsCipher;
     request.cf = __cf;
     // #28 — per-invocation CPU time. One fetch turn per process (serial), so the
     // process CPU delta across the handler is this invocation's CPU.
