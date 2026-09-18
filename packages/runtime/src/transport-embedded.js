@@ -1779,8 +1779,13 @@ function __sbEnsureSchema() {
   const s = __sbStore();
   __sbSql(
     s,
-    "CREATE TABLE IF NOT EXISTS kv (ns TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (ns, key))",
+    "CREATE TABLE IF NOT EXISTS kv (ns TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, " +
+      "expires_at INTEGER, PRIMARY KEY (ns, key))",
   );
+  const kvColumns = __sbSql(s, "PRAGMA table_info(kv)", []).rows;
+  let hasKvExpiresAt = false;
+  for (let i = 0; i < kvColumns.length; i++) if (kvColumns[i][1] === "expires_at") hasKvExpiresAt = true;
+  if (!hasKvExpiresAt) __sbSql(s, "ALTER TABLE kv ADD COLUMN expires_at INTEGER", []);
   // #56 — no `body` column: an object's bytes live in their own file under
   // "<data-dir>/r2-blobs/" (sb_r2_put_c/sb_r2_get_c), never in the sqlite row.
   __sbSql(
@@ -1869,16 +1874,28 @@ function __sbEmbeddedDispatch(msg) {
   if (op === "ping") return { ok: true, op: "pong", echo: msg.msg };
 
   if (op === "kv.get") {
-    const r = __sbSql(store, "SELECT value FROM kv WHERE ns = ? AND key = ?", [msg.ns, msg.key]);
-    return r.rows.length
-      ? { ok: true, found: true, value: r.rows[0][0] }
-      : { ok: true, found: false, value: null };
+    const r = __sbSql(store, "SELECT value, expires_at FROM kv WHERE ns = ? AND key = ?", [msg.ns, msg.key]);
+    if (!r.rows.length) return { ok: true, found: false, value: null };
+    const expiresAt = r.rows[0][1];
+    if (expiresAt != null && expiresAt <= Date.now()) {
+      __sbSql(store, "DELETE FROM kv WHERE ns = ? AND key = ?", [msg.ns, msg.key]);
+      return { ok: true, found: false, value: null };
+    }
+    return { ok: true, found: true, value: r.rows[0][0] };
   }
   if (op === "kv.put") {
+    // #58 — CF rejects expirationTtl under 60 seconds; matched here.
+    let expiresAt = null;
+    if (typeof msg.expirationTtl === "number") {
+      if (msg.expirationTtl < 60) throw new Error("expirationTtl must be at least 60 seconds");
+      expiresAt = Date.now() + msg.expirationTtl * 1000;
+    } else if (typeof msg.expiration === "number") {
+      expiresAt = msg.expiration * 1000;
+    }
     __sbSql(
       store,
-      "INSERT INTO kv (ns, key, value) VALUES (?1,?2,?3) ON CONFLICT (ns, key) DO UPDATE SET value = ?3",
-      [msg.ns, msg.key, msg.value],
+      "INSERT INTO kv (ns, key, value, expires_at) VALUES (?1,?2,?3,?4) ON CONFLICT (ns, key) DO UPDATE SET value = ?3, expires_at = ?4",
+      [msg.ns, msg.key, msg.value, expiresAt],
     );
     return { ok: true };
   }
@@ -1887,10 +1904,11 @@ function __sbEmbeddedDispatch(msg) {
     return { ok: true };
   }
   if (op === "kv.list") {
-    const r = __sbSql(store, "SELECT key FROM kv WHERE ns = ? AND key LIKE ? || '%' ORDER BY key", [
-      msg.ns,
-      msg.prefix || "",
-    ]);
+    const r = __sbSql(
+      store,
+      "SELECT key FROM kv WHERE ns = ? AND key LIKE ? || '%' AND (expires_at IS NULL OR expires_at > ?) ORDER BY key",
+      [msg.ns, msg.prefix || "", Date.now()],
+    );
     const keys = [];
     for (let i = 0; i < r.rows.length; i++) keys.push(r.rows[i][0]);
     return { ok: true, keys };

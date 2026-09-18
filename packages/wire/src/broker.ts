@@ -264,8 +264,11 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     conn.exec("PRAGMA journal_mode = WAL");
     conn.exec("PRAGMA synchronous = NORMAL");
     conn.exec(
-      "CREATE TABLE IF NOT EXISTS kv (ns TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (ns, key))",
+      "CREATE TABLE IF NOT EXISTS kv (ns TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, " +
+        "expires_at INTEGER, PRIMARY KEY (ns, key))",
     );
+    const kvColumns = conn.query<{ name: string }, []>("PRAGMA table_info(kv)").all();
+    if (!kvColumns.some((column) => column.name === "expires_at")) conn.exec("ALTER TABLE kv ADD COLUMN expires_at INTEGER");
     // #56 — no `body` column: an object's bytes live in their own file under
     // `r2Dir` (or an in-memory map for `:memory:`), never in the SQLite row.
     // Doubling every object through SQLite's own page cache on top of the
@@ -470,28 +473,47 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   };
 
   type KvStmts = {
-    get: Statement<{ value: string }, [string, string]>;
-    put: Statement<unknown, [string, string, string]>;
+    get: Statement<{ value: string; expires_at: number | null }, [string, string]>;
+    put: Statement<unknown, [string, string, string, number | null]>;
     del: Statement<unknown, [string, string]>;
-    list: Statement<{ key: string }, [string, string]>;
+    list: Statement<{ key: string }, [string, string, number]>;
   };
   const kvStmtCache = new Map<Database, KvStmts>();
   const kvStmts = (store: Database): KvStmts => {
     let stmts = kvStmtCache.get(store);
     if (!stmts) {
       stmts = {
-        get: store.query<{ value: string }, [string, string]>("SELECT value FROM kv WHERE ns = ? AND key = ?"),
+        get: store.query<{ value: string; expires_at: number | null }, [string, string]>(
+          "SELECT value, expires_at FROM kv WHERE ns = ? AND key = ?",
+        ),
         put: store.query(
-          "INSERT INTO kv (ns, key, value) VALUES (?1, ?2, ?3) ON CONFLICT (ns, key) DO UPDATE SET value = ?3",
+          "INSERT INTO kv (ns, key, value, expires_at) VALUES (?1, ?2, ?3, ?4) " +
+            "ON CONFLICT (ns, key) DO UPDATE SET value = ?3, expires_at = ?4",
         ),
         del: store.query("DELETE FROM kv WHERE ns = ? AND key = ?"),
-        list: store.query<{ key: string }, [string, string]>(
-          "SELECT key FROM kv WHERE ns = ? AND key LIKE ? || '%' ORDER BY key LIMIT 1000",
+        // #58 — an expired row is filtered out here; a periodic sweep to hard-delete
+        // it is a separate concern (ponytail: rows accumulate until touched by a
+        // get/list/put on the same key/prefix, add a cron sweep if that matters).
+        list: store.query<{ key: string }, [string, string, number]>(
+          "SELECT key FROM kv WHERE ns = ? AND key LIKE ? || '%' AND (expires_at IS NULL OR expires_at > ?) ORDER BY key LIMIT 1000",
         ),
       };
       kvStmtCache.set(store, stmts);
     }
     return stmts;
+  };
+  /** CF's own floor. Cloudflare rejects `expirationTtl < 60`; matched here so a
+   *  handler ported from Workers gets the same validation error either place. */
+  const MIN_KV_TTL_SECONDS = 60;
+  /** `{ expirationTtl }` (seconds from now) or `{ expiration }` (absolute unix
+   *  seconds) -> ms epoch, or `null` for no expiry. */
+  const kvExpiresAt = (msg: Frame): number | null => {
+    if (isNumber(msg.expirationTtl)) {
+      if (msg.expirationTtl < MIN_KV_TTL_SECONDS) throw new Error(`expirationTtl must be at least ${MIN_KV_TTL_SECONDS} seconds`);
+      return Date.now() + msg.expirationTtl * 1000;
+    }
+    if (isNumber(msg.expiration)) return msg.expiration * 1000;
+    return null;
   };
 
   const bound =
@@ -1190,12 +1212,18 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         return { ok: true, op: "pong", echo: msg.msg ?? null, pid: process.pid };
       case "kv.get": {
         const { store, part } = storeFor("kv", requireKv(msg.ns));
-        const row = kvStmts(store).get.get(part, str(msg.key));
-        return row ? { ok: true, found: true, value: row.value } : { ok: true, found: false, value: null };
+        const stmts = kvStmts(store);
+        const row = stmts.get.get(part, str(msg.key));
+        if (!row) return { ok: true, found: false, value: null };
+        if (row.expires_at != null && row.expires_at <= Date.now()) {
+          stmts.del.run(part, str(msg.key));
+          return { ok: true, found: false, value: null };
+        }
+        return { ok: true, found: true, value: row.value };
       }
       case "kv.put": {
         const { store, part } = storeFor("kv", requireKv(msg.ns));
-        kvStmts(store).put.run(part, str(msg.key), str(msg.value));
+        kvStmts(store).put.run(part, str(msg.key), str(msg.value), kvExpiresAt(msg));
         return { ok: true };
       }
       case "kv.delete": {
@@ -1208,7 +1236,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         return {
           ok: true,
           keys: kvStmts(store)
-            .list.all(part, str(msg.prefix))
+            .list.all(part, str(msg.prefix), Date.now())
             .map((r) => r.key),
         };
       }

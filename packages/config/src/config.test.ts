@@ -92,6 +92,14 @@ test("assets: bare directory (edge-only, no binding) is valid", () => {
   expect(r.ok && r.value.assets).toEqual({ directory: "public" });
 });
 
+test("version_metadata: accepts an UPPER_SNAKE binding name and collides like any other binding", () => {
+  const r = parseConfig(`${base}, "version_metadata": "CF_VERSION_METADATA" }`);
+  expect(r.ok && r.value.version_metadata).toBe("CF_VERSION_METADATA");
+  expect(parseConfig(`${base}, "version_metadata": "lower" }`).ok).toBe(false);
+  const collide = parseConfig(`${base}, "kv_namespaces": ["V"], "version_metadata": "V" }`);
+  expect(collide.ok).toBe(false);
+});
+
 test("omitting the binding fields is still valid", () => {
   const r = parseConfig(`${base} }`);
   expect(r.ok).toBe(true);

@@ -1170,8 +1170,11 @@ globalThis.__sbInstallBindings = function (target, bindings) {
         const r = __sbRpc("kv.get", { ns, key: String(key) });
         return r.found ? r.value : null;
       },
-      put(key, value) {
-        __sbRpc("kv.put", { ns, key: String(key), value: String(value) });
+      put(key, value, options) {
+        const msg = { ns, key: String(key), value: String(value) };
+        if (options && options.expirationTtl != null) msg.expirationTtl = Number(options.expirationTtl);
+        else if (options && options.expiration != null) msg.expiration = Number(options.expiration);
+        __sbRpc("kv.put", msg);
       },
       delete(key) {
         __sbRpc("kv.delete", { ns, key: String(key) });

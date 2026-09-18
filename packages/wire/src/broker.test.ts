@@ -50,6 +50,26 @@ test("KV put / get / list / delete, scoped to a bound namespace", async () => {
   expect(await b.dispatch({ op: "kv.get", ns: "CACHE", key: "k" })).toMatchObject({ found: false });
 });
 
+test("KV expirationTtl under 60 seconds is rejected, matching CF", async () => {
+  const b = make({ bindings: { kv: ["CACHE"] } });
+  await expect(b.dispatch({ op: "kv.put", ns: "CACHE", key: "k", value: "v", expirationTtl: 59 })).rejects.toThrow(
+    "at least 60 seconds",
+  );
+});
+
+test("a key past its expiration reads as absent and is omitted from list", async () => {
+  const b = make({ bindings: { kv: ["CACHE"] } });
+  const past = Math.floor((Date.now() - 1000) / 1000);
+  await b.dispatch({ op: "kv.put", ns: "CACHE", key: "expired", value: "v", expiration: past });
+  await b.dispatch({ op: "kv.put", ns: "CACHE", key: "fresh", value: "v", expirationTtl: 3600 });
+  expect(await b.dispatch({ op: "kv.get", ns: "CACHE", key: "expired" })).toEqual({
+    ok: true,
+    found: false,
+    value: null,
+  });
+  expect(await b.dispatch({ op: "kv.list", ns: "CACHE", prefix: "" })).toEqual({ ok: true, keys: ["fresh"] });
+});
+
 test("an unbound KV namespace is rejected", async () => {
   const b = make({ bindings: { kv: ["CACHE"] } });
   await expect(b.dispatch({ op: "kv.put", ns: "OTHER", key: "k", value: "v" })).rejects.toThrow("not bound");

@@ -67,6 +67,8 @@ export type SproutboatConfig = {
   ratelimiters?: RateLimiterConfig[];
   /** Static assets: a directory served edge-first (like Cloudflare), optionally bound as `env.<BINDING>.fetch(request)`. */
   assets?: AssetsConfig;
+  /** #126 — deployment identity binding: `env.<BINDING> = { id, tag, timestamp }`, baked at build time from the artifact digest. */
+  version_metadata?: string;
 };
 
 /** One named fixed-window rate limiter: at most `limit` calls per `period` seconds, per key. */
@@ -126,6 +128,7 @@ function validateConfig(value: ConfigInput): ConfigValidation {
     "triggers",
     "ratelimiters",
     "assets",
+    "version_metadata",
   ]);
   for (const key of Object.keys(value)) if (!allowed.has(key)) errors.push(`unsupported config field: ${key}`);
   const name = isString(value.name) && isProjectSlug(value.name) ? value.name : null;
@@ -214,6 +217,14 @@ function validateConfig(value: ConfigInput): ConfigValidation {
     }
     return out;
   };
+
+  const version_metadata =
+    value.version_metadata === undefined
+      ? undefined
+      : isString(value.version_metadata) && bindingName.test(value.version_metadata)
+        ? value.version_metadata
+        : null;
+  if (version_metadata === null) errors.push("version_metadata must be a binding name (UPPER_SNAKE_CASE)");
 
   const secrets = stringArray("secrets", bindingName, "binding names (UPPER_SNAKE_CASE)");
   const outbound = stringArray("outbound", hostPattern, "hostnames");
@@ -364,10 +375,18 @@ function validateConfig(value: ConfigInput): ConfigValidation {
     ...(ratelimiters ?? []).map((entry) => entry.binding),
     ...Object.keys(vars ?? {}),
     ...(assets?.binding ? [assets.binding] : []),
+    ...(version_metadata ? [version_metadata] : []),
   ];
   if (new Set(bindingSlots).size !== bindingSlots.length) errors.push("vars and binding names must not collide");
 
-  if (errors.length || name === null || main === null || compatibility_date === null || schema === null)
+  if (
+    errors.length ||
+    name === null ||
+    main === null ||
+    compatibility_date === null ||
+    schema === null ||
+    version_metadata === null
+  )
     return { ok: false, errors };
   const config: SproutboatConfig = { name, main, compatibility_date };
   if ("$schema" in value) config.$schema = schema;
@@ -384,6 +403,7 @@ function validateConfig(value: ConfigInput): ConfigValidation {
   if ("triggers" in value) config.triggers = triggers;
   if ("ratelimiters" in value) config.ratelimiters = ratelimiters;
   if ("assets" in value) config.assets = assets;
+  if ("version_metadata" in value) config.version_metadata = version_metadata;
   return { ok: true, value: config };
 }
 

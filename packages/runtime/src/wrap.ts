@@ -177,6 +177,13 @@ export function wrapNativeFetchHandler(
   assets?: { manifest: unknown; files: Record<string, string> },
   /** The selected transport determines whether the direct-transfer C ABI is real or stubbed. */
   transport: Transport = "broker",
+  /**
+   * #126 — `env.<binding> = { id, tag, timestamp }`. Baked at build time from the
+   * artifact digest, like `vars`: the control plane's own deployment id is a
+   * separate, later-assigned thing (minted at upload), so this is the artifact's
+   * own self-describing identity rather than a broker round trip.
+   */
+  versionMetadata?: { binding: string; id: string; tag: string; timestamp: string },
 ): string {
   const neutralised = neutraliseExports(source);
   if (neutralised === null || !/\bfetch\s*\(/.test(source)) {
@@ -184,6 +191,13 @@ export function wrapNativeFetchHandler(
   }
 
   const env = `const env = ${JSON.stringify(vars)};\nglobalThis.env = env;\n`;
+  const versionMetadataLine = versionMetadata
+    ? `env[${JSON.stringify(versionMetadata.binding)}] = ${JSON.stringify({
+        id: versionMetadata.id,
+        tag: versionMetadata.tag,
+        timestamp: versionMetadata.timestamp,
+      })};\n`
+    : "";
   // Baked, not a binding: the date belongs to the artifact, and a handler must
   // not be able to change the semantics it was compiled against at runtime.
   const compat =
@@ -215,7 +229,7 @@ export function wrapNativeFetchHandler(
     : "";
 
   return (
-    `${prelude}\n${nativeTransferAbi}${compat}${env}${wire}` +
+    `${prelude}\n${nativeTransferAbi}${compat}${env}${versionMetadataLine}${wire}` +
     `${neutralised}\n` +
     `${registerDO}${triggers}` +
     `export default {\n  port: ${port},\n  fetch(request) { return __sbEntry(__sbHandlers, request); }\n};\n`
