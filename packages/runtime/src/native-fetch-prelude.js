@@ -201,6 +201,63 @@ if (Response.json == null) {
   };
 }
 
+// #59 — caches.default / caches.open(name), backed by the broker's cache.*
+// ops (a sibling SQLite table, key on method+URL for v1 — no Vary yet).
+// Deliberately NOT async: every other buffered-body method on this runtime
+// (text/json/arrayBuffer/blob, formData above) is sync too, and #168's own
+// investigation found real coroutine-state corruption tied specifically to
+// nested `async function` calls accumulating across many requests — no
+// reason to add more async surface to that here. `await`ing a non-promise
+// still resolves immediately, so `await caches.default.match(...)` reads
+// exactly like the spec's Promise-returning version to calling code.
+if (globalThis.caches == null) {
+  function __sbCacheKey(request) {
+    return "GET " + (__sbIsStr(request) ? request : request.url);
+  }
+  class __SproutboatCache {
+    constructor(name) {
+      this._name = name;
+    }
+    match(request) {
+      const r = __sbRpc("cache.match", { name: this._name, key: __sbCacheKey(request) });
+      if (!r.found) return undefined;
+      return new Response(r.body, { status: r.status, headers: r.headers });
+    }
+    put(request, response) {
+      const method = __sbIsStr(request) ? "GET" : request.method;
+      if (method !== "GET") throw new TypeError("Cache.put: request method must be GET");
+      const headers = {};
+      response.headers.forEach((value, name) => {
+        headers[name] = value;
+      });
+      __sbRpc("cache.put", {
+        name: this._name,
+        key: __sbCacheKey(request),
+        status: response.status,
+        headers,
+        body: response.text(),
+      });
+      return undefined;
+    }
+    delete(request) {
+      return !!__sbRpc("cache.delete", { name: this._name, key: __sbCacheKey(request) }).deleted;
+    }
+  }
+  const __sbCacheInstances = new Map();
+  globalThis.caches = {
+    default: new __SproutboatCache("default"),
+    open(name) {
+      const key = String(name);
+      let instance = __sbCacheInstances.get(key);
+      if (!instance) {
+        instance = new __SproutboatCache(key);
+        __sbCacheInstances.set(key, instance);
+      }
+      return instance;
+    },
+  };
+}
+
 // Porffor's URL exposes href / origin / pathname / search only. Add the rest of
 // the WHATWG read surface, derived from `origin` (scheme://host[:port]).
 // `hash` is always '' server-side — browsers strip the fragment before the

@@ -75,6 +75,62 @@ test("an unbound KV namespace is rejected", async () => {
   await expect(b.dispatch({ op: "kv.put", ns: "OTHER", key: "k", value: "v" })).rejects.toThrow("not bound");
 });
 
+test("cache.match on an empty cache is a plain miss", async () => {
+  const b = make();
+  expect(await b.dispatch({ op: "cache.match", key: "GET https://example.com/a" })).toEqual({
+    ok: true,
+    found: false,
+  });
+});
+
+test("cache: put then match round-trips status/headers/body, deletes work, ambient (no binding needed)", async () => {
+  const b = make();
+  const key = "GET https://example.com/a";
+  expect(
+    await b.dispatch({ op: "cache.put", key, status: 200, headers: { "content-type": "text/plain" }, body: "hi" }),
+  ).toEqual({ ok: true, stored: true });
+  expect(await b.dispatch({ op: "cache.match", key })).toEqual({
+    ok: true,
+    found: true,
+    status: 200,
+    headers: { "content-type": "text/plain" },
+    body: "hi",
+  });
+  expect(await b.dispatch({ op: "cache.delete", key })).toEqual({ ok: true, deleted: true });
+  expect(await b.dispatch({ op: "cache.match", key })).toEqual({ ok: true, found: false });
+  expect(await b.dispatch({ op: "cache.delete", key })).toEqual({ ok: true, deleted: false });
+});
+
+test("cache.put skips storage (silently) for a 206, no-store, or private response", async () => {
+  const b = make();
+  await b.dispatch({ op: "cache.put", key: "k1", status: 206, body: "partial" });
+  await b.dispatch({ op: "cache.put", key: "k2", status: 200, headers: { "cache-control": "no-store" }, body: "x" });
+  await b.dispatch({ op: "cache.put", key: "k3", status: 200, headers: { "cache-control": "private" }, body: "x" });
+  expect(await b.dispatch({ op: "cache.match", key: "k1" })).toEqual({ ok: true, found: false });
+  expect(await b.dispatch({ op: "cache.match", key: "k2" })).toEqual({ ok: true, found: false });
+  expect(await b.dispatch({ op: "cache.match", key: "k3" })).toEqual({ ok: true, found: false });
+});
+
+test("cache.put derives TTL from s-maxage over max-age; an expired entry reads as a miss", async () => {
+  const b = make();
+  await b.dispatch({
+    op: "cache.put",
+    key: "k",
+    status: 200,
+    headers: { "cache-control": "max-age=3600, s-maxage=0" },
+    body: "x",
+  });
+  // s-maxage=0 wins over max-age=3600 -> expires immediately.
+  expect(await b.dispatch({ op: "cache.match", key: "k" })).toEqual({ ok: true, found: false });
+});
+
+test("cache namespaces (caches.open) don't collide on the same key", async () => {
+  const b = make();
+  await b.dispatch({ op: "cache.put", name: "images", key: "k", status: 200, body: "img" });
+  expect(await b.dispatch({ op: "cache.match", name: "images", key: "k" })).toMatchObject({ found: true, body: "img" });
+  expect(await b.dispatch({ op: "cache.match", key: "k" })).toEqual({ ok: true, found: false });
+});
+
 test("secrets resolve only when both bound and present", async () => {
   const b = make({ bindings: { secrets: ["API_KEY", "MISSING"] }, secrets: { API_KEY: "s3cr3t" } });
   expect(await b.dispatch({ op: "secret.get", name: "API_KEY" })).toEqual({ ok: true, value: "s3cr3t" });
