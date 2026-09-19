@@ -332,6 +332,14 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     "CREATE TABLE IF NOT EXISTS ratelimit (name TEXT NOT NULL, key TEXT NOT NULL, window_start INTEGER NOT NULL, " +
       "count INTEGER NOT NULL, PRIMARY KEY (name, key))",
   );
+  // #59 — caches.default: ambient, not a resource a project binds (no config
+  // key), so it lives in the per-deployment db like do_storage/ae rather than
+  // going through the account-level resource registry. Key on method+URL for
+  // v1, per the issue's own scoped-down ask; no Vary support yet.
+  db.exec(
+    "CREATE TABLE IF NOT EXISTS cache (name TEXT NOT NULL, cache_key TEXT NOT NULL, status INTEGER NOT NULL, " +
+      "headers_json TEXT NOT NULL, body TEXT NOT NULL, expires_at INTEGER, PRIMARY KEY (name, cache_key))",
+  );
 
   // #74 — one SQLite file per account-level resource id, opened on first use.
   const resourceDbs = new Map<string, Database>();
@@ -1240,6 +1248,50 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
             .map((r) => r.key),
         };
       }
+      case "cache.match": {
+        const name = str(msg.name) || "default";
+        const key = str(msg.key);
+        const row = db
+          .query<
+            { status: number; headers_json: string; body: string; expires_at: number | null },
+            [string, string]
+          >("SELECT status, headers_json, body, expires_at FROM cache WHERE name = ? AND cache_key = ?")
+          .get(name, key);
+        if (!row) return { ok: true, found: false };
+        if (row.expires_at != null && row.expires_at <= Date.now()) {
+          db.query("DELETE FROM cache WHERE name = ? AND cache_key = ?").run(name, key);
+          return { ok: true, found: false };
+        }
+        return { ok: true, found: true, status: row.status, headers: jsonObject(parseJsonValue(row.headers_json)) ?? {}, body: row.body };
+      }
+      case "cache.put": {
+        const name = str(msg.name) || "default";
+        const key = str(msg.key);
+        const status = Number(msg.status) || 200;
+        const headers = jsonObject(msg.headers ?? null) ?? {};
+        const cacheControl = str(headers["cache-control"] ?? headers["Cache-Control"] ?? "").toLowerCase();
+        // Mirrors Workers' own `caches.default.put()`: a 206 or an explicit
+        // no-store/private is a silent no-op, not an error — the handler's
+        // response still goes to the client either way.
+        if (status === 206 || cacheControl.includes("no-store") || cacheControl.includes("private")) {
+          return { ok: true, stored: false };
+        }
+        const sMaxAge = /s-maxage=(\d+)/.exec(cacheControl);
+        const maxAge = /max-age=(\d+)/.exec(cacheControl);
+        const ttlSeconds = sMaxAge ? Number(sMaxAge[1]) : maxAge ? Number(maxAge[1]) : null;
+        const expiresAt = ttlSeconds != null ? Date.now() + ttlSeconds * 1000 : null;
+        db.query(
+          "INSERT INTO cache (name, cache_key, status, headers_json, body, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) " +
+            "ON CONFLICT (name, cache_key) DO UPDATE SET status = ?3, headers_json = ?4, body = ?5, expires_at = ?6",
+        ).run(name, key, status, JSON.stringify(headers), str(msg.body), expiresAt);
+        return { ok: true, stored: true };
+      }
+      case "cache.delete": {
+        const name = str(msg.name) || "default";
+        const key = str(msg.key);
+        const r = db.query("DELETE FROM cache WHERE name = ? AND cache_key = ?").run(name, key);
+        return { ok: true, deleted: r.changes > 0 };
+      }
       case "secret.get": {
         const name = str(msg.name);
         if (!bindings.secrets.includes(name)) throw new Error(`secret not bound: ${name}`);
@@ -1704,6 +1756,8 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   const REPLAYABLE = new Set([
     "kv.put",
     "kv.delete",
+    "cache.put",
+    "cache.delete",
     "queue.send",
     "queue.send_batch",
     "d1.query",

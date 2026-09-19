@@ -1854,6 +1854,11 @@ function __sbEnsureSchema() {
     s,
     "CREATE TABLE IF NOT EXISTS ratelimit (name TEXT NOT NULL, key TEXT NOT NULL, window_start INTEGER NOT NULL, count INTEGER NOT NULL, PRIMARY KEY (name, key))",
   );
+  // #59 — caches.default, ambient like the broker's copy of this table.
+  __sbSql(
+    s,
+    "CREATE TABLE IF NOT EXISTS cache (name TEXT NOT NULL, cache_key TEXT NOT NULL, status INTEGER NOT NULL, headers_json TEXT NOT NULL, body TEXT NOT NULL, expires_at INTEGER, PRIMARY KEY (name, cache_key))",
+  );
 }
 
 function __sbHex(n) {
@@ -2424,6 +2429,48 @@ function __sbEmbeddedDispatch(msg) {
     );
     const count = r.rows.length ? Number(r.rows[0][0]) : 1;
     return { ok: true, success: count <= limit, resetAt: (windowStart + period) * 1000 };
+  }
+
+  if (op === "cache.match") {
+    const name = msg.name || "default";
+    const r = __sbSql(store, "SELECT status, headers_json, body, expires_at FROM cache WHERE name = ? AND cache_key = ?", [
+      name,
+      msg.key,
+    ]);
+    if (!r.rows.length) return { ok: true, found: false };
+    const [status, headersJson, body, expiresAt] = r.rows[0];
+    if (expiresAt != null && expiresAt <= Date.now()) {
+      __sbSql(store, "DELETE FROM cache WHERE name = ? AND cache_key = ?", [name, msg.key]);
+      return { ok: true, found: false };
+    }
+    return { ok: true, found: true, status, headers: JSON.parse(headersJson), body };
+  }
+  if (op === "cache.put") {
+    const name = msg.name || "default";
+    const status = Number(msg.status) || 200;
+    const headers = msg.headers || {};
+    const cacheControl = String(headers["cache-control"] || headers["Cache-Control"] || "").toLowerCase();
+    // Mirrors Workers' own caches.default.put(): a 206 or an explicit
+    // no-store/private is a silent no-op, not an error.
+    if (status === 206 || cacheControl.indexOf("no-store") !== -1 || cacheControl.indexOf("private") !== -1) {
+      return { ok: true, stored: false };
+    }
+    const sMaxAge = /s-maxage=(\d+)/.exec(cacheControl);
+    const maxAge = /max-age=(\d+)/.exec(cacheControl);
+    const ttlSeconds = sMaxAge ? Number(sMaxAge[1]) : maxAge ? Number(maxAge[1]) : null;
+    const expiresAt = ttlSeconds != null ? Date.now() + ttlSeconds * 1000 : null;
+    __sbSql(
+      store,
+      "INSERT INTO cache (name, cache_key, status, headers_json, body, expires_at) VALUES (?1,?2,?3,?4,?5,?6) " +
+        "ON CONFLICT (name, cache_key) DO UPDATE SET status = ?3, headers_json = ?4, body = ?5, expires_at = ?6",
+      [name, msg.key, status, JSON.stringify(headers), msg.body, expiresAt],
+    );
+    return { ok: true, stored: true };
+  }
+  if (op === "cache.delete") {
+    const name = msg.name || "default";
+    const r = __sbSql(store, "DELETE FROM cache WHERE name = ? AND cache_key = ?", [name, msg.key]);
+    return { ok: true, deleted: r.changes > 0 };
   }
 
   throw new Error("unknown op: " + op);
