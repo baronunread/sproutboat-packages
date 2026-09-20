@@ -5,9 +5,10 @@
 // expects: URLSearchParams (read + write), URL.prototype.searchParams and the
 // protocol/host/hostname/port/hash accessors, static Response.json,
 // crypto.randomUUID / crypto.getRandomValues, crypto.subtle (digest + HMAC
-// sign/verify, #133), and structuredClone. Each is feature-detected; delete a
-// block once Porffor ships that global. crypto.scryptVerify (#153) is a
-// Sproutboat extension, not WHATWG, and stays.
+// sign/verify, #133), structuredClone, and FormData + Request/Response
+// formData()/bytes() (#60). Each is feature-detected; delete a block once
+// Porffor ships that global. crypto.scryptVerify (#153) is a Sproutboat
+// extension, not WHATWG, and stays.
 // Tracked upstream in patches/UPSTREAM.md.
 //
 // Declared before it is referenced: a getter body that names a later top-level
@@ -255,6 +256,130 @@ if (globalThis.caches == null) {
       }
       return instance;
     },
+  };
+}
+
+// #60 — Porffor's Request/Response give text()/json()/arrayBuffer()/blob()
+// synchronously (buffered body, fine under http-sync-v0) but no FormData at
+// all. Parses the same buffered body, synchronously, into a FormData-like
+// object; url-encoded via the URLSearchParams shim above, multipart by hand
+// (RFC 7578: boundary-delimited parts, each a header block then a blank line
+// then the part body — one pass, no nested multipart).
+if (globalThis.FormData == null) {
+  class __SproutboatFormData {
+    constructor() {
+      this._entries = [];
+    }
+    append(name, value, filename) {
+      this._entries.push([String(name), value, filename]);
+    }
+    set(name, value, filename) {
+      name = String(name);
+      let replaced = false;
+      this._entries = this._entries.filter((e) => {
+        if (e[0] !== name) return true;
+        if (replaced) return false;
+        e[1] = value;
+        e[2] = filename;
+        replaced = true;
+        return true;
+      });
+      if (!replaced) this.append(name, value, filename);
+    }
+    get(name) {
+      for (let i = 0; i < this._entries.length; i++) if (this._entries[i][0] === name) return this._entries[i][1];
+      return null;
+    }
+    getAll(name) {
+      const out = [];
+      for (let i = 0; i < this._entries.length; i++) if (this._entries[i][0] === name) out.push(this._entries[i][1]);
+      return out;
+    }
+    has(name) {
+      for (let i = 0; i < this._entries.length; i++) if (this._entries[i][0] === name) return true;
+      return false;
+    }
+    delete(name) {
+      this._entries = this._entries.filter((e) => e[0] !== name);
+    }
+    forEach(cb) {
+      for (let i = 0; i < this._entries.length; i++) cb(this._entries[i][1], this._entries[i][0], this);
+    }
+    keys() {
+      return this._entries.map((e) => e[0]);
+    }
+    values() {
+      return this._entries.map((e) => e[1]);
+    }
+    entries() {
+      return this._entries.map((e) => [e[0], e[1]]);
+    }
+  }
+  globalThis.FormData = __SproutboatFormData;
+}
+
+function __sbParseUrlencodedFormData(text) {
+  const fd = new FormData();
+  // forEach, not keys()/values() — those are spec'd as iterators, not
+  // arrays, and this shim's own URLSearchParams.keys()/values() return
+  // arrays as an implementation shortcut, so relying on either shape here
+  // would break against whichever kind actually ends up installed.
+  new URLSearchParams(text).forEach((value, key) => fd.append(key, value));
+  return fd;
+}
+
+function __sbParseMultipartFormData(text, boundary) {
+  const fd = new FormData();
+  const delim = "--" + boundary;
+  const segments = text.split(delim);
+  // segments[0] is the preamble, the last is the closing "--" epilogue.
+  for (let i = 1; i < segments.length - 1; i++) {
+    let part = segments[i];
+    if (part.slice(0, 2) === "\r\n") part = part.slice(2);
+    if (part.slice(-2) === "\r\n") part = part.slice(0, -2);
+    const headerEnd = part.indexOf("\r\n\r\n");
+    if (headerEnd === -1) continue;
+    const headerText = part.slice(0, headerEnd);
+    const body = part.slice(headerEnd + 4);
+    const nameMatch = /name="([^"]*)"/i.exec(headerText);
+    if (!nameMatch) continue;
+    const filenameMatch = /filename="([^"]*)"/i.exec(headerText);
+    if (filenameMatch) fd.append(nameMatch[1], new Blob([body]), filenameMatch[1]);
+    else fd.append(nameMatch[1], body);
+  }
+  return fd;
+}
+
+function __sbFormDataFromBody(headers, text) {
+  const contentType = headers.get("content-type") || "";
+  if (contentType.indexOf("multipart/form-data") !== -1) {
+    const boundaryMatch = /boundary=(?:"([^"]*)"|([^;]+))/i.exec(contentType);
+    const boundary = boundaryMatch ? (boundaryMatch[1] || boundaryMatch[2]).trim() : null;
+    if (!boundary) throw new TypeError("multipart/form-data body has no boundary");
+    return __sbParseMultipartFormData(text, boundary);
+  }
+  return __sbParseUrlencodedFormData(text);
+}
+
+if (!("formData" in Request.prototype)) {
+  Request.prototype.formData = function () {
+    return __sbFormDataFromBody(this.headers, this.text());
+  };
+}
+if (!("formData" in Response.prototype)) {
+  Response.prototype.formData = function () {
+    return __sbFormDataFromBody(this.headers, this.text());
+  };
+}
+// #60 — the newer Uint8Array shorthand, trivial on top of arrayBuffer().
+if (!("bytes" in Request.prototype)) {
+  Request.prototype.bytes = function () {
+    return new Uint8Array(this.arrayBuffer());
+  };
+}
+if (!("bytes" in Response.prototype)) {
+  Response.prototype.bytes = function () {
+    return new Uint8Array(this.arrayBuffer());
   };
 }
 
@@ -1796,6 +1921,17 @@ function __sbClientIp(request) {
   }
   return peer;
 }
+// #128 — httpProtocol/tlsVersion/tlsCipher: only a trusted front proxy can set
+// these (an untrusted direct peer could otherwise fake any value), so this
+// reuses the same SB_TRUSTED_PROXIES chain #163 already resolves clientIp
+// against. Undefined when no trusted proxy is configured or it sent nothing —
+// omitted, not faked, matching how clientIp itself falls back to the raw peer.
+function __sbTrustedProxyHeader(request, name) {
+  const peer = __sbNormalizeIp(request.headers.get("x-sb-remote-addr") || "");
+  const trusted = __sbSplitList(__sbEnv("SB_TRUSTED_PROXIES"));
+  if (!trusted.length || !__sbIpTrusted(peer, trusted)) return undefined;
+  return request.headers.get(name) || undefined;
+}
 
 // #57 — ctx.waitUntil: work that must run before the turn completes but must
 // not block the response the handler already built. `waitUntil(p)` just
@@ -1881,9 +2017,18 @@ async function __sbQueueWithDrain(result, tasks) {
 globalThis.__sbEntry = function (handlers, request) {
   const trigger = request.headers.get("x-sb-trigger");
   if (!trigger) {
-    // #163 — expose the resolved client IP the Workers way, before the handler runs.
+    // #163/#128 — expose the request metadata the edge already has, the
+    // Workers way, before the handler runs. httpProtocol/tlsVersion/tlsCipher
+    // are only set when a trusted front proxy forwarded them; colo, ASN and
+    // geo fields stay absent everywhere (#128 explicitly rejects faking them).
     const __cf = request.cf || {};
     __cf.clientIp = __sbClientIp(request);
+    const __httpProtocol = __sbTrustedProxyHeader(request, "x-sb-http-protocol");
+    if (__httpProtocol) __cf.httpProtocol = __httpProtocol;
+    const __tlsVersion = __sbTrustedProxyHeader(request, "x-sb-tls-version");
+    if (__tlsVersion) __cf.tlsVersion = __tlsVersion;
+    const __tlsCipher = __sbTrustedProxyHeader(request, "x-sb-tls-cipher");
+    if (__tlsCipher) __cf.tlsCipher = __tlsCipher;
     request.cf = __cf;
     // #28 — per-invocation CPU time. One fetch turn per process (serial), so the
     // process CPU delta across the handler is this invocation's CPU.
