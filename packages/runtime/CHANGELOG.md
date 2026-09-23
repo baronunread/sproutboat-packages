@@ -1,5 +1,18 @@
 # @sproutboat/runtime
 
+## 0.12.0
+
+### Minor Changes
+
+- 4a7fe62: Cache API: `caches.default` / `caches.open(name)` (baronunread/sproutboat#59), with `match()`/`put()`/`delete()` backed by both transports (broker's `cache.*` ops and the standalone embedded transport, so behavior matches whichever way the app deploys). Keyed on method+URL for v1 (no `Vary` support yet). `put()` throws for a non-GET request, matching the spec; a 206 status or an explicit `no-store`/`private` `Cache-Control` is a silent no-op rather than an error, matching Workers' own `caches.default`. TTL derives from `s-maxage` (preferred) or `max-age`; entries with neither have no expiry.
+  
+  Deliberately synchronous, not Promise-returning: every other buffered-body method this runtime already ships (`text()`/`json()`/`arrayBuffer()`/`blob()`/`formData()`) is sync too, and this runtime's own coroutine machinery has a known, still-open memory-corruption issue tied specifically to nested `async function` calls accumulating across many requests (baronunread/sproutboat#168) — no reason to add more async surface here. `await caches.default.match(...)` still reads correctly: awaiting a non-promise value resolves to it immediately.
+- 96f97e2: `Request`/`Response` gain `formData()` (baronunread/sproutboat#60), parsing the buffered body synchronously — `application/x-www-form-urlencoded` via the existing `URLSearchParams` shim, `multipart/form-data` by hand (RFC 7578 boundary parsing, file fields come back as `Blob`s). Also adds `bytes()` (the `Uint8Array` shorthand over `arrayBuffer()`) to both classes. Everything is feature-detected, so this is a no-op the moment Porffor ships either natively.
+
+### Patch Changes
+
+- 81dc1f7: Preserve raw bytes in `crypto.subtle.digest`, HMAC signing, and `crypto.scryptVerify`. The runtime's byte conversion already produces UTF-8 bytes for text and copies BufferSource inputs exactly, so the native bridge must pass those bytes through without encoding them again. This fixes repeated HMAC signing with digest bytes above `0x7f`.
+
 ## 0.11.0
 
 ### Minor Changes
