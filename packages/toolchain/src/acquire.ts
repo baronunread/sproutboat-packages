@@ -37,6 +37,9 @@ const required = [
   "compiler/render.js",
   "compiler/index.js",
   "compiler/uwebsockets.js",
+  "compiler/precompile.js",
+  "compiler/builtins/typedarray.js",
+  "compiler/builtins_precompiled.js",
 ];
 async function digest(path: string): Promise<string> {
   return createHash("sha256")
