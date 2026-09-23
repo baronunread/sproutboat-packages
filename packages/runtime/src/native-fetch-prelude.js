@@ -768,6 +768,7 @@ Porffor.c`
 
 u32 porf_native_fetch_alloc_bytestring(const char* input, size_t len);
 int porf_native_fetch_read_value(jsval value, const char** out_buf, size_t* out_len, char** out_owned);
+int porf_native_fetch_read_raw_bytes(jsval value, const char** out_buf, size_t* out_len);
 
 // --- #133: SHA-2 + HMAC ---------------------------------------------------
 // Standalone links BearSSL, but a deployed sprout does not, and this inline C
@@ -1099,8 +1100,8 @@ function __sbRandomBytes(nStr) {
   return out;
 }
 
-// #133 — one-shot SHA-2 digest. `algoStr` is "256"|"384"|"512"; `data` is a
-// latin1 string (one char per byte). Returns the raw digest as a bytestring.
+// #133: one-shot SHA-2 digest. `algoStr` is "256"|"384"|"512"; `data` is a
+// bytestring (one char per byte). Returns the raw digest as a bytestring.
 // oxlint-disable-next-line no-unused-vars -- read inside the RawC block, not by JS.
 function __sbDigestRaw(algoStr, data) {
   let out = "";
@@ -1113,17 +1114,17 @@ function __sbDigestRaw(algoStr, data) {
     if (__aso) free(__aso);
     int __algo = atoi(__ab);
 
-    const char* __d; size_t __dl; char* __do = 0;
-    porf_native_fetch_read_value(data, &__d, &__dl, &__do);
+    const char* __d = 0; size_t __dl = 0;
+    // __sbToBytes has already encoded text. The generic reader would encode high bytes again.
+    int __raw = porf_native_fetch_read_raw_bytes(data, &__d, &__dl);
     unsigned char __out[64];
-    size_t __n = sb_digest(__algo, (const unsigned char*)__d, __dl, __out);
-    if (__do) free(__do);
+    size_t __n = __raw == 0 ? sb_digest(__algo, (const unsigned char*)__d, __dl, __out) : 0;
     if (__n) out = porf_box((f64)porf_native_fetch_alloc_bytestring((const char*)__out, __n), 195);
   `;
   return out;
 }
 
-// #133 — HMAC-SHA-2. `algoStr` "256"|"384"|"512"; `key` and `data` latin1.
+// #133: HMAC-SHA-2. `algoStr` "256"|"384"|"512"; `key` and `data` are bytestrings.
 // Returns the raw MAC as a bytestring.
 // oxlint-disable-next-line no-unused-vars -- read inside the RawC block, not by JS.
 function __sbHmacRaw(algoStr, key, data) {
@@ -1137,17 +1138,15 @@ function __sbHmacRaw(algoStr, key, data) {
     if (__aso) free(__aso);
     int __algo = atoi(__ab);
 
-    const char* __k; size_t __kl; char* __ko = 0;
-    porf_native_fetch_read_value(key, &__k, &__kl, &__ko);
-    unsigned char* __kc = (unsigned char*)malloc(__kl ? __kl : 1);
+    const char* __k = 0; size_t __kl = 0;
+    int __key_raw = porf_native_fetch_read_raw_bytes(key, &__k, &__kl);
+    unsigned char* __kc = __key_raw == 0 ? (unsigned char*)malloc(__kl ? __kl : 1) : 0;
     if (__kc) memcpy(__kc, __k, __kl);
-    if (__ko) free(__ko);
 
-    const char* __d; size_t __dl; char* __do = 0;
-    porf_native_fetch_read_value(data, &__d, &__dl, &__do);
+    const char* __d = 0; size_t __dl = 0;
+    int __data_raw = porf_native_fetch_read_raw_bytes(data, &__d, &__dl);
     unsigned char __out[64];
-    size_t __n = __kc ? sb_hmac(__algo, __kc, __kl, (const unsigned char*)__d, __dl, __out) : 0;
-    if (__do) free(__do);
+    size_t __n = __kc && __data_raw == 0 ? sb_hmac(__algo, __kc, __kl, (const unsigned char*)__d, __dl, __out) : 0;
     if (__kc) free(__kc);
     if (__n) out = porf_box((f64)porf_native_fetch_alloc_bytestring((const char*)__out, __n), 195);
   `;
@@ -1161,17 +1160,15 @@ function __sbScryptRaw(pw, salt, nStr, rStr, pStr, dkLenStr) {
   let out = "";
   // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
   Porffor.c`
-    const char* __p; size_t __pl; char* __po = 0;
-    porf_native_fetch_read_value(pw, &__p, &__pl, &__po);
-    unsigned char* __pc = (unsigned char*)malloc(__pl ? __pl : 1);
+    const char* __p = 0; size_t __pl = 0;
+    int __pw_raw = porf_native_fetch_read_raw_bytes(pw, &__p, &__pl);
+    unsigned char* __pc = __pw_raw == 0 ? (unsigned char*)malloc(__pl ? __pl : 1) : 0;
     if (__pc) memcpy(__pc, __p, __pl);
-    if (__po) free(__po);
 
-    const char* __s; size_t __sl; char* __so = 0;
-    porf_native_fetch_read_value(salt, &__s, &__sl, &__so);
-    unsigned char* __sc = (unsigned char*)malloc(__sl ? __sl : 1);
+    const char* __s = 0; size_t __sl = 0;
+    int __salt_raw = porf_native_fetch_read_raw_bytes(salt, &__s, &__sl);
+    unsigned char* __sc = __salt_raw == 0 ? (unsigned char*)malloc(__sl ? __sl : 1) : 0;
     if (__sc) memcpy(__sc, __s, __sl);
-    if (__so) free(__so);
 
     long __N = 0, __r = 0, __pp = 0, __dk = 0;
     { const char* q; size_t ql; char* qo = 0; char nb[24];
