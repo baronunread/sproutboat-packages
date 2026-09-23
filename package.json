@@ -8,6 +8,7 @@
   "workspaces": ["packages/*"],
   "scripts": {
     "test": "bun test packages/",
+    "test:native-crypto": "bun packages/runtime/test/native-crypto.ts",
     "lint": "oxlint .",
     "typecheck": "tsc --noEmit",
     "changeset": "changeset",
@@ -18,6 +19,7 @@
     "@changesets/cli": "^3.0.2",
     "@oxlint/plugins": "1.82.0",
     "bun-types": "^1.4.2",
+    "esbuild": "0.28.2",
     "oxlint": "1.82.0",
     "typescript": "^7.0.2"
   }
