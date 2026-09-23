@@ -1,6 +1,7 @@
 /**
  * Idempotent, marker-guarded in-place edits to Porffor's generated C
- * (`compiler/render.js`, `compiler/index.js`, `compiler/uwebsockets.js`). Run
+ * (`compiler/render.js`, `compiler/index.js`, `compiler/uwebsockets.js`,
+ * `compiler/builtins/typedarray.js`). Run
  * from the build path, not a `postinstall` hook: package managers block
  * dependency lifecycle scripts by default, so a published `postinstall` would
  * silently not run.
@@ -9,7 +10,7 @@
  * older version of this module still receives the newer edits. All of them are
  * tracked in patches/UPSTREAM.md and go away as Porffor closes the gaps.
  */
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, realpath, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 // --- compiler/render.js: the native-fetch server, rendered as C text ---
@@ -166,6 +167,28 @@ const CFLAGS_ANCHOR = "          '-xc', '-', '-c',\n";
 const CFLAGS_INJECT =
   "          ...(process.env.SB_EXTRA_CFLAGS ? process.env.SB_EXTRA_CFLAGS.split(' ').filter(Boolean) : []),\n";
 const CFLAGS_MARKER = "SB_EXTRA_CFLAGS";
+
+// Porffor's TypedArray.from only handles iterables. An array-like input such
+// as { length: 16 } silently becomes an empty typed array, including HMAC
+// keys made with Uint8Array.from({ length: 16 }, mapFn). The compiler uses a
+// precompiled builtin table, so the edited source must be precompiled again.
+const TYPED_ARRAY_FROM_ANCHOR =
+  "    len = i;\n  }\n\n  arr.length = len;\n\n  return new ${name}(arr);\n};";
+const TYPED_ARRAY_FROM_INJECT =
+  "    len = i;\n" +
+  "  } else {\n" +
+  "    // sproutboat: TypedArray.from accepts array-like objects.\n" +
+  "    let count = ecma262.ToIntegerOrInfinity(Porffor.object.get(arg, 'length'));\n" +
+  "    if (count < 0) count = 0;\n" +
+  "    if (count > 2147483643) throw new RangeError('Invalid TypedArray length (over maximum supported length)');\n" +
+  "    if (Porffor.type(mapFn) != Porffor.TYPES.undefined && Porffor.type(mapFn) != Porffor.TYPES.function)\n" +
+  "      throw new TypeError('Called TypedArray.from with a non-function mapFn');\n" +
+  "    for (let i: i32 = 0; i < count; i++) {\n" +
+  "      arr[i] = Porffor.type(mapFn) == Porffor.TYPES.undefined ? arg[i] : mapFn(arg[i], i);\n" +
+  "    }\n" +
+  "    len = count;\n" +
+  "  }\n\n  arr.length = len;\n\n  return new ${name}(arr);\n};";
+const TYPED_ARRAY_FROM_MARKER = "sproutboat: TypedArray.from accepts array-like objects";
 
 /**
  * #56 — make the inbound request-body limit configurable.
@@ -830,6 +853,34 @@ async function patchCompilerArgs(root: string): Promise<void> {
   if (changed) await writeFile(file, src);
 }
 
+export async function patchTypedArrayFrom(root: string): Promise<void> {
+  const file = resolve(root, "compiler/builtins/typedarray.js");
+  const src = await readFile(file, "utf8");
+  if (!src.includes(TYPED_ARRAY_FROM_MARKER) && !src.includes(TYPED_ARRAY_FROM_ANCHOR)) {
+    throw new Error(`could not patch Porffor's TypedArray.from: anchor not found in ${file}`);
+  }
+  if (!src.includes(TYPED_ARRAY_FROM_MARKER))
+    await writeFile(file, src.replace(TYPED_ARRAY_FROM_ANCHOR, TYPED_ARRAY_FROM_INJECT));
+  const table = resolve(root, "compiler/builtins_precompiled.js");
+  const before = await readFile(table);
+  // Porffor only writes the table when import.meta.url matches argv[1].
+  // macOS's /var -> /private/var symlink makes a noncanonical argv[1] skip it.
+  const precompile = await realpath(resolve(root, "compiler/precompile.js"));
+  const child = Bun.spawn(["node", precompile], {
+    cwd: root,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [code, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  if (code !== 0) throw new Error(`could not precompile Porffor's TypedArray.from: ${stderr || stdout}`);
+  if (!src.includes(TYPED_ARRAY_FROM_MARKER) && before.equals(await readFile(table)))
+    throw new Error(`Porffor precompile did not update ${table}`);
+}
+
 /** The native-fetch server source: $PORT support + the #165 console sink. Exported for tests. */
 export async function patchRenderJs(root: string): Promise<void> {
   const file = resolve(root, "compiler/render.js");
@@ -876,5 +927,6 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchCompilerArgs(root);
   await patchUwebsockets(root);
   await patchRenderJs(root);
+  await patchTypedArrayFrom(root);
   done.add(root);
 }

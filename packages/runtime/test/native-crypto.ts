@@ -26,9 +26,10 @@ const hex = (buffer) => {
 };
 export default {
   async fetch() {
-    const key = await crypto.subtle.importKey(
+    const keyBytes = Uint8Array.from({ length: 16 }, (_, i) => i + 1);
+    const hmacKey = await crypto.subtle.importKey(
       "raw",
-      new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
+      keyBytes,
       { name: "HMAC", hash: "SHA-256" },
       false,
       ["sign"],
@@ -36,7 +37,7 @@ export default {
     let data = new TextEncoder().encode("h1-regression-password-0001");
     const rounds = [];
     for (let i = 0; i < 2; i++) {
-      data = new Uint8Array(await crypto.subtle.sign("HMAC", key, data));
+      data = new Uint8Array(await crypto.subtle.sign("HMAC", hmacKey, data));
       rounds.push(hex(data));
     }
     const binary = new Uint8Array([0x00, 0x7f, 0x80, 0xff]);

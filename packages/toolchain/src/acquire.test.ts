@@ -29,6 +29,20 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "  return -1;\n" +
       "}\n",
     "compiler/index.js": "          '-xc', '-', '-c',\n          uSocketsArchive,\n          '-lm'\n",
+    "compiler/precompile.js":
+      "const fs = require('node:fs');\n" +
+      "const path = require('node:path');\n" +
+      "fs.writeFileSync(path.join(__dirname, 'builtins_precompiled.js'), fs.readFileSync(path.join(__dirname, 'builtins/typedarray.js')));\n",
+    "compiler/builtins_precompiled.js": "fixture:precompiled\n",
+    "compiler/builtins/typedarray.js":
+      "export const __${name}_from = (arg: any, mapFn: any): ${name} => {\n" +
+      "  const arr: any[] = Porffor.array.new(4);\n" +
+      "  let len: i32 = 0;\n" +
+      "  if (Porffor.type(arg) == Porffor.TYPES.array) {\n" +
+      "    let i: i32 = 0;\n" +
+      "    for (const x of arg) arr[i++] = x;\n" +
+      "    len = i;\n" +
+      "  }\n\n  arr.length = len;\n\n  return new ${name}(arr);\n};\n",
     "compiler/uwebsockets.js":
       "static const size_t REQUEST_BODY_MAX_BYTES = 1024u * 1024u;\n" +
       "int porf_native_fetch_read_value(struct jsval value, const char** out_buf, size_t* out_len, char** out_owned);\n" +
