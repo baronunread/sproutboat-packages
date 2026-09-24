@@ -1,5 +1,12 @@
 # @sproutboat/runtime
 
+## 0.12.1
+
+### Patch Changes
+
+- ed9640a: Point Porffor patch diagnostics, runtime comments, and historical notes to the
+  shared upstream notes in the Sproutboat platform repository.
+
 ## 0.12.0
 
 ### Minor Changes
