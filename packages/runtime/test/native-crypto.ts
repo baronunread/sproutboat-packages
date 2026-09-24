@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { ensurePorffor } from "../../toolchain/src/acquire";
 import { preludePath, TRANSPORT_MARKER, transportPath, wrapNativeFetchHandler } from "../src/wrap";
 
@@ -18,6 +18,7 @@ const expected = {
 };
 
 const handler = `
+import { keyBytes } from "./crypto-helper.js";
 const hex = (buffer) => {
   const bytes = new Uint8Array(buffer);
   let out = "";
@@ -26,10 +27,9 @@ const hex = (buffer) => {
 };
 export default {
   async fetch() {
-    const keyBytes = Uint8Array.from({ length: 16 }, (_, i) => i + 1);
-    const hmacKey = await crypto.subtle.importKey(
+    const key = await crypto.subtle.importKey(
       "raw",
-      keyBytes,
+      keyBytes(),
       { name: "HMAC", hash: "SHA-256" },
       false,
       ["sign"],
@@ -37,7 +37,7 @@ export default {
     let data = new TextEncoder().encode("h1-regression-password-0001");
     const rounds = [];
     for (let i = 0; i < 2; i++) {
-      data = new Uint8Array(await crypto.subtle.sign("HMAC", hmacKey, data));
+      data = new Uint8Array(await crypto.subtle.sign("HMAC", key, data));
       rounds.push(hex(data));
     }
     const binary = new Uint8Array([0x00, 0x7f, 0x80, 0xff]);
@@ -68,9 +68,8 @@ const workdir = await mkdtemp(join(tmpdir(), "sb-native-crypto-"));
 let server: ReturnType<typeof Bun.spawn> | undefined;
 try {
   const porffor = await ensurePorffor({ cacheRoot: workdir });
-  const esbuild = Bun.which("esbuild");
   const node = Bun.which("node");
-  if (!esbuild || !node) throw new Error("native crypto test needs esbuild and node on PATH");
+  if (!node) throw new Error("native crypto test needs node on PATH");
 
   const [core, broker] = await Promise.all([
     readFile(preludePath, "utf8"),
@@ -80,12 +79,15 @@ try {
   const prelude = core.replace(TRANSPORT_MARKER, broker);
   const generated = join(workdir, "crypto.generated.js");
   const binary = join(workdir, "crypto-native");
+  // This is a direct ESM import into Porffor, with no bundler in front of it.
+  await writeFile(join(workdir, "crypto-helper.js"),
+    "export const keyBytes = () => Uint8Array.from({ length: 16 }, (_, index) => index + 1);\n");
   await writeFile(generated, wrapNativeFetchHandler(handler, prelude));
   await rm(binary, { force: true });
 
   const compile = Bun.spawn([node, resolve(porffor, "runtime/index.js"), "native", generated, "-o", binary, "-s", "-O0"], {
     cwd: workdir,
-    env: { ...process.env, PATH: `${dirname(esbuild)}:${process.env.PATH ?? ""}` },
+    env: process.env,
     stdout: "pipe",
     stderr: "pipe",
   });

@@ -1,5 +1,5 @@
 // Prepended to every handler by tools/compile.ts, before Porffor's native-fetch
-// esbuild bundle. Porffor's runtime/fetch-globals.js (checked through alpha-4)
+// bundled handler. Porffor's runtime/fetch-globals.js (checked through alpha-4)
 // gives URL (href/origin/pathname/search only) and Response without a static
 // json(). This adds, additively, the rest of the WHATWG surface Worker code
 // expects: URLSearchParams (read + write), URL.prototype.searchParams and the

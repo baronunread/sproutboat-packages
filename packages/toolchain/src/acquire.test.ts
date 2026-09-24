@@ -28,7 +28,7 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "  }\n" +
       "  return -1;\n" +
       "}\n",
-    "compiler/index.js": "          '-xc', '-', '-c',\n          uSocketsArchive,\n          '-lm'\n",
+    "compiler/index.js": "      ...darwinReleaseCompileArgs,\n        uSocketsArchive,\n        '-lm'\n",
     "compiler/precompile.js":
       "const fs = require('node:fs');\n" +
       "const path = require('node:path');\n" +
