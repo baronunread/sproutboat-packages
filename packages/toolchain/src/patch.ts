@@ -152,20 +152,21 @@ const RENDER_REPLACEMENTS = [
  * a musl (deploy) build overrides it outright. This splices one spread of
  * `SB_EXTRA_LINK` before `-lm`, inert unless the variable is set.
  */
-const LINK_ANCHOR = "          uSocketsArchive,\n          '-lm'\n";
+const LINK_ANCHOR = "        uSocketsArchive,\n        '-lm'\n";
 const LINK_INJECT =
-  "          ...(process.env.SB_EXTRA_LINK ? process.env.SB_EXTRA_LINK.split(' ').filter(Boolean) : []),\n";
+  "        ...(process.env.SB_EXTRA_LINK ? process.env.SB_EXTRA_LINK.split(' ').filter(Boolean) : []),\n";
 const LINK_MARKER = "SB_EXTRA_LINK";
 
 /**
  * #15 — and the same for the compile step, so the prelude's inline C can
- * `#include <bearssl.h>`. The link patch alone is not enough: Porffor compiles
- * the generated C from stdin with a fixed argument list, so there is otherwise
- * no way to add an include path.
+ * `#include <bearssl.h>`. The link patch alone is not enough: Porffor's
+ * module builds compile several C units with a fixed argument list, so there
+ * is otherwise no way to add an include path. Add the flag before the cache
+ * stamp is computed so a change invalidates compiled units.
  */
-const CFLAGS_ANCHOR = "          '-xc', '-', '-c',\n";
+const CFLAGS_ANCHOR = "      ...darwinReleaseCompileArgs,\n";
 const CFLAGS_INJECT =
-  "          ...(process.env.SB_EXTRA_CFLAGS ? process.env.SB_EXTRA_CFLAGS.split(' ').filter(Boolean) : []),\n";
+  "      ...(process.env.SB_EXTRA_CFLAGS ? process.env.SB_EXTRA_CFLAGS.split(' ').filter(Boolean) : []),\n";
 const CFLAGS_MARKER = "SB_EXTRA_CFLAGS";
 
 // Porffor's TypedArray.from only handles iterables. An array-like input such
@@ -842,8 +843,8 @@ async function patchCompilerArgs(root: string): Promise<void> {
           "Porffor's native-fetch build changed — check patches/UPSTREAM.md.",
       );
     }
-    // After the anchor for cflags (the args follow it), before it for the link
-    // line (the object list ends with it).
+    // Add flags to compileOnlyArgs so every generated C unit sees them and
+    // Porffor's module-build cache includes them in its compiler command.
     src =
       marker === CFLAGS_MARKER
         ? src.slice(0, at + anchor.length) + inject + src.slice(at + anchor.length)
