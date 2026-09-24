@@ -8,7 +8,9 @@
  *
  * Each edit is independent and re-applied on every build; a file patched by an
  * older version of this module still receives the newer edits. All of them are
- * tracked in patches/UPSTREAM.md and go away as Porffor closes the gaps.
+ * tracked in the platform's upstream notes:
+ * https://github.com/baronunread/sproutboat/tree/main/patches/upstream
+ * They go away as Porffor closes the gaps.
  */
 import { readFile, realpath, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
@@ -817,7 +819,7 @@ export async function patchUwebsockets(root: string): Promise<void> {
     if (!src.includes(anchor)) {
       throw new Error(
         `could not patch Porffor's ${what}: anchor not found in ${file}. ` +
-          "Porffor's uWebSockets shim changed — check patches/UPSTREAM.md.",
+          "Porffor's uWebSockets shim changed. See https://github.com/baronunread/sproutboat/tree/main/patches/upstream.",
       );
     }
     src = src.replace(anchor, inject);
@@ -839,7 +841,7 @@ async function patchCompilerArgs(root: string): Promise<void> {
     if (at === -1) {
       throw new Error(
         `could not patch Porffor for ${what}: anchor not found in ${file}. ` +
-          "Porffor's native-fetch build changed — check patches/UPSTREAM.md.",
+          "Porffor's native-fetch build changed. See https://github.com/baronunread/sproutboat/tree/main/patches/upstream.",
       );
     }
     // After the anchor for cflags (the args follow it), before it for the link
@@ -892,7 +894,7 @@ export async function patchRenderJs(root: string): Promise<void> {
     if (at === -1) {
       throw new Error(
         `could not patch Porffor for ${what}: anchor not found in ${file}. ` +
-          "Porffor's native-fetch renderer changed — check patches/UPSTREAM.md.",
+          "Porffor's native-fetch renderer changed. See https://github.com/baronunread/sproutboat/tree/main/patches/upstream.",
       );
     }
     src = src.slice(0, at + anchor.length) + inject + src.slice(at + anchor.length);
@@ -906,7 +908,7 @@ export async function patchRenderJs(root: string): Promise<void> {
     if (!src.includes(anchor)) {
       throw new Error(
         `could not patch Porffor for ${what}: anchor not found in ${file}. ` +
-          "Porffor's native-fetch renderer changed — check patches/UPSTREAM.md.",
+          "Porffor's native-fetch renderer changed. See https://github.com/baronunread/sproutboat/tree/main/patches/upstream.",
       );
     }
     src = src.replace(anchor, inject);

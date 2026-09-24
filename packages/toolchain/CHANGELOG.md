@@ -87,7 +87,7 @@
   prototype and stop once the "next" pointer stops advancing, reading a
   fixed-point chain as "no `.then` found" instead of spinning. Not specific to
   `Date.prototype.toISOString()` — an earlier note wrongly correlated the bug
-  with that one call; see `sproutboat-cli/patches/UPSTREAM.md`.
+  with that one call; see `https://github.com/baronunread/sproutboat/tree/main/patches/upstream`.
 
 ## 0.4.0
 

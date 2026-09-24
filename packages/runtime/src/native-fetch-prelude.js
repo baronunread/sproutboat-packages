@@ -9,10 +9,12 @@
 // formData()/bytes() (#60). Each is feature-detected; delete a block once
 // Porffor ships that global. crypto.scryptVerify (#153) is a Sproutboat
 // extension, not WHATWG, and stays.
-// Tracked upstream in patches/UPSTREAM.md.
+// Tracked in the platform's upstream notes:
+// https://github.com/baronunread/sproutboat/blob/main/patches/upstream/whatwg-fetch-globals.md
 //
 // Declared before it is referenced: a getter body that names a later top-level
-// class throws ReferenceError in Porffor (see patches/UPSTREAM.md draft B).
+// class throws ReferenceError in Porffor. See:
+// https://github.com/baronunread/sproutboat/blob/main/patches/upstream/class-declaration-scope.md
 
 // Duck-typing helpers, `typeof`-free (the repo's anti-slop lint bans `typeof`;
 // these express the same spec-mandated checks and are verified under Porffor
@@ -386,7 +388,8 @@ if (!("bytes" in Response.prototype)) {
 // Porffor's URL exposes href / origin / pathname / search only. Add the rest of
 // the WHATWG read surface, derived from `origin` (scheme://host[:port]).
 // `hash` is always '' server-side — browsers strip the fragment before the
-// request, so there is nothing to recover. Tracked upstream (patches/UPSTREAM.md).
+// request, so there is nothing to recover. See:
+// https://github.com/baronunread/sproutboat/blob/main/patches/upstream/whatwg-fetch-globals.md
 function __sbDefineURLAccessor(name, get) {
   if (!(name in URL.prototype)) Object.defineProperty(URL.prototype, name, { configurable: true, get });
 }
@@ -1816,7 +1819,8 @@ function __sbTriggerAuthed(request) {
 // #163 — the connection's remote address, for `request.cf.clientIp`.
 //
 // `x-sb-remote-addr` is the TCP peer, appended by the server (see
-// patches/UPSTREAM.md #163) and stripped from anything a client sends, so it
+// https://github.com/baronunread/sproutboat/blob/main/patches/upstream/remote-address.md)
+// and stripped from anything a client sends, so it
 // cannot be forged. With no proxy in front, that is the client. Behind one, set
 // `SB_TRUSTED_PROXIES` to a comma-separated list of trusted CIDRs (or bare IPs):
 // when the peer is trusted, the client is the rightmost `x-forwarded-for` entry
