@@ -9,6 +9,7 @@
   "scripts": {
     "test": "bun test packages/",
     "test:native-crypto": "bun packages/runtime/test/native-crypto.ts",
+    "scorecard": "bun scripts/porffor-scorecard.ts",
     "lint": "oxlint .",
     "typecheck": "tsc --noEmit",
     "changeset": "changeset",
