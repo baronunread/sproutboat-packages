@@ -32,6 +32,18 @@ Releases use changesets with independent per-package versions. A breaking
 contract change ships with both consumers updated; the conformance suite
 (green on both backends) is the gate, not the version number.
 
+## Porffor pin review
+
+After regenerating the platform's compatibility report, run
+`bun run scorecard ../sproutboat/report.json`. This verifies that the pinned
+source accepts the local patches and writes a machine-readable snapshot under
+`packages/toolchain/scorecards/` plus [PORFFOR_SCORECARD.md](packages/toolchain/PORFFOR_SCORECARD.md).
+The scorecard records behavior matches, same-target compile time and binary
+size from the compatibility harness, and every active patch marker by upstream
+file. Compare it with the previous pin before deciding whether to keep, reduce,
+or replace the Porffor integration. Build telemetry remains tracked in
+[sproutboat#35](https://github.com/baronunread/sproutboat/issues/35).
+
 ## Status
 
 Published on npm at 0.2.0 and consumed by both repos from the registry.
