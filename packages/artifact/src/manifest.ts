@@ -37,6 +37,8 @@ export type ArtifactManifest = {
   sourceHash: `sha256:${string}`;
   binaryHash: `sha256:${string}`;
   binarySize: number;
+  /** Compile duration in milliseconds. Absent from artifacts built before this field was added. */
+  compileMs?: number;
   builtAt: string;
 };
 
@@ -118,6 +120,11 @@ export function validateManifest(value: ManifestInput): ManifestValidation {
   if (binaryHash === null) errors.push("binaryHash must be a sha256 digest");
   const binarySize = isPositiveInteger(value.binarySize) ? value.binarySize : null;
   if (binarySize === null) errors.push("binarySize must be a positive integer");
+  let compileMs: number | undefined;
+  if (value.compileMs !== undefined) {
+    if (Number.isSafeInteger(value.compileMs) && Number(value.compileMs) >= 0) compileMs = Number(value.compileMs);
+    else errors.push("compileMs must be a non-negative integer");
+  }
   const builtAt = isString(value.builtAt) && !Number.isNaN(Date.parse(value.builtAt)) ? value.builtAt : null;
   if (builtAt === null) errors.push("builtAt must be an ISO-8601 timestamp");
   // Optional by design: an artifact from before the field existed is valid and
@@ -160,6 +167,7 @@ export function validateManifest(value: ManifestInput): ManifestValidation {
       sourceHash,
       binaryHash,
       binarySize,
+      compileMs,
       builtAt,
       compatibilityDate,
     },
