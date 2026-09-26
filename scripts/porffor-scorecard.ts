@@ -54,6 +54,7 @@ const targets = {
   "compiler/render.js": ["PORT", "CONSOLE", "BYTESTRING", "READ_RAW"],
   "compiler/index.js": ["LINK", "CFLAGS"],
   "compiler/builtins/typedarray.js": ["TYPED_ARRAY_FROM"],
+  "compiler/builtins/date.ts": ["DATE_PARSER"],
   "compiler/uwebsockets.js": [
     "BODY",
     "STATUS_SIG",
