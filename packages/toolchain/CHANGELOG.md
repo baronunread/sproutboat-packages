@@ -1,5 +1,11 @@
 # @sproutboat/toolchain
 
+## 0.4.13
+
+### Patch Changes
+
+- bb1b6a2: Parse ISO date timezone offsets correctly in native Porffor builds, including zero fields and fractional seconds.
+
 ## 0.4.12
 
 ### Patch Changes
