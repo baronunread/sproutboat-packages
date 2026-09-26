@@ -38,6 +38,7 @@ const required = [
   "compiler/index.js",
   "compiler/uwebsockets.js",
   "compiler/precompile.js",
+  "compiler/builtins/date.ts",
   "compiler/builtins/typedarray.js",
   "compiler/builtins_precompiled.js",
 ];

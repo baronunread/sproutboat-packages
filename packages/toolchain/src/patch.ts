@@ -1,7 +1,7 @@
 /**
  * Idempotent, marker-guarded in-place edits to Porffor's generated C
  * (`compiler/render.js`, `compiler/index.js`, `compiler/uwebsockets.js`,
- * `compiler/builtins/typedarray.js`). Run
+ * `compiler/builtins/typedarray.js`, `compiler/builtins/date.ts`). Run
  * from the build path, not a `postinstall` hook: package managers block
  * dependency lifecycle scripts by default, so a published `postinstall` would
  * silently not run.
@@ -192,6 +192,93 @@ const TYPED_ARRAY_FROM_INJECT =
   "    len = count;\n" +
   "  }\n\n  arr.length = len;\n\n  return new ${name}(arr);\n};";
 const TYPED_ARRAY_FROM_MARKER = "sproutboat: TypedArray.from accepts array-like objects";
+
+// Porffor alpha 9 treats +02:00 as two milliseconds and adds offset hours
+// instead of subtracting them. Count fields even when they contain zero, and
+// apply the signed offset after parsing the local wall-clock fields.
+const DATE_PARSER_MARKER = "sproutboat: ISO timezone offset";
+const DATE_PARSER_ANCHOR = `  let n: number = 0;
+  let nInd: number = 0;
+
+  const len: i32 = string.length;
+  const endPtr: i32 = Porffor.IR.ptr(string) + len;
+  let ptr: i32 = Porffor.IR.ptr(string);
+
+  while (ptr <= endPtr) { // <= to include extra null byte to set last n
+    const chr: i32 = Porffor.IR.loadU8(ptr++, 4);
+    if (Porffor.fastAnd(chr >= 48, chr <= 57)) { // 0-9
+      n *= 10;
+      n += chr - 48;
+      continue;
+    }
+
+    if (chr == 45) { // -
+      if (Porffor.fastOr(ptr == Porffor.IR.ptr(string), nInd == 7)) n = -n;
+    }
+
+    if (n > 0) {
+      if (nInd == 0) y = n;
+        else if (nInd == 1) m = n - 1;
+        else if (nInd == 2) dt = n;
+        else if (nInd == 3) h = n;
+        else if (nInd == 4) min = n;
+        else if (nInd == 5) s = n;
+        else if (nInd == 6) milli = n;
+        else if (nInd == 7) tzHour = n;
+        else if (nInd == 8) tzMin = n;
+
+      n = 0;
+      nInd++;
+    }
+  }
+
+  h += tzHour;
+  min += tzMin;`;
+const DATE_PARSER_INJECT = `  // sproutboat: ISO timezone offset
+  let n: number = 0;
+  let nInd: number = 0;
+  let digits: i32 = 0;
+  let offsetSign: i32 = 0;
+
+  const len: i32 = string.length;
+  const endPtr: i32 = Porffor.IR.ptr(string) + len;
+  let ptr: i32 = Porffor.IR.ptr(string);
+
+  while (ptr <= endPtr) {
+    const chr: i32 = Porffor.IR.loadU8(ptr++, 4);
+    if (Porffor.fastAnd(chr >= 48, chr <= 57)) {
+      n = n * 10 + chr - 48;
+      digits++;
+      continue;
+    }
+
+    if (digits > 0) {
+      if (nInd == 0) y = n;
+        else if (nInd == 1) m = n - 1;
+        else if (nInd == 2) dt = n;
+        else if (nInd == 3) h = n;
+        else if (nInd == 4) min = n;
+        else if (nInd == 5) s = n;
+        else if (nInd == 6) {
+          while (digits < 3) { n *= 10; digits++; }
+          while (digits > 3) { n = Math.trunc(n / 10); digits--; }
+          milli = n;
+        }
+        else if (nInd == 7) tzHour = n;
+        else if (nInd == 8) tzMin = n;
+      n = 0;
+      nInd++;
+      digits = 0;
+    }
+
+    if (Porffor.fastOr(chr == 43, chr == 45) && nInd >= 6) {
+      offsetSign = chr == 43 ? 1 : -1;
+      nInd = 7;
+    }
+  }
+
+  h -= offsetSign * tzHour;
+  min -= offsetSign * tzMin;`;
 
 /**
  * #56 — make the inbound request-body limit configurable.
@@ -856,6 +943,19 @@ async function patchCompilerArgs(root: string): Promise<void> {
   if (changed) await writeFile(file, src);
 }
 
+export async function patchDateParser(root: string): Promise<void> {
+  const file = resolve(root, "compiler/builtins/date.ts");
+  const src = await readFile(file, "utf8");
+  if (src.includes(DATE_PARSER_MARKER)) return;
+  const start = src.indexOf("export const __ecma262_ParseDTSF");
+  const end = src.indexOf("// RFC 7231 or Date.prototype.toString() parser", start);
+  if (start < 0 || end < 0) throw new Error(`could not find Porffor's ISO date parser in ${file}`);
+  const parser = src.slice(start, end);
+  if (!parser.includes(DATE_PARSER_ANCHOR))
+    throw new Error(`could not patch Porffor's ISO date parser: anchor not found in ${file}`);
+  await writeFile(file, src.slice(0, start) + parser.replace(DATE_PARSER_ANCHOR, DATE_PARSER_INJECT) + src.slice(end));
+}
+
 export async function patchTypedArrayFrom(root: string): Promise<void> {
   const file = resolve(root, "compiler/builtins/typedarray.js");
   const src = await readFile(file, "utf8");
@@ -930,6 +1030,7 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchCompilerArgs(root);
   await patchUwebsockets(root);
   await patchRenderJs(root);
+  await patchDateParser(root);
   await patchTypedArrayFrom(root);
   done.add(root);
 }
