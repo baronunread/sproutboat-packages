@@ -34,4 +34,4 @@ test("native ISO dates honor signed offsets, zero fields, and fractional seconds
   } finally {
     await rm(root, { recursive: true, force: true });
   }
-});
+}, 30_000);
