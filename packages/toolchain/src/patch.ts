@@ -14,6 +14,7 @@
  */
 import { readFile, realpath, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import { patchUnicode } from "./unicode";
 
 // --- compiler/render.js: the native-fetch server, rendered as C text ---
 
@@ -1032,5 +1033,6 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchRenderJs(root);
   await patchDateParser(root);
   await patchTypedArrayFrom(root);
+  await patchUnicode(root);
   done.add(root);
 }
