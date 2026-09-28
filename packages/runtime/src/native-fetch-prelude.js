@@ -1,7 +1,7 @@
 // Prepended to every handler by tools/compile.ts, before Porffor's native-fetch
-// bundled handler. Porffor's runtime/fetch-globals.js (checked through alpha-4)
-// gives URL (href/origin/pathname/search only) and Response without a static
-// json(). This adds, additively, the rest of the WHATWG surface Worker code
+// bundled handler. Porffor's runtime/fetch-globals.js (checked through alpha-10)
+// gives URL (href/origin/pathname/search only) and Response without static
+// json() or redirect(). This adds, additively, the rest of the WHATWG surface Worker code
 // expects: URLSearchParams (read + write), URL.prototype.searchParams and the
 // protocol/host/hostname/port/hash accessors, static Response.json,
 // crypto.randomUUID / crypto.getRandomValues, crypto.subtle (digest + HMAC
@@ -18,7 +18,7 @@
 
 // Duck-typing helpers, `typeof`-free (the repo's anti-slop lint bans `typeof`;
 // these express the same spec-mandated checks and are verified under Porffor
-// alpha-4 by examples/kitchen-sink/harness.ts).
+// alpha-10 by examples/kitchen-sink/harness.ts).
 function __sbIsStr(v) {
   return Object(v) !== v && v === String(v);
 }
@@ -68,7 +68,7 @@ function __sbCpuMs() {
   return res === "" ? 0 : parseFloat(res);
 }
 
-// #28 — stamp `x-sb-cpu-ms` onto a handler Response. Porffor alpha-4's
+// #28 — stamp `x-sb-cpu-ms` onto a handler Response. Porffor alpha-10's
 // native-fetch serializer only reads headers from the plain object passed to
 // `new Response(body, { headers })` — a later `.set()` or a `Headers` instance
 // is ignored on the wire — so the metric is carried by rebuilding the Response
@@ -201,6 +201,16 @@ if (Response.json == null) {
     const response = new Response(JSON.stringify(data), init);
     if (!response.headers.has("content-type")) response.headers.set("content-type", "application/json;charset=utf-8");
     return response;
+  };
+}
+
+// Porffor alpha-10 has no static Response.redirect().
+if (Response.redirect == null) {
+  Response.redirect = function (url, status = 302) {
+    if (status !== 301 && status !== 302 && status !== 303 && status !== 307 && status !== 308) {
+      throw new RangeError("invalid redirect status");
+    }
+    return new Response("", { status, headers: { location: String(url) } });
   };
 }
 
@@ -2015,7 +2025,26 @@ async function __sbQueueWithDrain(result, tasks) {
   return new Response(JSON.stringify(r), { headers: { "content-type": "application/json" } });
 }
 
+// Native HTTP ingress stores the body as one character per raw byte. Keep
+// that representation for binary consumers, but decode text lazily before
+// handing the request to user code. Request.text() in Porffor otherwise treats
+// the raw bytes as already-decoded characters and corrupts Unicode/HMAC input.
+function __sbDecodeIngress(request) {
+  const raw = request.body;
+  if (raw == null) return;
+  let decoded = null;
+  request.text = function () {
+    if (decoded === null) decoded = __sbFromUtf8(raw);
+    return decoded;
+  };
+  request.json = function () {
+    if (decoded === null) decoded = __sbFromUtf8(raw);
+    return JSON.parse(decoded);
+  };
+}
+
 globalThis.__sbEntry = function (handlers, request) {
+  __sbDecodeIngress(request);
   const trigger = request.headers.get("x-sb-trigger");
   if (!trigger) {
     // #163/#128 — expose the request metadata the edge already has, the
@@ -2037,7 +2066,7 @@ globalThis.__sbEntry = function (handlers, request) {
     // concurrent in-process requests.
     //
     // Sync handlers only. An async handler's promise is handed straight back:
-    // Porffor alpha-4's native-fetch server resolves the promise the handler
+    // Porffor alpha-10's native-fetch server resolves the promise the handler
     // itself returned, but never one derived from `.then()`, so chaining the
     // tag on hangs the request forever. cpuMs is documented as absent for
     // async handlers (see LogEvent in services/edge) — that is this.
@@ -2050,7 +2079,9 @@ globalThis.__sbEntry = function (handlers, request) {
     };
     let __res;
     try {
-      __res = handlers.fetch(request, ctx);
+      __res = globalThis.__sbCompat >= "2026-09-28"
+        ? handlers.fetch(request, globalThis.env, ctx)
+        : handlers.fetch(request, ctx);
     } catch {
       // #179 — a synchronous throw anywhere in the handler must not take the
       // whole process (and every other in-flight request) down with it.
@@ -2077,10 +2108,10 @@ globalThis.__sbEntry = function (handlers, request) {
     };
     let __sres;
     try {
-      __sres = handlers.scheduled(
-        { cron: body.cron || "", scheduledTime: body.scheduledTime || Date.now(), noRetry() {} },
-        ctx,
-      );
+      const event = { cron: body.cron || "", scheduledTime: body.scheduledTime || Date.now(), noRetry() {} };
+      __sres = globalThis.__sbCompat >= "2026-09-28"
+        ? handlers.scheduled(event, globalThis.env, ctx)
+        : handlers.scheduled(event, ctx);
     } catch {
       // #179 — same rule as fetch: don't let a throw here crash the process.
       return new Response("", { status: 204 });
@@ -2167,7 +2198,9 @@ async function __sbRunQueueBatch(handlers, body, ctx) {
     },
   };
   try {
-    const __qres = handlers.queue(batch, ctx);
+    const __qres = globalThis.__sbCompat >= "2026-09-28"
+      ? handlers.queue(batch, globalThis.env, ctx)
+      : handlers.queue(batch, ctx);
     // Was fire-and-forget: an async `queue()` had this default-ack pass run (and
     // the response go out) before its own `await`s did, so any ack()/retry()
     // past the first one never counted.
