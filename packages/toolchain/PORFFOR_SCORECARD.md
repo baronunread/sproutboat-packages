@@ -1,18 +1,18 @@
 # Porffor pin scorecard
 
-Pin: alpha-9 (de4eb588264885b3a1596f75010e371a2052033f). Compatibility report: 2026-09-26T00:32:42.739Z.
+Pin: alpha-10 (08ac7ee1077c05da2bec18dcca15197051e87b62). Compatibility report: 2026-09-28T07:08:44.821Z.
 
 | Measure | Result |
 | --- | ---: |
 | Fixtures compiled | 32/32 |
 | Behavior matches | 30/32 |
-| Median / p95 compile, ms | 3139 / 3472 |
+| Median / p95 compile, ms | 4468 / 7436 |
 | Median / p95 binary, bytes | 983392 / 1016464 |
 | Patch markers | 27 |
 | Upstream files written | 6 |
 | Fresh patch application | pass |
 
-This is the first recorded pin. Compare the next pin against this snapshot.
+Previous snapshot: alpha-9-de4eb58.json. Matches 30/32 to 30/32; patch markers 27 to 27.
 
 ## Patch inventory
 
@@ -23,7 +23,7 @@ This is the first recorded pin. Compare the next pin against this snapshot.
 - `compiler/uwebsockets.js`: BODY_MARKER, STATUS_SIG_MARKER, STATUS_303_MARKER, STATUS_DEFAULT_MARKER, HDR_SIG_MARKER, HDR_CALL_MARKER, HDR_CAP_MARKER, HDR_SKIP_MARKER, HDR_APPEND_MARKER, READ_RAW_DECL_MARKER, FORBIDDEN_HDR_MARKER, WRITE_RESPONSE_MARKER, R2_TRANSFER_MARKER, R2_TRANSFER_CALL_MARKER, R2_DOWNLOAD_CACHE_MARKER, R2_RANGE_CACHE_MARKER, R2_CONDITIONAL_CACHE_MARKER, R2_STREAMING_CACHE_MARKER, R2_RANGE_HEADER_CACHE_MARKER
 - `compiler/builtins_precompiled.js`: regenerated builtin table
 
-Patch source SHA-256: `69cf5d0bcf3f4d4c05b81df0ff04b83479af622539fa19566155531bf3ee469c`.
+Patch source SHA-256: `edf60b7104e2d0b8efb64e38459fd2d5616ccdf24995ad1d4ca07fa232db4eaf`.
 
 ## Known behavior gaps
 

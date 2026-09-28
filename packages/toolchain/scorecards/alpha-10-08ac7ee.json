@@ -1,0 +1,58 @@
+{
+  "pin": "alpha-10 (08ac7ee1077c05da2bec18dcca15197051e87b62)",
+  "reportGeneratedAt": "2026-09-28T07:08:44.821Z",
+  "fixtures": 32,
+  "compiled": 32,
+  "matched": 30,
+  "medianCompileMs": 4468,
+  "p95CompileMs": 7436,
+  "medianBinaryBytes": 983392,
+  "p95BinaryBytes": 1016464,
+  "patchSourceSha256": "edf60b7104e2d0b8efb64e38459fd2d5616ccdf24995ad1d4ca07fa232db4eaf",
+  "patchMarkerCount": 27,
+  "patchTargets": {
+    "compiler/render.js": [
+      "PORT_MARKER",
+      "CONSOLE_MARKER",
+      "BYTESTRING_MARKER",
+      "READ_RAW_MARKER"
+    ],
+    "compiler/index.js": [
+      "LINK_MARKER",
+      "CFLAGS_MARKER"
+    ],
+    "compiler/builtins/typedarray.js": [
+      "TYPED_ARRAY_FROM_MARKER"
+    ],
+    "compiler/builtins/date.ts": [
+      "DATE_PARSER_MARKER"
+    ],
+    "compiler/uwebsockets.js": [
+      "BODY_MARKER",
+      "STATUS_SIG_MARKER",
+      "STATUS_303_MARKER",
+      "STATUS_DEFAULT_MARKER",
+      "HDR_SIG_MARKER",
+      "HDR_CALL_MARKER",
+      "HDR_CAP_MARKER",
+      "HDR_SKIP_MARKER",
+      "HDR_APPEND_MARKER",
+      "READ_RAW_DECL_MARKER",
+      "FORBIDDEN_HDR_MARKER",
+      "WRITE_RESPONSE_MARKER",
+      "R2_TRANSFER_MARKER",
+      "R2_TRANSFER_CALL_MARKER",
+      "R2_DOWNLOAD_CACHE_MARKER",
+      "R2_RANGE_CACHE_MARKER",
+      "R2_CONDITIONAL_CACHE_MARKER",
+      "R2_STREAMING_CACHE_MARKER",
+      "R2_RANGE_HEADER_CACHE_MARKER"
+    ],
+    "compiler/builtins_precompiled.js": []
+  },
+  "patchApplication": "pass",
+  "mismatches": [
+    "15-date-iso.js: request 3 mismatch: expected {\"status\":200,\"body\":\"2008-03-04T23:00:00.000Z\",\"content-type\":null}, got {\"status\":200,\"body\":\"0003-05-08T00:00:00.000Z\",\"content-type\":null}",
+    "16-date-parts.js: request 3 mismatch: expected {\"status\":200,\"body\":\"{\\\"year\\\":2008,\\\"month\\\":3,\\\"day\\\":4}\",\"content-type\":\"application/json;charset=utf-8\"}, got {\"status\":200,\"body\":\"{\\\"year\\\":3,\\\"month\\\":5,\\\"day\\\":8}\",\"content-type\":\"application/json;charset=utf-8\"}"
+  ]
+}

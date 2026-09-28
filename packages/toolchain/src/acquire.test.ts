@@ -16,7 +16,7 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
   const source = join(root, `porffor-${PORFFOR_COMMIT_FULL}`);
   const files = {
     "runtime/index.js": "fixture:runtime/index.js\n",
-    "compiler/render.js":
+    "compiler/render.js": "// sb_native_utf8_scalar_v1\n" +
       "void porf_native_fetch_runtime_init(void) {\n  signal(SIGPIPE, SIG_IGN);\n  porf_init(0, NULL);\n}\n" +
       "f64 porf_native_fetch_get_port(void) {\nfixture:compiler/render.js\n" +
       "int porf_native_fetch_read_value(jsval value, const char** out_buf, size_t* out_len, char** out_owned) {\n" +
@@ -113,6 +113,8 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "\n" +
       "  if (body_owned) free(body_owned);\n" +
       "}\n",
+    "compiler/builtins/json.ts": "// sb_json_utf16_v1\n",
+    "runtime/fetch-globals.js": "// sb_text_encoder_scalar_v1\n",
     "compiler/builtins/promise.ts":
       "export const __Porffor_promise_resolve = (value: any, promise: any): void => {\n" +
       "  if (Porffor.type(value) == Porffor.TYPES.object) {\n" +
