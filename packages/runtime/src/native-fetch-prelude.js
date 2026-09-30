@@ -1272,9 +1272,9 @@ function __sbMakeD1(dbName) {
       return { count: (String(sql).match(/;/g) || []).length, duration: 0 };
     },
     // Sproutboat extension (not in CF Workers D1): an online, integrity-checked
-    // snapshot of this database. Standalone only for now — the broker transport
-    // returns an error until hosted backup (#139) covers it. `name` lands under
-    // `<data-dir>/backups/`; omit it for a timestamped default. See #164.
+    // snapshot of this database. Both transports implement it: standalone writes
+    // under `<data-dir>/backups/`, the broker under the resource directory's
+    // `backups/`. Omit `name` for a timestamped default. See #164.
     backup(name) {
       const r = __sbRpc("d1.backup", { db: dbName, name: name == null ? "" : String(name) });
       return { path: r.path, bytes: r.bytes };
