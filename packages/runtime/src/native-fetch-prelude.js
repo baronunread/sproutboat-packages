@@ -1993,18 +1993,33 @@ async function __sbFetchWithDrain(res, tasks) {
   let r;
   try {
     r = res && __sbIsFn(res.then) ? await res : res;
-  } catch {
+  } catch (error) {
     // #179 — a rejected handler promise must not take the process down with it.
-    r = __sbErrorResponse();
+    r = __sbErrorResponse(error);
   }
   await __sbDrainWaitUntil(tasks);
   return r;
 }
 
 // #179 — turn an uncaught handler exception into a 500 instead of letting it
-// propagate past __sbEntry and crash the whole server.
-function __sbErrorResponse() {
+// propagate past __sbEntry and crash the whole server. Logged first, the way a
+// Worker logs "Uncaught Error: ...": a swallowed exception left a 500 with
+// nothing on stderr, which hid #168 entirely.
+function __sbErrorResponse(error) {
+  __sbLogUncaught("fetch", error);
   return new Response("Internal Server Error", { status: 500 });
+}
+
+function __sbLogUncaught(where, error) {
+  try {
+    let text = "";
+    if (error && error.stack) text = String(error.stack);
+    else if (error && error.message != null) text = (error.name || "Error") + ": " + error.message;
+    else text = String(error);
+    console.error("Uncaught (in " + where + ") " + text);
+  } catch {
+    /* logging must never turn a handled error into a crash */
+  }
 }
 
 // Shared by alarm and scheduled: both reply with an empty 204 once their
@@ -2012,8 +2027,9 @@ function __sbErrorResponse() {
 async function __sb204WithDrain(res, tasks) {
   try {
     if (res && __sbIsFn(res.then)) await res;
-  } catch {
+  } catch (error) {
     // #179 — same rule as fetch: a rejected scheduled/alarm promise must not crash the process.
+    __sbLogUncaught("scheduled/alarm", error);
   }
   await __sbDrainWaitUntil(tasks);
   return new Response("", { status: 204 });
@@ -2082,10 +2098,10 @@ globalThis.__sbEntry = function (handlers, request) {
       __res = globalThis.__sbCompat >= "2026-09-28"
         ? handlers.fetch(request, globalThis.env, ctx)
         : handlers.fetch(request, ctx);
-    } catch {
+    } catch (error) {
       // #179 — a synchronous throw anywhere in the handler must not take the
       // whole process (and every other in-flight request) down with it.
-      return __sbErrorResponse();
+      return __sbErrorResponse(error);
     }
     // Same promise-identity rule as above applies to `__sbFetchWithDrain`'s
     // own return, which is why it's tail-called rather than chained on here.
@@ -2112,8 +2128,9 @@ globalThis.__sbEntry = function (handlers, request) {
       __sres = globalThis.__sbCompat >= "2026-09-28"
         ? handlers.scheduled(event, globalThis.env, ctx)
         : handlers.scheduled(event, ctx);
-    } catch {
+    } catch (error) {
       // #179 — same rule as fetch: don't let a throw here crash the process.
+      __sbLogUncaught("scheduled", error);
       return new Response("", { status: 204 });
     }
     if (__sbTasks.length || (__sres && __sbIsFn(__sres.then))) return __sb204WithDrain(__sres, __sbTasks);
@@ -2146,8 +2163,9 @@ globalThis.__sbEntry = function (handlers, request) {
     let __ares;
     try {
       __ares = inst.alarm();
-    } catch {
+    } catch (error) {
       // #179 — same rule as fetch: don't let a throw here crash the process.
+      __sbLogUncaught("alarm", error);
       return new Response("", { status: 204 });
     }
     // Was fire-and-forget before: an async `alarm()` and any `state.waitUntil()`
