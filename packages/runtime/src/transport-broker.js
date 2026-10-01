@@ -147,6 +147,66 @@ static int sb_broker_roundtrip(const char* req, size_t req_len, char** resp_out,
   return rc;
 }
 
+// baronunread/sproutboat#189 -- the broker writes its reply JSON as UTF-8,
+// but it reaches JS as a bytestring, one char per byte, so any non-ASCII text
+// (a D1 row, a KV value, a cached body) came back as Latin-1 mojibake. Non-ASCII
+// bytes only ever sit inside JSON strings, so rewriting each UTF-8 sequence as
+// \uXXXX gives the same JSON in pure ASCII, and JSON.parse rebuilds the real
+// strings. A byte that starts no valid sequence passes through as \u00XX.
+// Returns a malloc'd copy, or 0 when the reply is already ASCII.
+static char* sb_json_ascii(const char* s, size_t n, size_t* out_len) {
+  size_t high = 0;
+  for (size_t i = 0; i < n; i++) if ((unsigned char)s[i] >= 0x80) high++;
+  if (!high) return 0;
+  char* out = (char*)malloc(n + high * 12 + 1);
+  if (!out) return 0;
+  size_t o = 0;
+  for (size_t i = 0; i < n; i++) {
+    unsigned char c = (unsigned char)s[i];
+    if (c < 0x80) { out[o++] = (char)c; continue; }
+    unsigned int cp = 0, min = 0;
+    size_t len = 0;
+    if ((c & 0xe0) == 0xc0) { cp = c & 0x1f; len = 2; min = 0x80; }
+    else if ((c & 0xf0) == 0xe0) { cp = c & 0x0f; len = 3; min = 0x800; }
+    else if ((c & 0xf8) == 0xf0) { cp = c & 0x07; len = 4; min = 0x10000; }
+    int ok = len > 0 && i + len <= n;
+    for (size_t k = 1; ok && k < len; k++) {
+      unsigned char cc = (unsigned char)s[i + k];
+      if ((cc & 0xc0) != 0x80) ok = 0;
+      else cp = (cp << 6) | (cc & 0x3f);
+    }
+    if (ok && (cp < min || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff))) ok = 0;
+    if (!ok) { o += (size_t)sprintf(out + o, "\\u%04x", c); continue; }
+    if (cp >= 0x10000) {
+      cp -= 0x10000;
+      o += (size_t)sprintf(out + o, "\\u%04x\\u%04x", 0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+    } else {
+      o += (size_t)sprintf(out + o, "\\u%04x", cp);
+    }
+    i += len - 1;
+  }
+  out[o] = 0;
+  *out_len = o;
+  return out;
+}
+
+// fetch and service.fetch are the exception: their body is the upstream's
+// bytes, which the prelude keeps one char per byte (x-sb-raw-body) and decodes
+// itself. __sbRpc always writes {"v":1,"id":N,"op":... first, so the op is a
+// fixed-position prefix, not a search through user data.
+static int sb_req_is_fetch(const char* req, size_t n) {
+  const char* head = "{\"v\":1,\"id\":";
+  size_t hl = strlen(head);
+  if (n < hl || memcmp(req, head, hl) != 0) return 0;
+  size_t i = hl;
+  while (i < n && req[i] >= '0' && req[i] <= '9') i++;
+  const char* a = ",\"op\":\"fetch\"";
+  const char* b = ",\"op\":\"service.fetch\"";
+  if (n - i >= strlen(a) && memcmp(req + i, a, strlen(a)) == 0) return 1;
+  if (n - i >= strlen(b) && memcmp(req + i, b, strlen(b)) == 0) return 1;
+  return 0;
+}
+
 // A v1 exchange: marker, json length, json, then the body bytes. The reply is
 // split the same way, its JSON returned and its bytes stashed for __sbTakeBin.
 static int sb_broker_roundtrip_v1(const char* json, size_t json_len, const char* body, size_t body_len,
@@ -215,8 +275,12 @@ function __sbCall(reqJson) {
     porf_native_fetch_read_value(reqJson, &__req, &__reqlen, &__reqowned);
     char* __resp = 0; size_t __resplen = 0;
     int __rc = sb_broker_roundtrip(__req, __reqlen, &__resp, &__resplen);
+    int __raw = sb_req_is_fetch(__req, __reqlen);
     if (__reqowned) free(__reqowned);
     if (__rc == 0) {
+      size_t __al = 0;
+      char* __ascii = __raw ? 0 : sb_json_ascii(__resp, __resplen, &__al);
+      if (__ascii) { free(__resp); __resp = __ascii; __resplen = __al; }
       res = porf_box((f64)porf_native_fetch_alloc_bytestring(__resp, __resplen), 195);
       free(__resp);
     } else {
@@ -258,6 +322,9 @@ function __sbCallBin(reqJson, body) {
     if (__jo) free(__jo);
     if (__bo) free(__bo);
     if (__rc == 0) {
+      size_t __al = 0;
+      char* __ascii = sb_json_ascii(__resp, __resplen, &__al);
+      if (__ascii) { free(__resp); __resp = __ascii; __resplen = __al; }
       res = porf_box((f64)porf_native_fetch_alloc_bytestring(__resp, __resplen), 195);
       free(__resp);
     } else {
