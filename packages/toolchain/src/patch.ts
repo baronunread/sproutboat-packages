@@ -133,10 +133,11 @@ const READ_RAW_MARKER = "porf_native_fetch_read_raw_bytes(jsval value";
 
 /**
  * baronunread/sproutboat#178: every async function runs on its own fiber
- * stack, and alpha-10 fixes those at 256 KiB. A large handler compiled at -O0
- * (what `sproutboat dev` builds) spends ~40 KiB of stack per call into the
- * biggest generated functions, so a few nested awaits run off the end into
- * the guard page and the sprout dies with SIGBUS on its first request, no log.
+ * stack, and Porffor (alpha-10 through alpha-13) fixes those at 256 KiB. A
+ * large handler compiled at -O0 (what `sproutboat dev` builds) spends ~40 KiB
+ * of stack per call into the biggest generated functions, so a few nested
+ * awaits run off the end into the guard page and the sprout dies with SIGBUS
+ * on its first request, no log.
  * -O3 frames are smaller, which only raises the threshold: a deep enough
  * async chain hits it in a release build too.
  *
