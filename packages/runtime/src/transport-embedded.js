@@ -184,6 +184,53 @@ static void sb_putjson(sb_buf* b, const char* s, size_t n) {
   }
   sb_put(b, "\"", 1);
 }
+// baronunread/sproutboat#189 -- sb_putjson for bytes that are UTF-8 text
+// (SQLite TEXT, its error messages). The reply reaches JS as a bytestring, one
+// char per byte, so a raw multi-byte sequence came back as Latin-1 mojibake
+// ("café" as "cafÃ©"). Escaping every code point >= 0x80 as \uXXXX keeps the
+// reply pure ASCII and lets JSON.parse rebuild the real string. A byte that
+// doesn't start a valid sequence passes through as \u00XX, the same rule as
+// the prelude's __sbFromUtf8. Raw byte producers (the HTTP client's body,
+// BLOB columns) keep sb_putjson.
+static void sb_putjson_text(sb_buf* b, const char* s, size_t n) {
+  sb_put(b, "\"", 1);
+  for (size_t i = 0; i < n; i++) {
+    unsigned char c = (unsigned char)s[i];
+    if (c < 0x80) {
+      if (c == '"' || c == '\\') { char e[2] = { '\\', (char)c }; sb_put(b, e, 2); }
+      else if (c == '\n') sb_put(b, "\\n", 2);
+      else if (c == '\r') sb_put(b, "\\r", 2);
+      else if (c == '\t') sb_put(b, "\\t", 2);
+      else if (c < 0x20) { char e[8]; int k = snprintf(e, 8, "\\u%04x", c); sb_put(b, e, (size_t)k); }
+      else sb_put(b, (const char*)&c, 1);
+      continue;
+    }
+    unsigned int cp = 0, min = 0;
+    size_t len = 0;
+    if ((c & 0xe0) == 0xc0) { cp = c & 0x1f; len = 2; min = 0x80; }
+    else if ((c & 0xf0) == 0xe0) { cp = c & 0x0f; len = 3; min = 0x800; }
+    else if ((c & 0xf8) == 0xf0) { cp = c & 0x07; len = 4; min = 0x10000; }
+    int ok = len > 0 && i + len <= n;
+    for (size_t k = 1; ok && k < len; k++) {
+      unsigned char cc = (unsigned char)s[i + k];
+      if ((cc & 0xc0) != 0x80) ok = 0;
+      else cp = (cp << 6) | (cc & 0x3f);
+    }
+    if (ok && (cp < min || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff))) ok = 0;
+    char e[16];
+    int k;
+    if (!ok) { k = snprintf(e, sizeof(e), "\\u%04x", c); sb_put(b, e, (size_t)k); continue; }
+    if (cp >= 0x10000) {
+      cp -= 0x10000;
+      k = snprintf(e, sizeof(e), "\\u%04x\\u%04x", 0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+    } else {
+      k = snprintf(e, sizeof(e), "\\u%04x", cp);
+    }
+    sb_put(b, e, (size_t)k);
+    i += len - 1;
+  }
+  sb_put(b, "\"", 1);
+}
 
 // --- the narrow JSON reader: a flat array of null | number | string ----------
 // Only ever fed __sbSql's own params, which JS builds; anything unexpected
@@ -495,7 +542,7 @@ static char* sb_r2_put_c(const char* path, const char* bucket, const char* key, 
     if (strcmp(previous, etag) != 0) unlink(blobpath);
     sb_puts(&out, "{\"ok\":false,\"error\":");
     const char* m = sqlite3_errmsg(db);
-    sb_putjson(&out, m, strlen(m));
+    sb_putjson_text(&out, m, strlen(m));
     sb_puts(&out, "}");
     return out.p;
   }
@@ -817,7 +864,7 @@ static char* sb_sql_script(const char* path, const char* sql) {
   char* err = 0;
   if (sqlite3_exec(sb_dbs[idx], sql, 0, 0, &err) != 0) {
     sb_puts(&b, "{\"ok\":false,\"error\":");
-    sb_putjson(&b, err ? err : "exec failed", err ? strlen(err) : 11);
+    sb_putjson_text(&b, err ? err : "exec failed", err ? strlen(err) : 11);
     sb_puts(&b, "}");
     return b.p;
   }
@@ -837,7 +884,7 @@ static char* sb_sql_run(const char* path, const char* sql, const char* params) {
   if (!st) {
     sb_puts(&b, "{\"ok\":false,\"error\":");
     const char* m = sqlite3_errmsg(db);
-    sb_putjson(&b, m, strlen(m));
+    sb_putjson_text(&b, m, strlen(m));
     sb_puts(&b, "}");
     return b.p;
   }
@@ -848,7 +895,7 @@ static char* sb_sql_run(const char* path, const char* sql, const char* params) {
   for (int i = 0; i < ncol; i++) {
     if (i) sb_puts(&b, ",");
     const char* name = sqlite3_column_name(st, i);
-    sb_putjson(&b, name ? name : "", name ? strlen(name) : 0);
+    sb_putjson_text(&b, name ? name : "", name ? strlen(name) : 0);
   }
   sb_puts(&b, "],\"rows\":[");
   int rc, first = 1;
@@ -868,7 +915,9 @@ static char* sb_sql_run(const char* path, const char* sql, const char* params) {
       }
       const unsigned char* txt = sqlite3_column_text(st, i);
       int n = sqlite3_column_bytes(st, i);
-      sb_putjson(&b, txt ? (const char*)txt : "", txt ? (size_t)n : 0);
+      // TEXT is UTF-8 and decodes (#189); a BLOB stays one char per byte.
+      if (t == 4) sb_putjson(&b, txt ? (const char*)txt : "", txt ? (size_t)n : 0);
+      else sb_putjson_text(&b, txt ? (const char*)txt : "", txt ? (size_t)n : 0);
     }
     sb_puts(&b, "]");
   }
@@ -883,7 +932,7 @@ static char* sb_sql_run(const char* path, const char* sql, const char* params) {
     sb_buf e = { 0, 0, 0 };
     sb_puts(&e, "{\"ok\":false,\"error\":");
     const char* m = sqlite3_errmsg(db);
-    sb_putjson(&e, m, strlen(m));
+    sb_putjson_text(&e, m, strlen(m));
     sb_puts(&e, "}");
     return e.p;
   }
@@ -909,7 +958,7 @@ static char* sb_sql_backup(const char* src_path, const char* dest_path) {
   if (sqlite3_prepare_v2(db, "VACUUM INTO ?1", -1, &st, 0) != 0 || !st) {
     sb_puts(&b, "{\"ok\":false,\"error\":");
     const char* m = sqlite3_errmsg(db);
-    sb_putjson(&b, m, strlen(m));
+    sb_putjson_text(&b, m, strlen(m));
     sb_puts(&b, "}");
     return b.p;
   }
@@ -919,7 +968,7 @@ static char* sb_sql_backup(const char* src_path, const char* dest_path) {
   if (rc != SB_SQLITE_DONE) {
     sb_puts(&b, "{\"ok\":false,\"error\":");
     const char* m = sqlite3_errmsg(db);
-    sb_putjson(&b, m, strlen(m));
+    sb_putjson_text(&b, m, strlen(m));
     sb_puts(&b, "}");
     return b.p;
   }
@@ -1097,7 +1146,7 @@ static char* sb_error_json(const char* prefix, const char* detail) {
   sb_buf msg = { 0, 0, 0 };
   sb_puts(&msg, prefix);
   if (detail) { sb_puts(&msg, detail); }
-  sb_putjson(&out, msg.p ? msg.p : "", msg.len);
+  sb_putjson_text(&out, msg.p ? msg.p : "", msg.len);
   sb_puts(&out, "}");
   free(msg.p);
   return out.p;
