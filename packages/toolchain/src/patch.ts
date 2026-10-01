@@ -192,6 +192,21 @@ const CFLAGS_INJECT =
   "      ...(process.env.SB_EXTRA_CFLAGS ? process.env.SB_EXTRA_CFLAGS.split(' ').filter(Boolean) : []),\n";
 const CFLAGS_MARKER = "SB_EXTRA_CFLAGS";
 
+// baronunread/sproutboat#168: Porffor represents null as an object-typed value
+// with pointer 0, so __Porffor_promise_resolve's cheap `then` probe treated a
+// promise resolving to null as an object and looked `then` up at memory offset
+// 0. Once something (Date.prototype.toISOString's scratch writes, in practice)
+// left bytes there that hash-match, the probe "found" a then, read null.then,
+// and rejected with "Cannot get property of null". Every later async function
+// resolving to null then failed, permanently. Only non-null objects can be
+// thenables (ECMA-262 Promise Resolve Functions step 8), so exclude null.
+const PROMISE_NULL_ANCHOR =
+  "  if (Porffor.type(value) == Porffor.TYPES.object) {\n    // cheap prototype-chain probe for 'then'";
+const PROMISE_NULL_INJECT =
+  "  // sproutboat #168: null is object-typed with pointer 0, never a thenable.\n" +
+  "  if (Porffor.type(value) == Porffor.TYPES.object && value != null) {\n    // cheap prototype-chain probe for 'then'";
+const PROMISE_NULL_MARKER = "sproutboat #168: null is object-typed";
+
 // Porffor's TypedArray.from only handles iterables. An array-like input such
 // as { length: 16 } silently becomes an empty typed array, including HMAC
 // keys made with Uint8Array.from({ length: 16 }, mapFn). The compiler uses a
@@ -977,6 +992,16 @@ export async function patchDateParser(root: string): Promise<void> {
   await writeFile(file, src.slice(0, start) + parser.replace(DATE_PARSER_ANCHOR, DATE_PARSER_INJECT) + src.slice(end));
 }
 
+/** #168: keep a promise resolving to null out of the `then` probe. Precompiled by patchTypedArrayFrom. */
+export async function patchPromiseResolveNull(root: string): Promise<void> {
+  const file = resolve(root, "compiler/builtins/promise.ts");
+  const src = await readFile(file, "utf8");
+  if (src.includes(PROMISE_NULL_MARKER)) return;
+  if (!src.includes(PROMISE_NULL_ANCHOR))
+    throw new Error(`could not patch Porffor's promise resolve for null: anchor not found in ${file}`);
+  await writeFile(file, src.replace(PROMISE_NULL_ANCHOR, PROMISE_NULL_INJECT));
+}
+
 export async function patchTypedArrayFrom(root: string): Promise<void> {
   const file = resolve(root, "compiler/builtins/typedarray.js");
   const src = await readFile(file, "utf8");
@@ -1052,6 +1077,9 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchUwebsockets(root);
   await patchRenderJs(root);
   await patchDateParser(root);
+  await patchPromiseResolveNull(root);
+  // Last of the builtin edits: its precompile picks up the date and promise
+  // patches above too.
   await patchTypedArrayFrom(root);
   await patchUnicode(root);
   done.add(root);

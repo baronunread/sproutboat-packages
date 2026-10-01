@@ -119,6 +119,7 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
     "compiler/builtins/promise.ts":
       "export const __Porffor_promise_resolve = (value: any, promise: any): void => {\n" +
       "  if (Porffor.type(value) == Porffor.TYPES.object) {\n" +
+      "    // cheap prototype-chain probe for 'then' before the expensive Get below, does not invoke getters\n" +
       "    const thenHash: i32 = __Porffor_object_hash('then');\n" +
       "    let probe: any = value;\n" +
       "    while (Porffor.type(probe) == Porffor.TYPES.object) {\n" +
@@ -197,6 +198,10 @@ test("the default call (no url/expectedSha256 override) never touches the networ
     },
   });
   expect(await readFile(join(dir, "runtime/index.js"), "utf8")).not.toBe("");
+  // #168: the real vendored source takes the null guard on the `then` probe.
+  expect(await readFile(join(dir, "compiler/builtins/promise.ts"), "utf8")).toContain(
+    "if (Porffor.type(value) == Porffor.TYPES.object && value != null) {",
+  );
 });
 
 test("a corrupted warm cache is replaced from the verified archive", async () => {
