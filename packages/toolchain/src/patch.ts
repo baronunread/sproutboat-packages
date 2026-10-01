@@ -192,6 +192,14 @@ const CFLAGS_INJECT =
   "      ...(process.env.SB_EXTRA_CFLAGS ? process.env.SB_EXTRA_CFLAGS.split(' ').filter(Boolean) : []),\n";
 const CFLAGS_MARKER = "SB_EXTRA_CFLAGS";
 
+// baronunread/sproutboat#235: clang's default -ffp-contract=on fuses `a * b + c`
+// into one FMA on arm64, rounding once where JavaScript rounds twice. A seeded
+// LCG (seed * 1103515245 + 12345, past 2^53) diverged from V8 at step 23.
+// Every compiled unit keeps JS's separate roundings with contraction off.
+const FP_CONTRACT_ANCHOR = "      '-fno-ident', '-ffunction-sections', '-fdata-sections',\n";
+const FP_CONTRACT_INJECT = "      '-ffp-contract=off', // sproutboat #235: JS rounds a * b + c twice\n";
+const FP_CONTRACT_MARKER = "sproutboat #235";
+
 // baronunread/sproutboat#168: Porffor represents null as an object-typed value
 // with pointer 0, so __Porffor_promise_resolve's cheap `then` probe treated a
 // promise resolving to null as an object and looked `then` up at memory offset
@@ -959,6 +967,7 @@ async function patchCompilerArgs(root: string): Promise<void> {
   for (const [marker, anchor, inject, what] of [
     [LINK_MARKER, LINK_ANCHOR, LINK_INJECT, "extra link args"],
     [CFLAGS_MARKER, CFLAGS_ANCHOR, CFLAGS_INJECT, "extra compiler flags"],
+    [FP_CONTRACT_MARKER, FP_CONTRACT_ANCHOR, FP_CONTRACT_INJECT, "floating-point contraction"],
   ] as const) {
     if (src.includes(marker)) continue;
     const at = src.indexOf(anchor);
@@ -971,7 +980,7 @@ async function patchCompilerArgs(root: string): Promise<void> {
     // Add flags to compileOnlyArgs so every generated C unit sees them and
     // Porffor's module-build cache includes them in its compiler command.
     src =
-      marker === CFLAGS_MARKER
+      marker !== LINK_MARKER
         ? src.slice(0, at + anchor.length) + inject + src.slice(at + anchor.length)
         : src.slice(0, at) + inject + src.slice(at);
     changed = true;
