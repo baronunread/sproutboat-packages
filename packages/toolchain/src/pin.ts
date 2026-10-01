@@ -11,14 +11,14 @@
  * uWebSockets archive in `sproutboat-cli/vendor/` — then run both repos'
  * test + conformance suites. See sproutboat-cli/MIGRATION.md.
  */
-export const PORFFOR_CHANNEL = "alpha-10";
-export const PORFFOR_COMMIT_FULL = "08ac7ee1077c05da2bec18dcca15197051e87b62";
+export const PORFFOR_CHANNEL = "alpha-13";
+export const PORFFOR_COMMIT_FULL = "547c7815125b6f02474591950f8b0dd7031a03f0";
 export const PORFFOR_COMMIT = PORFFOR_COMMIT_FULL.slice(0, 7);
 export const PORFFOR_ARCHIVE_SHA256 =
-  "d49ce6724efde555b4cdeea0d2610baddd4310153956c79b352d86ba9cf0f60f";
+  "d0ff4bf7778f85445ff99bb8f6b2e07f2b83a33a109612f9eba6f2e5cba291b5";
 export const PORFFOR_ARCHIVE_URL = `https://codeload.github.com/CanadaHonk/porffor/tar.gz/${PORFFOR_COMMIT_FULL}`;
 
-/** A compact identity string for a manifest / report (`alpha-10 (08ac7ee)`). */
+/** A compact identity string for a manifest / report (`alpha-13 (547c781)`). */
 export function porfforVersion(): string {
   return process.env.PORFFOR_VERSION || `${PORFFOR_CHANNEL} (${PORFFOR_COMMIT})`;
 }

@@ -1,0 +1,9 @@
+# Porffor alpha-13 upgrade audit
+
+The source pin moves from alpha-10 (`08ac7ee`) to the [alpha-13 release](https://github.com/CanadaHonk/porffor/releases/tag/alpha-13), commit `547c7815125b6f02474591950f8b0dd7031a03f0`, published September 30, 2026. The vendored codeload archive has SHA-256 `d0ff4bf7778f85445ff99bb8f6b2e07f2b83a33a109612f9eba6f2e5cba291b5`.
+
+Alpha-11 brings array and typed array fast paths (merge sort, `shift`, same-type `set`) and codegen fixes for closures in loops and function literals. Alpha-12 fixes module handling (reassigned exports, strict-mode analysis, module-init closures). Alpha-13 adds a basic `RegExp` search, a `String.prototype.normalize` stub, more reserved C keywords and lowercase JSON hex escapes. Its `compiler/uwebsockets.js` still pins `360c276d609d59af56ae6932adb95154ace9f15f`, so the CLI's vendored uWebSockets archive does not change. All 28 Sproutboat patches apply without changing their anchors or markers. `PORF_CORO_STACK_SIZE` is still 256 KiB upstream, so the #178 patch still applies and still matters.
+
+The native package suite passed 152 tests, plus the native crypto vectors. Linked to this toolchain, the CLI passed 103 tests (`SURFACE.md` only needs the new provenance stamp), 28 broker checks, 30 standalone checks and all 21 examples. The platform's 32-handler comparison compiled all 32 and matched Bun on 30, unchanged from alpha-10. The remaining two failures are non-ISO date parsing in `15-date-iso.js` and `16-date-parts.js`. See [the scorecard](PORFFOR_SCORECARD.md) for the exact results.
+
+The open runtime bugs reproduce unchanged: baronunread/sproutboat#168 (an async chain using `new Date().toISOString()` flips to permanent 500s after 5 to 12 requests) and the read half of #189 (non-ASCII D1 and KV values come back as Latin-1 bytes).

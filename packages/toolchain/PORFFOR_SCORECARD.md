@@ -1,29 +1,29 @@
 # Porffor pin scorecard
 
-Pin: alpha-10 (08ac7ee1077c05da2bec18dcca15197051e87b62). Compatibility report: 2026-09-28T07:08:44.821Z.
+Pin: alpha-13 (547c7815125b6f02474591950f8b0dd7031a03f0). Compatibility report: 2026-10-01T10:57:31.463Z.
 
 | Measure | Result |
 | --- | ---: |
 | Fixtures compiled | 32/32 |
 | Behavior matches | 30/32 |
-| Median / p95 compile, ms | 4468 / 7436 |
-| Median / p95 binary, bytes | 983392 / 1016464 |
-| Patch markers | 27 |
+| Median / p95 compile, ms | 3212 / 4703 |
+| Median / p95 binary, bytes | 966864 / 999936 |
+| Patch markers | 28 |
 | Upstream files written | 6 |
 | Fresh patch application | pass |
 
-Previous snapshot: alpha-9-de4eb58.json. Matches 30/32 to 30/32; patch markers 27 to 27.
+Previous snapshot: alpha-10-08ac7ee.json. Matches 30/32 to 30/32; patch markers 27 to 28.
 
 ## Patch inventory
 
-- `compiler/render.js`: PORT_MARKER, CONSOLE_MARKER, BYTESTRING_MARKER, READ_RAW_MARKER
+- `compiler/render.js`: PORT_MARKER, CONSOLE_MARKER, BYTESTRING_MARKER, READ_RAW_MARKER, CORO_STACK_MARKER
 - `compiler/index.js`: LINK_MARKER, CFLAGS_MARKER
 - `compiler/builtins/typedarray.js`: TYPED_ARRAY_FROM_MARKER
 - `compiler/builtins/date.ts`: DATE_PARSER_MARKER
 - `compiler/uwebsockets.js`: BODY_MARKER, STATUS_SIG_MARKER, STATUS_303_MARKER, STATUS_DEFAULT_MARKER, HDR_SIG_MARKER, HDR_CALL_MARKER, HDR_CAP_MARKER, HDR_SKIP_MARKER, HDR_APPEND_MARKER, READ_RAW_DECL_MARKER, FORBIDDEN_HDR_MARKER, WRITE_RESPONSE_MARKER, R2_TRANSFER_MARKER, R2_TRANSFER_CALL_MARKER, R2_DOWNLOAD_CACHE_MARKER, R2_RANGE_CACHE_MARKER, R2_CONDITIONAL_CACHE_MARKER, R2_STREAMING_CACHE_MARKER, R2_RANGE_HEADER_CACHE_MARKER
 - `compiler/builtins_precompiled.js`: regenerated builtin table
 
-Patch source SHA-256: `edf60b7104e2d0b8efb64e38459fd2d5616ccdf24995ad1d4ca07fa232db4eaf`.
+Patch source SHA-256: `6f607ac6b66fc4a51c2bf9e9525d0ab7f4e9b9dd3f942a820bbad46b7e3dbf56`.
 
 ## Known behavior gaps
 
