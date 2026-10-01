@@ -35,6 +35,9 @@ int porf_native_fetch_read_value(jsval value, const char** out_buf, size_t* out_
 
   return -1;
 }
+
+#define PORF_CORO_STACK_SIZE (256u * 1024u)
+#define PORF_CORO_MAX 16384
 `;
 
 // Porffor's compiler/uwebsockets.js, trimmed to the parts the patch touches:
@@ -288,6 +291,10 @@ test("#165: render.js routes console output to stderr, unbuffered, idempotently"
     expect(once).toContain(
       "int porf_native_fetch_read_value(jsval value, const char** out_buf, size_t* out_len, char** out_owned) {",
     );
+
+    // #178: fiber stacks big enough for -O0 frames in a few nested awaits.
+    expect(once).toContain("#define PORF_CORO_STACK_SIZE (8u * 1024u * 1024u)");
+    expect(once).not.toContain("(256u * 1024u)");
 
     await patchRenderJs(root);
     expect(await readFile(join(root, "compiler/render.js"), "utf8")).toBe(once);

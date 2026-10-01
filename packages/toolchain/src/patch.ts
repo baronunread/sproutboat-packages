@@ -132,6 +132,24 @@ const READ_RAW_INJECT =
 const READ_RAW_MARKER = "porf_native_fetch_read_raw_bytes(jsval value";
 
 /**
+ * baronunread/sproutboat#178: every async function runs on its own fiber
+ * stack, and alpha-10 fixes those at 256 KiB. A large handler compiled at -O0
+ * (what `sproutboat dev` builds) spends ~40 KiB of stack per call into the
+ * biggest generated functions, so a few nested awaits run off the end into
+ * the guard page and the sprout dies with SIGBUS on its first request, no log.
+ * -O3 frames are smaller, which only raises the threshold: a deep enough
+ * async chain hits it in a release build too.
+ *
+ * Match a thread's usual 8 MiB. The reservation is MAP_NORESERVE with a guard
+ * page, so only touched pages cost memory and a shallow handler pays nothing.
+ */
+const CORO_STACK_ANCHOR = "#define PORF_CORO_STACK_SIZE (256u * 1024u)";
+const CORO_STACK_INJECT =
+  "// sproutboat #178: 256 KiB overflows -O0 frames in a few nested awaits.\n" +
+  "#define PORF_CORO_STACK_SIZE (8u * 1024u * 1024u)";
+const CORO_STACK_MARKER = "sproutboat #178";
+
+/**
  * render.js full-block replacements: `[marker, anchor, inject, what]`, each a
  * complete swap of the matched region (unlike `RENDER_EDITS`, which only ever
  * inserts after its anchor).
@@ -139,6 +157,7 @@ const READ_RAW_MARKER = "porf_native_fetch_read_raw_bytes(jsval value";
 const RENDER_REPLACEMENTS = [
   [BYTESTRING_MARKER, BYTESTRING_ANCHOR, BYTESTRING_INJECT, "bytestring UTF-8 encoding (#172)"],
   [READ_RAW_MARKER, READ_RAW_ANCHOR, READ_RAW_INJECT, "raw bytestring passthrough function (#176)"],
+  [CORO_STACK_MARKER, CORO_STACK_ANCHOR, CORO_STACK_INJECT, "coroutine stack size (#178)"],
 ] as const;
 
 // #15 — no `--port` flag: Porffor's native-fetch entry point calls
