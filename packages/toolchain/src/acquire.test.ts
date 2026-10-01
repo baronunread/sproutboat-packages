@@ -27,7 +27,8 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "    return 0;\n" +
       "  }\n" +
       "  return -1;\n" +
-      "}\n",
+      "}\n" +
+      "#define PORF_CORO_STACK_SIZE (256u * 1024u)\n",
     "compiler/index.js": "      ...darwinReleaseCompileArgs,\n        uSocketsArchive,\n        '-lm'\n",
     "compiler/precompile.js":
       "const fs = require('node:fs');\n" +
