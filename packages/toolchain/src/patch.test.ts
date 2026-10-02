@@ -44,7 +44,9 @@ int porf_native_fetch_read_value(jsval value, const char** out_buf, size_t* out_
 // body limit (#56), the #156 status-line switch, #163's collect_headers, and
 // #176's read_value forward decl / is_forbidden_response_header /
 // write_response_value.
-const SHIM = `static const size_t REQUEST_BODY_MAX_BYTES = 1024u * 1024u;
+const SHIM = `export const makeUWebSocketsShimSource = () => \`
+#include "App.h"
+static const size_t REQUEST_BODY_MAX_BYTES = 1024u * 1024u;
 
 int porf_native_fetch_read_value(struct jsval value, const char** out_buf, size_t* out_len, char** out_owned);
 

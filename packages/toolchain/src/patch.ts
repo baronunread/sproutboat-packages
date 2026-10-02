@@ -200,6 +200,61 @@ const FP_CONTRACT_ANCHOR = "      '-fno-ident', '-ffunction-sections', '-fdata-s
 const FP_CONTRACT_INJECT = "      '-ffp-contract=off', // sproutboat #235: JS rounds a * b + c twice\n";
 const FP_CONTRACT_MARKER = "sproutboat #235";
 
+// baronunread/sproutboat#236: uWebSockets answers any request line that isn't
+// HTTP/1.1 with 505, so a standalone sprout behind nginx's default
+// `proxy_http_version 1.0` failed every request. Its HttpRequest already has
+// isAncient(), which closes the connection after the response; the parser just
+// never sets it. uWebSockets is header-only and lives in Porffor's deps cache,
+// not in the Porffor checkout, so a helper written next to compiler/index.js
+// edits HttpParser.h right before each native-fetch compile (marker-guarded).
+const HTTP10_HELPER = String.raw`// sproutboat #236: accept HTTP/1.0 request lines in uWebSockets.
+import fs from 'node:fs';
+
+const MARK = 'sb_http10_request';
+const edits = [
+  [
+    'struct HttpParser {',
+    '/* sproutboat #236: set by consumeRequestLine for an HTTP/1.0 request line. */\ninline thread_local bool sb_http10_request = false;\n\nstruct HttpParser {'
+  ],
+  [
+    '/* Scan until single SP, assume next is / (origin request) */\n        char *start = data;',
+    '/* Scan until single SP, assume next is / (origin request) */\n        sb_http10_request = false;\n        char *start = data;'
+  ],
+  [
+    'if (memcmp(" HTTP/1.1\\r\\n", data, std::min<unsigned int>(11, (unsigned int) (end - data))) == 0) {\n                            return nullptr;\n                        }',
+    'if (memcmp(" HTTP/1.1\\r\\n", data, std::min<unsigned int>(11, (unsigned int) (end - data))) == 0) {\n                            return nullptr;\n                        }\n                        if (memcmp(" HTTP/1.0\\r\\n", data, std::min<unsigned int>(11, (unsigned int) (end - data))) == 0) {\n                            return nullptr;\n                        }'
+  ],
+  [
+    'if (memcmp(" HTTP/1.1\\r\\n", data, 11) == 0) {\n                        return data + 11;\n                    }',
+    'if (memcmp(" HTTP/1.1\\r\\n", data, 11) == 0) {\n                        return data + 11;\n                    }\n                    if (memcmp(" HTTP/1.0\\r\\n", data, 11) == 0) {\n                        sb_http10_request = true;\n                        return data + 11;\n                    }'
+  ],
+  [ 'req->ancientHttp = false;', 'req->ancientHttp = sb_http10_request;' ]
+];
+
+export const sbPatchHttp10 = uwsDir => {
+  const file = uwsDir + '/src/HttpParser.h';
+  let src = fs.readFileSync(file, 'utf8');
+  if (src.includes(MARK)) return;
+  for (const [ from, to ] of edits) {
+    if (!src.includes(from)) throw new Error('sproutboat #236: uWebSockets HttpParser.h changed, anchor not found: ' + from.slice(0, 60));
+    src = src.replace(from, to);
+  }
+  fs.writeFileSync(file, src);
+};
+`;
+const HTTP10_IMPORT_ANCHOR = "import { hashId } from './modules.js';\n";
+const HTTP10_IMPORT_INJECT = "import { sbPatchHttp10 } from './sb-http10.js'; // sproutboat #236\n";
+const HTTP10_IMPORT_MARKER = "./sb-http10.js";
+const HTTP10_CALL_ANCHOR = "      const uwsDir = uwebsockets.ensureUWebSockets();\n";
+const HTTP10_CALL_INJECT = "      sbPatchHttp10(uwsDir);\n";
+const HTTP10_CALL_MARKER = "sbPatchHttp10(uwsDir)";
+// The shim is content-cached, so a header edit alone would never recompile it.
+// This line changes the shim once, which rebuilds it against the edited header.
+const HTTP10_SHIM_ANCHOR = 'export const makeUWebSocketsShimSource = () => `\n#include "App.h"\n';
+const HTTP10_SHIM_INJECT =
+  'export const makeUWebSocketsShimSource = () => `\n#include "App.h"\n// sproutboat #236: built against an HttpParser.h that accepts HTTP/1.0\n';
+const HTTP10_SHIM_MARKER = "sproutboat #236: built against";
+
 // baronunread/sproutboat#168: Porffor represents null as an object-typed value
 // with pointer 0, so __Porffor_promise_resolve's cheap `then` probe treated a
 // promise resolving to null as an object and looked `then` up at memory offset
@@ -775,6 +830,7 @@ const done = new Set<string>();
 
 /** Edits to Porffor's uWebSockets shim: `[marker, anchor, inject, what]`. */
 const UWS_EDITS = [
+  [HTTP10_SHIM_MARKER, HTTP10_SHIM_ANCHOR, HTTP10_SHIM_INJECT, "shim rebuild for HTTP/1.0 (#236)"],
   [BODY_MARKER, BODY_ANCHOR, BODY_INJECT, "request body limit"],
   [STATUS_SIG_MARKER, STATUS_SIG_ANCHOR, STATUS_SIG_INJECT, "status-line return type (#156)"],
   [STATUS_303_MARKER, STATUS_303_ANCHOR, STATUS_303_INJECT, "status-line 303 case (#156)"],
@@ -961,6 +1017,7 @@ export async function patchUwebsockets(root: string): Promise<void> {
 }
 
 async function patchCompilerArgs(root: string): Promise<void> {
+  await writeFile(resolve(root, "compiler/sb-http10.js"), HTTP10_HELPER);
   const file = resolve(root, "compiler/index.js");
   let src = await readFile(file, "utf8");
   let changed = false;
@@ -968,6 +1025,8 @@ async function patchCompilerArgs(root: string): Promise<void> {
     [LINK_MARKER, LINK_ANCHOR, LINK_INJECT, "extra link args"],
     [CFLAGS_MARKER, CFLAGS_ANCHOR, CFLAGS_INJECT, "extra compiler flags"],
     [FP_CONTRACT_MARKER, FP_CONTRACT_ANCHOR, FP_CONTRACT_INJECT, "floating-point contraction"],
+    [HTTP10_IMPORT_MARKER, HTTP10_IMPORT_ANCHOR, HTTP10_IMPORT_INJECT, "HTTP/1.0 helper import (#236)"],
+    [HTTP10_CALL_MARKER, HTTP10_CALL_ANCHOR, HTTP10_CALL_INJECT, "HTTP/1.0 parser edit (#236)"],
   ] as const) {
     if (src.includes(marker)) continue;
     const at = src.indexOf(anchor);
