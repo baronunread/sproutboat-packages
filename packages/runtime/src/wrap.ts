@@ -228,11 +228,21 @@ export function wrapNativeFetchHandler(
     ? `__sbStartLocalTriggers(__sbHandlers, ${JSON.stringify(bindings)});\n`
     : "";
 
+  // baronunread/sproutboat#238: the handler runs in its own function scope.
+  // Spliced in at the prelude's top level, a bundle's own top-level
+  // `const URL = ...` (uuid exports one) replaced the URL class for the whole
+  // module, prelude included, and the binary died at startup. Porffor resolves
+  // a top-level name module-wide, so a block is not enough; a function is.
+  // Static imports (a direct-ESM handler, no bundler in front) are only legal
+  // at module top level, so they stay outside the function.
+  const importPattern = /^import\s(?:[\s\S]*?\sfrom\s*)?["'][^"'\n]+["'];?[ \t]*$/gm;
+  const imports = (neutralised.match(importPattern) ?? []).join("\n");
+  const body = neutralised.replace(importPattern, "");
   return (
     `${prelude}\n${nativeTransferAbi}${compat}${env}${versionMetadataLine}${wire}` +
-    `${neutralised}\n` +
-    `${registerDO}${triggers}` +
-    `export default {\n  port: ${port},\n  fetch(request) { return __sbEntry(__sbHandlers, request); }\n};\n`
+    `${imports ? `${imports}\n` : ""}const __sbUserHandlers = (() => {\n${body}\n` +
+    `${registerDO}${triggers}return __sbHandlers;\n})();\n` +
+    `export default {\n  port: ${port},\n  fetch(request) { return __sbEntry(__sbUserHandlers, request); }\n};\n`
   );
 }
 

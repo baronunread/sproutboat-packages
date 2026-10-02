@@ -12,7 +12,10 @@ import { EMPTY_BINDINGS, preludePath, TRANSPORT_MARKER, transportPath, wrapNativ
 // two hot paths (KV, D1) and a non-ASCII SQLite error message.
 const text = "/café/日本/😀/x";
 
+// #238: the handler's own top-level \`URL\` (uuid exports one) must not replace
+// the URL class the prelude extends; the handler runs in its own scope.
 const handler = `
+const URL = "shadowed";
 export default {
   async fetch() {
     await env.KV.put("k", ${JSON.stringify(text)});
@@ -22,7 +25,7 @@ export default {
     const d1 = (await env.DB.prepare("SELECT v FROM t").first()).v;
     let error = "";
     try { await env.DB.prepare("SELECT * FROM tabellà").first(); } catch (e) { error = String(e.message); }
-    return Response.json({ kv, kvLength: kv.length, d1, d1Length: d1.length, error });
+    return Response.json({ kv, kvLength: kv.length, d1, d1Length: d1.length, error, url: URL });
   },
 };
 `;
@@ -96,13 +99,21 @@ try {
   assert.equal(response.status, 200);
   // SAFETY: the handler above is the only producer of this body and always
   // returns exactly these five fields; deepEqual below checks every one.
-  const body = (await response.json()) as { kv: string; kvLength: number; d1: string; d1Length: number; error: string };
+  const body = (await response.json()) as {
+    kv: string;
+    kvLength: number;
+    d1: string;
+    d1Length: number;
+    error: string;
+    url: string;
+  };
   assert.deepEqual(
     { kv: body.kv, kvLength: body.kvLength, d1: body.d1, d1Length: body.d1Length },
     { kv: text, kvLength: text.length, d1: text, d1Length: text.length },
   );
   assert.match(body.error, /tabellà/);
-  console.log("Non-ASCII KV, D1 and error text round-trip through the broker");
+  assert.equal(body.url, "shadowed");
+  console.log("Non-ASCII KV, D1 and error text round-trip through the broker; a handler-level URL stays scoped");
 } finally {
   if (server) {
     server.kill(9);
