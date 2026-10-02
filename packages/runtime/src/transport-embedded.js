@@ -2603,6 +2603,11 @@ globalThis.__sbR2MultipartPut = function (bucket, key, uploadId, partNumber, bod
   return { ok: true, part: { partNumber, etag: reply.etag } };
 };
 
+// #232 — the C HTTP client already hands back raw bytes, one char per byte.
+globalThis.__sbFetchUpstream = function (op, msg) {
+  return __sbRpc(op, msg);
+};
+
 globalThis.__sbAssetsGet = function (path) {
   return __sbEmbeddedDispatch({ op: "assets.get", path });
 };

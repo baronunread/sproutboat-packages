@@ -154,6 +154,23 @@ test("fetch is gated by the exact-host allowlist", async () => {
   expect(calls).toEqual(["https://api.example.com/x"]);
 });
 
+test("#232: a v1 fetch returns the upstream body as raw bytes; v0 keeps decoded text", async () => {
+  const binary = Uint8Array.from({ length: 256 }, (_, i) => i);
+  const fetchImpl: FetchLike = async (url) =>
+    new Response(String(url).endsWith("/bin") ? binary : "café", { status: 200 });
+  const b = make({ bindings: { outbound: ["api.example.com"] }, fetchImpl });
+
+  const raw = decodeV1Frame(
+    await b.handleFrame(encodeV1({ v: 1, token: "tok", op: "fetch", url: "https://api.example.com/bin" })),
+  );
+  expect(raw.json).toMatchObject({ ok: true, status: 200 });
+  expect(raw.json.body).toBeUndefined();
+  expect(Buffer.from(raw.bytes).equals(Buffer.from(binary))).toBe(true);
+
+  // Already-deployed sprouts speak v0 and expect the body as text in the JSON.
+  expect(await b.dispatch({ op: "fetch", url: "https://api.example.com/t" })).toMatchObject({ body: "café" });
+});
+
 test("D1: query / run / batch on a bound database, isolated per name", async () => {
   const b = make({ bindings: { d1: ["DB", "OTHER"] } });
   await b.dispatch({ op: "d1.exec", db: "DB", sql: "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)" });
