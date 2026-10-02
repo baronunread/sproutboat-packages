@@ -30,6 +30,8 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "}\n" +
       "#define PORF_CORO_STACK_SIZE (256u * 1024u)\n",
     "compiler/index.js":
+      "import { hashId } from './modules.js';\n" +
+      "      const uwsDir = uwebsockets.ensureUWebSockets();\n" +
       "      '-fno-ident', '-ffunction-sections', '-fdata-sections',\n      ...darwinReleaseCompileArgs,\n        uSocketsArchive,\n        '-lm'\n",
     "compiler/precompile.js":
       "const fs = require('node:fs');\n" +
@@ -47,6 +49,7 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "    len = i;\n" +
       "  }\n\n  arr.length = len;\n\n  return new ${name}(arr);\n};\n",
     "compiler/uwebsockets.js":
+      'export const makeUWebSocketsShimSource = () => `\n#include "App.h"\n' +
       "static const size_t REQUEST_BODY_MAX_BYTES = 1024u * 1024u;\n" +
       "int porf_native_fetch_read_value(struct jsval value, const char** out_buf, size_t* out_len, char** out_owned);\n" +
       "static std::string_view lookup_status_line(i32 status) {\n" +
@@ -199,6 +202,11 @@ test("the default call (no url/expectedSha256 override) never touches the networ
     },
   });
   expect(await readFile(join(dir, "runtime/index.js"), "utf8")).not.toBe("");
+  // #236: the native-fetch build edits uWebSockets to accept HTTP/1.0.
+  const index = await readFile(join(dir, "compiler/index.js"), "utf8");
+  expect(index).toContain("import { sbPatchHttp10 } from './sb-http10.js';");
+  expect(index).toContain("const uwsDir = uwebsockets.ensureUWebSockets();\n      sbPatchHttp10(uwsDir);");
+  expect(await readFile(join(dir, "compiler/sb-http10.js"), "utf8")).toContain("export const sbPatchHttp10");
   // #235: every compiled unit keeps JavaScript's separate float roundings.
   expect(await readFile(join(dir, "compiler/index.js"), "utf8")).toContain("'-ffp-contract=off',");
   // #168: the real vendored source takes the null guard on the `then` probe.
