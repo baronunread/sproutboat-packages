@@ -305,6 +305,47 @@ const TA_STORE_INJECT =
   "      // sproutboat #238: typed-array stores wrap modulo 2^n (ToUint32), not saturate.\n" +
   "      stmt(scope, Store(ctype, addr, 4, ctype === 'f64' || ctype === 'f32' ? f : signed ? Convert(T.i32, toUint32(scope, f), CONVERT_RANGE_KNOWN | CONVERT_SIGNED) : toUint32(scope, f)));";
 const TA_STORE_MARKER = "sproutboat #238: typed-array stores wrap";
+// baronunread/sproutboat#238: unary `~` had the same saturating conversion, so
+// ~x for x >= 2^31 (or ~~x, the common truncation idiom) clamped to
+// +/-2147483648, and ~Infinity gave -2147483648 instead of -1. uuid's SHA-1
+// computes `x & y ^ ~x & z` on words above 2^31, so every v5 UUID was wrong.
+const BITNOT_ANCHOR =
+  "      return Box(Convert(T.f64, Un('~', T.i32, Convert(T.i32, numValue(toNumeric())))), Const(T.i32, TYPES.number));";
+const BITNOT_INJECT =
+  "      // sproutboat #238: ~ applies ToInt32 (wrap modulo 2^32), not a saturating cast.\n" +
+  "      return Box(Convert(T.f64, Un('~', T.i32, Convert(T.i32, toUint32(scope, numValue(toNumeric())), CONVERT_RANGE_KNOWN | CONVERT_SIGNED))), Const(T.i32, TYPES.number));";
+const BITNOT_MARKER = "sproutboat #238: ~ applies ToInt32";
+// baronunread/sproutboat#238: typed-array element reads and writes had no
+// bounds check. A read past the end returned whatever sat in the next
+// allocation instead of undefined (uuid's SHA-1 reads past its buffer, so v5
+// UUIDs changed run to run) and a[-1] / a[1.5] broke outright. Reuse the
+// plain-array index check and compare against the typed array's length.
+// Builtins keep the unchecked read: they index within bounds, and the check
+// broke typed-array join/toString when compiled into them. Writes need the same
+// guard, but builtins such as the constructor and fill() store elements before
+// they set the length, so that is left for a follow-up.
+const TA_GET_ANCHOR =
+  "  const taGet = (ctype, size, signed = true) => () => {\n" +
+  "    const loaded = Load(ctype, taAddr(size), 4);\n" +
+  "    const f = ctype === 'f32' || ctype === 'f64' ? loaded : Convert(T.f64, loaded, signed ? CONVERT_SIGNED : 0);\n" +
+  "    return Box(f, Const(T.i32, TYPES.number));\n" +
+  "  };";
+const TA_GET_INJECT =
+  "  const taGet = (ctype, size, signed = true) => () => {\n" +
+  "    // sproutboat #238: only a valid in-range integer index reads; anything else is undefined.\n" +
+  "    // User code only: builtins (precompiled) index within bounds themselves and\n" +
+  "    // typed-array join/toString misbehave with the extra check.\n" +
+  "    if (globalThis.precompile) {\n" +
+  "      const raw = Load(ctype, taAddr(size), 4);\n" +
+  "      return Box(ctype === 'f32' || ctype === 'f64' ? raw : Convert(T.f64, raw, signed ? CONVERT_SIGNED : 0), Const(T.i32, TYPES.number));\n" +
+  "    }\n" +
+  "    const { idx, valid } = denseArrayIndexKey(scope, prop);\n" +
+  "    const loaded = Load(ctype, Bin('+', T.u32, Load('u32', JvPtr(obj), 4), size === 1 ? idx : Bin('*', T.u32, idx, Const(T.u32, size))), 4);\n" +
+  "    const f = ctype === 'f32' || ctype === 'f64' ? loaded : Convert(T.f64, loaded, signed ? CONVERT_SIGNED : 0);\n" +
+  "    return Select(Bin('&&', T.i32, valid, Bin('<', T.i32, idx, Load('u32', JvPtr(obj), 0))),\n" +
+  "      Box(f, Const(T.i32, TYPES.number)), valUndefined());\n" +
+  "  };";
+const TA_GET_MARKER = "sproutboat #238: only a valid in-range integer index reads";
 
 // baronunread/sproutboat#238: TypedArray.prototype.set(source) with no offset
 // ran `offset = Math.trunc(undefined)`, which is NaN. The same-type fast path
@@ -1137,11 +1178,19 @@ export async function patchReplaceAll(root: string): Promise<void> {
 /** #238: modular typed-array stores. Before the precompile so builtins get it too. */
 export async function patchTypedArrayStore(root: string): Promise<void> {
   const file = resolve(root, "compiler/codegen.js");
-  const src = await readFile(file, "utf8");
-  if (src.includes(TA_STORE_MARKER)) return;
-  if (!src.includes(TA_STORE_ANCHOR))
-    throw new Error(`could not patch Porffor's typed-array store conversion: anchor not found in ${file}`);
-  await writeFile(file, src.replace(TA_STORE_ANCHOR, TA_STORE_INJECT));
+  let src = await readFile(file, "utf8");
+  let changed = false;
+  for (const [marker, anchor, inject, what] of [
+    [TA_STORE_MARKER, TA_STORE_ANCHOR, TA_STORE_INJECT, "typed-array store conversion"],
+    [BITNOT_MARKER, BITNOT_ANCHOR, BITNOT_INJECT, "bitwise NOT conversion"],
+    [TA_GET_MARKER, TA_GET_ANCHOR, TA_GET_INJECT, "typed-array read bounds"],
+  ] as const) {
+    if (src.includes(marker)) continue;
+    if (!src.includes(anchor)) throw new Error(`could not patch Porffor's ${what}: anchor not found in ${file}`);
+    src = src.replace(anchor, inject);
+    changed = true;
+  }
+  if (changed) await writeFile(file, src);
 }
 
 export async function patchTypedArrayFrom(root: string): Promise<void> {

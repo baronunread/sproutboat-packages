@@ -122,7 +122,13 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
     "compiler/builtins/json.ts": "// sb_json_utf16_v1\n",
     "runtime/fetch-globals.js": "// sb_text_encoder_scalar_v1\n",
     "compiler/codegen.js":
-      "      stmt(scope, Store(ctype, addr, 4, ctype === 'f64' || ctype === 'f32' ? f : signed ? Convert(T.i32, f) : Convert(T.u32, f, 0)));\n",
+      "      stmt(scope, Store(ctype, addr, 4, ctype === 'f64' || ctype === 'f32' ? f : signed ? Convert(T.i32, f) : Convert(T.u32, f, 0)));\n" +
+      "      return Box(Convert(T.f64, Un('~', T.i32, Convert(T.i32, numValue(toNumeric())))), Const(T.i32, TYPES.number));\n" +
+      "  const taGet = (ctype, size, signed = true) => () => {\n" +
+      "    const loaded = Load(ctype, taAddr(size), 4);\n" +
+      "    const f = ctype === 'f32' || ctype === 'f64' ? loaded : Convert(T.f64, loaded, signed ? CONVERT_SIGNED : 0);\n" +
+      "    return Box(f, Const(T.i32, TYPES.number));\n" +
+      "  };\n",
     "compiler/builtins/string.ts":
       "export const __Porffor_string_replaceAll = (str: any, searchValue: any, replaceValue: any) => {\n" +
       "  let out: any = __Porffor_string_emptyLike(str);\n  let appendIndex: i32 = 0;\n  let searchIndex: i32 = 0;\n  let matched: boolean = false;\n" +
@@ -215,6 +221,10 @@ test("the default call (no url/expectedSha256 override) never touches the networ
   expect(await readFile(join(dir, "compiler/builtins/typedarray.js"), "utf8")).toContain(
     "offset = ecma262.ToIntegerOrInfinity(offset);",
   );
+  // #238: ~ wraps (ToInt32), and out-of-range typed-array reads are undefined.
+  const codegen = await readFile(join(dir, "compiler/codegen.js"), "utf8");
+  expect(codegen).toContain("Convert(T.i32, toUint32(scope, numValue(toNumeric())), CONVERT_RANGE_KNOWN | CONVERT_SIGNED)");
+  expect(codegen).toContain("Box(f, Const(T.i32, TYPES.number)), valUndefined());");
   // #238: integer typed-array stores wrap modulo 2^n instead of saturating.
   expect(await readFile(join(dir, "compiler/codegen.js"), "utf8")).toContain(
     "signed ? Convert(T.i32, toUint32(scope, f), CONVERT_RANGE_KNOWN | CONVERT_SIGNED) : toUint32(scope, f)",
