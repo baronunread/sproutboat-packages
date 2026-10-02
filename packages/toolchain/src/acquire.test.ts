@@ -120,6 +120,12 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "}\n",
     "compiler/builtins/json.ts": "// sb_json_utf16_v1\n",
     "runtime/fetch-globals.js": "// sb_text_encoder_scalar_v1\n",
+    "compiler/builtins/string.ts":
+      "export const __Porffor_string_replaceAll = (str: any, searchValue: any, replaceValue: any) => {\n" +
+      "  let out: any = __Porffor_string_emptyLike(str);\n  let appendIndex: i32 = 0;\n  let searchIndex: i32 = 0;\n  let matched: boolean = false;\n" +
+      "    out = __Porffor_strcat(out, __Porffor_string_substringLike(str, appendIndex, matchIndex));\n    out = __Porffor_strcat(out, __Porffor_string_applyReplacer(str, match, matchIndex, replaceValue));\n" +
+      "  if (!matched) return str;\n  return __Porffor_strcat(out, __Porffor_string_substringLike(str, appendIndex, thisLen));\n};\n" +
+      "export const __String_prototype_replaceAll = function (this: string, searchValue: any, replaceValue: any) {};\n",
     "compiler/builtins/promise.ts":
       "export const __Porffor_promise_resolve = (value: any, promise: any): void => {\n" +
       "  if (Porffor.type(value) == Porffor.TYPES.object) {\n" +
@@ -202,6 +208,10 @@ test("the default call (no url/expectedSha256 override) never touches the networ
     },
   });
   expect(await readFile(join(dir, "runtime/index.js"), "utf8")).not.toBe("");
+  // #237: replaceAll joins its pieces once instead of a strcat per match.
+  expect(await readFile(join(dir, "compiler/builtins/string.ts"), "utf8")).toContain(
+    "return Porffor.callThis(__Array_prototype_join, pieces, '');",
+  );
   // #236: the native-fetch build edits uWebSockets to accept HTTP/1.0.
   const index = await readFile(join(dir, "compiler/index.js"), "utf8");
   expect(index).toContain("import { sbPatchHttp10 } from './sb-http10.js';");
