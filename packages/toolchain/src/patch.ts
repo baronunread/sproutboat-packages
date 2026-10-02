@@ -306,6 +306,17 @@ const TA_STORE_INJECT =
   "      stmt(scope, Store(ctype, addr, 4, ctype === 'f64' || ctype === 'f32' ? f : signed ? Convert(T.i32, toUint32(scope, f), CONVERT_RANGE_KNOWN | CONVERT_SIGNED) : toUint32(scope, f)));";
 const TA_STORE_MARKER = "sproutboat #238: typed-array stores wrap";
 
+// baronunread/sproutboat#238: TypedArray.prototype.set(source) with no offset
+// ran `offset = Math.trunc(undefined)`, which is NaN. The same-type fast path
+// then copied to `base + NaN * BYTES_PER_ELEMENT`: nothing landed where it
+// should (noble's HMAC lost its key in `pad.set(key)`), and the write went
+// somewhere else in memory. ECMA-262 uses ToIntegerOrInfinity, which maps
+// undefined and NaN to 0; subarray right below already does.
+const TA_SET_OFFSET_ANCHOR = "  offset = Math.trunc(offset);\n  if (Porffor.fastOr(offset < 0, offset > len)) throw new RangeError('Offset out of bounds');";
+const TA_SET_OFFSET_INJECT =
+  "  offset = ecma262.ToIntegerOrInfinity(offset); // sproutboat #238: undefined offset is 0, not NaN\n  if (Porffor.fastOr(offset < 0, offset > len)) throw new RangeError('Offset out of bounds');";
+const TA_SET_OFFSET_MARKER = "sproutboat #238: undefined offset is 0";
+
 // Porffor's TypedArray.from only handles iterables. An array-like input such
 // as { length: 16 } silently becomes an empty typed array, including HMAC
 // keys made with Uint8Array.from({ length: 16 }, mapFn). The compiler uses a
@@ -1139,8 +1150,14 @@ export async function patchTypedArrayFrom(root: string): Promise<void> {
   if (!src.includes(TYPED_ARRAY_FROM_MARKER) && !src.includes(TYPED_ARRAY_FROM_ANCHOR)) {
     throw new Error(`could not patch Porffor's TypedArray.from: anchor not found in ${file}`);
   }
-  if (!src.includes(TYPED_ARRAY_FROM_MARKER))
-    await writeFile(file, src.replace(TYPED_ARRAY_FROM_ANCHOR, TYPED_ARRAY_FROM_INJECT));
+  let edited = src;
+  if (!edited.includes(TYPED_ARRAY_FROM_MARKER)) edited = edited.replace(TYPED_ARRAY_FROM_ANCHOR, TYPED_ARRAY_FROM_INJECT);
+  if (!edited.includes(TA_SET_OFFSET_MARKER)) {
+    if (!edited.includes(TA_SET_OFFSET_ANCHOR))
+      throw new Error(`could not patch Porffor's TypedArray.prototype.set offset: anchor not found in ${file}`);
+    edited = edited.replace(TA_SET_OFFSET_ANCHOR, TA_SET_OFFSET_INJECT);
+  }
+  if (edited !== src) await writeFile(file, edited);
   const table = resolve(root, "compiler/builtins_precompiled.js");
   const before = await readFile(table);
   // Porffor only writes the table when import.meta.url matches argv[1].
@@ -1157,7 +1174,7 @@ export async function patchTypedArrayFrom(root: string): Promise<void> {
     new Response(child.stderr).text(),
   ]);
   if (code !== 0) throw new Error(`could not precompile Porffor's TypedArray.from: ${stderr || stdout}`);
-  if (!src.includes(TYPED_ARRAY_FROM_MARKER) && before.equals(await readFile(table)))
+  if (edited !== src && before.equals(await readFile(table)))
     throw new Error(`Porffor precompile did not update ${table}`);
 }
 

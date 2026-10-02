@@ -40,6 +40,7 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
     "compiler/builtins_precompiled.js": "fixture:precompiled\n",
     "compiler/builtins/date.ts": "export const __ecma262_ParseDTSF = (string: string) => {\n  let n: number = 0;\n  let nInd: number = 0;\n\n  const len: i32 = string.length;\n  const endPtr: i32 = Porffor.IR.ptr(string) + len;\n  let ptr: i32 = Porffor.IR.ptr(string);\n\n  while (ptr <= endPtr) { // <= to include extra null byte to set last n\n    const chr: i32 = Porffor.IR.loadU8(ptr++, 4);\n    if (Porffor.fastAnd(chr >= 48, chr <= 57)) { // 0-9\n      n *= 10;\n      n += chr - 48;\n      continue;\n    }\n\n    if (chr == 45) { // -\n      if (Porffor.fastOr(ptr == Porffor.IR.ptr(string), nInd == 7)) n = -n;\n    }\n\n    if (n > 0) {\n      if (nInd == 0) y = n;\n        else if (nInd == 1) m = n - 1;\n        else if (nInd == 2) dt = n;\n        else if (nInd == 3) h = n;\n        else if (nInd == 4) min = n;\n        else if (nInd == 5) s = n;\n        else if (nInd == 6) milli = n;\n        else if (nInd == 7) tzHour = n;\n        else if (nInd == 8) tzMin = n;\n\n      n = 0;\n      nInd++;\n    }\n  }\n\n  h += tzHour;\n  min += tzMin;\n};\n// RFC 7231 or Date.prototype.toString() parser\n",
     "compiler/builtins/typedarray.js":
+      "  offset = Math.trunc(offset);\n  if (Porffor.fastOr(offset < 0, offset > len)) throw new RangeError('Offset out of bounds');\n" +
       "export const __${name}_from = (arg: any, mapFn: any): ${name} => {\n" +
       "  const arr: any[] = Porffor.array.new(4);\n" +
       "  let len: i32 = 0;\n" +
@@ -210,6 +211,10 @@ test("the default call (no url/expectedSha256 override) never touches the networ
     },
   });
   expect(await readFile(join(dir, "runtime/index.js"), "utf8")).not.toBe("");
+  // #238: TypedArray.prototype.set(source) with no offset copies to index 0.
+  expect(await readFile(join(dir, "compiler/builtins/typedarray.js"), "utf8")).toContain(
+    "offset = ecma262.ToIntegerOrInfinity(offset);",
+  );
   // #238: integer typed-array stores wrap modulo 2^n instead of saturating.
   expect(await readFile(join(dir, "compiler/codegen.js"), "utf8")).toContain(
     "signed ? Convert(T.i32, toUint32(scope, f), CONVERT_RANGE_KNOWN | CONVERT_SIGNED) : toUint32(scope, f)",
