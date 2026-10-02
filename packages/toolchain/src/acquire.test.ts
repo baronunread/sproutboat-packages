@@ -120,6 +120,8 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "}\n",
     "compiler/builtins/json.ts": "// sb_json_utf16_v1\n",
     "runtime/fetch-globals.js": "// sb_text_encoder_scalar_v1\n",
+    "compiler/codegen.js":
+      "      stmt(scope, Store(ctype, addr, 4, ctype === 'f64' || ctype === 'f32' ? f : signed ? Convert(T.i32, f) : Convert(T.u32, f, 0)));\n",
     "compiler/builtins/string.ts":
       "export const __Porffor_string_replaceAll = (str: any, searchValue: any, replaceValue: any) => {\n" +
       "  let out: any = __Porffor_string_emptyLike(str);\n  let appendIndex: i32 = 0;\n  let searchIndex: i32 = 0;\n  let matched: boolean = false;\n" +
@@ -208,6 +210,10 @@ test("the default call (no url/expectedSha256 override) never touches the networ
     },
   });
   expect(await readFile(join(dir, "runtime/index.js"), "utf8")).not.toBe("");
+  // #238: integer typed-array stores wrap modulo 2^n instead of saturating.
+  expect(await readFile(join(dir, "compiler/codegen.js"), "utf8")).toContain(
+    "signed ? Convert(T.i32, toUint32(scope, f), CONVERT_RANGE_KNOWN | CONVERT_SIGNED) : toUint32(scope, f)",
+  );
   // #237: replaceAll joins its pieces once instead of a strcat per match.
   expect(await readFile(join(dir, "compiler/builtins/string.ts"), "utf8")).toContain(
     "return Porffor.callThis(__Array_prototype_join, pieces, '');",
