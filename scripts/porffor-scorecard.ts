@@ -56,6 +56,7 @@ const targets = {
   "compiler/builtins/typedarray.js": ["TYPED_ARRAY_FROM"],
   "compiler/builtins/date.ts": ["DATE_PARSER"],
   "compiler/builtins/promise.ts": ["PROMISE_NULL"],
+  "compiler/builtins/string.ts": ["REPLACE_ALL"],
   "compiler/uwebsockets.js": [
     "HTTP10_SHIM",
     "BODY",

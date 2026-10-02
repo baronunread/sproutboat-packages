@@ -270,6 +270,27 @@ const PROMISE_NULL_INJECT =
   "  if (Porffor.type(value) == Porffor.TYPES.object && value != null) {\n    // cheap prototype-chain probe for 'then'";
 const PROMISE_NULL_MARKER = "sproutboat #168: null is object-typed";
 
+// baronunread/sproutboat#237: String.prototype.replaceAll grew its result with
+// one __Porffor_strcat per match, and each strcat copies everything so far, so
+// a 2.7 MB string with many matches took ~22 s (Node: 17 ms). Collect the
+// pieces and join once: Array.prototype.join sizes the result up front and
+// copies each piece a single time.
+const REPLACE_ALL_EDITS = [
+  [
+    "  let out: any = __Porffor_string_emptyLike(str);\n  let appendIndex: i32 = 0;\n  let searchIndex: i32 = 0;\n  let matched: boolean = false;",
+    "  // sproutboat #237: pieces joined once, not a strcat (full copy) per match.\n  const pieces: any[] = Porffor.array.new(0);\n  let appendIndex: i32 = 0;\n  let searchIndex: i32 = 0;\n  let matched: boolean = false;",
+  ],
+  [
+    "    out = __Porffor_strcat(out, __Porffor_string_substringLike(str, appendIndex, matchIndex));\n    out = __Porffor_strcat(out, __Porffor_string_applyReplacer(str, match, matchIndex, replaceValue));",
+    "    Porffor.array.fastPush(pieces, __Porffor_string_substringLike(str, appendIndex, matchIndex));\n    Porffor.array.fastPush(pieces, __Porffor_string_applyReplacer(str, match, matchIndex, replaceValue));",
+  ],
+  [
+    "  if (!matched) return str;\n  return __Porffor_strcat(out, __Porffor_string_substringLike(str, appendIndex, thisLen));\n};",
+    "  if (!matched) return str;\n  Porffor.array.fastPush(pieces, __Porffor_string_substringLike(str, appendIndex, thisLen));\n  return Porffor.callThis(__Array_prototype_join, pieces, '');\n};",
+  ],
+] as const;
+const REPLACE_ALL_MARKER = "sproutboat #237: pieces joined once";
+
 // Porffor's TypedArray.from only handles iterables. An array-like input such
 // as { length: 16 } silently becomes an empty typed array, including HMAC
 // keys made with Uint8Array.from({ length: 16 }, mapFn). The compiler uses a
@@ -1070,6 +1091,23 @@ export async function patchPromiseResolveNull(root: string): Promise<void> {
   await writeFile(file, src.replace(PROMISE_NULL_ANCHOR, PROMISE_NULL_INJECT));
 }
 
+/** #237: linear String.prototype.replaceAll. Precompiled by patchTypedArrayFrom. */
+export async function patchReplaceAll(root: string): Promise<void> {
+  const file = resolve(root, "compiler/builtins/string.ts");
+  let src = await readFile(file, "utf8");
+  if (src.includes(REPLACE_ALL_MARKER)) return;
+  const start = src.indexOf("export const __Porffor_string_replaceAll = ");
+  const end = src.indexOf("export const __String_prototype_replaceAll = ", start);
+  if (start < 0 || end < 0) throw new Error(`could not find Porffor's replaceAll in ${file}`);
+  let body = src.slice(start, end);
+  for (const [anchor, inject] of REPLACE_ALL_EDITS) {
+    if (!body.includes(anchor)) throw new Error(`could not patch Porffor's replaceAll: anchor not found in ${file}`);
+    body = body.replace(anchor, inject);
+  }
+  src = src.slice(0, start) + body + src.slice(end);
+  await writeFile(file, src);
+}
+
 export async function patchTypedArrayFrom(root: string): Promise<void> {
   const file = resolve(root, "compiler/builtins/typedarray.js");
   const src = await readFile(file, "utf8");
@@ -1146,8 +1184,9 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchRenderJs(root);
   await patchDateParser(root);
   await patchPromiseResolveNull(root);
-  // Last of the builtin edits: its precompile picks up the date and promise
-  // patches above too.
+  await patchReplaceAll(root);
+  // Last of the builtin edits: its precompile picks up the date, promise and
+  // replaceAll patches above too.
   await patchTypedArrayFrom(root);
   await patchUnicode(root);
   done.add(root);
