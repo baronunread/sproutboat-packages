@@ -1,5 +1,11 @@
 # @sproutboat/toolchain
 
+## 0.4.18
+
+### Patch Changes
+
+- e0d0e17: Compile every unit with `-ffp-contract=off` (baronunread/sproutboat#235). On arm64, clang fused `a * b + c` into a single FMA that rounds once, where JavaScript rounds after the multiply and again after the add, so native sprouts could compute different doubles from V8 for the same code. A seeded LCG diverged at step 23.
+
 ## 0.4.17
 
 ### Patch Changes
