@@ -291,6 +291,21 @@ const REPLACE_ALL_EDITS = [
 ] as const;
 const REPLACE_ALL_MARKER = "sproutboat #237: pieces joined once";
 
+// baronunread/sproutboat#238: an integer typed-array element store converted
+// its value with a saturating f64 -> int Convert, so a negative value stored
+// into a Uint32Array became 0 and 4e9 into an Int32Array became 2147483647.
+// ECMA-262 (IntegerIndexedElementSet -> ToUint32 / ToInt32 / ToUint16 ...) wraps
+// modulo 2^n instead. noble-hashes' SHA-256 stores `x | 0` into a Uint32Array,
+// so every negative schedule word was zeroed and the digest came out wrong.
+// Route the store through codegen's own modular toUint32 (what bitwise ops use);
+// narrower stores keep the low bits, which is exactly the modular result.
+const TA_STORE_ANCHOR =
+  "      stmt(scope, Store(ctype, addr, 4, ctype === 'f64' || ctype === 'f32' ? f : signed ? Convert(T.i32, f) : Convert(T.u32, f, 0)));";
+const TA_STORE_INJECT =
+  "      // sproutboat #238: typed-array stores wrap modulo 2^n (ToUint32), not saturate.\n" +
+  "      stmt(scope, Store(ctype, addr, 4, ctype === 'f64' || ctype === 'f32' ? f : signed ? Convert(T.i32, toUint32(scope, f), CONVERT_RANGE_KNOWN | CONVERT_SIGNED) : toUint32(scope, f)));";
+const TA_STORE_MARKER = "sproutboat #238: typed-array stores wrap";
+
 // Porffor's TypedArray.from only handles iterables. An array-like input such
 // as { length: 16 } silently becomes an empty typed array, including HMAC
 // keys made with Uint8Array.from({ length: 16 }, mapFn). The compiler uses a
@@ -1108,6 +1123,16 @@ export async function patchReplaceAll(root: string): Promise<void> {
   await writeFile(file, src);
 }
 
+/** #238: modular typed-array stores. Before the precompile so builtins get it too. */
+export async function patchTypedArrayStore(root: string): Promise<void> {
+  const file = resolve(root, "compiler/codegen.js");
+  const src = await readFile(file, "utf8");
+  if (src.includes(TA_STORE_MARKER)) return;
+  if (!src.includes(TA_STORE_ANCHOR))
+    throw new Error(`could not patch Porffor's typed-array store conversion: anchor not found in ${file}`);
+  await writeFile(file, src.replace(TA_STORE_ANCHOR, TA_STORE_INJECT));
+}
+
 export async function patchTypedArrayFrom(root: string): Promise<void> {
   const file = resolve(root, "compiler/builtins/typedarray.js");
   const src = await readFile(file, "utf8");
@@ -1185,6 +1210,7 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchDateParser(root);
   await patchPromiseResolveNull(root);
   await patchReplaceAll(root);
+  await patchTypedArrayStore(root);
   // Last of the builtin edits: its precompile picks up the date, promise and
   // replaceAll patches above too.
   await patchTypedArrayFrom(root);

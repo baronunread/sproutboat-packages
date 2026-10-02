@@ -57,6 +57,7 @@ const targets = {
   "compiler/builtins/date.ts": ["DATE_PARSER"],
   "compiler/builtins/promise.ts": ["PROMISE_NULL"],
   "compiler/builtins/string.ts": ["REPLACE_ALL"],
+  "compiler/codegen.js": ["TA_STORE"],
   "compiler/uwebsockets.js": [
     "HTTP10_SHIM",
     "BODY",
