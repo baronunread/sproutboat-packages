@@ -655,6 +655,12 @@ function __sbRawBodyResponse(body, init) {
       return decoded;
     };
     resp.json = () => JSON.parse(resp.text());
+    // #232 — Porffor's arrayBuffer() goes through text(), which decodes UTF-8
+    // above and so collapsed a binary body's multi-byte runs. The body already
+    // is the bytes, one char per byte. blob() stays text-based: Porffor's Blob
+    // only holds text and has no arrayBuffer() to read bytes back out of.
+    resp.arrayBuffer = () => __sbBufFrom(body);
+    resp.bytes = () => new Uint8Array(__sbBufFrom(body));
   }
   return resp;
 }
@@ -1584,7 +1590,7 @@ globalThis.__sbInstallBindings = function (target, bindings) {
           if (__sbIsFn(opts.headers.forEach)) opts.headers.forEach((v, k) => headers.push([k, v]));
           else for (const k in opts.headers) headers.push([k, opts.headers[k]]);
         }
-        const r = __sbRpc("service.fetch", {
+        const r = globalThis.__sbFetchUpstream("service.fetch", {
           binding,
           url,
           method: opts.method || "GET",
@@ -1611,7 +1617,7 @@ globalThis.__sbInstallBindings = function (target, bindings) {
         if (__sbIsFn(opts.headers.forEach)) opts.headers.forEach((v, k) => headers.push([k, v]));
         else for (const k in opts.headers) headers.push([k, opts.headers[k]]);
       }
-      const r = __sbRpc("fetch", {
+      const r = globalThis.__sbFetchUpstream("fetch", {
         url,
         method: opts.method || "GET",
         headers,

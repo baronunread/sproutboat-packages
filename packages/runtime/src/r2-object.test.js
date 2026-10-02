@@ -12,7 +12,8 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const src = readFileSync(fileURLToPath(new URL("./native-fetch-prelude.js", import.meta.url)), "utf8");
-const utf8Start = src.indexOf("function __sbFromUtf8(");
+// From __sbBufFrom (raw-body arrayBuffer, #232) through __sbFromUtf8.
+const utf8Start = src.indexOf("function __sbBufFrom(");
 const rawStart = src.indexOf("function __sbRawBodyResponse(");
 const utf8End = rawStart;
 const rawEnd = src.indexOf("function __sbEqCt(");

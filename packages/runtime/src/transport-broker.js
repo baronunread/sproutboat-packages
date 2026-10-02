@@ -391,6 +391,22 @@ globalThis.__sbR2MultipartPut = function (bucket, key, uploadId, partNumber, bod
   return reply;
 };
 
+/**
+ * #232 — outbound / service fetch over a v1 frame, so the body arrives as the
+ * upstream's raw bytes (one char per byte) instead of UTF-8-decoded text. A
+ * broker that predates this answers v1 fetch with the body still in its JSON:
+ * re-encode that to bytes so it matches today's behaviour rather than breaking.
+ */
+globalThis.__sbFetchUpstream = function (op, msg) {
+  const req = { v: 1, id: ++__sbReqId, token: __sbEnv("SB_BROKER_TOKEN"), op };
+  for (const k in msg) req[k] = msg[k];
+  const reply = JSON.parse(__sbCallBin(JSON.stringify(req), ""));
+  if (reply.ok === false) throw new Error("sproutboat " + op + ": " + (reply.error || "failed"));
+  const bytes = __sbTakeBin();
+  reply.body = reply.body != null ? __sbToBytes(reply.body) : bytes;
+  return reply;
+};
+
 /** Static asset metadata stays JSON; the response body uses the v1 byte tail. */
 globalThis.__sbAssetsGet = function (path) {
   const token = __sbEnv("SB_BROKER_TOKEN");

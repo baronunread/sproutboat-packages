@@ -1119,12 +1119,12 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
    * end the process. 32 MiB by default, and the same variable the embedded
    * transport reads so both backends agree.
    */
-  async function readCapped(response: Response, host: string): Promise<string> {
+  async function readCapped(response: Response, host: string): Promise<Buffer> {
     const cap = Number(process.env.SB_FETCH_MAX_BYTES) || 32 * 1024 * 1024;
     const declared = Number(response.headers.get("content-length") || 0);
     if (declared > cap) throw new Error(`response exceeds SB_FETCH_MAX_BYTES from ${host}`);
     const reader = response.body?.getReader();
-    if (!reader) return "";
+    if (!reader) return Buffer.alloc(0);
     const parts: Uint8Array[] = [];
     let total = 0;
     for (;;) {
@@ -1137,10 +1137,19 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       }
       parts.push(value);
     }
-    return new TextDecoder().decode(Buffer.concat(parts));
+    return Buffer.concat(parts);
   }
 
-  async function proxyFetch(msg: Frame): Promise<Frame> {
+  /**
+   * #232 — an upstream response as metadata plus its raw bytes. The v0 frame
+   * carries the body as UTF-8 text inside the JSON (what already-deployed
+   * sprouts expect), which turns a binary body into U+FFFD soup; the v1 frame
+   * sends the bytes untouched in its binary section instead.
+   */
+  type Upstream = { reply: Frame; bytes: Buffer };
+  const asTextFrame = (u: Upstream) => ({ ...u.reply, body: new TextDecoder().decode(u.bytes) });
+
+  async function proxyFetch(msg: Frame): Promise<Upstream> {
     let url: URL;
     try {
       url = new URL(str(msg.url));
@@ -1165,7 +1174,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     });
     const outHeaders: Array<[string, string]> = [];
     res.headers.forEach((v, k) => outHeaders.push([k, v]));
-    return { ok: true, status: res.status, headers: outHeaders, body: await readCapped(res, url.host) };
+    return { reply: { ok: true, status: res.status, headers: outHeaders }, bytes: await readCapped(res, url.host) };
   }
 
   /**
@@ -1176,7 +1185,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
    * minus the trip through the network (and therefore minus TLS and the
    * default-deny egress rules, which is why this is not `fetch`).
    */
-  async function serviceFetch(msg: Frame): Promise<Frame> {
+  async function serviceFetch(msg: Frame): Promise<Upstream> {
     const binding = str(msg.binding);
     const declared = bindings.services.find((entry) => entry.binding === binding);
     if (!declared) throw new Error(`service not bound: ${binding}`);
@@ -1211,7 +1220,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     });
     const outHeaders: Array<[string, string]> = [];
     res.headers.forEach((v, k) => outHeaders.push([k, v]));
-    return { ok: true, status: res.status, headers: outHeaders, body: await readCapped(res, host) };
+    return { reply: { ok: true, status: res.status, headers: outHeaders }, bytes: await readCapped(res, host) };
   }
 
   async function dispatch(msg: Frame): Promise<Frame> {
@@ -1299,10 +1308,10 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         return { ok: true, value: secrets[name] };
       }
       case "fetch":
-        return proxyFetch(msg);
+        return asTextFrame(await proxyFetch(msg));
 
       case "service.fetch":
-        return serviceFetch(msg);
+        return asTextFrame(await serviceFetch(msg));
 
       case "d1.query": {
         const conn = d1(requireD1(msg.db));
@@ -1694,6 +1703,10 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         bytes: r2ReadBlob(store, bucket, key, row.blob_id) ?? new Uint8Array(0),
       };
     }
+
+    // #232 — a v1 fetch gets the upstream body as raw bytes, not decoded text.
+    if (msg.op === "fetch") return proxyFetch(msg);
+    if (msg.op === "service.fetch") return serviceFetch(msg);
 
     if (msg.op === "assets.get") {
       if (!bindings.assets) throw new Error("assets not bound");
