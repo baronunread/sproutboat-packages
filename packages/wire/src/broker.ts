@@ -85,6 +85,12 @@ export type BrokerOptions = {
    * data outlives a redeploy.
    */
   resourceDir?: string;
+  /**
+   * #207 — SQLite file for Durable Object storage and alarms. The supervisor
+   * points this at a per-project path, so an object's state outlives a
+   * redeploy as it does on Workers. Defaults to the per-broker `db`.
+   */
+  doDb?: string;
   /** Account whose R2 resources this broker may mutate. */
   ownerId?: string;
   /** Account-wide R2 byte ceiling. Zero disables the ceiling for local development. */
@@ -312,9 +318,14 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   };
 
   const db = openStore(dbPath);
-  // Durable Object storage and Analytics Engine rows stay in the per-broker db —
-  // neither is an account-level resource (#74).
-  db.exec(
+  // #207 — Durable Object state lives in its own file when the supervisor gives
+  // one (per project, stable across deploys); otherwise in the per-broker db.
+  const doDb = opts.doDb ? new Database(opts.doDb, { create: true }) : db;
+  if (doDb !== db) {
+    doDb.exec("PRAGMA journal_mode = WAL");
+    doDb.exec("PRAGMA synchronous = NORMAL");
+  }
+  doDb.exec(
     "CREATE TABLE IF NOT EXISTS do_storage (cls TEXT NOT NULL, id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, " +
       "PRIMARY KEY (cls, id, key))",
   );
@@ -324,12 +335,12 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   );
   // #125 — at most one pending alarm per object, which is the Workers rule: a
   // later setAlarm replaces the earlier one rather than queueing beside it.
-  db.exec(
+  doDb.exec(
     "CREATE TABLE IF NOT EXISTS do_alarm (cls TEXT NOT NULL, id TEXT NOT NULL, at INTEGER NOT NULL, " +
       "attempts INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (cls, id))",
   );
   // Alarm polling reads the earliest due objects across classes.
-  db.exec("CREATE INDEX IF NOT EXISTS do_alarm_due ON do_alarm (at)");
+  doDb.exec("CREATE INDEX IF NOT EXISTS do_alarm_due ON do_alarm (at)");
   // #69 — fixed-window rate-limiter counters, per binding name + key.
   db.exec(
     "CREATE TABLE IF NOT EXISTS ratelimit (name TEXT NOT NULL, key TEXT NOT NULL, window_start INTEGER NOT NULL, " +
@@ -1564,7 +1575,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
 
       case "do.storage.get": {
         const cls = requireDoClass(msg.cls);
-        const row = db
+        const row = doDb
           .query<{ value: string }, [string, string, string]>(
             "SELECT value FROM do_storage WHERE cls = ? AND id = ? AND key = ?",
           )
@@ -1572,24 +1583,24 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         return row ? { ok: true, found: true, value: row.value } : { ok: true, found: false };
       }
       case "do.storage.put":
-        db.query(
+        doDb.query(
           "INSERT INTO do_storage (cls, id, key, value) VALUES (?1,?2,?3,?4) " +
             "ON CONFLICT (cls, id, key) DO UPDATE SET value = ?4",
         ).run(requireDoClass(msg.cls), str(msg.id), str(msg.key), str(msg.value));
         return { ok: true };
       case "do.storage.delete": {
-        const r = db
+        const r = doDb
           .query("DELETE FROM do_storage WHERE cls = ? AND id = ? AND key = ?")
           .run(requireDoClass(msg.cls), str(msg.id), str(msg.key));
         return { ok: true, deleted: r.changes > 0 };
       }
       case "do.storage.delete_all":
-        db.query("DELETE FROM do_storage WHERE cls = ? AND id = ?").run(requireDoClass(msg.cls), str(msg.id));
+        doDb.query("DELETE FROM do_storage WHERE cls = ? AND id = ?").run(requireDoClass(msg.cls), str(msg.id));
         return { ok: true };
       case "do.storage.list": {
         const cls = requireDoClass(msg.cls);
         const limit = Math.min(Math.max(Number(msg.limit) || 1000, 1), 10000);
-        const rows = db
+        const rows = doDb
           .query<{ key: string; value: string }, [string, string, string, number]>(
             "SELECT key, value FROM do_storage WHERE cls = ? AND id = ? AND key LIKE ? || '%' ORDER BY key LIMIT ?",
           )
@@ -1600,19 +1611,19 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       // #125 — alarms. `at` is epoch ms; setting one replaces any pending alarm
       // for that object, and attempts resets because this is a fresh schedule.
       case "do.alarm.set":
-        db.query(
+        doDb.query(
           "INSERT INTO do_alarm (cls, id, at, attempts) VALUES (?1,?2,?3,0) " +
             "ON CONFLICT (cls, id) DO UPDATE SET at = ?3, attempts = 0",
         ).run(requireDoClass(msg.cls), str(msg.id), Math.trunc(Number(msg.at) || 0));
         return { ok: true };
       case "do.alarm.get": {
-        const row = db
+        const row = doDb
           .query<{ at: number }, [string, string]>("SELECT at FROM do_alarm WHERE cls = ? AND id = ?")
           .get(requireDoClass(msg.cls), str(msg.id));
         return { ok: true, at: row ? row.at : null };
       }
       case "do.alarm.delete": {
-        const r = db.query("DELETE FROM do_alarm WHERE cls = ? AND id = ?").run(requireDoClass(msg.cls), str(msg.id));
+        const r = doDb.query("DELETE FROM do_alarm WHERE cls = ? AND id = ?").run(requireDoClass(msg.cls), str(msg.id));
         return { ok: true, deleted: r.changes > 0 };
       }
 
@@ -1930,14 +1941,14 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   function fireAlarmsOnce(): void {
     if (!opts.sproutUrl || !dispatchEnabled() || bindings.do.length === 0) return;
     const now = Date.now();
-    const due = db
+    const due = doDb
       .query<{ cls: string; id: string; at: number; attempts: number }, [number]>(
         "SELECT cls, id, at, attempts FROM do_alarm WHERE at <= ? ORDER BY at LIMIT 10",
       )
       .all(now);
     if (due.length === 0) return;
-    const claim = db.query("DELETE FROM do_alarm WHERE cls = ? AND id = ?");
-    const rearm = db.query(
+    const claim = doDb.query("DELETE FROM do_alarm WHERE cls = ? AND id = ?");
+    const rearm = doDb.query(
       "INSERT INTO do_alarm (cls, id, at, attempts) VALUES (?1,?2,?3,?4) ON CONFLICT (cls, id) DO NOTHING",
     );
     for (const row of due) {
@@ -1980,6 +1991,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       for (const t of timers) clearInterval(t);
       for (const conn of d1Conns.values()) conn.close();
       for (const conn of resourceDbs.values()) conn.close();
+      if (doDb !== db) doDb.close();
       db.close();
     },
   };
@@ -2086,6 +2098,7 @@ if (import.meta.main) {
       db: { type: "string" },
       "data-dir": { type: "string" },
       "resource-dir": { type: "string" },
+      "do-db": { type: "string" },
       "owner-id": { type: "string" },
       "r2-quota-bytes": { type: "string" },
       "r2-resource-ids": { type: "string" },
@@ -2138,6 +2151,7 @@ if (import.meta.main) {
     db: values.db,
     dataDir: values["data-dir"],
     resourceDir: values["resource-dir"],
+    doDb: values["do-db"],
     ownerId: values["owner-id"],
     r2QuotaBytes: Number(values["r2-quota-bytes"] ?? process.env.SPROUTBOAT_R2_QUOTA_BYTES) || undefined,
     r2ResourceIds: values["r2-resource-ids"] ? String(values["r2-resource-ids"]).split(",").filter(Boolean) : undefined,
