@@ -39,12 +39,25 @@ test("ping round-trips", async () => {
   expect(await b.dispatch({ op: "ping", msg: "hi" })).toMatchObject({ ok: true, op: "pong", echo: "hi" });
 });
 
+test("#233: a KV value put as bytes is flagged binary and survives an existing store", async () => {
+  const b = make({ bindings: { kv: ["CACHE"] } });
+  // One char per byte, as the runtime sends a put of an ArrayBuffer/view.
+  const bytes = Array.from({ length: 256 }, (_, i) => String.fromCharCode(i)).join("");
+  await b.dispatch({ op: "kv.put", ns: "CACHE", key: "bin", value: bytes, binary: true });
+  await b.dispatch({ op: "kv.put", ns: "CACHE", key: "txt", value: "café" });
+  expect(await b.dispatch({ op: "kv.get", ns: "CACHE", key: "bin" })).toEqual({ ok: true, found: true, value: bytes, binary: true });
+  expect(await b.dispatch({ op: "kv.get", ns: "CACHE", key: "txt" })).toMatchObject({ value: "café", binary: false });
+  // Overwriting a binary value with text clears the flag.
+  await b.dispatch({ op: "kv.put", ns: "CACHE", key: "bin", value: "now text" });
+  expect(await b.dispatch({ op: "kv.get", ns: "CACHE", key: "bin" })).toMatchObject({ value: "now text", binary: false });
+});
+
 test("KV put / get / list / delete, scoped to a bound namespace", async () => {
   const b = make({ bindings: { kv: ["CACHE"] } });
   expect(await b.dispatch({ op: "kv.get", ns: "CACHE", key: "k" })).toEqual({ ok: true, found: false, value: null });
   await b.dispatch({ op: "kv.put", ns: "CACHE", key: "k", value: "v" });
   await b.dispatch({ op: "kv.put", ns: "CACHE", key: "k2", value: "v2" });
-  expect(await b.dispatch({ op: "kv.get", ns: "CACHE", key: "k" })).toEqual({ ok: true, found: true, value: "v" });
+  expect(await b.dispatch({ op: "kv.get", ns: "CACHE", key: "k" })).toEqual({ ok: true, found: true, value: "v", binary: false });
   expect(await b.dispatch({ op: "kv.list", ns: "CACHE", prefix: "k" })).toEqual({ ok: true, keys: ["k", "k2"] });
   await b.dispatch({ op: "kv.delete", ns: "CACHE", key: "k" });
   expect(await b.dispatch({ op: "kv.get", ns: "CACHE", key: "k" })).toMatchObject({ found: false });
@@ -152,6 +165,21 @@ test("fetch is gated by the exact-host allowlist", async () => {
   const res = await b.dispatch({ op: "fetch", url: "https://api.example.com/x" });
   expect(res).toMatchObject({ ok: true, status: 200, body: "body" });
   expect(calls).toEqual(["https://api.example.com/x"]);
+});
+
+test("#232: a binary fetch request body is sent as its bytes, a text body as UTF-8", async () => {
+  const seen: Uint8Array[] = [];
+  const fetchImpl: FetchLike = async (_url, init) => {
+    seen.push(new Uint8Array(await new Response(init?.body).arrayBuffer()));
+    return new Response("ok");
+  };
+  const b = make({ bindings: { outbound: ["api.example.com"] }, fetchImpl });
+  // The runtime sends a binary body one char per byte, flagged bodyBinary.
+  const raw = Array.from({ length: 256 }, (_, i) => String.fromCharCode(i)).join("");
+  await b.dispatch({ op: "fetch", url: "https://api.example.com/up", method: "POST", body: raw, bodyBinary: true });
+  await b.dispatch({ op: "fetch", url: "https://api.example.com/up", method: "POST", body: "café" });
+  expect(Array.from(seen[0])).toEqual(Array.from({ length: 256 }, (_, i) => i));
+  expect(Array.from(seen[1])).toEqual([99, 97, 102, 195, 169]);
 });
 
 test("#232: a v1 fetch returns the upstream body as raw bytes; v0 keeps decoded text", async () => {
@@ -705,6 +733,7 @@ test("resource-backed KV persists across brokers and is shared by id", async () 
     expect(await second.dispatch({ op: "kv.get", ns: "SHORTENER", key: "a" })).toEqual({
       ok: true,
       found: true,
+      binary: false,
       value: "1",
     });
     second.close();

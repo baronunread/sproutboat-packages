@@ -1042,14 +1042,15 @@ static int sb_tcp_connect(const char* host, int port) {
   return fd;
 }
 
+// body_len, not strlen(body): a binary body can contain NUL bytes (#232).
 static void sb_build_request(sb_buf* req, const char* host, const char* path, const char* method,
-                             const char* headers, const char* body) {
+                             const char* headers, const char* body, size_t body_len) {
   sb_puts(req, method); sb_puts(req, " "); sb_puts(req, path); sb_puts(req, " HTTP/1.1\r\n");
   sb_puts(req, "Host: "); sb_puts(req, host); sb_puts(req, "\r\n");
   sb_puts(req, "Connection: close\r\n");
   sb_puts(req, "Accept-Encoding: identity\r\n");
   if (headers && *headers) sb_puts(req, headers);
-  size_t blen = body ? strlen(body) : 0;
+  size_t blen = body ? body_len : 0;
   if (blen) {
     char cl[64];
     int k = snprintf(cl, sizeof(cl), "Content-Length: %zu\r\n", blen);
@@ -1153,12 +1154,12 @@ static char* sb_error_json(const char* prefix, const char* detail) {
 }
 
 static char* sb_http_plain(const char* host, int port, const char* path, const char* method,
-                           const char* headers, const char* body) {
+                           const char* headers, const char* body, size_t body_len) {
   int fd = sb_tcp_connect(host, port);
   if (fd < 0) return sb_error_json("could not connect to ", host);
 
   sb_buf req = { 0, 0, 0 };
-  sb_build_request(&req, host, path, method, headers, body);
+  sb_build_request(&req, host, path, method, headers, body, body_len);
   size_t sent = 0;
   while (sent < req.len) {
     long n = write(fd, req.p + sent, req.len - sent);
@@ -1343,7 +1344,7 @@ static int sb_sock_write(void* ctx, const unsigned char* buf, size_t len) {
 }
 
 static char* sb_https(const char* host, int port, const char* path, const char* method,
-                      const char* headers, const char* body) {
+                      const char* headers, const char* body, size_t body_len) {
   int fd = sb_tcp_connect(host, port);
   if (fd < 0) return sb_error_json("could not connect to ", host);
 
@@ -1362,7 +1363,7 @@ static char* sb_https(const char* host, int port, const char* path, const char* 
   br_sslio_init(&ioc, &sc->eng, sb_sock_read, &fd, sb_sock_write, &fd);
 
   sb_buf req = { 0, 0, 0 };
-  sb_build_request(&req, host, path, method, headers, body);
+  sb_build_request(&req, host, path, method, headers, body, body_len);
   int wrote = br_sslio_write_all(&ioc, req.p, req.len);
   free(req.p);
   if (wrote != 0) {
@@ -1412,9 +1413,9 @@ static char* sb_https(const char* host, int port, const char* path, const char* 
 }
 
 static char* sb_http_request(const char* host, int port, const char* path, const char* method,
-                             const char* headers, const char* body, int tls) {
-  return tls ? sb_https(host, port, path, method, headers, body)
-             : sb_http_plain(host, port, path, method, headers, body);
+                             const char* headers, const char* body, size_t body_len, int tls) {
+  return tls ? sb_https(host, port, path, method, headers, body, body_len)
+             : sb_http_plain(host, port, path, method, headers, body, body_len);
 }
 `;
 
@@ -1730,17 +1731,33 @@ function __sbHttpRaw(host, portStr, path, method, headersText, body, tlsFlag) {
     char* __hdrs = (char*)malloc(__hdl + 1); memcpy(__hdrs, __hd, __hdl); __hdrs[__hdl] = 0;
     if (__hdo) free(__hdo);
 
-    const char* __b; size_t __bl; char* __bo = 0;
-    porf_native_fetch_read_value(body, &__b, &__bl, &__bo);
-    char* __body = (char*)malloc(__bl + 1); memcpy(__body, __b, __bl); __body[__bl] = 0;
-    if (__bo) free(__bo);
-
+    // tlsFlag is "0"/"1", plus "b" when the body is raw bytes (#233-style flag
+    // for #232's request half): one char per byte, sent as-is, not UTF-8 encoded.
     const char* __t; size_t __tl; char* __to = 0;
     porf_native_fetch_read_value(tlsFlag, &__t, &__tl, &__to);
     int __tls = (__tl > 0 && __t[0] == '1') ? 1 : 0;
+    int __rawBody = (__tl > 1 && __t[1] == 'b') ? 1 : 0;
     if (__to) free(__to);
 
-    char* __out = sb_http_request(__host, atoi(__portbuf), __path, __method, __hdrs, __body, __tls);
+    const char* __b; size_t __bl; char* __bo = 0;
+    if (__rawBody && porf_native_fetch_read_raw_bytes(body, &__b, &__bl) == 0) {
+      // a bytestring is already one byte per char
+    } else if (__rawBody && body.type == 67) {
+      // A UTF-16 string (type 67: u32 length, then u16 units) still holds one
+      // byte per unit here; narrow each unit instead of UTF-8 encoding it.
+      const u32 __bp = (u32)body.val;
+      __bl = (size_t)*(u32*)(MEM + __bp);
+      __bo = (char*)malloc(__bl + 1);
+      const u16* __bs = (const u16*)(MEM + __bp + 4);
+      for (size_t __i = 0; __i < __bl; __i++) __bo[__i] = (char)(__bs[__i] & 0xff);
+      __b = __bo;
+    } else {
+      porf_native_fetch_read_value(body, &__b, &__bl, &__bo);
+    }
+    char* __body = (char*)malloc(__bl + 1); memcpy(__body, __b, __bl); __body[__bl] = 0;
+    if (__bo) free(__bo);
+
+    char* __out = sb_http_request(__host, atoi(__portbuf), __path, __method, __hdrs, __body, __bl, __tls);
     free(__host); free(__path); free(__method); free(__hdrs); free(__body);
     if (__out) {
       res = porf_box((f64)porf_native_fetch_alloc_bytestring(__out, strlen(__out)), 195);
@@ -1835,6 +1852,10 @@ function __sbEnsureSchema() {
   let hasKvExpiresAt = false;
   for (let i = 0; i < kvColumns.length; i++) if (kvColumns[i][1] === "expires_at") hasKvExpiresAt = true;
   if (!hasKvExpiresAt) __sbSql(s, "ALTER TABLE kv ADD COLUMN expires_at INTEGER", []);
+  // #233 — 1 when the value was put as bytes, same column as the broker's.
+  let hasKvBinary = false;
+  for (let i = 0; i < kvColumns.length; i++) if (kvColumns[i][1] === "binary") hasKvBinary = true;
+  if (!hasKvBinary) __sbSql(s, "ALTER TABLE kv ADD COLUMN binary INTEGER NOT NULL DEFAULT 0", []);
   // #56 — no `body` column: an object's bytes live in their own file under
   // "<data-dir>/r2-blobs/" (sb_r2_put_c/sb_r2_get_c), never in the sqlite row.
   __sbSql(
@@ -1928,14 +1949,14 @@ function __sbEmbeddedDispatch(msg) {
   if (op === "ping") return { ok: true, op: "pong", echo: msg.msg };
 
   if (op === "kv.get") {
-    const r = __sbSql(store, "SELECT value, expires_at FROM kv WHERE ns = ? AND key = ?", [msg.ns, msg.key]);
+    const r = __sbSql(store, "SELECT value, expires_at, binary FROM kv WHERE ns = ? AND key = ?", [msg.ns, msg.key]);
     if (!r.rows.length) return { ok: true, found: false, value: null };
     const expiresAt = r.rows[0][1];
     if (expiresAt != null && expiresAt <= Date.now()) {
       __sbSql(store, "DELETE FROM kv WHERE ns = ? AND key = ?", [msg.ns, msg.key]);
       return { ok: true, found: false, value: null };
     }
-    return { ok: true, found: true, value: r.rows[0][0] };
+    return { ok: true, found: true, value: r.rows[0][0], binary: r.rows[0][2] === 1 };
   }
   if (op === "kv.put") {
     // #58 — CF rejects expirationTtl under 60 seconds; matched here.
@@ -1949,8 +1970,8 @@ function __sbEmbeddedDispatch(msg) {
     }
     __sbSql(
       store,
-      "INSERT INTO kv (ns, key, value, expires_at) VALUES (?1,?2,?3,?4) ON CONFLICT (ns, key) DO UPDATE SET value = ?3, expires_at = ?4",
-      [msg.ns, msg.key, msg.value, expiresAt],
+      "INSERT INTO kv (ns, key, value, expires_at, binary) VALUES (?1,?2,?3,?4,?5) ON CONFLICT (ns, key) DO UPDATE SET value = ?3, expires_at = ?4, binary = ?5",
+      [msg.ns, msg.key, msg.value, expiresAt, msg.binary === true ? 1 : 0],
     );
     return { ok: true };
   }
@@ -2047,7 +2068,7 @@ function __sbEmbeddedDispatch(msg) {
         String(msg.method || "GET").toUpperCase(),
         headerText,
         msg.body == null ? "" : String(msg.body),
-        tls ? "1" : "0",
+        (tls ? "1" : "0") + (msg.bodyBinary === true ? "b" : ""),
       ),
     );
     if (reply.ok === false) throw new Error(reply.error);
