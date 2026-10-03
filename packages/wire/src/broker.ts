@@ -269,6 +269,9 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     );
     const kvColumns = conn.query<{ name: string }, []>("PRAGMA table_info(kv)").all();
     if (!kvColumns.some((column) => column.name === "expires_at")) conn.exec("ALTER TABLE kv ADD COLUMN expires_at INTEGER");
+    // #233 — 1 when the value was put as bytes (stored one char per byte), so get()
+    // can hand back exact bytes or decoded text depending on the requested type.
+    if (!kvColumns.some((column) => column.name === "binary")) conn.exec("ALTER TABLE kv ADD COLUMN binary INTEGER NOT NULL DEFAULT 0");
     // #56 — no `body` column: an object's bytes live in their own file under
     // `r2Dir` (or an in-memory map for `:memory:`), never in the SQLite row.
     // Doubling every object through SQLite's own page cache on top of the
@@ -481,8 +484,8 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   };
 
   type KvStmts = {
-    get: Statement<{ value: string; expires_at: number | null }, [string, string]>;
-    put: Statement<unknown, [string, string, string, number | null]>;
+    get: Statement<{ value: string; expires_at: number | null; binary: number }, [string, string]>;
+    put: Statement<unknown, [string, string, string, number | null, number]>;
     del: Statement<unknown, [string, string]>;
     list: Statement<{ key: string }, [string, string, number]>;
   };
@@ -491,12 +494,12 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     let stmts = kvStmtCache.get(store);
     if (!stmts) {
       stmts = {
-        get: store.query<{ value: string; expires_at: number | null }, [string, string]>(
-          "SELECT value, expires_at FROM kv WHERE ns = ? AND key = ?",
+        get: store.query<{ value: string; expires_at: number | null; binary: number }, [string, string]>(
+          "SELECT value, expires_at, binary FROM kv WHERE ns = ? AND key = ?",
         ),
         put: store.query(
-          "INSERT INTO kv (ns, key, value, expires_at) VALUES (?1, ?2, ?3, ?4) " +
-            "ON CONFLICT (ns, key) DO UPDATE SET value = ?3, expires_at = ?4",
+          "INSERT INTO kv (ns, key, value, expires_at, binary) VALUES (?1, ?2, ?3, ?4, ?5) " +
+            "ON CONFLICT (ns, key) DO UPDATE SET value = ?3, expires_at = ?4, binary = ?5",
         ),
         del: store.query("DELETE FROM kv WHERE ns = ? AND key = ?"),
         // #58 — an expired row is filtered out here; a periodic sweep to hard-delete
@@ -1149,6 +1152,14 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   type Upstream = { reply: Frame; bytes: Buffer };
   const asTextFrame = (u: Upstream) => ({ ...u.reply, body: new TextDecoder().decode(u.bytes) });
 
+  /** #232 — a binary request body arrives one char per byte; send those bytes, not their UTF-8. */
+  const upstreamBody = (msg: Frame): string | Uint8Array<ArrayBuffer> | undefined =>
+    msg.body == null
+      ? undefined
+      : msg.bodyBinary === true
+        ? new Uint8Array(Buffer.from(str(msg.body), "latin1"))
+        : str(msg.body);
+
   async function proxyFetch(msg: Frame): Promise<Upstream> {
     let url: URL;
     try {
@@ -1169,7 +1180,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     const res = await doFetch(url, {
       method,
       headers,
-      body: msg.body == null || method === "GET" || method === "HEAD" ? undefined : str(msg.body),
+      body: method === "GET" || method === "HEAD" ? undefined : upstreamBody(msg),
       redirect: "manual",
     });
     const outHeaders: Array<[string, string]> = [];
@@ -1215,7 +1226,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     const res = await doFetch(target, {
       method,
       headers,
-      body: msg.body == null || method === "GET" || method === "HEAD" ? undefined : str(msg.body),
+      body: method === "GET" || method === "HEAD" ? undefined : upstreamBody(msg),
       redirect: "manual",
     });
     const outHeaders: Array<[string, string]> = [];
@@ -1236,11 +1247,11 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
           stmts.del.run(part, str(msg.key));
           return { ok: true, found: false, value: null };
         }
-        return { ok: true, found: true, value: row.value };
+        return { ok: true, found: true, value: row.value, binary: row.binary === 1 };
       }
       case "kv.put": {
         const { store, part } = storeFor("kv", requireKv(msg.ns));
-        kvStmts(store).put.run(part, str(msg.key), str(msg.value), kvExpiresAt(msg));
+        kvStmts(store).put.run(part, str(msg.key), str(msg.value), kvExpiresAt(msg), msg.binary === true ? 1 : 0);
         return { ok: true };
       }
       case "kv.delete": {

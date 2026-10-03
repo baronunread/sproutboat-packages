@@ -646,6 +646,18 @@ function __sbFromUtf8(bytes) {
 // on every asset request regardless of whether anything used it -- this was
 // a real, shipped performance regression on sproutboat.com, caught after
 // the fact by unexpectedly slow page loads.
+// #232 — a fetch() request body for the wire: text as-is, and an ArrayBuffer or
+// any view as its bytes (one char per byte) flagged bodyBinary, instead of
+// String(view), which sent "0,1,2,...".
+function __sbRequestBody(body) {
+  if (body == null) return { body: null };
+  if (!__sbIsStr(body) && body.byteLength !== undefined) {
+    const bytes = body.buffer !== undefined ? new Uint8Array(body.buffer, body.byteOffset, body.byteLength) : body;
+    return { body: __sbToBytes(bytes), bodyBinary: true };
+  }
+  return { body: String(body) };
+}
+
 function __sbRawBodyResponse(body, init) {
   const resp = new Response(body == null ? "" : body, init);
   if (body != null) {
@@ -1364,12 +1376,27 @@ globalThis.__sbInstallBindings = function (target, bindings) {
   for (let i = 0; i < (bindings.kv || []).length; i++) {
     const ns = bindings.kv[i];
     target[ns] = {
-      get(key) {
+      // #233 — Workers' get(key, type | { type }): "text" (default), "json",
+      // "arrayBuffer". A value put as bytes is stored one char per byte and
+      // flagged, so text decodes it as UTF-8 and arrayBuffer returns it
+      // exactly; a text value read as arrayBuffer is its UTF-8 encoding.
+      get(key, typeOrOptions) {
         const r = __sbRpc("kv.get", { ns, key: String(key) });
-        return r.found ? r.value : null;
+        if (!r.found) return null;
+        const type = typeOrOptions == null ? "text" : __sbIsStr(typeOrOptions) ? typeOrOptions : typeOrOptions.type || "text";
+        if (type === "arrayBuffer") return __sbBufFrom(r.binary ? r.value : __sbToBytes(r.value));
+        if (type === "stream") throw new TypeError('KV get type "stream" is not supported (no ReadableStream); use "arrayBuffer"');
+        const text = r.binary ? __sbFromUtf8(r.value) : r.value;
+        return type === "json" ? JSON.parse(text) : text;
       },
       put(key, value, options) {
-        const msg = { ns, key: String(key), value: String(value) };
+        const msg = { ns, key: String(key), value: "" };
+        if (value != null && !__sbIsStr(value) && value.byteLength !== undefined) {
+          // ArrayBuffer or any ArrayBufferView: its bytes, not String(view) ("0,1,2,...").
+          const bytes = value.buffer !== undefined ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength) : value;
+          msg.value = __sbToBytes(bytes);
+          msg.binary = true;
+        } else msg.value = String(value);
         if (options && options.expirationTtl != null) msg.expirationTtl = Number(options.expirationTtl);
         else if (options && options.expiration != null) msg.expiration = Number(options.expiration);
         __sbRpc("kv.put", msg);
@@ -1595,7 +1622,7 @@ globalThis.__sbInstallBindings = function (target, bindings) {
           url,
           method: opts.method || "GET",
           headers,
-          body: opts.body == null ? null : String(opts.body),
+          ...__sbRequestBody(opts.body),
         });
         const respHeaders = new Headers();
         for (let j = 0; j < (r.headers || []).length; j++) respHeaders.set(r.headers[j][0], r.headers[j][1]);
@@ -1621,7 +1648,7 @@ globalThis.__sbInstallBindings = function (target, bindings) {
         url,
         method: opts.method || "GET",
         headers,
-        body: opts.body == null ? null : String(opts.body),
+        ...__sbRequestBody(opts.body),
       });
       const respHeaders = new Headers();
       for (let j = 0; j < (r.headers || []).length; j++) respHeaders.set(r.headers[j][0], r.headers[j][1]);
