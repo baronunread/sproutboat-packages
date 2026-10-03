@@ -375,6 +375,17 @@ const TA_SET_OFFSET_INJECT =
   "  offset = ecma262.ToIntegerOrInfinity(offset); // sproutboat #238: undefined offset is 0, not NaN\n  if (Porffor.fastOr(offset < 0, offset > len)) throw new RangeError('Offset out of bounds');";
 const TA_SET_OFFSET_MARKER = "sproutboat #238: undefined offset is 0";
 
+// baronunread/sproutboat#242: typedarray.js generates each TypedArray method
+// from array.ts with `.replaceAll('any[]', name)`. That also retyped join's and
+// toString's internal `const parts: any[]` helper as e.g. a Uint8Array, so the
+// joined strings were stored into a "typed array": Uint8Array join returned
+// garbage and Uint16Array join crashed. Put `parts` back to a plain array after
+// the replacement; map/filter's intentionally typed `out` is untouched.
+const TA_JOIN_ANCHOR = ".replaceAll('Array', name).replaceAll('any[]', name) + '\\n\\n'";
+const TA_JOIN_INJECT =
+  ".replaceAll('Array', name).replaceAll('any[]', name).replaceAll('const parts: ' + name + ' =', 'const parts: any[] =') /* sproutboat #242 */ + '\\n\\n'";
+const TA_JOIN_MARKER = "sproutboat #242";
+
 // Porffor's TypedArray.from only handles iterables. An array-like input such
 // as { length: 16 } silently becomes an empty typed array, including HMAC
 // keys made with Uint8Array.from({ length: 16 }, mapFn). The compiler uses a
@@ -1219,6 +1230,11 @@ export async function patchTypedArrayFrom(root: string): Promise<void> {
   }
   let edited = src;
   if (!edited.includes(TYPED_ARRAY_FROM_MARKER)) edited = edited.replace(TYPED_ARRAY_FROM_ANCHOR, TYPED_ARRAY_FROM_INJECT);
+  if (!edited.includes(TA_JOIN_MARKER)) {
+    if (!edited.includes(TA_JOIN_ANCHOR))
+      throw new Error(`could not patch Porffor's typed-array method generator: anchor not found in ${file}`);
+    edited = edited.replace(TA_JOIN_ANCHOR, TA_JOIN_INJECT);
+  }
   if (!edited.includes(TA_SET_OFFSET_MARKER)) {
     if (!edited.includes(TA_SET_OFFSET_ANCHOR))
       throw new Error(`could not patch Porffor's TypedArray.prototype.set offset: anchor not found in ${file}`);
