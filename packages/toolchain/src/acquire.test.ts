@@ -225,6 +225,8 @@ test("the default call (no url/expectedSha256 override) never touches the networ
   const codegen = await readFile(join(dir, "compiler/codegen.js"), "utf8");
   expect(codegen).toContain("Convert(T.i32, toUint32(scope, numValue(toNumeric())), CONVERT_RANGE_KNOWN | CONVERT_SIGNED)");
   expect(codegen).toContain("Box(f, Const(T.i32, TYPES.number)), valUndefined());");
+  // #241: out-of-range typed-array writes are ignored in user code.
+  expect(codegen).toContain("if (globalThis.precompile) store();");
   // #238: integer typed-array stores wrap modulo 2^n instead of saturating.
   expect(await readFile(join(dir, "compiler/codegen.js"), "utf8")).toContain(
     "signed ? Convert(T.i32, toUint32(scope, f), CONVERT_RANGE_KNOWN | CONVERT_SIGNED) : toUint32(scope, f)",

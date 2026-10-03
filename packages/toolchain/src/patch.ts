@@ -346,6 +346,23 @@ const TA_GET_INJECT =
   "      Box(f, Const(T.i32, TYPES.number)), valUndefined());\n" +
   "  };";
 const TA_GET_MARKER = "sproutboat #238: only a valid in-range integer index reads";
+// baronunread/sproutboat#241: a typed-array write outside the array stored into
+// whatever memory followed it (and a[-1] = x wrote a[0], via the saturating
+// index conversion). ECMA-262 ignores the write. Same check as taGet, in user
+// code only: builtins such as the constructor store elements before they set
+// the length, and they only write in bounds anyway. Applies after TA_STORE,
+// whose output line is the anchor.
+const TA_SET_BOUNDS_ANCHOR =
+  "      stmt(scope, Store(ctype, addr, 4, ctype === 'f64' || ctype === 'f32' ? f : signed ? Convert(T.i32, toUint32(scope, f), CONVERT_RANGE_KNOWN | CONVERT_SIGNED) : toUint32(scope, f)));";
+const TA_SET_BOUNDS_INJECT =
+  "      const store = () => stmt(scope, Store(ctype, addr, 4, ctype === 'f64' || ctype === 'f32' ? f : signed ? Convert(T.i32, toUint32(scope, f), CONVERT_RANGE_KNOWN | CONVERT_SIGNED) : toUint32(scope, f)));\n" +
+  "      // sproutboat #241: a write outside the array is ignored, not stored into the next allocation.\n" +
+  "      if (globalThis.precompile) store();\n" +
+  "      else {\n" +
+  "        const { idx: sbIdx, valid: sbValid } = denseArrayIndexKey(scope, prop);\n" +
+  "        emitIf(scope, Bin('&&', T.i32, sbValid, Bin('<', T.i32, sbIdx, Load('u32', JvPtr(obj), 0))), store);\n" +
+  "      }";
+const TA_SET_BOUNDS_MARKER = "sproutboat #241: a write outside the array is ignored";
 
 // baronunread/sproutboat#238: TypedArray.prototype.set(source) with no offset
 // ran `offset = Math.trunc(undefined)`, which is NaN. The same-type fast path
@@ -1184,6 +1201,7 @@ export async function patchTypedArrayStore(root: string): Promise<void> {
     [TA_STORE_MARKER, TA_STORE_ANCHOR, TA_STORE_INJECT, "typed-array store conversion"],
     [BITNOT_MARKER, BITNOT_ANCHOR, BITNOT_INJECT, "bitwise NOT conversion"],
     [TA_GET_MARKER, TA_GET_ANCHOR, TA_GET_INJECT, "typed-array read bounds"],
+    [TA_SET_BOUNDS_MARKER, TA_SET_BOUNDS_ANCHOR, TA_SET_BOUNDS_INJECT, "typed-array write bounds"],
   ] as const) {
     if (src.includes(marker)) continue;
     if (!src.includes(anchor)) throw new Error(`could not patch Porffor's ${what}: anchor not found in ${file}`);
