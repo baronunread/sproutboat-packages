@@ -706,6 +706,40 @@ test("cronMatches: fields, steps, ranges, lists (UTC)", () => {
 // #74 — a binding wired to an account-level resource stores in its own file
 // under resourceDir, keyed by id, so the data outlives a "redeploy" (a new
 // broker with a fresh per-deployment db but the same resourceDir).
+test("#207: Durable Object storage and alarms in doDb outlive a redeploy", async () => {
+  const root = mkdtempSync(join(tmpdir(), "sb-broker-do-"));
+  try {
+    mkdirSync(join(root, "dep-a"), { recursive: true });
+    mkdirSync(join(root, "dep-b"), { recursive: true });
+    const doDb = join(root, "do_0123456789abcdef01234567.sqlite");
+    const bindings = { do: [{ binding: "COUNTER", className: "Counter" }] };
+
+    const first = createBroker({ db: join(root, "dep-a", "state.sqlite"), doDb, bindings });
+    await first.dispatch({ op: "do.storage.put", cls: "Counter", id: "global", key: "n", value: "41" });
+    await first.dispatch({ op: "do.alarm.set", cls: "Counter", id: "global", at: 1234 });
+    first.close();
+
+    // A redeploy: new per-deployment state.sqlite, same per-project doDb.
+    const second = createBroker({ db: join(root, "dep-b", "state.sqlite"), doDb, bindings });
+    expect(await second.dispatch({ op: "do.storage.get", cls: "Counter", id: "global", key: "n" })).toEqual({
+      ok: true,
+      found: true,
+      value: "41",
+    });
+    expect(await second.dispatch({ op: "do.alarm.get", cls: "Counter", id: "global" })).toMatchObject({ at: 1234 });
+    second.close();
+
+    // Without doDb the state stays per deployment, as before.
+    const third = createBroker({ db: join(root, "dep-a", "state.sqlite"), bindings });
+    expect(await third.dispatch({ op: "do.storage.get", cls: "Counter", id: "global", key: "n" })).toMatchObject({
+      found: false,
+    });
+    third.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("resource-backed KV persists across brokers and is shared by id", async () => {
   const root = mkdtempSync(join(tmpdir(), "sb-broker-res-"));
   try {
