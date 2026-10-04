@@ -13,9 +13,9 @@
  *   reply payload   : "<json>"
  *
  * ponytail: one SQLite file for KV, secrets from a plain JSON file, fetch
- * allowlisted by exact host. Encryption at rest, per-key TTLs, redirect
- * re-validation and private-IP blocking are v2 — the exact-host allowlist is
- * the only SSRF control today.
+ * allowlisted by exact host and refused for private addresses (#174).
+ * Encryption at rest and per-key TTLs are v2; redirects are never followed,
+ * so there is nothing to re-validate.
  */
 import { Database, type Statement } from "bun:sqlite";
 import { createHash, randomBytes } from "node:crypto";
