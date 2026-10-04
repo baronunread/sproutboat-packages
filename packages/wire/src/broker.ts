@@ -24,9 +24,8 @@ import { open } from "node:fs/promises";
 import { dirname, join, normalize, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { resolveAssetKey, type AssetManifest } from "@sproutboat/assets";
-import { egressAllowList, egressRefusal } from "@sproutboat/runtime";
-import { lookup } from "node:dns/promises";
-import { isIP } from "node:net";
+import { egressAllowList } from "@sproutboat/runtime";
+import { EGRESS_ERROR_HEADER, EGRESS_TOKEN_HEADER, EGRESS_URL_HEADER, resolveAll, vettedFetch } from "./egress";
 import { isSafeInteger } from "./json";
 import { isBoolean, isString, jsonObject, parseJsonValue, type JsonObject, type JsonValue } from "./json";
 
@@ -124,6 +123,10 @@ export type BrokerOptions = {
   /** #174 — private addresses `fetch()` may reach anyway. Defaults to
    *  `SB_EGRESS_ALLOW` (`*` or comma-separated exact addresses). */
   egressAllow?: string[];
+  /** #252 — send `fetch()` through the egress service (egress.ts) instead of
+   *  connecting directly. Defaults to `SB_EGRESS_URL` / `SB_EGRESS_TOKEN`. */
+  egressUrl?: string;
+  egressToken?: string;
 };
 
 type SqlParam = string | number | null;
@@ -261,8 +264,10 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   const replayed = new Map<string, Frame>();
   const serviceHosts = opts.services ?? {};
   const doFetch = opts.fetchImpl ?? fetch;
-  const resolveHost = opts.resolveImpl ?? ((hostname: string) => lookup(hostname, { all: true }));
+  const resolveHost = opts.resolveImpl ?? resolveAll;
   const egressAllow = opts.egressAllow ?? egressAllowList(process.env.SB_EGRESS_ALLOW);
+  const egressUrl = opts.egressUrl ?? process.env.SB_EGRESS_URL ?? "";
+  const egressToken = opts.egressToken ?? process.env.SB_EGRESS_TOKEN ?? "";
 
   const dbPath = opts.db ?? ":memory:";
   const inMemory = dbPath === ":memory:" || dbPath === "";
@@ -1179,6 +1184,21 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         ? new Uint8Array(Buffer.from(str(msg.body), "latin1"))
         : str(msg.body);
 
+  /** #252 — the egress service vets and fetches; its refusal reads as ours. */
+  async function viaEgressService(url: URL, init: RequestInit): Promise<Response> {
+    const headers = new Headers(init.headers);
+    headers.set(EGRESS_URL_HEADER, url.href);
+    headers.set(EGRESS_TOKEN_HEADER, egressToken);
+    const res = await doFetch(egressUrl, { ...init, headers });
+    if (res.headers.get(EGRESS_ERROR_HEADER)) {
+      // SAFETY: the egress service answers a refusal with { error: string }.
+      const { error } = (await res.json()) as { error: string };
+      throw new Error(error);
+    }
+    if (res.status === 401) throw new Error("the egress service rejected this broker's token");
+    return res;
+  }
+
   async function proxyFetch(msg: Frame): Promise<Upstream> {
     let url: URL;
     try {
@@ -1194,37 +1214,16 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         if (Array.isArray(pair) && pair.length === 2) headers.set(str(pair[0]), str(pair[1]));
       }
     }
-    // #174 — resolve, vet every address, then connect to the vetted one, never
-    // the name: handing the name to fetch() would resolve it again, and DNS
-    // rebinding lives in that gap. TLS still verifies against the name.
-    const hostname = url.hostname.replace(/^\[|\]$/g, "");
-    let addresses: Array<{ address: string }>;
-    try {
-      addresses = await resolveHost(hostname);
-    } catch {
-      throw new Error(`could not resolve ${url.hostname}`);
-    }
-    let refusal: string | null = null;
-    const vetted = addresses.find(({ address }) => {
-      const why = egressRefusal(url.hostname, address, egressAllow);
-      refusal ??= why;
-      return why === null;
-    });
-    if (!vetted) throw new Error(refusal ?? `could not resolve ${url.hostname}`);
-    const pinned = new URL(url);
-    pinned.hostname = isIP(vetted.address) === 6 ? `[${vetted.address}]` : vetted.address;
-    headers.set("host", url.host);
-
     const method = str(msg.method || "GET").toUpperCase();
-    const init: RequestInit & { tls?: { serverName: string } } = {
+    const init: RequestInit = {
       method,
       headers,
       body: method === "GET" || method === "HEAD" ? undefined : upstreamBody(msg),
       redirect: "manual",
     };
-    // Bun's TLS option: SNI and certificate checks against the name, not the address.
-    if (url.protocol === "https:" && !isIP(hostname)) init.tls = { serverName: hostname };
-    const res = await doFetch(pinned, init);
+    const res = egressUrl
+      ? await viaEgressService(url, init)
+      : await vettedFetch(url, init, { resolve: resolveHost, allow: egressAllow, fetchImpl: doFetch });
     const outHeaders: Array<[string, string]> = [];
     res.headers.forEach((v, k) => outHeaders.push([k, v]));
     return { reply: { ok: true, status: res.status, headers: outHeaders }, bytes: await readCapped(res, url.host) };
