@@ -17,7 +17,8 @@
   "exports": {
     ".": "./src/index.ts",
     "./broker": "./src/broker.ts",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./egress": "./src/egress.ts"
   },
   "scripts": {
     "test": "bun test ./"
