@@ -411,14 +411,18 @@ __sbDefineURLAccessor("host", function () {
   const i = this.origin.indexOf("://");
   return i === -1 ? "" : this.origin.slice(i + 3);
 });
+// The port colon is the one after an IPv6 literal's closing bracket: `[::1]:9`.
+function __sbPortColon(host) {
+  return host.indexOf(":", host.charAt(0) === "[" ? host.indexOf("]") : 0);
+}
 __sbDefineURLAccessor("hostname", function () {
   const h = this.host;
-  const c = h.indexOf(":");
+  const c = __sbPortColon(h);
   return c === -1 ? h : h.slice(0, c);
 });
 __sbDefineURLAccessor("port", function () {
   const h = this.host;
-  const c = h.indexOf(":");
+  const c = __sbPortColon(h);
   return c === -1 ? "" : h.slice(c + 1);
 });
 __sbDefineURLAccessor("hash", function () {
