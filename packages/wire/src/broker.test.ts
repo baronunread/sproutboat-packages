@@ -152,17 +152,15 @@ test("secrets resolve only when both bound and present", async () => {
   await expect(b.dispatch({ op: "secret.get", name: "UNBOUND" })).rejects.toThrow("not bound");
 });
 
-test("fetch is gated by the exact-host allowlist", async () => {
+test("fetch reaches any public host, with no allowlist (#174)", async () => {
   const calls: string[] = [];
   const fetchImpl: FetchLike = async (url) => {
     calls.push(String(url));
     return new Response("body", { status: 200, headers: { "x-mark": "1" } });
   };
-  const b = make({ bindings: { outbound: ["api.example.com"] }, fetchImpl });
+  const b = make({ fetchImpl });
 
-  await expect(b.dispatch({ op: "fetch", url: "https://evil.example.com/x" })).rejects.toThrow("allowlist");
-  expect(calls).toEqual([]);
-
+  await expect(b.dispatch({ op: "fetch", url: "ftp://api.example.com/x" })).rejects.toThrow("unsupported protocol");
   const res = await b.dispatch({ op: "fetch", url: "https://api.example.com/x" });
   expect(res).toMatchObject({ ok: true, status: 200, body: "body" });
   expect(calls).toEqual(["https://93.184.216.34/x"]);
@@ -175,11 +173,10 @@ test("#174: fetch never connects to a private address, whatever the name says", 
     return new Response("ok");
   };
   const resolving = (addresses: string[]) => async () => addresses.map((address) => ({ address }));
-  const bindings = { outbound: ["api.example.com"] };
 
-  // An allowlisted name that resolves somewhere private is refused before connect.
+  // A public-looking name that resolves somewhere private is refused before connect.
   for (const address of ["127.0.0.1", "169.254.169.254", "10.0.0.7", "::1", "64:ff9b::7f00:1"]) {
-    const b = make({ bindings, fetchImpl, resolveImpl: resolving([address]), egressAllow: [] });
+    const b = make({ fetchImpl, resolveImpl: resolving([address]), egressAllow: [] });
     await expect(b.dispatch({ op: "fetch", url: "https://api.example.com/x" })).rejects.toThrow(
       `api.example.com resolves to ${address}, a private or reserved address`,
     );
@@ -187,12 +184,12 @@ test("#174: fetch never connects to a private address, whatever the name says", 
   expect(calls).toEqual([]);
 
   // A mixed answer connects to the public address, not the first one.
-  const mixed = make({ bindings, fetchImpl, resolveImpl: resolving(["10.0.0.7", "2606:4700::1111"]), egressAllow: [] });
+  const mixed = make({ fetchImpl, resolveImpl: resolving(["10.0.0.7", "2606:4700::1111"]), egressAllow: [] });
   await mixed.dispatch({ op: "fetch", url: "https://api.example.com/x" });
   expect(calls).toEqual(["https://[2606:4700::1111]/x"]);
 
   // The operator, not the handler, can let one address through.
-  const allowed = make({ bindings, fetchImpl, resolveImpl: resolving(["10.0.0.7"]), egressAllow: ["10.0.0.7"] });
+  const allowed = make({ fetchImpl, resolveImpl: resolving(["10.0.0.7"]), egressAllow: ["10.0.0.7"] });
   expect(await allowed.dispatch({ op: "fetch", url: "https://api.example.com/x" })).toMatchObject({ status: 200 });
 });
 
@@ -202,7 +199,7 @@ test("#174: the pinned connection still sends the name as Host and verifies TLS 
     inits.push(init ?? {});
     return new Response("ok");
   };
-  const b = make({ bindings: { outbound: ["api.example.com"] }, fetchImpl });
+  const b = make({ fetchImpl });
   await b.dispatch({ op: "fetch", url: "https://api.example.com/x" });
   expect(new Headers(inits[0].headers).get("host")).toBe("api.example.com");
   expect(inits[0]).toMatchObject({ tls: { serverName: "api.example.com" } });
@@ -212,9 +209,9 @@ test("#174: a real request reaches an allowed local upstream through the pinned 
   const upstream = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: (req) => new Response(req.headers.get("host")) });
   try {
     const host = `localhost:${upstream.port}`;
-    const b = make({ bindings: { outbound: [host] }, resolveImpl: undefined, egressAllow: ["127.0.0.1"] });
+    const b = make({ resolveImpl: undefined, egressAllow: ["127.0.0.1"] });
     expect(await b.dispatch({ op: "fetch", url: `http://${host}/` })).toMatchObject({ status: 200, body: host });
-    const blocked = make({ bindings: { outbound: [host] }, resolveImpl: undefined, egressAllow: [] });
+    const blocked = make({ resolveImpl: undefined, egressAllow: [] });
     await expect(blocked.dispatch({ op: "fetch", url: `http://${host}/` })).rejects.toThrow("SB_EGRESS_ALLOW=");
   } finally {
     upstream.stop(true);
@@ -227,7 +224,7 @@ test("#232: a binary fetch request body is sent as its bytes, a text body as UTF
     seen.push(new Uint8Array(await new Response(init?.body).arrayBuffer()));
     return new Response("ok");
   };
-  const b = make({ bindings: { outbound: ["api.example.com"] }, fetchImpl });
+  const b = make({ fetchImpl });
   // The runtime sends a binary body one char per byte, flagged bodyBinary.
   const raw = Array.from({ length: 256 }, (_, i) => String.fromCharCode(i)).join("");
   await b.dispatch({ op: "fetch", url: "https://api.example.com/up", method: "POST", body: raw, bodyBinary: true });
@@ -240,7 +237,7 @@ test("#232: a v1 fetch returns the upstream body as raw bytes; v0 keeps decoded 
   const binary = Uint8Array.from({ length: 256 }, (_, i) => i);
   const fetchImpl: FetchLike = async (url) =>
     new Response(String(url).endsWith("/bin") ? binary : "café", { status: 200 });
-  const b = make({ bindings: { outbound: ["api.example.com"] }, fetchImpl });
+  const b = make({ fetchImpl });
 
   const raw = decodeV1Frame(
     await b.handleFrame(encodeV1({ v: 1, token: "tok", op: "fetch", url: "https://api.example.com/bin" })),
@@ -1165,21 +1162,21 @@ test("service: declared but not deployed says so, instead of a bare 502", async 
   );
 });
 
-test("service: a call is not subject to the outbound allowlist", async () => {
-  // The target is reached internally through the edge, so a project with no
-  // `outbound` hosts can still call a service binding.
+test("service: a call reaches the edge on loopback, which plain fetch() may not", async () => {
+  // The target is reached internally through the edge, so the private-address
+  // block (#174) does not apply to it.
   const fetchImpl: FetchLike = async () => new Response("ok", { status: 200 });
   const b = make({
-    bindings: { ...svcBindings, outbound: [] },
+    bindings: svcBindings,
     services: { AUTH: "auth-api.andrea.example.com" },
     edgeUrl: "http://127.0.0.1:8080/",
     fetchImpl,
+    resolveImpl: async () => [{ address: "127.0.0.1" }],
+    egressAllow: [],
   });
   expect((await b.dispatch({ op: "service.fetch", binding: "AUTH", url: "https://service/" })).status).toBe(200);
-  // ...while real egress to the same host is still refused.
-  await expect(b.dispatch({ op: "fetch", url: "https://auth-api.andrea.example.com/" })).rejects.toThrow(
-    /outbound allowlist/,
-  );
+  // ...while real egress to the same place is refused.
+  await expect(b.dispatch({ op: "fetch", url: "http://127.0.0.1:8080/" })).rejects.toThrow("private or reserved");
 });
 
 // --- v1 frames (#63) --------------------------------------------------------

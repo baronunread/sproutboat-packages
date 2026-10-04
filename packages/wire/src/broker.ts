@@ -13,7 +13,7 @@
  *   reply payload   : "<json>"
  *
  * ponytail: one SQLite file for KV, secrets from a plain JSON file, fetch
- * allowlisted by exact host and refused for private addresses (#174).
+ * to any public address, never a private one (#174).
  * Encryption at rest and per-key TTLs are v2; redirects are never followed,
  * so there is nothing to re-validate.
  */
@@ -33,7 +33,6 @@ import { isBoolean, isString, jsonObject, parseJsonValue, type JsonObject, type 
 export type Bindings = {
   kv: string[];
   secrets: string[];
-  outbound: string[];
   d1: string[];
   r2: string[];
   queues: string[];
@@ -222,7 +221,6 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   const bindings: Bindings = {
     kv: [],
     secrets: [],
-    outbound: [],
     d1: [],
     r2: [],
     queues: [],
@@ -1139,7 +1137,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
    *
    * The size is the remote host's choice, and the body is held whole: measured
    * on a standalone binary, a 100 MB response took resident memory from 43 MB
-   * to 321 MB. One allowlisted upstream having a bad day should not be able to
+   * to 321 MB. One upstream having a bad day should not be able to
    * end the process. 32 MiB by default, and the same variable the embedded
    * transport reads so both backends agree.
    */
@@ -1189,7 +1187,6 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       throw new Error(`invalid url: ${str(msg.url)}`);
     }
     if (url.protocol !== "https:" && url.protocol !== "http:") throw new Error(`unsupported protocol: ${url.protocol}`);
-    if (!bindings.outbound.includes(url.host)) throw new Error(`host not in outbound allowlist: ${url.host}`);
 
     const headers = new Headers();
     if (Array.isArray(msg.headers)) {

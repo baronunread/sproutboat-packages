@@ -9,6 +9,8 @@ import {
   parseAddress,
   spliceEgressTable,
 } from "./egress";
+import { validateHttpSyncSource } from "./source";
+import { wrapNativeFetchHandler } from "./wrap";
 
 const BLOCKED = [
   "0.0.0.0",
@@ -143,4 +145,11 @@ int main(int argc, char** argv) {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("#174: fetch() needs no config, so every sprout gets it", () => {
+  const handler = `export default { async fetch() { return await fetch("https://api.example.com/"); } };`;
+  expect(validateHttpSyncSource(handler)).toEqual({ ok: true });
+  const prelude = readFileSync(new URL("./native-fetch-prelude.js", import.meta.url), "utf8");
+  expect(wrapNativeFetchHandler(handler, prelude)).toContain("__sbInstallFetch();");
 });

@@ -1008,7 +1008,7 @@ static char* sb_sql_backup(const char* src_path, const char* dest_path) {
 // response parser: the only thing that differs is how bytes move.
 
 // #56 — an outbound response is held whole in memory, and its size is chosen by
-// the remote host, not by us. Without a cap one allowlisted upstream can drive a
+// the remote host, not by us. Without a cap one upstream can drive a
 // sprout out of memory: a 100 MB body measured at 321 MB resident. 32 MiB by
 // default, raisable for a deployment that knowingly fetches something bigger.
 static size_t sb_fetch_max(void) {
@@ -1808,7 +1808,7 @@ function __sbD1BackupRaw(src, dest) {
 }
 
 // Outbound HTTP. String params so C can read each directly; the JS side has
-// already split the URL and enforced the allowlist. `tlsFlag` is "1" or "0" —
+// already split the URL; the connect refuses private addresses. `tlsFlag` is "1" or "0" —
 // a string like the rest, so the marshalling stays uniform.
 // oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
 function __sbHttpRaw(host, portStr, path, method, headersText, body, tlsFlag) {
@@ -1914,12 +1914,6 @@ function __sbSqlRaw(path, sql, paramsJson) {
 // --- the op dispatch, in JS -------------------------------------------------
 // Deliberately the same SQL and the same partition keys as broker.ts. When one
 // changes the other has to, and the conformance suite is what says so.
-
-// The allowlist is baked into the module by wrap.ts; read it lazily so the
-// dispatch has no import-order dependency on __sbInstallBindings.
-function bindingsOutbound() {
-  return globalThis.__sbOutbound || [];
-}
 
 var __sbDataDir = "";
 function __sbDir() {
@@ -2158,9 +2152,6 @@ function __sbEmbeddedDispatch(msg) {
     const url = new URL(String(msg.url));
     const tls = url.protocol === "https:";
     if (!tls && url.protocol !== "http:") throw new Error("unsupported protocol: " + url.protocol);
-    const allow = bindingsOutbound();
-    if (allow.indexOf(url.host) === -1)
-      throw new Error("host not in outbound allowlist: " + url.host);
     let headerText = "";
     const pairs = msg.headers || [];
     for (let i = 0; i < pairs.length; i++) {

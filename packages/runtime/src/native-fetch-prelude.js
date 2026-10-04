@@ -1605,7 +1605,7 @@ globalThis.__sbInstallBindings = function (target, bindings) {
 
   // #48 — worker-to-worker. Same wire shape as outbound fetch, but the broker
   // resolves the target itself and forwards it internally, so this is not
-  // egress and is not subject to the outbound allowlist.
+  // egress and is not subject to the private-address block.
   for (let i = 0; i < (bindings.services || []).length; i++) {
     const binding = bindings.services[i].binding;
     target[binding] = {
@@ -1635,30 +1635,35 @@ globalThis.__sbInstallBindings = function (target, bindings) {
     };
   }
 
-  if ((bindings.outbound || []).length > 0) {
-    globalThis.fetch = function (input, init) {
-      const url = __sbIsStr(input) ? input : String(input.url);
-      const opts = init || {};
-      const headers = [];
-      if (opts.headers) {
-        if (__sbIsFn(opts.headers.forEach)) opts.headers.forEach((v, k) => headers.push([k, v]));
-        else for (const k in opts.headers) headers.push([k, opts.headers[k]]);
-      }
-      const r = globalThis.__sbFetchUpstream("fetch", {
-        url,
-        method: opts.method || "GET",
-        headers,
-        ...__sbRequestBody(opts.body),
-      });
-      const respHeaders = new Headers();
-      for (let j = 0; j < (r.headers || []).length; j++) respHeaders.set(r.headers[j][0], r.headers[j][1]);
-      // #176: bytes from an outbound HTTP response, not a string this handler
-      // built -- must not be re-encoded if the handler proxies it straight
-      // through (see the assets binding for the same reasoning).
-      if (r.body != null) respHeaders.set("x-sb-raw-body", "1");
-      return __sbRawBodyResponse(r.body, { status: r.status || 502, headers: respHeaders });
-    };
-  }
+};
+
+// fetch() reaches any public address; the transport refuses private and
+// reserved ones at connect (baronunread/sproutboat#174). No config, like a
+// Worker's fetch. Installed by the generated module (wrap.ts), not here: the
+// prelude must not replace fetch just by being evaluated.
+globalThis.__sbInstallFetch = function () {
+  globalThis.fetch = function (input, init) {
+    const url = __sbIsStr(input) ? input : String(input.url);
+    const opts = init || {};
+    const headers = [];
+    if (opts.headers) {
+      if (__sbIsFn(opts.headers.forEach)) opts.headers.forEach((v, k) => headers.push([k, v]));
+      else for (const k in opts.headers) headers.push([k, opts.headers[k]]);
+    }
+    const r = globalThis.__sbFetchUpstream("fetch", {
+      url,
+      method: opts.method || "GET",
+      headers,
+      ...__sbRequestBody(opts.body),
+    });
+    const respHeaders = new Headers();
+    for (let j = 0; j < (r.headers || []).length; j++) respHeaders.set(r.headers[j][0], r.headers[j][1]);
+    // #176: bytes from an outbound HTTP response, not a string this handler
+    // built -- must not be re-encoded if the handler proxies it straight
+    // through (see the assets binding for the same reasoning).
+    if (r.body != null) respHeaders.set("x-sb-raw-body", "1");
+    return __sbRawBodyResponse(r.body, { status: r.status || 502, headers: respHeaders });
+  };
 };
 
 // ---------------------------------------------------------------------------
