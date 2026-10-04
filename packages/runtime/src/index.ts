@@ -8,3 +8,4 @@
 // src/native-fetch-prelude.js.
 export * from "./wrap";
 export * from "./source";
+export * from "./egress";
