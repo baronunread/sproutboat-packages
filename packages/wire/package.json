@@ -1,6 +1,6 @@
 {
   "name": "@sproutboat/wire",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "license": "MIT",
   "type": "module",
   "repository": {
@@ -12,7 +12,7 @@
   "types": "./src/index.ts",
   "dependencies": {
     "@sproutboat/assets": "^0.3.0",
-    "@sproutboat/runtime": "^0.13.5"
+    "@sproutboat/runtime": "^0.14.0"
   },
   "exports": {
     ".": "./src/index.ts",
