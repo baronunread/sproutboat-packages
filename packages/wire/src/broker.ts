@@ -13,9 +13,9 @@
  *   reply payload   : "<json>"
  *
  * ponytail: one SQLite file for KV, secrets from a plain JSON file, fetch
- * allowlisted by exact host. Encryption at rest, per-key TTLs, redirect
- * re-validation and private-IP blocking are v2 — the exact-host allowlist is
- * the only SSRF control today.
+ * to any public address, never a private one (#174).
+ * Encryption at rest and per-key TTLs are v2; redirects are never followed,
+ * so there is nothing to re-validate.
  */
 import { Database, type Statement } from "bun:sqlite";
 import { createHash, randomBytes } from "node:crypto";
@@ -24,13 +24,15 @@ import { open } from "node:fs/promises";
 import { dirname, join, normalize, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { resolveAssetKey, type AssetManifest } from "@sproutboat/assets";
+import { egressAllowList, egressRefusal } from "@sproutboat/runtime";
+import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
 import { isSafeInteger } from "./json";
 import { isBoolean, isString, jsonObject, parseJsonValue, type JsonObject, type JsonValue } from "./json";
 
 export type Bindings = {
   kv: string[];
   secrets: string[];
-  outbound: string[];
   d1: string[];
   r2: string[];
   queues: string[];
@@ -117,6 +119,11 @@ export type BrokerOptions = {
   assetsDir?: string;
   /** Injected in tests; defaults to the global `fetch`. */
   fetchImpl?: FetchLike;
+  /** Injected in tests; defaults to `dns.lookup` with every address. */
+  resolveImpl?: (hostname: string) => Promise<Array<{ address: string }>>;
+  /** #174 — private addresses `fetch()` may reach anyway. Defaults to
+   *  `SB_EGRESS_ALLOW` (`*` or comma-separated exact addresses). */
+  egressAllow?: string[];
 };
 
 type SqlParam = string | number | null;
@@ -214,7 +221,6 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   const bindings: Bindings = {
     kv: [],
     secrets: [],
-    outbound: [],
     d1: [],
     r2: [],
     queues: [],
@@ -255,6 +261,8 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   const replayed = new Map<string, Frame>();
   const serviceHosts = opts.services ?? {};
   const doFetch = opts.fetchImpl ?? fetch;
+  const resolveHost = opts.resolveImpl ?? ((hostname: string) => lookup(hostname, { all: true }));
+  const egressAllow = opts.egressAllow ?? egressAllowList(process.env.SB_EGRESS_ALLOW);
 
   const dbPath = opts.db ?? ":memory:";
   const inMemory = dbPath === ":memory:" || dbPath === "";
@@ -1129,7 +1137,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
    *
    * The size is the remote host's choice, and the body is held whole: measured
    * on a standalone binary, a 100 MB response took resident memory from 43 MB
-   * to 321 MB. One allowlisted upstream having a bad day should not be able to
+   * to 321 MB. One upstream having a bad day should not be able to
    * end the process. 32 MiB by default, and the same variable the embedded
    * transport reads so both backends agree.
    */
@@ -1179,7 +1187,6 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       throw new Error(`invalid url: ${str(msg.url)}`);
     }
     if (url.protocol !== "https:" && url.protocol !== "http:") throw new Error(`unsupported protocol: ${url.protocol}`);
-    if (!bindings.outbound.includes(url.host)) throw new Error(`host not in outbound allowlist: ${url.host}`);
 
     const headers = new Headers();
     if (Array.isArray(msg.headers)) {
@@ -1187,13 +1194,37 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         if (Array.isArray(pair) && pair.length === 2) headers.set(str(pair[0]), str(pair[1]));
       }
     }
+    // #174 — resolve, vet every address, then connect to the vetted one, never
+    // the name: handing the name to fetch() would resolve it again, and DNS
+    // rebinding lives in that gap. TLS still verifies against the name.
+    const hostname = url.hostname.replace(/^\[|\]$/g, "");
+    let addresses: Array<{ address: string }>;
+    try {
+      addresses = await resolveHost(hostname);
+    } catch {
+      throw new Error(`could not resolve ${url.hostname}`);
+    }
+    let refusal: string | null = null;
+    const vetted = addresses.find(({ address }) => {
+      const why = egressRefusal(url.hostname, address, egressAllow);
+      refusal ??= why;
+      return why === null;
+    });
+    if (!vetted) throw new Error(refusal ?? `could not resolve ${url.hostname}`);
+    const pinned = new URL(url);
+    pinned.hostname = isIP(vetted.address) === 6 ? `[${vetted.address}]` : vetted.address;
+    headers.set("host", url.host);
+
     const method = str(msg.method || "GET").toUpperCase();
-    const res = await doFetch(url, {
+    const init: RequestInit & { tls?: { serverName: string } } = {
       method,
       headers,
       body: method === "GET" || method === "HEAD" ? undefined : upstreamBody(msg),
       redirect: "manual",
-    });
+    };
+    // Bun's TLS option: SNI and certificate checks against the name, not the address.
+    if (url.protocol === "https:" && !isIP(hostname)) init.tls = { serverName: hostname };
+    const res = await doFetch(pinned, init);
     const outHeaders: Array<[string, string]> = [];
     res.headers.forEach((v, k) => outHeaders.push([k, v]));
     return { reply: { ok: true, status: res.status, headers: outHeaders }, bytes: await readCapped(res, url.host) };

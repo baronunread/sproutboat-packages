@@ -11,6 +11,7 @@
   "main": "./src/index.ts",
   "types": "./src/index.ts",
   "scripts": {
-    "test": "bun test ./"
+    "test": "bun test ./",
+    "gen:egress": "bun src/gen-egress.ts"
   }
 }

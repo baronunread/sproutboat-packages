@@ -46,8 +46,6 @@ export type SproutboatConfig = {
   kv_namespaces?: ResourceRef[];
   /** Secret binding names, exposed as `env.<NAME>` (value fetched at use). */
   secrets?: string[];
-  /** Hostnames the sprout's `fetch()` may reach (exact host match). */
-  outbound?: string[];
   /** D1 (SQLite) database bindings, exposed as `env.<NAME>`. */
   d1_databases?: ResourceRef[];
   /** R2 (object storage) bucket bindings, exposed as `env.<NAME>`. */
@@ -85,7 +83,13 @@ export type AssetsConfig = {
   run_sprout_first?: boolean | string[];
 };
 
-export type ConfigValidation = { ok: true; value: SproutboatConfig } | { ok: false; errors: string[] };
+export type ConfigValidation =
+  | { ok: true; value: SproutboatConfig; warnings: string[] }
+  | { ok: false; errors: string[] };
+
+/** #174 — `outbound` is read for one more minor release, then refused. */
+export const OUTBOUND_IGNORED =
+  "outbound is ignored: fetch() reaches any public address and never a private one. Remove it from sproutboat.jsonc.";
 
 type JsonValue = string | number | boolean | null | ConfigJsonObject | JsonValue[];
 
@@ -161,9 +165,8 @@ function validateConfig(value: ConfigInput): ConfigValidation {
     }
   }
   const bindingName = /^[A-Z][A-Z0-9_]*$/;
-  const hostPattern = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/;
   const stringArray = (
-    field: "secrets" | "outbound" | "analytics_engine_datasets",
+    field: "secrets" | "analytics_engine_datasets",
     item: RegExp,
     label: string,
   ): string[] | undefined => {
@@ -227,7 +230,6 @@ function validateConfig(value: ConfigInput): ConfigValidation {
   if (version_metadata === null) errors.push("version_metadata must be a binding name (UPPER_SNAKE_CASE)");
 
   const secrets = stringArray("secrets", bindingName, "binding names (UPPER_SNAKE_CASE)");
-  const outbound = stringArray("outbound", hostPattern, "hostnames");
   // Analytics Engine datasets aren't provisioned — the dataset name springs into
   // existence on first writeDataPoint(), so there's no resource id to bind (#74).
   const analytics_engine_datasets = stringArray(
@@ -393,7 +395,6 @@ function validateConfig(value: ConfigInput): ConfigValidation {
   if ("vars" in value) config.vars = vars;
   if ("kv_namespaces" in value) config.kv_namespaces = kv_namespaces;
   if ("secrets" in value) config.secrets = secrets;
-  if ("outbound" in value) config.outbound = outbound;
   if ("d1_databases" in value) config.d1_databases = d1_databases;
   if ("r2_buckets" in value) config.r2_buckets = r2_buckets;
   if ("queues" in value) config.queues = queues;
@@ -404,7 +405,7 @@ function validateConfig(value: ConfigInput): ConfigValidation {
   if ("ratelimiters" in value) config.ratelimiters = ratelimiters;
   if ("assets" in value) config.assets = assets;
   if ("version_metadata" in value) config.version_metadata = version_metadata;
-  return { ok: true, value: config };
+  return { ok: true, value: config, warnings: "outbound" in value ? [OUTBOUND_IGNORED] : [] };
 }
 
 export function parseConfig(source: string): ConfigValidation {

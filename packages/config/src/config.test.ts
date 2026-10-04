@@ -1,16 +1,15 @@
 import { expect, test } from "bun:test";
-import { parseConfig, pinBindingId } from "./config";
+import { OUTBOUND_IGNORED, parseConfig, pinBindingId } from "./config";
 
 const base = `{ "name": "app", "main": "src/index.js", "compatibility_date": "2026-08-26"`;
 
-test("accepts kv_namespaces / secrets / outbound / d1_databases / r2_buckets and passes them through", () => {
+test("accepts kv_namespaces / secrets / d1_databases / r2_buckets and passes them through", () => {
   const r = parseConfig(
-    `${base}, "kv_namespaces": ["CACHE"], "secrets": ["API_KEY"], "outbound": ["api.example.com"], "d1_databases": ["DB"], "r2_buckets": ["ASSETS"] }`,
+    `${base}, "kv_namespaces": ["CACHE"], "secrets": ["API_KEY"], "d1_databases": ["DB"], "r2_buckets": ["ASSETS"] }`,
   );
   expect(r.ok && r.value).toMatchObject({
     kv_namespaces: ["CACHE"],
     secrets: ["API_KEY"],
-    outbound: ["api.example.com"],
     d1_databases: ["DB"],
     r2_buckets: ["ASSETS"],
   });
@@ -21,9 +20,14 @@ test("binding names must be UPPER_SNAKE_CASE", () => {
   expect(r.ok).toBe(false);
 });
 
-test("outbound entries must look like hostnames", () => {
-  expect(parseConfig(`${base}, "outbound": ["https://api.example.com"] }`).ok).toBe(false);
-  expect(parseConfig(`${base}, "outbound": ["localhost"] }`).ok).toBe(false);
+test("#174: outbound is accepted with a warning and dropped, whatever it holds", () => {
+  for (const outbound of [`["api.example.com"]`, `["localhost"]`, `"anything"`]) {
+    const r = parseConfig(`${base}, "outbound": ${outbound} }`);
+    expect(r.ok && r.warnings).toEqual([OUTBOUND_IGNORED]);
+    expect(r.ok && "outbound" in r.value).toBe(false);
+  }
+  const clean = parseConfig(`${base} }`);
+  expect(clean.ok && clean.warnings).toEqual([]);
 });
 
 test("a var and a binding may not share a name (any binding kind)", () => {

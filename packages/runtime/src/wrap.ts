@@ -58,7 +58,6 @@ export const BASELINE_COMPATIBILITY_DATE = "2026-08-26";
 export type Bindings = {
   kv: string[];
   secrets: string[];
-  outbound: string[];
   d1: string[];
   r2: string[];
   queues: string[];
@@ -78,7 +77,6 @@ export type Bindings = {
 export const EMPTY_BINDINGS: Bindings = {
   kv: [],
   secrets: [],
-  outbound: [],
   d1: [],
   r2: [],
   queues: [],
@@ -94,7 +92,6 @@ function hasBindings(b: Bindings): boolean {
   return (
     b.kv.length > 0 ||
     b.secrets.length > 0 ||
-    b.outbound.length > 0 ||
     b.d1.length > 0 ||
     b.r2.length > 0 ||
     b.queues.length > 0 ||
@@ -204,8 +201,6 @@ export function wrapNativeFetchHandler(
     `globalThis.__sbCompat = ${JSON.stringify(compatibilityDate)};\n` +
     // #15 — the embedded transport derives its default data directory from this.
     `globalThis.__sbAppName = ${JSON.stringify(appName)};\n` +
-    // #15 — and enforces the outbound allowlist itself, with no broker to do it.
-    `globalThis.__sbOutbound = ${JSON.stringify(bindings.outbound)};\n` +
     (assets ? `globalThis.__sbAssets = ${JSON.stringify(assets)};\n` : "");
   // The native transfer hook runs before JavaScript receives its Request. It
   // has a real file-backed implementation only in embedded builds. The broker
@@ -215,9 +210,10 @@ export function wrapNativeFetchHandler(
     transport === "embedded"
       ? `Porffor.c\`const char* sb_standalone_app_name(void) { return ${JSON.stringify(appName)}; }\`;\n`
       : "Porffor.c`typedef struct sb_r2_transfer_ctx { int unused; } sb_r2_transfer_ctx; int sb_r2_transfer_open(const char* a, const char* b, size_t c, sb_r2_transfer_ctx** d) { if (d) *d = 0; return 404; } int sb_r2_transfer_write(sb_r2_transfer_ctx* a, const char* b, size_t c) { return 404; } int sb_r2_transfer_finish(sb_r2_transfer_ctx* a) { return 404; } void sb_r2_transfer_abort(sb_r2_transfer_ctx* a) {} int sb_r2_transfer_download_open(const char* a, const char* b, sb_r2_transfer_ctx** c) { if (c) *c = 0; return 404; } size_t sb_r2_transfer_download_size(sb_r2_transfer_ctx* a) { return 0; } const char* sb_r2_transfer_download_etag(sb_r2_transfer_ctx* a) { return \"\"; } size_t sb_r2_transfer_download_read(sb_r2_transfer_ctx* a, size_t b, char* c, size_t d) { return 0; } void sb_r2_transfer_download_close(sb_r2_transfer_ctx* a) {}`;\n";
-  const wire = hasBindings(bindings)
-    ? `__sbInstallBindings(env, ${JSON.stringify(bindings)});\n`
-    : "";
+  // #174 — fetch() needs no binding: every sprout gets it.
+  const wire =
+    "__sbInstallFetch();\n" +
+    (hasBindings(bindings) ? `__sbInstallBindings(env, ${JSON.stringify(bindings)});\n` : "");
   const registerDO = bindings.do.length
     ? `__sbRegisterDO({ ${bindings.do.map((d) => `${d.className}: ${d.className}`).join(", ")} });\n`
     : "";
@@ -320,7 +316,6 @@ export function readBindingsFromEnv(): Bindings {
   return {
     kv: strings(parsed.kv),
     secrets: strings(parsed.secrets),
-    outbound: strings(parsed.outbound),
     d1: strings(parsed.d1),
     r2: strings(parsed.r2),
     queues: strings(parsed.queues),

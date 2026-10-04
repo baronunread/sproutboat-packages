@@ -14,7 +14,7 @@
     },
     "packages/artifact": {
       "name": "@sproutboat/artifact",
-      "version": "0.2.0",
+      "version": "0.3.0",
     },
     "packages/assets": {
       "name": "@sproutboat/assets",
@@ -26,17 +26,18 @@
     },
     "packages/runtime": {
       "name": "@sproutboat/runtime",
-      "version": "0.12.1",
+      "version": "0.13.5",
     },
     "packages/toolchain": {
       "name": "@sproutboat/toolchain",
-      "version": "0.4.12",
+      "version": "0.4.24",
     },
     "packages/wire": {
       "name": "@sproutboat/wire",
-      "version": "0.9.1",
+      "version": "0.10.0",
       "dependencies": {
-        "@sproutboat/assets": "workspace:*",
+        "@sproutboat/assets": "^0.3.0",
+        "@sproutboat/runtime": "^0.13.5",
       },
     },
   },
