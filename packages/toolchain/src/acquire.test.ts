@@ -27,8 +27,7 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "    return 0;\n" +
       "  }\n" +
       "  return -1;\n" +
-      "}\n" +
-      "#define PORF_CORO_STACK_SIZE (256u * 1024u)\n",
+      "}\n",
     "compiler/parse.js":
       "import link from './modules.js';\n" +
       "export default (input) => {\n" +
@@ -130,8 +129,7 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
     "compiler/builtins/json.ts": "// sb_json_utf16_v1\n",
     "runtime/fetch-globals.js": "// sb_text_encoder_scalar_v1\n",
     "compiler/codegen.js":
-      "      stmt(scope, Store(ctype, addr, 4, ctype === 'f64' || ctype === 'f32' ? f : signed ? Convert(T.i32, f) : Convert(T.u32, f, 0)));\n" +
-      "      return Box(Convert(T.f64, Un('~', T.i32, Convert(T.i32, numValue(toNumeric())))), Const(T.i32, TYPES.number));\n" +
+      "      stmt(scope, Store(ctype, addr, 4, ctype === 'f64' || ctype === 'f32' ? f : toUint32(scope, f)));\n" +
       "  const taGet = (ctype, size, signed = true) => () => {\n" +
       "    const loaded = Load(ctype, taAddr(size), 4);\n" +
       "    const f = ctype === 'f32' || ctype === 'f64' ? loaded : Convert(T.f64, loaded, signed ? CONVERT_SIGNED : 0);\n" +
@@ -233,16 +231,12 @@ test("the default call (no url/expectedSha256 override) never touches the networ
   expect(await readFile(join(dir, "compiler/builtins/typedarray.js"), "utf8")).toContain(
     "offset = ecma262.ToIntegerOrInfinity(offset);",
   );
-  // #238: ~ wraps (ToInt32), and out-of-range typed-array reads are undefined.
+  // #238: out-of-range typed-array reads are undefined. (The store and `~`
+  // conversions #238 also patched are upstream's own code since alpha-14.)
   const codegen = await readFile(join(dir, "compiler/codegen.js"), "utf8");
-  expect(codegen).toContain("Convert(T.i32, toUint32(scope, numValue(toNumeric())), CONVERT_RANGE_KNOWN | CONVERT_SIGNED)");
   expect(codegen).toContain("Box(f, Const(T.i32, TYPES.number)), valUndefined());");
   // #241: out-of-range typed-array writes are ignored in user code.
   expect(codegen).toContain("if (globalThis.precompile) store();");
-  // #238: integer typed-array stores wrap modulo 2^n instead of saturating.
-  expect(await readFile(join(dir, "compiler/codegen.js"), "utf8")).toContain(
-    "signed ? Convert(T.i32, toUint32(scope, f), CONVERT_RANGE_KNOWN | CONVERT_SIGNED) : toUint32(scope, f)",
-  );
   // #256: named class expressions inside functions are rewritten at parse time.
   expect(await readFile(join(dir, "compiler/parse.js"), "utf8")).toContain("sbClassSelf(ast); // sproutboat #256");
   expect(await readFile(join(dir, "compiler/sb-class-self.js"), "utf8")).toContain("sproutboat #256");

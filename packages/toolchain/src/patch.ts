@@ -131,24 +131,6 @@ const READ_RAW_INJECT =
   READ_RAW_ANCHOR;
 const READ_RAW_MARKER = "porf_native_fetch_read_raw_bytes(jsval value";
 
-/**
- * baronunread/sproutboat#178: every async function runs on its own fiber
- * stack, and Porffor (alpha-10 through alpha-13) fixes those at 256 KiB. A
- * large handler compiled at -O0 (what `sproutboat dev` builds) spends ~40 KiB
- * of stack per call into the biggest generated functions, so a few nested
- * awaits run off the end into the guard page and the sprout dies with SIGBUS
- * on its first request, no log.
- * -O3 frames are smaller, which only raises the threshold: a deep enough
- * async chain hits it in a release build too.
- *
- * Match a thread's usual 8 MiB. The reservation is MAP_NORESERVE with a guard
- * page, so only touched pages cost memory and a shallow handler pays nothing.
- */
-const CORO_STACK_ANCHOR = "#define PORF_CORO_STACK_SIZE (256u * 1024u)";
-const CORO_STACK_INJECT =
-  "// sproutboat #178: 256 KiB overflows -O0 frames in a few nested awaits.\n" +
-  "#define PORF_CORO_STACK_SIZE (8u * 1024u * 1024u)";
-const CORO_STACK_MARKER = "sproutboat #178";
 
 /**
  * render.js full-block replacements: `[marker, anchor, inject, what]`, each a
@@ -158,7 +140,6 @@ const CORO_STACK_MARKER = "sproutboat #178";
 const RENDER_REPLACEMENTS = [
   [BYTESTRING_MARKER, BYTESTRING_ANCHOR, BYTESTRING_INJECT, "bytestring UTF-8 encoding (#172)"],
   [READ_RAW_MARKER, READ_RAW_ANCHOR, READ_RAW_INJECT, "raw bytestring passthrough function (#176)"],
-  [CORO_STACK_MARKER, CORO_STACK_ANCHOR, CORO_STACK_INJECT, "coroutine stack size (#178)"],
 ] as const;
 
 // #15 — no `--port` flag: Porffor's native-fetch entry point calls
@@ -380,30 +361,6 @@ const REPLACE_ALL_EDITS = [
 ] as const;
 const REPLACE_ALL_MARKER = "sproutboat #237: pieces joined once";
 
-// baronunread/sproutboat#238: an integer typed-array element store converted
-// its value with a saturating f64 -> int Convert, so a negative value stored
-// into a Uint32Array became 0 and 4e9 into an Int32Array became 2147483647.
-// ECMA-262 (IntegerIndexedElementSet -> ToUint32 / ToInt32 / ToUint16 ...) wraps
-// modulo 2^n instead. noble-hashes' SHA-256 stores `x | 0` into a Uint32Array,
-// so every negative schedule word was zeroed and the digest came out wrong.
-// Route the store through codegen's own modular toUint32 (what bitwise ops use);
-// narrower stores keep the low bits, which is exactly the modular result.
-const TA_STORE_ANCHOR =
-  "      stmt(scope, Store(ctype, addr, 4, ctype === 'f64' || ctype === 'f32' ? f : signed ? Convert(T.i32, f) : Convert(T.u32, f, 0)));";
-const TA_STORE_INJECT =
-  "      // sproutboat #238: typed-array stores wrap modulo 2^n (ToUint32), not saturate.\n" +
-  "      stmt(scope, Store(ctype, addr, 4, ctype === 'f64' || ctype === 'f32' ? f : signed ? Convert(T.i32, toUint32(scope, f), CONVERT_RANGE_KNOWN | CONVERT_SIGNED) : toUint32(scope, f)));";
-const TA_STORE_MARKER = "sproutboat #238: typed-array stores wrap";
-// baronunread/sproutboat#238: unary `~` had the same saturating conversion, so
-// ~x for x >= 2^31 (or ~~x, the common truncation idiom) clamped to
-// +/-2147483648, and ~Infinity gave -2147483648 instead of -1. uuid's SHA-1
-// computes `x & y ^ ~x & z` on words above 2^31, so every v5 UUID was wrong.
-const BITNOT_ANCHOR =
-  "      return Box(Convert(T.f64, Un('~', T.i32, Convert(T.i32, numValue(toNumeric())))), Const(T.i32, TYPES.number));";
-const BITNOT_INJECT =
-  "      // sproutboat #238: ~ applies ToInt32 (wrap modulo 2^32), not a saturating cast.\n" +
-  "      return Box(Convert(T.f64, Un('~', T.i32, Convert(T.i32, toUint32(scope, numValue(toNumeric())), CONVERT_RANGE_KNOWN | CONVERT_SIGNED))), Const(T.i32, TYPES.number));";
-const BITNOT_MARKER = "sproutboat #238: ~ applies ToInt32";
 // baronunread/sproutboat#238: typed-array element reads and writes had no
 // bounds check. A read past the end returned whatever sat in the next
 // allocation instead of undefined (uuid's SHA-1 reads past its buffer, so v5
@@ -439,12 +396,13 @@ const TA_GET_MARKER = "sproutboat #238: only a valid in-range integer index read
 // whatever memory followed it (and a[-1] = x wrote a[0], via the saturating
 // index conversion). ECMA-262 ignores the write. Same check as taGet, in user
 // code only: builtins such as the constructor store elements before they set
-// the length, and they only write in bounds anyway. Applies after TA_STORE,
-// whose output line is the anchor.
+// the length, and they only write in bounds anyway. Alpha-14 fixed the store's
+// conversion upstream (ToUint32, which our #238 patch used to add); the bounds
+// check is still missing there.
 const TA_SET_BOUNDS_ANCHOR =
-  "      stmt(scope, Store(ctype, addr, 4, ctype === 'f64' || ctype === 'f32' ? f : signed ? Convert(T.i32, toUint32(scope, f), CONVERT_RANGE_KNOWN | CONVERT_SIGNED) : toUint32(scope, f)));";
+  "      stmt(scope, Store(ctype, addr, 4, ctype === 'f64' || ctype === 'f32' ? f : toUint32(scope, f)));";
 const TA_SET_BOUNDS_INJECT =
-  "      const store = () => stmt(scope, Store(ctype, addr, 4, ctype === 'f64' || ctype === 'f32' ? f : signed ? Convert(T.i32, toUint32(scope, f), CONVERT_RANGE_KNOWN | CONVERT_SIGNED) : toUint32(scope, f)));\n" +
+  "      const store = () => stmt(scope, Store(ctype, addr, 4, ctype === 'f64' || ctype === 'f32' ? f : toUint32(scope, f)));\n" +
   "      // sproutboat #241: a write outside the array is ignored, not stored into the next allocation.\n" +
   "      if (globalThis.precompile) store();\n" +
   "      else {\n" +
@@ -1324,8 +1282,6 @@ export async function patchTypedArrayStore(root: string): Promise<void> {
   let src = await readFile(file, "utf8");
   let changed = false;
   for (const [marker, anchor, inject, what] of [
-    [TA_STORE_MARKER, TA_STORE_ANCHOR, TA_STORE_INJECT, "typed-array store conversion"],
-    [BITNOT_MARKER, BITNOT_ANCHOR, BITNOT_INJECT, "bitwise NOT conversion"],
     [TA_GET_MARKER, TA_GET_ANCHOR, TA_GET_INJECT, "typed-array read bounds"],
     [TA_SET_BOUNDS_MARKER, TA_SET_BOUNDS_ANCHOR, TA_SET_BOUNDS_INJECT, "typed-array write bounds"],
   ] as const) {
