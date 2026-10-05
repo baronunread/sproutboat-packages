@@ -29,6 +29,13 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "  return -1;\n" +
       "}\n" +
       "#define PORF_CORO_STACK_SIZE (256u * 1024u)\n",
+    "compiler/parse.js":
+      "import link from './modules.js';\n" +
+      "export default (input) => {\n" +
+      "  const ast = parse(input);\n" +
+      "  if (ast._ts) globalThis.typedInput = Prefs.optTypes;\n" +
+      "  return ast;\n" +
+      "};\n",
     "compiler/index.js":
       "import { hashId } from './modules.js';\n" +
       "      const uwsDir = uwebsockets.ensureUWebSockets();\n" +
@@ -236,6 +243,9 @@ test("the default call (no url/expectedSha256 override) never touches the networ
   expect(await readFile(join(dir, "compiler/codegen.js"), "utf8")).toContain(
     "signed ? Convert(T.i32, toUint32(scope, f), CONVERT_RANGE_KNOWN | CONVERT_SIGNED) : toUint32(scope, f)",
   );
+  // #256: named class expressions inside functions are rewritten at parse time.
+  expect(await readFile(join(dir, "compiler/parse.js"), "utf8")).toContain("sbClassSelf(ast); // sproutboat #256");
+  expect(await readFile(join(dir, "compiler/sb-class-self.js"), "utf8")).toContain("sproutboat #256");
   // #237: replaceAll joins its pieces once instead of a strcat per match.
   expect(await readFile(join(dir, "compiler/builtins/string.ts"), "utf8")).toContain(
     "return Porffor.callThis(__Array_prototype_join, pieces, '');",
