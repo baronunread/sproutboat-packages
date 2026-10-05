@@ -1,29 +1,33 @@
 # Porffor pin scorecard
 
-Pin: alpha-13 (547c7815125b6f02474591950f8b0dd7031a03f0). Compatibility report: 2026-10-01T10:57:31.463Z.
+Pin: alpha-15 (72d048d73d49e217631ac8a1bc4fa9070d22fbc9). Compatibility report: 2026-10-05T00:30:02.525Z.
 
 | Measure | Result |
 | --- | ---: |
 | Fixtures compiled | 32/32 |
 | Behavior matches | 30/32 |
-| Median / p95 compile, ms | 3212 / 4703 |
-| Median / p95 binary, bytes | 966864 / 999936 |
-| Patch markers | 28 |
-| Upstream files written | 6 |
+| Median / p95 compile, ms | 420 / 822 |
+| Median / p95 binary, bytes | 1033344 / 1049904 |
+| Patch markers | 38 |
+| Upstream files written | 10 |
 | Fresh patch application | pass |
 
-Previous snapshot: alpha-10-08ac7ee.json. Matches 30/32 to 30/32; patch markers 27 to 28.
+Previous snapshot: alpha-13-547c781.json. Matches 30/32 to 30/32; patch markers 28 to 38.
 
 ## Patch inventory
 
-- `compiler/render.js`: PORT_MARKER, CONSOLE_MARKER, BYTESTRING_MARKER, READ_RAW_MARKER, CORO_STACK_MARKER
-- `compiler/index.js`: LINK_MARKER, CFLAGS_MARKER
-- `compiler/builtins/typedarray.js`: TYPED_ARRAY_FROM_MARKER
+- `compiler/render.js`: PORT_MARKER, CONSOLE_MARKER, BYTESTRING_MARKER, READ_RAW_MARKER
+- `compiler/index.js`: LINK_MARKER, CFLAGS_MARKER, FP_CONTRACT_MARKER, HTTP10_IMPORT_MARKER, HTTP10_CALL_MARKER
+- `compiler/builtins/typedarray.js`: TYPED_ARRAY_FROM_MARKER, TA_SET_OFFSET_MARKER, TA_JOIN_MARKER
 - `compiler/builtins/date.ts`: DATE_PARSER_MARKER
-- `compiler/uwebsockets.js`: BODY_MARKER, STATUS_SIG_MARKER, STATUS_303_MARKER, STATUS_DEFAULT_MARKER, HDR_SIG_MARKER, HDR_CALL_MARKER, HDR_CAP_MARKER, HDR_SKIP_MARKER, HDR_APPEND_MARKER, READ_RAW_DECL_MARKER, FORBIDDEN_HDR_MARKER, WRITE_RESPONSE_MARKER, R2_TRANSFER_MARKER, R2_TRANSFER_CALL_MARKER, R2_DOWNLOAD_CACHE_MARKER, R2_RANGE_CACHE_MARKER, R2_CONDITIONAL_CACHE_MARKER, R2_STREAMING_CACHE_MARKER, R2_RANGE_HEADER_CACHE_MARKER
+- `compiler/builtins/promise.ts`: PROMISE_NULL_MARKER
+- `compiler/builtins/string.ts`: REPLACE_ALL_MARKER
+- `compiler/codegen.js`: TA_GET_MARKER, TA_SET_BOUNDS_MARKER
+- `compiler/parse.js`: CLASS_SELF_MARKER
+- `compiler/uwebsockets.js`: HTTP10_SHIM_MARKER, BODY_MARKER, STATUS_SIG_MARKER, STATUS_303_MARKER, STATUS_DEFAULT_MARKER, HDR_SIG_MARKER, HDR_CALL_MARKER, HDR_CAP_MARKER, HDR_SKIP_MARKER, HDR_APPEND_MARKER, READ_RAW_DECL_MARKER, FORBIDDEN_HDR_MARKER, WRITE_RESPONSE_MARKER, R2_TRANSFER_MARKER, R2_TRANSFER_CALL_MARKER, R2_DOWNLOAD_CACHE_MARKER, R2_RANGE_CACHE_MARKER, R2_CONDITIONAL_CACHE_MARKER, R2_STREAMING_CACHE_MARKER, R2_RANGE_HEADER_CACHE_MARKER
 - `compiler/builtins_precompiled.js`: regenerated builtin table
 
-Patch source SHA-256: `6f607ac6b66fc4a51c2bf9e9525d0ab7f4e9b9dd3f942a820bbad46b7e3dbf56`.
+Patch source SHA-256: `849997ab545a760019941886780b3fc70c89b67581cc9acf2b51ca6ff8a37d17`.
 
 ## Known behavior gaps
 
