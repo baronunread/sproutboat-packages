@@ -1,5 +1,17 @@
 # @sproutboat/toolchain
 
+## 0.5.0
+
+### Minor Changes
+
+- 16f9b79: Pin and vendor Porffor alpha-15 (`72d048d`). Alpha-14 and alpha-15 bring stackless coroutines, iterator support, class hoisting and typed-array fixes. Three Sproutboat patches are dropped because upstream now covers them: the typed-array store and `~` conversions (#238) and the coroutine stack size (#178). The #241 write-bounds guard is re-anchored. uWebSockets stays on the same commit and the compatibility suite is unchanged at 30/32. See `PORFFOR_ALPHA15.md`.
+
+### Patch Changes
+
+- bf4ac00: Named class expressions work inside handlers again (baronunread/sproutboat#256). Inside a function, Porffor gave a class expression's own name, as seen from its methods, a new function object instead of the class, so `var R = class l { static lex() { return new l() } }` failed with "value is not a constructor". Every handler has run inside a function since #238, and bundlers emit this shape for any class whose static members refer to themselves, so marked and similar packages broke. A parse-time rewrite turns such a class into the equivalent `(() => { const l = class { ... }; return l; })()`, which Porffor handles correctly.
+  
+  The ISO date parser no longer reads one byte past the end of the string. When that byte happened to be `+` or `-`, a timezone offset's sign flipped, so `-00:30` could parse as `+00:30` depending on what sat next in memory.
+
 ## 0.4.24
 
 ### Patch Changes
