@@ -181,6 +181,95 @@ const LINK_INJECT =
 const LINK_MARKER = "SB_EXTRA_LINK";
 
 /**
+ * baronunread/sproutboat#256: inside a function, Porffor gives a named class
+ * expression's own name, as seen from its methods, a fresh function object
+ * instead of the class. So `var R = class l { static lex() { return new l() } }`
+ * builds an object with none of the class's methods ("value is not a
+ * constructor"). Top level is fine. Since #238 every handler runs inside a
+ * function, and bundlers emit exactly this shape for classes whose static
+ * members refer to themselves (marked's Lexer and Parser, esbuild's
+ * `class _X`).
+ *
+ * The rewrite keeps the meaning: the name becomes an ordinary const, which
+ * Porffor captures correctly, and `const l = class {}` still names it "l".
+ *
+ *   class l { ... }  ->  (() => { const l = class { ... }; return l; })()
+ *
+ * Only named class expressions inside a function whose body refers to the name.
+ * Skipped when `extends` or a computed key holds await/yield, which an arrow
+ * would change.
+ */
+const CLASS_SELF_HELPER = String.raw`// sproutboat #256: a named class expression's own name inside a function.
+const isFn = (n) => n.type === 'FunctionDeclaration' || n.type === 'FunctionExpression' || n.type === 'ArrowFunctionExpression';
+
+const mentions = (node, name) => {
+  if (node == null || typeof node !== 'object') return false;
+  if (Array.isArray(node)) return node.some((x) => mentions(x, name));
+  if (node.type === 'Identifier') return node.name === name;
+  for (const key in node) {
+    if (key[0] === '_' || key === 'start' || key === 'end' || key === 'loc' || key === 'range') continue;
+    if (mentions(node[key], name)) return true;
+  }
+  return false;
+};
+
+const suspends = (node) => {
+  if (node == null || typeof node !== 'object') return false;
+  if (Array.isArray(node)) return node.some(suspends);
+  if (node.type === 'AwaitExpression' || node.type === 'YieldExpression') return true;
+  if (isFn(node) || node.type === 'ClassExpression' || node.type === 'ClassDeclaration') return false;
+  for (const key in node) {
+    if (key[0] === '_' || key === 'start' || key === 'end' || key === 'loc' || key === 'range') continue;
+    if (suspends(node[key])) return true;
+  }
+  return false;
+};
+
+const rewrite = (cls) => {
+  const name = cls.id.name;
+  const at = { start: cls.start, end: cls.end };
+  const id = () => ({ type: 'Identifier', name, ...at });
+  return {
+    type: 'CallExpression', optional: false, arguments: [], ...at,
+    callee: {
+      type: 'ArrowFunctionExpression', id: null, params: [], async: false, generator: false, expression: false, ...at,
+      body: {
+        type: 'BlockStatement', ...at,
+        body: [
+          { type: 'VariableDeclaration', kind: 'const', ...at, declarations: [
+            { type: 'VariableDeclarator', id: id(), init: { ...cls, id: null }, ...at },
+          ] },
+          { type: 'ReturnStatement', argument: id(), ...at },
+        ],
+      },
+    },
+  };
+};
+
+const walk = (node, inFn) => {
+  if (node == null || typeof node !== 'object') return node;
+  if (Array.isArray(node)) {
+    for (let i = 0; i < node.length; i++) node[i] = walk(node[i], inFn);
+    return node;
+  }
+  const childInFn = inFn || isFn(node);
+  for (const key in node) {
+    if (key[0] === '_' || key === 'start' || key === 'end' || key === 'loc' || key === 'range') continue;
+    const value = node[key];
+    if (value && typeof value === 'object') node[key] = walk(value, childInFn);
+  }
+  if (
+    inFn && node.type === 'ClassExpression' && node.id?.name &&
+    mentions(node.body, node.id.name) &&
+    !suspends(node.superClass) && !node.body.body.some((m) => m.computed && suspends(m.key))
+  ) return rewrite(node);
+  return node;
+};
+
+export default (ast) => (globalThis.precompile ? ast : walk(ast, false));
+`;
+
+/**
  * #15 — and the same for the compile step, so the prelude's inline C can
  * `#include <bearssl.h>`. The link patch alone is not enough: Porffor's
  * module builds compile several C units with a fixed argument list, so there
@@ -1132,6 +1221,28 @@ export async function patchUwebsockets(root: string): Promise<void> {
   if (changed) await writeFile(file, src);
 }
 
+const CLASS_SELF_IMPORT_ANCHOR = "import link from './modules.js';";
+const CLASS_SELF_IMPORT_INJECT = "import link from './modules.js';\nimport sbClassSelf from './sb-class-self.js';";
+const CLASS_SELF_CALL_ANCHOR = "  if (ast._ts) globalThis.typedInput = Prefs.optTypes;";
+const CLASS_SELF_CALL_INJECT = "  sbClassSelf(ast); // sproutboat #256\n  if (ast._ts) globalThis.typedInput = Prefs.optTypes;";
+const CLASS_SELF_MARKER = "sproutboat #256";
+
+/** #256 — see CLASS_SELF_HELPER. */
+export async function patchClassSelfName(root: string): Promise<void> {
+  await writeFile(resolve(root, "compiler/sb-class-self.js"), CLASS_SELF_HELPER);
+  const file = resolve(root, "compiler/parse.js");
+  let src = await readFile(file, "utf8");
+  if (src.includes(CLASS_SELF_MARKER)) return;
+  for (const [anchor, what] of [
+    [CLASS_SELF_IMPORT_ANCHOR, "import"],
+    [CLASS_SELF_CALL_ANCHOR, "call"],
+  ] as const) {
+    if (!src.includes(anchor)) throw new Error(`could not patch Porffor's class self-name rewrite (${what}): anchor not found in ${file}`);
+  }
+  src = src.replace(CLASS_SELF_IMPORT_ANCHOR, CLASS_SELF_IMPORT_INJECT).replace(CLASS_SELF_CALL_ANCHOR, CLASS_SELF_CALL_INJECT);
+  await writeFile(file, src);
+}
+
 async function patchCompilerArgs(root: string): Promise<void> {
   await writeFile(resolve(root, "compiler/sb-http10.js"), HTTP10_HELPER);
   const file = resolve(root, "compiler/index.js");
@@ -1305,6 +1416,7 @@ export async function patchRenderJs(root: string): Promise<void> {
 export async function ensurePorfforPatched(root: string): Promise<void> {
   if (done.has(root)) return;
   await patchCompilerArgs(root);
+  await patchClassSelfName(root);
   await patchUwebsockets(root);
   await patchRenderJs(root);
   await patchDateParser(root);
