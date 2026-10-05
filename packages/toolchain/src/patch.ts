@@ -548,8 +548,12 @@ const DATE_PARSER_INJECT = `  // sproutboat: ISO timezone offset
   const endPtr: i32 = Porffor.IR.ptr(string) + len;
   let ptr: i32 = Porffor.IR.ptr(string);
 
+  // Loop once past the last character to flush the final number, but read a
+  // 0 there, not the byte after the string: if that byte happened to be '+' or
+  // '-' it flipped the offset's sign.
   while (ptr <= endPtr) {
-    const chr: i32 = Porffor.IR.loadU8(ptr++, 4);
+    const chr: i32 = ptr < endPtr ? Porffor.IR.loadU8(ptr, 4) : 0;
+    ptr++;
     if (Porffor.fastAnd(chr >= 48, chr <= 57)) {
       n = n * 10 + chr - 48;
       digits++;
