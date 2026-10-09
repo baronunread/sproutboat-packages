@@ -1370,6 +1370,64 @@ function __sbR2Multipart(bucket, key, uploadId) {
   };
 }
 
+// Asset rules use the same parsed manifest in both transports. Matching mirrors
+// @sproutboat/assets; parity tests cover the portable native implementation.
+function __sbAssetRedirect(rule, path) {
+  const star = rule.from.indexOf("*");
+  if (star !== -1) {
+    const prefix = rule.from.slice(0, star);
+    if (!path.startsWith(prefix)) return null;
+    return rule.to.split(":splat").join(path.slice(prefix.length));
+  }
+  const from = rule.from.split("/").filter(Boolean);
+  const parts = path.split("/").filter(Boolean);
+  if (from.length !== parts.length) return null;
+  const params = {};
+  for (let i = 0; i < from.length; i++) {
+    if (from[i].startsWith(":")) params[from[i].slice(1)] = parts[i];
+    else if (from[i] !== parts[i]) return null;
+  }
+  let to = rule.to;
+  for (const name in params) to = to.split(":" + name).join(params[name]);
+  return to;
+}
+
+function __sbAssetHeaderMatches(pattern, path) {
+  const from = pattern.split("/").filter(Boolean);
+  const parts = path.split("/").filter(Boolean);
+  for (let i = 0; i < from.length; i++) {
+    if (from[i] === "*") return true;
+    if (from[i] !== parts[i]) return false;
+  }
+  return from.length === parts.length;
+}
+
+function __sbAssetResponse(path, r) {
+  if (r.location != null) return new Response(null, { status: r.status, headers: { location: r.location } });
+  const rules = r.rules || {};
+  const redirects = rules.redirects || [];
+  for (let i = 0; i < redirects.length; i++) {
+    const to = __sbAssetRedirect(redirects[i], path);
+    if (to !== null) return new Response(null, { status: redirects[i].status, headers: { location: to } });
+  }
+  const headers = new Headers();
+  if (r.type) headers.set("content-type", r.type);
+  if (r.found) headers.set("etag", '"' + r.hash + '"');
+  // A custom 404 page is also an asset; a generated Not Found is not.
+  if (r.type) {
+    const list = rules.headers || [];
+    for (let i = 0; i < list.length; i++) {
+      const rule = list[i];
+      if (!__sbAssetHeaderMatches(rule.pattern, path)) continue;
+      for (let j = 0; j < rule.unset.length; j++) headers.delete(rule.unset[j]);
+      for (let j = 0; j < rule.set.length; j++) headers.set(rule.set[j][0], rule.set[j][1]);
+    }
+  }
+  // Apply the internal byte marker after user rules so they cannot remove it.
+  if (r.body != null) headers.set("x-sb-raw-body", "1");
+  return __sbRawBodyResponse(r.body, { status: r.status || (r.found ? 200 : 404), headers });
+}
+
 // Installed only when the project declares bindings. `env` is the module-scoped
 // object from compile.ts (a `const`, but mutable); we add the binding accessors
 // to it in place. compile.ts emits `__sbInstallBindings(env, {...})` right after
@@ -1593,16 +1651,7 @@ globalThis.__sbInstallBindings = function (target, bindings) {
         } catch {
           /* use as-is */
         }
-        const r = globalThis.__sbAssetsGet(path);
-        const headers = {};
-        if (r.type) headers["content-type"] = r.type;
-        if (r.found) headers["etag"] = '"' + r.hash + '"';
-        // #176: these bytes came off disk already-finished (UTF-8 text or
-        // binary, doesn't matter which) -- the reserved x-sb-raw-body header
-        // tells the C write path to pass them through untouched instead of
-        // re-encoding as if this were a JS string a handler built.
-        if (r.body != null) headers["x-sb-raw-body"] = "1";
-        return __sbRawBodyResponse(r.body, { status: r.status || (r.found ? 200 : 404), headers });
+        return __sbAssetResponse(path, globalThis.__sbAssetsGet(path));
       },
     };
   }

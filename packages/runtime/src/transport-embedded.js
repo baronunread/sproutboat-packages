@@ -2104,6 +2104,11 @@ function __sbEmbeddedDispatch(msg) {
     const meta = (bundle.manifest && bundle.manifest.files) || {};
     let path = String(msg.path || "/");
     if (path.charAt(0) !== "/") path = "/" + path;
+    const redirects = (bundle.manifest && bundle.manifest.redirects) || [];
+    for (let i = 0; i < redirects.length; i++) {
+      const location = __sbAssetRedirect(redirects[i], path);
+      if (location !== null) return { ok: true, found: false, status: redirects[i].status, location };
+    }
 
     let key = null;
     if (path.charAt(path.length - 1) === "/") {
@@ -2731,7 +2736,10 @@ globalThis.__sbFetchUpstream = function (op, msg) {
 };
 
 globalThis.__sbAssetsGet = function (path) {
-  return __sbEmbeddedDispatch({ op: "assets.get", path });
+  const reply = __sbEmbeddedDispatch({ op: "assets.get", path });
+  const manifest = globalThis.__sbAssets.manifest || {};
+  reply.rules = { headers: manifest.headers || [], redirects: manifest.redirects || [] };
+  return reply;
 };
 
 /** The transport contract: one request string in, one reply string out. */
