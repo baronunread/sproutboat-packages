@@ -93,6 +93,22 @@ function __sbTagCpu(res, t0) {
   return res;
 }
 
+// Live iterators use the current collection on each next(), including mutations.
+function __sbCollectionIterator(owner, kind, formData) {
+  let index = 0;
+  return {
+    next() {
+      const length = formData ? owner._entries.length : owner._keys.length;
+      if (index >= length) return { value: undefined, done: true };
+      const key = formData ? owner._entries[index][0] : owner._keys[index];
+      const value = formData ? owner._entries[index][1] : owner._vals[index];
+      index++;
+      return { value: kind === 0 ? key : kind === 1 ? value : [key, value], done: false };
+    },
+    [Symbol.iterator]() { return this; },
+  };
+}
+
 class __SproutboatURLSearchParams {
   constructor(init) {
     this._keys = [];
@@ -165,11 +181,15 @@ class __SproutboatURLSearchParams {
     this._vals = idx.map((i) => this._vals[i]);
   }
   keys() {
-    return this._keys.slice();
+    return __sbCollectionIterator(this, 0, false);
   }
   values() {
-    return this._vals.slice();
+    return __sbCollectionIterator(this, 1, false);
   }
+  entries() {
+    return __sbCollectionIterator(this, 2, false);
+  }
+  [Symbol.iterator]() { return this.entries(); }
   get size() {
     return this._keys.length;
   }
@@ -318,24 +338,22 @@ if (globalThis.FormData == null) {
       for (let i = 0; i < this._entries.length; i++) cb(this._entries[i][1], this._entries[i][0], this);
     }
     keys() {
-      return this._entries.map((e) => e[0]);
+      return __sbCollectionIterator(this, 0, true);
     }
     values() {
-      return this._entries.map((e) => e[1]);
+      return __sbCollectionIterator(this, 1, true);
     }
     entries() {
-      return this._entries.map((e) => [e[0], e[1]]);
+      return __sbCollectionIterator(this, 2, true);
     }
   }
+  __SproutboatFormData.prototype[Symbol.iterator] = __SproutboatFormData.prototype.entries;
   globalThis.FormData = __SproutboatFormData;
 }
 
 function __sbParseUrlencodedFormData(text) {
   const fd = new FormData();
-  // forEach, not keys()/values() — those are spec'd as iterators, not
-  // arrays, and this shim's own URLSearchParams.keys()/values() return
-  // arrays as an implementation shortcut, so relying on either shape here
-  // would break against whichever kind actually ends up installed.
+  // forEach handles both the native API and the local shim.
   new URLSearchParams(text).forEach((value, key) => fd.append(key, value));
   return fd;
 }

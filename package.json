@@ -4,8 +4,13 @@
   "private": true,
   "type": "module",
   "license": "MIT",
-  "repository": { "type": "git", "url": "git+https://github.com/baronunread/sproutboat-packages.git" },
-  "workspaces": ["packages/*"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/baronunread/sproutboat-packages.git"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
     "test": "bun test packages/",
     "test:native-crypto": "bun packages/runtime/test/native-crypto.ts",
@@ -15,7 +20,8 @@
     "typecheck": "tsc --noEmit",
     "changeset": "changeset",
     "version-packages": "changeset version",
-    "release": "changeset publish"
+    "release": "changeset publish",
+    "test:native-iterators": "bun packages/runtime/test/native-iterators.ts"
   },
   "devDependencies": {
     "@changesets/cli": "^3.0.2",

@@ -1,24 +1,23 @@
 # Porffor pin scorecard
 
-Pin: alpha-15 (72d048d73d49e217631ac8a1bc4fa9070d22fbc9). Compatibility report: 2026-10-05T00:30:02.525Z.
+Pin: alpha-16 (43087d42f0b90d14f04f3cddac034822560aefad). Compatibility report: 2026-10-10T08:51:03.637Z.
 
 | Measure | Result |
 | --- | ---: |
 | Fixtures compiled | 32/32 |
 | Behavior matches | 30/32 |
-| Median / p95 compile, ms | 420 / 822 |
-| Median / p95 binary, bytes | 1033344 / 1049904 |
-| Patch markers | 38 |
-| Upstream files written | 10 |
+| Median / p95 compile, ms | 13266 / 33619 |
+| Median / p95 binary, bytes | 1082960 / 1099536 |
+| Patch markers | 35 |
+| Upstream files written | 9 |
 | Fresh patch application | pass |
 
-Previous snapshot: alpha-13-547c781.json. Matches 30/32 to 30/32; patch markers 28 to 38.
+Previous snapshot: alpha-15-72d048d.json. Matches 30/32 to 30/32; patch markers 38 to 35.
 
 ## Patch inventory
 
 - `compiler/render.js`: PORT_MARKER, CONSOLE_MARKER, BYTESTRING_MARKER, READ_RAW_MARKER
 - `compiler/index.js`: LINK_MARKER, CFLAGS_MARKER, FP_CONTRACT_MARKER, HTTP10_IMPORT_MARKER, HTTP10_CALL_MARKER
-- `compiler/builtins/typedarray.js`: TYPED_ARRAY_FROM_MARKER, TA_SET_OFFSET_MARKER, TA_JOIN_MARKER
 - `compiler/builtins/date.ts`: DATE_PARSER_MARKER
 - `compiler/builtins/promise.ts`: PROMISE_NULL_MARKER
 - `compiler/builtins/string.ts`: REPLACE_ALL_MARKER
@@ -27,7 +26,7 @@ Previous snapshot: alpha-13-547c781.json. Matches 30/32 to 30/32; patch markers 
 - `compiler/uwebsockets.js`: HTTP10_SHIM_MARKER, BODY_MARKER, STATUS_SIG_MARKER, STATUS_303_MARKER, STATUS_DEFAULT_MARKER, HDR_SIG_MARKER, HDR_CALL_MARKER, HDR_CAP_MARKER, HDR_SKIP_MARKER, HDR_APPEND_MARKER, READ_RAW_DECL_MARKER, FORBIDDEN_HDR_MARKER, WRITE_RESPONSE_MARKER, R2_TRANSFER_MARKER, R2_TRANSFER_CALL_MARKER, R2_DOWNLOAD_CACHE_MARKER, R2_RANGE_CACHE_MARKER, R2_CONDITIONAL_CACHE_MARKER, R2_STREAMING_CACHE_MARKER, R2_RANGE_HEADER_CACHE_MARKER
 - `compiler/builtins_precompiled.js`: regenerated builtin table
 
-Patch source SHA-256: `849997ab545a760019941886780b3fc70c89b67581cc9acf2b51ca6ff8a37d17`.
+Patch source SHA-256: `65a48b098fb6bd355785684774be43524d31491c89be1f6b0dee17f24b9cdd20`.
 
 ## Known behavior gaps
 

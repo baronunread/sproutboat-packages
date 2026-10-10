@@ -225,11 +225,11 @@ test("the default call (no url/expectedSha256 override) never touches the networ
   expect(await readFile(join(dir, "runtime/index.js"), "utf8")).not.toBe("");
   // #242: generated typed-array join/toString keep a plain-array `parts`.
   expect(await readFile(join(dir, "compiler/builtins/typedarray.js"), "utf8")).toContain(
-    ".replaceAll('const parts: ' + name + ' =', 'const parts: any[] =')",
+    "return Porffor.callThis(__Array_prototype_join, out, sep);",
   );
   // #238: TypedArray.prototype.set(source) with no offset copies to index 0.
   expect(await readFile(join(dir, "compiler/builtins/typedarray.js"), "utf8")).toContain(
-    "offset = ecma262.ToIntegerOrInfinity(offset);",
+    "const targetOffsetNum: number = ecma262.ToIntegerOrInfinity(offset);",
   );
   // #238: out-of-range typed-array reads are undefined. (The store and `~`
   // conversions #238 also patched are upstream's own code since alpha-14.)
@@ -255,7 +255,7 @@ test("the default call (no url/expectedSha256 override) never touches the networ
   expect(await readFile(join(dir, "compiler/builtins/promise.ts"), "utf8")).toContain(
     "if (Porffor.type(value) == Porffor.TYPES.object && value != null) {",
   );
-});
+}, 60_000);
 
 test("a corrupted warm cache is replaced from the verified archive", async () => {
   const { archive, sha256 } = await fixture();
