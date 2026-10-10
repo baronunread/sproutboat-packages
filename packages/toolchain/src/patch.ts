@@ -1,7 +1,7 @@
 /**
  * Idempotent, marker-guarded in-place edits to Porffor's generated C
  * (`compiler/render.js`, `compiler/index.js`, `compiler/uwebsockets.js`,
- * `compiler/builtins/typedarray.js`, `compiler/builtins/date.ts`). Run
+ * `compiler/builtins/date.ts`). Run
  * from the build path, not a `postinstall` hook: package managers block
  * dependency lifecycle scripts by default, so a published `postinstall` would
  * silently not run.
@@ -410,50 +410,6 @@ const TA_SET_BOUNDS_INJECT =
   "        emitIf(scope, Bin('&&', T.i32, sbValid, Bin('<', T.i32, sbIdx, Load('u32', JvPtr(obj), 0))), store);\n" +
   "      }";
 const TA_SET_BOUNDS_MARKER = "sproutboat #241: a write outside the array is ignored";
-
-// baronunread/sproutboat#238: TypedArray.prototype.set(source) with no offset
-// ran `offset = Math.trunc(undefined)`, which is NaN. The same-type fast path
-// then copied to `base + NaN * BYTES_PER_ELEMENT`: nothing landed where it
-// should (noble's HMAC lost its key in `pad.set(key)`), and the write went
-// somewhere else in memory. ECMA-262 uses ToIntegerOrInfinity, which maps
-// undefined and NaN to 0; subarray right below already does.
-const TA_SET_OFFSET_ANCHOR = "  offset = Math.trunc(offset);\n  if (Porffor.fastOr(offset < 0, offset > len)) throw new RangeError('Offset out of bounds');";
-const TA_SET_OFFSET_INJECT =
-  "  offset = ecma262.ToIntegerOrInfinity(offset); // sproutboat #238: undefined offset is 0, not NaN\n  if (Porffor.fastOr(offset < 0, offset > len)) throw new RangeError('Offset out of bounds');";
-const TA_SET_OFFSET_MARKER = "sproutboat #238: undefined offset is 0";
-
-// baronunread/sproutboat#242: typedarray.js generates each TypedArray method
-// from array.ts with `.replaceAll('any[]', name)`. That also retyped join's and
-// toString's internal `const parts: any[]` helper as e.g. a Uint8Array, so the
-// joined strings were stored into a "typed array": Uint8Array join returned
-// garbage and Uint16Array join crashed. Put `parts` back to a plain array after
-// the replacement; map/filter's intentionally typed `out` is untouched.
-const TA_JOIN_ANCHOR = ".replaceAll('Array', name).replaceAll('any[]', name) + '\\n\\n'";
-const TA_JOIN_INJECT =
-  ".replaceAll('Array', name).replaceAll('any[]', name).replaceAll('const parts: ' + name + ' =', 'const parts: any[] =') /* sproutboat #242 */ + '\\n\\n'";
-const TA_JOIN_MARKER = "sproutboat #242";
-
-// Porffor's TypedArray.from only handles iterables. An array-like input such
-// as { length: 16 } silently becomes an empty typed array, including HMAC
-// keys made with Uint8Array.from({ length: 16 }, mapFn). The compiler uses a
-// precompiled builtin table, so the edited source must be precompiled again.
-const TYPED_ARRAY_FROM_ANCHOR =
-  "    len = i;\n  }\n\n  arr.length = len;\n\n  return new ${name}(arr);\n};";
-const TYPED_ARRAY_FROM_INJECT =
-  "    len = i;\n" +
-  "  } else {\n" +
-  "    // sproutboat: TypedArray.from accepts array-like objects.\n" +
-  "    let count = ecma262.ToIntegerOrInfinity(Porffor.object.get(arg, 'length'));\n" +
-  "    if (count < 0) count = 0;\n" +
-  "    if (count > 2147483643) throw new RangeError('Invalid TypedArray length (over maximum supported length)');\n" +
-  "    if (Porffor.type(mapFn) != Porffor.TYPES.undefined && Porffor.type(mapFn) != Porffor.TYPES.function)\n" +
-  "      throw new TypeError('Called TypedArray.from with a non-function mapFn');\n" +
-  "    for (let i: i32 = 0; i < count; i++) {\n" +
-  "      arr[i] = Porffor.type(mapFn) == Porffor.TYPES.undefined ? arg[i] : mapFn(arg[i], i);\n" +
-  "    }\n" +
-  "    len = count;\n" +
-  "  }\n\n  arr.length = len;\n\n  return new ${name}(arr);\n};";
-const TYPED_ARRAY_FROM_MARKER = "sproutboat: TypedArray.from accepts array-like objects";
 
 // Porffor alpha 9 treats +02:00 as two milliseconds and adds offset hours
 // instead of subtracting them. Count fields even when they contain zero, and
@@ -1249,7 +1205,7 @@ export async function patchDateParser(root: string): Promise<void> {
   await writeFile(file, src.slice(0, start) + parser.replace(DATE_PARSER_ANCHOR, DATE_PARSER_INJECT) + src.slice(end));
 }
 
-/** #168: keep a promise resolving to null out of the `then` probe. Precompiled by patchTypedArrayFrom. */
+/** #168: keep a promise resolving to null out of the `then` probe. */
 export async function patchPromiseResolveNull(root: string): Promise<void> {
   const file = resolve(root, "compiler/builtins/promise.ts");
   const src = await readFile(file, "utf8");
@@ -1259,7 +1215,7 @@ export async function patchPromiseResolveNull(root: string): Promise<void> {
   await writeFile(file, src.replace(PROMISE_NULL_ANCHOR, PROMISE_NULL_INJECT));
 }
 
-/** #237: linear String.prototype.replaceAll. Precompiled by patchTypedArrayFrom. */
+/** #237: linear String.prototype.replaceAll. Precompiled by precompileBuiltins. */
 export async function patchReplaceAll(root: string): Promise<void> {
   const file = resolve(root, "compiler/builtins/string.ts");
   let src = await readFile(file, "utf8");
@@ -1293,27 +1249,8 @@ export async function patchTypedArrayStore(root: string): Promise<void> {
   if (changed) await writeFile(file, src);
 }
 
-export async function patchTypedArrayFrom(root: string): Promise<void> {
-  const file = resolve(root, "compiler/builtins/typedarray.js");
-  const src = await readFile(file, "utf8");
-  if (!src.includes(TYPED_ARRAY_FROM_MARKER) && !src.includes(TYPED_ARRAY_FROM_ANCHOR)) {
-    throw new Error(`could not patch Porffor's TypedArray.from: anchor not found in ${file}`);
-  }
-  let edited = src;
-  if (!edited.includes(TYPED_ARRAY_FROM_MARKER)) edited = edited.replace(TYPED_ARRAY_FROM_ANCHOR, TYPED_ARRAY_FROM_INJECT);
-  if (!edited.includes(TA_JOIN_MARKER)) {
-    if (!edited.includes(TA_JOIN_ANCHOR))
-      throw new Error(`could not patch Porffor's typed-array method generator: anchor not found in ${file}`);
-    edited = edited.replace(TA_JOIN_ANCHOR, TA_JOIN_INJECT);
-  }
-  if (!edited.includes(TA_SET_OFFSET_MARKER)) {
-    if (!edited.includes(TA_SET_OFFSET_ANCHOR))
-      throw new Error(`could not patch Porffor's TypedArray.prototype.set offset: anchor not found in ${file}`);
-    edited = edited.replace(TA_SET_OFFSET_ANCHOR, TA_SET_OFFSET_INJECT);
-  }
-  if (edited !== src) await writeFile(file, edited);
+export async function precompileBuiltins(root: string): Promise<void> {
   const table = resolve(root, "compiler/builtins_precompiled.js");
-  const before = await readFile(table);
   // Porffor only writes the table when import.meta.url matches argv[1].
   // macOS's /var -> /private/var symlink makes a noncanonical argv[1] skip it.
   const precompile = await realpath(resolve(root, "compiler/precompile.js"));
@@ -1327,9 +1264,8 @@ export async function patchTypedArrayFrom(root: string): Promise<void> {
     new Response(child.stdout).text(),
     new Response(child.stderr).text(),
   ]);
-  if (code !== 0) throw new Error(`could not precompile Porffor's TypedArray.from: ${stderr || stdout}`);
-  if (edited !== src && before.equals(await readFile(table)))
-    throw new Error(`Porffor precompile did not update ${table}`);
+  if (code !== 0) throw new Error(`could not precompile Porffor's patched builtins: ${stderr || stdout}`);
+  if ((await readFile(table)).length === 0) throw new Error(`Porffor precompile produced an empty ${table}`);
 }
 
 /** The native-fetch server source: $PORT support + the #165 console sink. Exported for tests. */
@@ -1385,7 +1321,7 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchTypedArrayStore(root);
   // Last of the builtin edits: its precompile picks up the date, promise and
   // replaceAll patches above too.
-  await patchTypedArrayFrom(root);
+  await precompileBuiltins(root);
   await patchUnicode(root);
   done.add(root);
 }

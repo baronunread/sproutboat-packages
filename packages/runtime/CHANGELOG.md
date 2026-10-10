@@ -1,5 +1,11 @@
 # @sproutboat/runtime
 
+## 0.15.0
+
+### Minor Changes
+
+- Pin and vendor Porffor alpha-16 (43087d4). Enable Proxy and revocable Proxy in handler validation, add native regression coverage for traps and iterators, and drop three typed-array patches now implemented upstream. URLSearchParams and FormData now provide live, self-iterable keys, values and entries iterators. See PORFFOR_ALPHA16.md for the complete change audit and remaining package compatibility limits.
+
 ## 0.14.0
 
 ### Minor Changes

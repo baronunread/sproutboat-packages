@@ -25,14 +25,7 @@ const alwaysForbidden: Array<[RegExp, string]> = [
   // match would also flag it appearing in an ordinary string a dependency
   // happens to construct (a doc link, a log message).
   [/['"`]node:/, "Node, Bun, and Deno APIs are not supported"],
-  // The Porffor pin compiles `new Proxy(...)` and then ignores the handler: a
-  // trapped property reads back as `undefined`, with no throw. Rejecting it
-  // here is the difference between a build error and a 502 nobody can explain.
-  // It is why itty-router and other Proxy-based routers do not work yet.
-  [
-    /\bnew\s+Proxy\s*\(|\bProxy\s*\.\s*revocable\s*\(/,
-    "Proxy is not supported by the compiler: its traps are silently ignored and the property reads back as undefined",
-  ],
+
 ];
 
 export function validateHttpSyncSource(source: string): SourceValidation {
