@@ -47,8 +47,13 @@ support. See the runtime's WEB_STREAMS.md for the stream transport limits.
 
 ## Verification
 
-The package suite passes 183 tests, the CLI suite passes 114, broker kitchen
+The development branches pass 183 package tests and 114 CLI tests; broker kitchen
 sink passes 37 checks, standalone kitchen sink passes 40 checks, and all 21
-small examples pass. Native crypto, Unicode, live iterators, streams, base64,
+small examples pass. The isolated package release passes 177 tests. Native
+crypto, Unicode, live iterators, streams, base64,
 model resolution and global timer checks pass. Native timer functions are also
 exposed on globalThis for libraries using host-task yields.
+
+The stream ponyfill IIFE still fails with a prototype TypeError on Alpha 17;
+its module-scope adaptation remains necessary. The saved standalone auth probe
+also passes with fresh noble hashes 2.4 and zod 4.6.5 dependencies.

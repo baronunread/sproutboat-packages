@@ -27,15 +27,15 @@
     },
     "packages/runtime": {
       "name": "@sproutboat/runtime",
-      "version": "0.15.0",
+      "version": "0.16.0",
     },
     "packages/toolchain": {
       "name": "@sproutboat/toolchain",
-      "version": "0.6.0",
+      "version": "0.7.0",
     },
     "packages/wire": {
       "name": "@sproutboat/wire",
-      "version": "0.12.1",
+      "version": "0.12.2",
       "dependencies": {
         "@sproutboat/assets": "^0.3.0",
         "@sproutboat/runtime": "^0.15.0",
