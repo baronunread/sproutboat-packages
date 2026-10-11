@@ -1249,6 +1249,44 @@ export async function patchTypedArrayStore(root: string): Promise<void> {
   if (changed) await writeFile(file, src);
 }
 
+/** Register elided local function expressions so inference uses their lexical binding. */
+export async function patchLocalFunctionTypes(root: string): Promise<void> {
+  const file = resolve(root, "compiler/codegen.js");
+  let src = await readFile(file, "utf8");
+  const marker = "sproutboat: preserve lexical types for direct-only local functions";
+  if (src.includes(marker)) return;
+  const anchor = "if (!hoistRead && directCallOnlyFunctionBinding(scope, kind, name, pattern, func)) {\n        return valUndefined();";
+  if (!src.includes(anchor)) throw new Error(`could not patch Porffor local function types: anchor not found in ${file}`);
+  src = src.replace(anchor,
+    "if (!hoistRead && directCallOnlyFunctionBinding(scope, kind, name, pattern, func)) {\n" +
+    `        // ${marker}\n` +
+    "        bindNamedFunction(scope, name, func);\n        return valUndefined();");
+  // resolveNamedFunction already handles unambiguous global fallbacks. Falling
+  // back again can infer a type from an unrelated same-named function.
+  const fallback = "const func = resolveNamedFunction(scope, name) ?? funcByName(name);";
+  if (!src.includes(fallback)) throw new Error(`could not patch Porffor local function type fallback: anchor not found in ${file}`);
+  src = src.replace(fallback, "const func = resolveNamedFunction(scope, name);");
+  await writeFile(file, src);
+}
+
+/** Keep base64 option tags accurate and truncate the complete-chunk count. */
+export async function patchUint8ArrayBase64(root: string): Promise<void> {
+  const file = resolve(root, "compiler/builtins/uint8array_base64.ts");
+  let src = await readFile(file, "utf8");
+  const marker = "sproutboat: base64 option tags and complete chunks";
+  if (src.includes(marker)) return;
+  const edits = [
+    ["let alphabet: string =", "let alphabet: any ="],
+    ["let lastChunkHandling: string =", "let lastChunkHandling: any ="],
+    ["const fullChunks: i32 = (len / 3) * 3;", "const fullChunks: i32 = ((len / 3) | 0) * 3;"],
+  ] as const;
+  for (const [anchor, replacement] of edits) {
+    if (!src.includes(anchor)) throw new Error(`could not patch Porffor base64: anchor not found in ${file}`);
+    src = src.replaceAll(anchor, replacement);
+  }
+  await writeFile(file, `// ${marker}\n${src}`);
+}
+
 export async function precompileBuiltins(root: string): Promise<void> {
   const table = resolve(root, "compiler/builtins_precompiled.js");
   // Porffor only writes the table when import.meta.url matches argv[1].
@@ -1319,6 +1357,8 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchPromiseResolveNull(root);
   await patchReplaceAll(root);
   await patchTypedArrayStore(root);
+  await patchLocalFunctionTypes(root);
+  await patchUint8ArrayBase64(root);
   // Last of the builtin edits: its precompile picks up the date, promise and
   // replaceAll patches above too.
   await precompileBuiltins(root);

@@ -32,6 +32,12 @@ crypto random values, binding shims, trigger dispatch) and is identical
 for both transports, which is what lets one conformance suite hold them
 honest.
 
+## Web Streams
+
+The prelude includes readable, writable and transform stream globals. These
+operate in memory; HTTP bodies remain buffered. See [native Web Streams](WEB_STREAMS.md)
+for tested APIs, transport limits and Better Auth compatibility.
+
 ## R2 multipart uploads
 
 R2 bindings implement the Cloudflare multipart method shape for objects that

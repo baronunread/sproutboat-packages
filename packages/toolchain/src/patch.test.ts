@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EMPTY_BINDINGS, wrapNativeFetchHandler } from "../../runtime/src/wrap";
-import { patchRenderJs, patchUwebsockets } from "./patch";
+import { patchLocalFunctionTypes, patchUint8ArrayBase64, patchRenderJs, patchUwebsockets } from "./patch";
 
 // The parts of Porffor's compiler/render.js the patch anchors to.
 const RENDER = `void porf_native_fetch_runtime_init(void) {
@@ -295,6 +295,43 @@ test("#165: render.js routes console output to stderr, unbuffered, idempotently"
 
     await patchRenderJs(root);
     expect(await readFile(join(root, "compiler/render.js"), "utf8")).toBe(once);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+
+test("local function type patch registers lexical bindings and is idempotent", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sb-local-functions-"));
+  try {
+    await mkdir(join(root, "compiler"));
+    const file = join(root, "compiler/codegen.js");
+    await writeFile(file, "if (!hoistRead && directCallOnlyFunctionBinding(scope, kind, name, pattern, func)) {\n        return valUndefined();\n}\nconst func = resolveNamedFunction(scope, name) ?? funcByName(name);");
+    await patchLocalFunctionTypes(root);
+    const patched = await readFile(file, "utf8");
+    expect(patched).toContain("bindNamedFunction(scope, name, func);");
+    expect(patched).not.toContain("?? funcByName(name)");
+    await patchLocalFunctionTypes(root);
+    expect(await readFile(file, "utf8")).toBe(patched);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+
+test("base64 patch preserves option tags and truncates full chunks, idempotently", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sb-base64-patch-"));
+  try {
+    await mkdir(join(root, "compiler/builtins"), { recursive: true });
+    const file = join(root, "compiler/builtins/uint8array_base64.ts");
+    await writeFile(file, "let alphabet: string = 'base64';\nlet lastChunkHandling: string = 'loose';\nconst fullChunks: i32 = (len / 3) * 3;");
+    await patchUint8ArrayBase64(root);
+    const patched = await readFile(file, "utf8");
+    expect(patched).toContain("let alphabet: any =");
+    expect(patched).toContain("let lastChunkHandling: any =");
+    expect(patched).toContain("((len / 3) | 0) * 3");
+    await patchUint8ArrayBase64(root);
+    expect(await readFile(file, "utf8")).toBe(patched);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

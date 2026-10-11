@@ -128,7 +128,9 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "}\n",
     "compiler/builtins/json.ts": "// sb_json_utf16_v1\n",
     "runtime/fetch-globals.js": "// sb_text_encoder_scalar_v1\n",
+    "compiler/builtins/uint8array_base64.ts": "let alphabet: string = 'base64';\nlet lastChunkHandling: string = 'loose';\nconst fullChunks: i32 = (len / 3) * 3;\n",
     "compiler/codegen.js":
+      "if (!hoistRead && directCallOnlyFunctionBinding(scope, kind, name, pattern, func)) {\n        return valUndefined();\n}\nconst func = resolveNamedFunction(scope, name) ?? funcByName(name);\n" +
       "      stmt(scope, Store(ctype, addr, 4, ctype === 'f64' || ctype === 'f32' ? f : toUint32(scope, f)));\n" +
       "  const taGet = (ctype, size, signed = true) => () => {\n" +
       "    const loaded = Load(ctype, taAddr(size), 4);\n" +
