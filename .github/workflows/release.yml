@@ -48,6 +48,10 @@ jobs:
       - run: bun run lint
       - run: bun run test
       - run: bun run test:native-crypto
+      - run: bun run test:native-base64
+      - run: bun run test:native-model-resolver
+      - run: bun run test:native-streams
+      - run: bun run test:native-timers
       - run: bun run test:native-iterators
       - run: bun run test:native-utf8
       - name: Version or publish

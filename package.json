@@ -21,13 +21,19 @@
     "changeset": "changeset",
     "version-packages": "changeset version",
     "release": "changeset publish",
-    "test:native-iterators": "bun packages/runtime/test/native-iterators.ts"
+    "test:native-iterators": "bun packages/runtime/test/native-iterators.ts",
+    "gen:streams": "bun packages/runtime/src/gen-streams.ts",
+    "test:native-streams": "bun packages/runtime/test/native-streams.ts",
+    "test:native-model-resolver": "bun packages/runtime/test/native-model-resolver.ts",
+    "test:native-base64": "bun packages/runtime/test/native-base64.ts",
+    "test:native-timers": "bun packages/runtime/test/native-timers.ts"
   },
   "devDependencies": {
     "@changesets/cli": "^3.0.2",
     "@oxlint/plugins": "1.82.0",
     "bun-types": "^1.4.2",
     "oxlint": "1.82.0",
-    "typescript": "^7.0.2"
+    "typescript": "^7.0.2",
+    "web-streams-polyfill": "4.3.0"
   }
 }
