@@ -57,3 +57,10 @@ exposed on globalThis for libraries using host-task yields.
 The stream ponyfill IIFE still fails with a prototype TypeError on Alpha 17;
 its module-scope adaptation remains necessary. The saved standalone auth probe
 also passes with fresh noble hashes 2.4 and zod 4.6.5 dependencies.
+
+The isolated release consumer passes 103 CLI tests, 35 broker checks, 38
+standalone checks and all 21 examples. The standalone Better Auth flow passes
+with the locked fresh dependency tree. All 32 platform handlers compile and
+30 match Bun; the two existing non-ISO date parsing mismatches remain. Rechecked
+qs nested parse/stringify, IttyRouter GET/Unicode POST/404 and the basic tRPC
+server caller pass. Standard itty Router still fails at labelled iterator breaks.
