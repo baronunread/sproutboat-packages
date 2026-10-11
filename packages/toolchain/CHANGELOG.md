@@ -1,5 +1,17 @@
 # @sproutboat/toolchain
 
+## 0.7.0
+
+### Minor Changes
+
+- 14546a0: Upgrade the verified vendored Porffor pin to Alpha 17, including correct Math.round ties and signed zero, native number parsing and formatting, full console number precision, and class-field capture fixes. Keep downstream compatibility patches until equivalent upstream changes ship.
+
+### Patch Changes
+
+- 14546a0: Register direct-only local function expressions in their lexical scope so type inference does not borrow an unrelated same-named function's return type. Fixes Better Auth's model-name resolver incorrectly treating an existing user schema as missing.
+
+  Correct Uint8Array base64 option string tags and complete-chunk truncation, unblocking base64url signatures and fixing padding and decoding.
+
 ## 0.6.0
 
 ### Minor Changes
