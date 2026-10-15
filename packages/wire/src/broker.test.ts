@@ -1251,15 +1251,30 @@ test("v1: a binary static asset round-trips without UTF-8 replacement", async ()
   writeFileSync(
     join(dir, "assets.json"),
     JSON.stringify({
+      headers: [{ pattern: "/*", set: [["X-Test", "asset"]], unset: ["ETag"] }],
+      redirects: [{ from: "/old", to: "/new", status: 301 }],
       notFound: "none",
       runSproutFirst: false,
-      files: { "/fixture.bin": { type: "application/octet-stream", hash: "fixture" } },
+      files: {
+        "/fixture.bin": { type: "application/octet-stream", hash: "fixture" },
+        "/old": { type: "text/html", hash: "missing-file" },
+      },
     }),
   );
   const b = make({ bindings: { assets: "ASSETS" }, assetsDir: assets, token: "tok" });
   const server = listen(b, "127.0.0.1", 0);
   const got = await v1(server, { v: 1, token: "tok", op: "assets.get", path: "/fixture.bin" });
   expect(got.json.found).toBe(true);
+  expect(got.json.rules).toEqual({
+    headers: [{ pattern: "/*", set: [["X-Test", "asset"]], unset: ["ETag"] }],
+    redirects: [{ from: "/old", to: "/new", status: 301 }],
+  });
+  const missing = await v1(server, { v: 1, token: "tok", op: "assets.get", path: "/old" });
+  expect(missing.json.found).toBe(false);
+  expect(missing.json.status).toBe(301);
+  expect(missing.json.location).toBe("/new");
+  expect(missing.bytes.length).toBe(0);
+  expect(missing.json.rules).toEqual(got.json.rules);
   expect(Buffer.from(got.bytes).equals(Buffer.from(body))).toBe(true);
   server.stop();
   b.close();
