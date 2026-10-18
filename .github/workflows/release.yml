@@ -43,6 +43,7 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
       - run: npm install -g npm@latest # Trusted Publishing needs npm >= 11.5.1
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc libsqlite3-dev
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
       - run: bun run lint

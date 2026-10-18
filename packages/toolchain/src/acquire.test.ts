@@ -17,6 +17,11 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
   const files = {
     "runtime/index.js": "fixture:runtime/index.js\n",
     "compiler/render.js": "// sb_native_utf8_scalar_v1\n" +
+      "void porf_native_fetch_collect_normal_from(void* stack_top) {\n" +
+      "  if (porf_heap_base == 0) return;\n" +
+      "  void* prev_stack_top = porf_c_stack_top;\n  porf_c_stack_top = stack_top;\n" +
+      "  porf_gc_collect_idle();\n  porf_c_stack_top = prev_stack_top;\n}\n" +
+      "\nint porf_native_fetch_should_collect(void) { return 0; }\n" +
       "void porf_native_fetch_runtime_init(void) {\n  signal(SIGPIPE, SIG_IGN);\n  porf_init(0, NULL);\n}\n" +
       "f64 porf_native_fetch_get_port(void) {\nfixture:compiler/render.js\n" +
       "int porf_native_fetch_read_value(jsval value, const char** out_buf, size_t* out_len, char** out_owned) {\n" +
@@ -58,6 +63,9 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "  }\n\n  arr.length = len;\n\n  return new ${name}(arr);\n};\n",
     "compiler/uwebsockets.js":
       'export const makeUWebSocketsShimSource = () => `\n#include "App.h"\n' +
+      "void porf_native_fetch_collect_normal_from(void* stack_top);\n" +
+      "static void collect_after_request(void) {\n  volatile int porf_stack_anchor = 0;\n" +
+      "  porf_native_fetch_collect_normal_from((void*)&porf_stack_anchor);\n}\n" +
       "static const size_t REQUEST_BODY_MAX_BYTES = 1024u * 1024u;\n" +
       "int porf_native_fetch_read_value(struct jsval value, const char** out_buf, size_t* out_len, char** out_owned);\n" +
       "static std::string_view lookup_status_line(i32 status) {\n" +

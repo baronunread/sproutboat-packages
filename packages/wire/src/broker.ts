@@ -17,6 +17,8 @@
  * Encryption at rest and per-key TTLs are v2; redirects are never followed,
  * so there is nothing to re-validate.
  */
+import { createD1Store } from "./d1";
+import type { D1Pool } from "./d1-pool";
 import { Database, type Statement } from "bun:sqlite";
 import { createHash, randomBytes } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statfsSync, statSync, writeFileSync } from "node:fs";
@@ -27,7 +29,7 @@ import { matchRedirect, resolveAssetKey, type AssetManifest } from "@sproutboat/
 import { egressAllowList } from "@sproutboat/runtime";
 import { EGRESS_ERROR_HEADER, EGRESS_TOKEN_HEADER, EGRESS_URL_HEADER, resolveAll, vettedFetch } from "./egress";
 import { isSafeInteger } from "./json";
-import { isBoolean, isString, jsonObject, parseJsonValue, type JsonObject, type JsonValue } from "./json";
+import { isString, jsonObject, parseJsonValue, type JsonObject, type JsonValue } from "./json";
 
 export type Bindings = {
   kv: string[];
@@ -61,6 +63,8 @@ export type Frame = { [key: string]: JsonValue | undefined };
 export type FetchLike = (input: URL | string, init?: RequestInit) => Promise<Response>;
 
 export type BrokerOptions = {
+  /** Shared-mode SQL isolation, owned by the multi-session worker. */
+  d1Pool?: D1Pool;
   db?: string;
   /** Directory for per-D1-binding SQLite files. Defaults to `<dirname(db)>/d1`, or in-memory when `db` is `:memory:`. */
   dataDir?: string;
@@ -114,6 +118,9 @@ export type BrokerOptions = {
   /** Lets a supervisor prepare a replacement without two brokers claiming
    * queues, alarms, or cron ticks at once. Defaults to active. */
   dispatchEnabled?: () => boolean;
+  /** Bounded delivery timeout; leases outlive this deadline. */
+  deliveryTimeoutMs?: number;
+  deliveryLeaseMs?: number;
   /** Directory of published static assets (its sibling `assets.json` is the manifest). Backs `assets.get`. */
   assetsDir?: string;
   /** Injected in tests; defaults to the global `fetch`. */
@@ -129,12 +136,6 @@ export type BrokerOptions = {
   egressToken?: string;
 };
 
-type SqlParam = string | number | null;
-/** The `{ results, meta }` shape Cloudflare's D1 client expects back per statement. */
-type D1Result = {
-  results: JsonValue[];
-  meta: { duration: number; changes: number; last_row_id: number; rows_read: number };
-};
 type R2Row = {
   key: string;
   size: number;
@@ -165,11 +166,6 @@ type R2TransferRow = {
 };
 const MULTIPART_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000;
 const isNumber = (v: JsonValue | undefined): v is number => Number.isFinite(v);
-const sqlParams = (v: JsonValue | undefined): SqlParam[] => {
-  if (!Array.isArray(v)) return [];
-  return v.map((p) => (p === null || isNumber(p) || isString(p) ? p : isBoolean(p) ? (p ? 1 : 0) : String(p)));
-};
-
 // One binding call = one frame, and an R2/KV value travels inside it as a JSON
 // string (escaping can inflate binary content several ×). 32 MiB keeps a ~25 MB
 // upload working; true large-object streaming is v2.
@@ -281,7 +277,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   const openStore = (path: string): Database => {
     const conn = new Database(path, { create: true });
     conn.exec("PRAGMA journal_mode = WAL");
-    conn.exec("PRAGMA synchronous = NORMAL");
+    conn.exec("PRAGMA synchronous = NORMAL; PRAGMA busy_timeout=5000");
     conn.exec(
       "CREATE TABLE IF NOT EXISTS kv (ns TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, " +
         "expires_at INTEGER, PRIMARY KEY (ns, key))",
@@ -327,6 +323,8 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     // Every queue poll filters one partition's live rows and takes its earliest
     // visible batch. This additive index also upgrades existing resource files.
     conn.exec("CREATE INDEX IF NOT EXISTS mq_due ON mq (queue, dead, visible_at)");
+    if (!conn.query<{ name: string }, []>("PRAGMA table_info(mq)").all().some((c) => c.name === "claim_token"))
+      conn.exec("ALTER TABLE mq ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''");
     return conn;
   };
 
@@ -354,6 +352,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   );
   // Alarm polling reads the earliest due objects across classes.
   doDb.exec("CREATE INDEX IF NOT EXISTS do_alarm_due ON do_alarm (at)");
+  doDb.exec("CREATE TABLE IF NOT EXISTS do_alarm_delivery (cls TEXT NOT NULL, id TEXT NOT NULL, at INTEGER NOT NULL, attempts INTEGER NOT NULL, token TEXT NOT NULL, expires INTEGER NOT NULL, PRIMARY KEY(cls,id))");
   // #69 — fixed-window rate-limiter counters, per binding name + key.
   db.exec(
     "CREATE TABLE IF NOT EXISTS ratelimit (name TEXT NOT NULL, key TEXT NOT NULL, window_start INTEGER NOT NULL, " +
@@ -577,69 +576,17 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   // binding wired to an account-level resource (#74) opens `<resource-id>.sqlite`
   // under `resourceDir` (survives redeploys); a bare-string binding keeps its
   // per-broker `<name>.sqlite` under `d1Dir`.
-  const d1Conns = new Map<string, Database>();
-  const d1 = (name: string): Database => {
+  const d1Store = createD1Store();
+  const d1Session = opts.d1Pool?.session();
+  const d1 = (name: string, msg: Frame): Frame | Promise<Frame> => {
     const resource = bindings.resources[name];
     const key = resource && resource.kind === "d1" ? resource.id : name;
-    let conn = d1Conns.get(key);
-    if (!conn) {
-      const dir = resource && resource.kind === "d1" ? resourceDir : d1Dir;
-      if (dir) mkdirSync(dir, { recursive: true });
-      conn = new Database(dir ? join(dir, `${key}.sqlite`) : ":memory:", { create: true });
-      conn.exec("PRAGMA journal_mode = WAL");
-      conn.exec("PRAGMA synchronous = NORMAL");
-      d1Conns.set(key, conn);
-    }
-    return conn;
-  };
-
-  // Run one statement, return CF-D1-shaped { results, meta }.
-  const d1Run = (conn: Database, sql: string, params: SqlParam[]): D1Result => {
-    const started = performance.now();
-    // SQLite hands back column->(string|number|null|blob) rows, i.e. a JSON object.
-    const results = conn.query<JsonObject, SqlParam[]>(sql).all(...params);
-    const m = conn
-      .query<{ changes: number; last_row_id: number }, []>(
-        "SELECT changes() AS changes, last_insert_rowid() AS last_row_id",
-      )
-      .get();
-    return {
-      results,
-      meta: {
-        duration: performance.now() - started,
-        changes: m?.changes ?? 0,
-        last_row_id: m?.last_row_id ?? 0,
-        rows_read: results.length,
-      },
-    };
-  };
-
-  // #164 — an online, integrity-checked snapshot of a D1 database via
-  // VACUUM INTO. Standalone (transport-embedded) is the primary target; the
-  // broker carries it too so one conformance suite covers both backends.
-  const d1Backup = (conn: Database, dbName: string, name: string) => {
-    const source = conn.filename;
-    if (!source || source === ":memory:") throw new Error("d1 backup needs a file-backed database");
-    // A caller-supplied name must be a plain basename; else use the default.
-    const file = /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)
-      ? name
-      : `${dbName}-${new Date().toISOString().replace(/[:.]/g, "-")}.sqlite`;
-    const dir = join(dirname(dirname(resolve(source))), "backups");
-    mkdirSync(dir, { recursive: true });
-    const dest = join(dir, file);
-    if (existsSync(dest)) rmSync(dest); // VACUUM INTO refuses an existing target
-    conn.run("VACUUM INTO ?", [dest]);
-    const copy = new Database(dest, { readonly: true });
-    try {
-      const row = copy.query<{ integrity_check: string }, []>("PRAGMA integrity_check").get();
-      if (row?.integrity_check !== "ok") {
-        rmSync(dest, { force: true });
-        throw new Error("integrity check failed on the backup");
-      }
-    } finally {
-      copy.close();
-    }
-    return { path: dest, bytes: statSync(dest).size };
+    const dir = resource && resource.kind === "d1" ? resourceDir : d1Dir;
+    const path = dir ? resolve(dir, `${key}.sqlite`) : ":memory:";
+    // In-memory namespaces belong to this session; file resources share affinity.
+    const identity = path === ":memory:" ? `${token}:${dbPath}:${key}` : path;
+    const request = { key: identity, path, name, msg };
+    return d1Session ? d1Session.execute(request) : d1Store.execute({ ...request, owner: "dedicated" });
   };
 
   /**
@@ -948,7 +895,9 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       const row = store.query<R2Row, [string, string]>("SELECT * FROM r2 WHERE bucket = ? AND key = ?").get(bucket, ticket.key);
       if (!row) return new Response("not found", { status: 404 });
       const etag = `"${row.etag}"`;
-      if (request.headers.get("if-none-match") === etag) return new Response(null, { status: 304, headers: { etag } });
+      const noneMatch = request.headers.get("if-none-match");
+      if (noneMatch?.split(",").some((value) => value.trim() === "*" || value.trim().replace(/^W\//, "") === etag))
+        return new Response(null, { status: 304, headers: { etag } });
       const rangeHeader = request.headers.get("range");
       const range = parseRange(rangeHeader, row.size);
       if (!range) {
@@ -1365,25 +1314,11 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       case "service.fetch":
         return asTextFrame(await serviceFetch(msg));
 
-      case "d1.query": {
-        const conn = d1(requireD1(msg.db));
-        return { ok: true, ...d1Run(conn, str(msg.sql), sqlParams(msg.params)) };
-      }
-      case "d1.batch": {
-        const conn = d1(requireD1(msg.db));
-        const stmts = Array.isArray(msg.statements) ? msg.statements.map((s) => jsonObject(s) ?? {}) : [];
-        const runAll = conn.transaction(() => stmts.map((s) => d1Run(conn, str(s.sql), sqlParams(s.params))));
-        return { ok: true, results: runAll() };
-      }
-      case "d1.exec": {
-        const conn = d1(requireD1(msg.db));
-        conn.exec(str(msg.sql));
-        return { ok: true };
-      }
-      case "d1.backup": {
-        const name = requireD1(msg.db);
-        return { ok: true, ...d1Backup(d1(name), name, msg.name == null ? "" : str(msg.name)) };
-      }
+      case "d1.query":
+      case "d1.batch":
+      case "d1.exec":
+      case "d1.backup":
+        return await d1(requireD1(msg.db), msg);
 
       case "ratelimit.check": {
         // #69 — fixed window; limit/period arrive in the message. Same upsert as
@@ -1640,21 +1575,37 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
 
       // #125 — alarms. `at` is epoch ms; setting one replaces any pending alarm
       // for that object, and attempts resets because this is a fresh schedule.
-      case "do.alarm.set":
-        doDb.query(
-          "INSERT INTO do_alarm (cls, id, at, attempts) VALUES (?1,?2,?3,0) " +
-            "ON CONFLICT (cls, id) DO UPDATE SET at = ?3, attempts = 0",
-        ).run(requireDoClass(msg.cls), str(msg.id), Math.trunc(Number(msg.at) || 0));
-        return { ok: true };
+      case "do.alarm.set": {
+        const cls = requireDoClass(msg.cls);
+        doDb.transaction(() => {
+          doDb.query("DELETE FROM do_alarm_delivery WHERE cls=? AND id=? AND expires<=?").run(cls,str(msg.id),Date.now());
+          doDb.query("INSERT INTO do_alarm (cls,id,at,attempts) VALUES (?1,?2,?3,0) ON CONFLICT (cls,id) DO UPDATE SET at=?3,attempts=0").run(cls,str(msg.id),Math.trunc(Number(msg.at)||0));
+        }).immediate();
+        return {ok:true};
+      }
       case "do.alarm.get": {
         const row = doDb
-          .query<{ at: number }, [string, string]>("SELECT at FROM do_alarm WHERE cls = ? AND id = ?")
+          .query<{ at: number }, [string, string]>(
+            "SELECT at FROM do_alarm WHERE cls = ? AND id = ?",
+          )
           .get(requireDoClass(msg.cls), str(msg.id));
-        return { ok: true, at: row ? row.at : null };
+        const retry = row
+          ? null
+          : doDb
+              .query<{ at: number }, [string, string, number]>(
+                "SELECT at FROM do_alarm_delivery WHERE cls=? AND id=? AND expires <= ? AND attempts < 5",
+              )
+              .get(str(msg.cls), str(msg.id), Date.now() + 5_000);
+        return { ok: true, at: row ? row.at : (retry?.at ?? null) };
       }
       case "do.alarm.delete": {
-        const r = doDb.query("DELETE FROM do_alarm WHERE cls = ? AND id = ?").run(requireDoClass(msg.cls), str(msg.id));
-        return { ok: true, deleted: r.changes > 0 };
+        const cls = requireDoClass(msg.cls);
+        const deleted = doDb.transaction(() => {
+          const pending = doDb.query("DELETE FROM do_alarm WHERE cls=? AND id=?").run(cls,str(msg.id));
+          const delivery = doDb.query("DELETE FROM do_alarm_delivery WHERE cls=? AND id=?").run(cls,str(msg.id));
+          return pending.changes > 0 || delivery.changes > 0;
+        }).immediate();
+        return {ok:true,deleted};
       }
 
       case "assets.get": {
@@ -1898,103 +1849,189 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   const QUEUE_BATCH = 10;
   const QUEUE_MAX_ATTEMPTS = 5;
 
-  async function deliverTrigger(kind: "scheduled" | "queue" | "alarm", body: JsonObject): Promise<Response | null> {
-    if (!opts.sproutUrl || !dispatchEnabled()) return null;
+  const timeoutMs = opts.deliveryTimeoutMs ?? 25_000;
+  const leaseMs = opts.deliveryLeaseMs ?? 30_000;
+  if (!(timeoutMs > 0 && leaseMs > timeoutMs))
+    throw new Error("delivery lease must exceed its timeout");
+  let closed = false;
+  const deliveries = new Set<AbortController>();
+  async function deliverTrigger(
+    kind: "scheduled" | "queue" | "alarm",
+    body: JsonObject,
+  ): Promise<Response | null> {
+    if (!opts.sproutUrl || !dispatchEnabled() || closed) return null;
+    const abort = new AbortController();
+    deliveries.add(abort);
+    const timer = setTimeout(() => abort.abort(), timeoutMs);
     try {
-      return await doFetch(opts.sproutUrl, {
-        method: "POST",
-        headers: { "x-sb-trigger": kind, "x-sb-token": token, "content-type": "application/json" },
-        body: JSON.stringify(body),
-      });
+      const response = await Promise.race([
+        doFetch(opts.sproutUrl, {
+          method: "POST",
+          signal: abort.signal,
+          headers: {
+            "x-sb-trigger": kind,
+            "x-sb-token": token,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify(body),
+        }).then(async (res) => {
+            if (kind !== "queue") { await res.body?.cancel(); return new Response(null,{status:res.status}); }
+            const chunks: Uint8Array[] = [];
+            let size = 0;
+            const reader = res.body?.getReader();
+            try {
+              if (reader) for (;;) {
+                const part = await reader.read();
+                if (part.done) break;
+                size += part.value.byteLength;
+                if (size > 65_536) { await reader.cancel(); throw new Error("delivery acknowledgement exceeds 64 KiB"); }
+                chunks.push(part.value);
+              }
+            } finally { reader?.releaseLock(); }
+            return new Response(size ? Buffer.concat(chunks) : null,{status:res.status,headers:res.headers});
+          }),
+        new Promise<never>((_, reject) =>
+          abort.signal.addEventListener("abort", () => reject(new Error("delivery interrupted")), {
+            once: true,
+          }),
+        ),
+      ]);
+      return response;
     } catch {
       return null;
+    } finally {
+      clearTimeout(timer);
+      deliveries.delete(abort);
     }
   }
 
   function drainQueuesOnce(): void {
-    if (!opts.sproutUrl || !dispatchEnabled() || bindings.queues.length === 0) return;
-    const now = Date.now();
+    if (!opts.sproutUrl || !dispatchEnabled() || closed) return;
     for (const binding of bindings.queues) {
-      // `store`/`part` route the rows to this queue's backing file (#74); the
-      // trigger payload still carries the binding name the sprout matches on.
       const { store, part } = storeFor("queue", binding);
+      const now = Date.now();
+      const claim = randomBytes(24).toString("hex");
       const rows = store
-        .query<{ id: string; body: string; attempts: number }, [string, number, number]>(
-          "SELECT id, body, attempts FROM mq WHERE queue = ? AND dead = 0 AND visible_at <= ? ORDER BY visible_at LIMIT ?",
-        )
-        .all(part, now, QUEUE_BATCH);
-      if (rows.length === 0) continue;
-      // hide the batch so the next tick doesn't re-deliver it while in flight
-      const hideUntil = now + 30_000;
-      const hide = store.query("UPDATE mq SET visible_at = ? WHERE id = ?");
-      for (const r of rows) hide.run(hideUntil, r.id);
-
+        .transaction(() => {
+          store
+            .query("UPDATE mq SET dead = 1 WHERE queue = ? AND visible_at <= ? AND attempts >= ?")
+            .run(part, now, QUEUE_MAX_ATTEMPTS);
+          const due = store
+            .query<{ id: string; body: string; attempts: number }, [string, number, number]>(
+              "SELECT id, body, attempts FROM mq WHERE queue = ? AND dead = 0 AND visible_at <= ? ORDER BY visible_at LIMIT ?",
+            )
+            .all(part, now, QUEUE_BATCH);
+          for (const row of due)
+            store
+              .query(
+                "UPDATE mq SET visible_at = ?, claim_token = ?, attempts = attempts + 1 WHERE queue = ? AND id = ?",
+              )
+              .run(now + leaseMs, claim, part, row.id);
+          return due;
+        })
+        .immediate();
+      if (!rows.length) continue;
       void deliverTrigger("queue", {
         queue: binding,
-        messages: rows.map((r) => ({ id: r.id, body: r.body, timestamp: now, attempts: r.attempts + 1 })),
+        messages: rows.map((r) => ({
+          id: r.id,
+          body: r.body,
+          timestamp: now,
+          attempts: r.attempts + 1,
+        })),
       }).then(async (res) => {
-        let ack: string[] = rows.map((r) => r.id); // default: ack all if the sprout did not say
+        if (closed || !dispatchEnabled()) return;
+        const claimed = new Set(rows.map((r) => r.id));
+        let ack = rows.map((r) => r.id);
         let retry: string[] = [];
-        if (res && res.ok) {
+        if (res?.ok) {
           try {
             const parsed = jsonObject(parseJsonValue(await res.text()));
-            const ids = (value: JsonValue | undefined) => (Array.isArray(value) ? value.filter(isString) : null);
+            const ids = (v: JsonValue | undefined) =>
+              Array.isArray(v) ? v.filter(isString).filter((id) => claimed.has(id)) : null;
             ack = (parsed && ids(parsed.ack)) ?? ack;
             retry = (parsed && ids(parsed.retry)) ?? [];
           } catch {
-            /* keep defaults */
+            ack = [];
+            retry = rows.map((r) => r.id);
           }
         } else {
           ack = [];
-          retry = rows.map((r) => r.id); // delivery failed → retry all
+          retry = rows.map((r) => r.id);
         }
-        const del = store.query("DELETE FROM mq WHERE id = ?");
-        for (const id of ack) del.run(id);
-        const bump = store.query(
-          "UPDATE mq SET attempts = attempts + 1, visible_at = ?, dead = CASE WHEN attempts + 1 >= ? THEN 1 ELSE 0 END WHERE id = ?",
-        );
-        for (const id of retry) bump.run(Date.now() + 5_000, QUEUE_MAX_ATTEMPTS, id);
+        if (closed || !dispatchEnabled()) return;
+        const retrySet = new Set(retry);
+        store
+          .transaction(() => {
+            for (const id of ack)
+              if (!retrySet.has(id))
+                store
+                  .query(
+                    "DELETE FROM mq WHERE queue = ? AND id = ? AND claim_token = ? AND visible_at > ?",
+                  )
+                  .run(part, id, claim, Date.now());
+            for (const id of retry)
+              store
+                .query(
+                  "UPDATE mq SET visible_at = ?, claim_token = '', dead = CASE WHEN attempts >= ? THEN 1 ELSE 0 END WHERE queue = ? AND id = ? AND claim_token = ? AND visible_at > ?",
+                )
+                .run(Date.now() + 5_000, QUEUE_MAX_ATTEMPTS, part, id, claim, Date.now());
+          })
+          .immediate();
       });
     }
   }
 
   const ALARM_MAX_ATTEMPTS = 5;
-
-  /**
-   * #125 — fire alarms that are due.
-   *
-   * Claim-then-deliver, not deliver-then-delete: `alarm()` is allowed to call
-   * `setAlarm()` for its next run, and that write lands *during* delivery. If
-   * we deleted afterwards we would erase the alarm the handler just scheduled,
-   * which is how a self-rescheduling object silently stops. Deleting first
-   * means the handler's row is a fresh insert nothing else touches.
-   *
-   * A failed delivery re-arms with the queue consumer's policy — 5s apart, five
-   * attempts — and `DO NOTHING` so a re-arm never overwrites an alarm the
-   * handler set itself.
-   */
   function fireAlarmsOnce(): void {
-    if (!opts.sproutUrl || !dispatchEnabled() || bindings.do.length === 0) return;
+    if (!opts.sproutUrl || !dispatchEnabled() || bindings.do.length === 0 || closed) return;
     const now = Date.now();
-    const due = doDb
-      .query<{ cls: string; id: string; at: number; attempts: number }, [number]>(
-        "SELECT cls, id, at, attempts FROM do_alarm WHERE at <= ? ORDER BY at LIMIT 10",
-      )
-      .all(now);
-    if (due.length === 0) return;
-    const claim = doDb.query("DELETE FROM do_alarm WHERE cls = ? AND id = ?");
-    const rearm = doDb.query(
-      "INSERT INTO do_alarm (cls, id, at, attempts) VALUES (?1,?2,?3,?4) ON CONFLICT (cls, id) DO NOTHING",
-    );
-    for (const row of due) {
-      claim.run(row.cls, row.id);
-      void deliverTrigger("alarm", { cls: row.cls, id: row.id, scheduledTime: row.at }).then((res) => {
-        if (res && res.ok) return;
-        const attempts = row.attempts + 1;
-        if (attempts >= ALARM_MAX_ATTEMPTS) return; // give up rather than spin forever
-        rearm.run(row.cls, row.id, Date.now() + 5_000, attempts);
+    const claimed = doDb
+      .transaction(() => {
+        doDb.query("DELETE FROM do_alarm_delivery WHERE expires<=? AND attempts>=5 AND EXISTS (SELECT 1 FROM do_alarm a WHERE a.cls=do_alarm_delivery.cls AND a.id=do_alarm_delivery.id)").run(now);
+        const due = doDb
+          .query<{ cls: string; id: string; at: number; attempts: number }, [number]>(
+            "SELECT cls,id,at,attempts FROM do_alarm WHERE at <= ? AND NOT EXISTS (SELECT 1 FROM do_alarm_delivery d WHERE d.cls=do_alarm.cls AND d.id=do_alarm.id) ORDER BY at LIMIT 10",
+          )
+          .all(now)
+          .filter((r) => bindings.do.some((b) => b.className === r.cls));
+        for (const r of due) {
+          doDb
+            .query("INSERT INTO do_alarm_delivery VALUES (?,?,?,?,?,?)")
+            .run(r.cls, r.id, r.at, r.attempts, "", 0);
+          doDb.query("DELETE FROM do_alarm WHERE cls=? AND id=? AND at=?").run(r.cls, r.id, r.at);
+        }
+        const expired = doDb
+          .query<{ cls: string; id: string; at: number; attempts: number }, [number, number]>(
+            "SELECT cls,id,at,attempts FROM do_alarm_delivery WHERE expires <= ? AND attempts < ? LIMIT 10",
+          )
+          .all(now, ALARM_MAX_ATTEMPTS)
+          .filter((r) => bindings.do.some((b) => b.className === r.cls));
+        return expired.map((r) => {
+          const claim = randomBytes(24).toString("hex");
+          doDb
+            .query(
+              "UPDATE do_alarm_delivery SET token=?,expires=?,attempts=attempts+1 WHERE cls=? AND id=?",
+            )
+            .run(claim, now + leaseMs, r.cls, r.id);
+          return { ...r, claim };
+        });
+      })
+      .immediate();
+    for (const r of claimed)
+      void deliverTrigger("alarm", { cls: r.cls, id: r.id, scheduledTime: r.at }).then((res) => {
+        if (closed || !dispatchEnabled()) return;
+        if (res?.ok || doDb.query("SELECT 1 FROM do_alarm WHERE cls=? AND id=?").get(r.cls, r.id))
+          doDb
+            .query("DELETE FROM do_alarm_delivery WHERE cls=? AND id=? AND token=? AND expires > ?")
+            .run(r.cls, r.id, r.claim, Date.now());
+        else
+          doDb
+            .query(
+              "UPDATE do_alarm_delivery SET expires=? WHERE cls=? AND id=? AND token=? AND expires > ?",
+            )
+            .run(Date.now() + 5_000, r.cls, r.id, r.claim, Date.now());
       });
-    }
   }
 
   if (opts.sproutUrl) {
@@ -2010,7 +2047,8 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
           if (stamp === lastTick) return; // once per minute
           lastTick = stamp;
           for (const expr of bindings.crons) {
-            if (cronMatches(expr, now)) void deliverTrigger("scheduled", { cron: expr, scheduledTime: now.getTime() });
+            if (cronMatches(expr, now))
+              void deliverTrigger("scheduled", { cron: expr, scheduledTime: now.getTime() });
           }
         }, 15_000),
       );
@@ -2023,8 +2061,11 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     handleFrame,
     transfer,
     close: () => {
+      closed = true;
+      for (const delivery of deliveries) delivery.abort();
       for (const t of timers) clearInterval(t);
-      for (const conn of d1Conns.values()) conn.close();
+      d1Session?.close();
+      d1Store.close();
       for (const conn of resourceDbs.values()) conn.close();
       if (doDb !== db) doDb.close();
       db.close();
@@ -2075,18 +2116,63 @@ export function listen(broker: Broker, hostname: string, port: number): BrokerSe
   // Concatenating on every chunk copies the accumulated buffer each time, which
   // is quadratic in the body size: an 8 MB object arriving in 64 KB pieces
   // copied hundreds of megabytes before anything was parsed.
-  const server = Bun.listen<{ chunks: Buffer[]; size: number }>({
+  type SocketState = {
+    chunks: Buffer[];
+    size: number;
+    processing: boolean;
+    closed: boolean;
+    output: Buffer | null;
+    offset: number;
+    written: (() => void) | null;
+  };
+  const flush = (socket: Bun.Socket<SocketState>): void => {
+    const state = socket.data;
+    if (state.closed || !state.output) return;
+    const accepted = socket.write(state.output.subarray(state.offset));
+    if (accepted < 0) { socket.end(); return; }
+    state.offset += accepted;
+    if (state.offset === state.output.length) {
+      state.output = null;
+      const done = state.written;
+      state.written = null;
+      done?.();
+    }
+  };
+  const send = (socket: Bun.Socket<SocketState>, output: Buffer): Promise<void> => {
+    if (socket.data.closed) return Promise.resolve();
+    return new Promise((done) => {
+      socket.data.output = output;
+      socket.data.offset = 0;
+      socket.data.written = done;
+      flush(socket);
+    });
+  };
+  const server = Bun.listen<SocketState>({
     hostname,
     port,
     socket: {
       open(socket) {
-        socket.data = { chunks: [], size: 0 };
+        socket.data = { chunks: [], size: 0, processing: false, closed: false, output: null, offset: 0, written: null };
+      },
+      drain: flush,
+      close(socket) {
+        const state = socket.data;
+        state.closed = true;
+        state.chunks = [];
+        state.size = 0;
+        state.output = null;
+        const done = state.written;
+        state.written = null;
+        done?.();
       },
       async data(socket, chunk) {
         const state = socket.data;
         state.chunks.push(chunk);
         state.size += chunk.length;
-        for (;;) {
+        if (state.processing) return;
+        state.processing = true;
+        try { for (;;) {
+          if (state.closed) return;
           if (state.size < 4) return;
           if (state.chunks.length > 1) {
             state.chunks = [Buffer.concat(state.chunks, state.size)];
@@ -2094,7 +2180,7 @@ export function listen(broker: Broker, hostname: string, port: number): BrokerSe
           const buf = state.chunks[0];
           const len = buf.readUInt32LE(0);
           if (len > MAX_FRAME) {
-            socket.write(encodeFrame({ ok: false, error: "frame too large" }));
+            await send(socket, encodeFrame({ ok: false, error: "frame too large" }));
             socket.end();
             return;
           }
@@ -2105,8 +2191,10 @@ export function listen(broker: Broker, hostname: string, port: number): BrokerSe
           const rest = buf.subarray(4 + len);
           state.chunks = rest.length ? [Buffer.from(rest)] : [];
           state.size = rest.length;
-          socket.write(await broker.handleFrame(payload));
-        }
+          // Bun does not buffer unwritten bytes. Serialize replies and retain
+          // the unsent suffix until drain, including binary R2 responses.
+          await send(socket, await broker.handleFrame(payload));
+        } } finally { state.processing = false; }
       },
     },
   });
@@ -2124,8 +2212,9 @@ export function listenTransfers(broker: Broker, hostname: string, port: number):
   return { port: server.port ?? port, stop: () => server.stop(true) };
 }
 
-if (import.meta.main) {
+export function startBroker(argv: string[], d1Pool?: D1Pool) {
   const { values } = parseArgs({
+    args: argv,
     options: {
       port: { type: "string" },
       "transfer-port": { type: "string" },
@@ -2165,7 +2254,9 @@ if (import.meta.main) {
       const parsed = jsonObject(parseJsonValue(values.services));
       if (parsed) {
         services = Object.fromEntries(
-          Object.entries(parsed).flatMap(([binding, host]) => (isString(host) ? [[binding, host] as const] : [])),
+          Object.entries(parsed).flatMap(([binding, host]) =>
+            isString(host) ? [[binding, host] as const] : [],
+          ),
         );
       }
     } catch {
@@ -2176,21 +2267,20 @@ if (import.meta.main) {
   // supervisor promotes one only after the edge points at it, using a local
   // signal instead of a network-visible control endpoint.
   let dispatchEnabled = !values["dispatch-disabled"];
-  process.on("SIGUSR1", () => {
-    dispatchEnabled = true;
-  });
-  process.on("SIGUSR2", () => {
-    dispatchEnabled = false;
-  });
   const broker = createBroker({
+    d1Pool,
     db: values.db,
     dataDir: values["data-dir"],
     resourceDir: values["resource-dir"],
     doDb: values["do-db"],
     ownerId: values["owner-id"],
-    r2QuotaBytes: Number(values["r2-quota-bytes"] ?? process.env.SPROUTBOAT_R2_QUOTA_BYTES) || undefined,
-    r2ResourceIds: values["r2-resource-ids"] ? String(values["r2-resource-ids"]).split(",").filter(Boolean) : undefined,
-    r2MinFreeBytes: Number(values["r2-min-free-bytes"] ?? process.env.SPROUTBOAT_R2_MIN_FREE_BYTES) || undefined,
+    r2QuotaBytes:
+      Number(values["r2-quota-bytes"] ?? process.env.SPROUTBOAT_R2_QUOTA_BYTES) || undefined,
+    r2ResourceIds: values["r2-resource-ids"]
+      ? String(values["r2-resource-ids"]).split(",").filter(Boolean)
+      : undefined,
+    r2MinFreeBytes:
+      Number(values["r2-min-free-bytes"] ?? process.env.SPROUTBOAT_R2_MIN_FREE_BYTES) || undefined,
     token: values.token ?? process.env.SB_BROKER_TOKEN,
     bindings,
     secrets,
@@ -2200,10 +2290,42 @@ if (import.meta.main) {
     services,
     dispatchEnabled: () => dispatchEnabled,
   });
-  const { port } = listen(broker, "127.0.0.1", Number(values.port ?? process.env.SB_BROKER_PORT ?? 0));
+  let listener: BrokerServer;
+  try {
+    listener = listen(broker, "127.0.0.1", Number(values.port ?? process.env.SB_BROKER_PORT ?? 0));
+  } catch (error) {
+    broker.close();
+    throw error;
+  }
+  const { port } = listener;
   const transferPort = Number(values["transfer-port"] ?? process.env.SB_R2_TRANSFER_PORT ?? 0);
-  const transferServer = transferPort > 0 ? listenTransfers(broker, "127.0.0.1", transferPort) : null;
-  console.log(
-    `sproutboat broker: 127.0.0.1:${port} transfer=${transferServer?.port ?? "off"} db=${values.db ?? ":memory:"} sprout=${values["sprout-url"] ?? process.env.SB_SPROUT_URL ?? "(none)"} dispatch=${dispatchEnabled ? "enabled" : "disabled"}`,
-  );
+  let transferServer: BrokerServer | null = null;
+  try {
+    transferServer = transferPort > 0 ? listenTransfers(broker, "127.0.0.1", transferPort) : null;
+  } catch (error) {
+    listener.stop();
+    broker.close();
+    throw error;
+  }
+  return {
+    port,
+    enableDispatch: () => {
+      dispatchEnabled = true;
+    },
+    disableDispatch: () => {
+      dispatchEnabled = false;
+    },
+    close: () => {
+      listener.stop();
+      transferServer?.stop();
+      broker.close();
+    },
+  };
+}
+
+if (import.meta.main) {
+  const session = startBroker(process.argv.slice(2));
+  process.on("SIGUSR1", session.enableDispatch);
+  process.on("SIGUSR2", session.disableDispatch);
+  console.log(`sproutboat broker: 127.0.0.1:${session.port}`);
 }

@@ -12,7 +12,7 @@
     "packages/*"
   ],
   "scripts": {
-    "test": "bun test packages/",
+    "test": "bun run build:sql-budget && bun test packages/",
     "test:native-crypto": "bun packages/runtime/test/native-crypto.ts",
     "test:native-utf8": "bun packages/runtime/test/native-utf8.ts",
     "scorecard": "bun scripts/porffor-scorecard.ts",
@@ -26,7 +26,8 @@
     "test:native-streams": "bun packages/runtime/test/native-streams.ts",
     "test:native-model-resolver": "bun packages/runtime/test/native-model-resolver.ts",
     "test:native-base64": "bun packages/runtime/test/native-base64.ts",
-    "test:native-timers": "bun packages/runtime/test/native-timers.ts"
+    "test:native-timers": "bun packages/runtime/test/native-timers.ts",
+    "build:sql-budget": "bun packages/wire/src/build-d1-budget.ts"
   },
   "devDependencies": {
     "@changesets/cli": "^3.0.2",

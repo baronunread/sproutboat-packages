@@ -1954,7 +1954,8 @@ function __sbEnsureSchema() {
   );
   const kvColumns = __sbSql(s, "PRAGMA table_info(kv)", []).rows;
   let hasKvExpiresAt = false;
-  for (let i = 0; i < kvColumns.length; i++) if (kvColumns[i][1] === "expires_at") hasKvExpiresAt = true;
+  for (let i = 0; i < kvColumns.length; i++)
+    if (kvColumns[i][1] === "expires_at") hasKvExpiresAt = true;
   if (!hasKvExpiresAt) __sbSql(s, "ALTER TABLE kv ADD COLUMN expires_at INTEGER", []);
   // #233 — 1 when the value was put as bytes, same column as the broker's.
   let hasKvBinary = false;
@@ -2011,6 +2012,10 @@ function __sbEnsureSchema() {
   );
   // Additive: old standalone store.sqlite files gain the poll index on open.
   __sbSql(s, "CREATE INDEX IF NOT EXISTS mq_due ON mq (queue, dead, visible_at)", []);
+  const mqColumns = __sbSql(s, "PRAGMA table_info(mq)", []).rows;
+  let mqClaim = false;
+  for (let i = 0; i < mqColumns.length; i++) if (mqColumns[i][1] === "claim_token") mqClaim = true;
+  if (!mqClaim) __sbSql(s, "ALTER TABLE mq ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''", []);
   __sbSql(
     s,
     "CREATE TABLE IF NOT EXISTS do_storage (cls TEXT NOT NULL, id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (cls, id, key))",
@@ -2020,6 +2025,11 @@ function __sbEnsureSchema() {
     "CREATE TABLE IF NOT EXISTS do_alarm (cls TEXT NOT NULL, id TEXT NOT NULL, at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (cls, id))",
   );
   __sbSql(s, "CREATE INDEX IF NOT EXISTS do_alarm_due ON do_alarm (at)", []);
+  __sbSql(
+    s,
+    "CREATE TABLE IF NOT EXISTS do_alarm_delivery (cls TEXT NOT NULL, id TEXT NOT NULL, at INTEGER NOT NULL, attempts INTEGER NOT NULL, token TEXT NOT NULL, expires INTEGER NOT NULL, PRIMARY KEY(cls,id))",
+    [],
+  );
   __sbSql(
     s,
     "CREATE TABLE IF NOT EXISTS ae (dataset TEXT NOT NULL, ts INTEGER NOT NULL, indexes_json TEXT NOT NULL, blobs_json TEXT NOT NULL, doubles_json TEXT NOT NULL)",
@@ -2053,7 +2063,10 @@ function __sbEmbeddedDispatch(msg) {
   if (op === "ping") return { ok: true, op: "pong", echo: msg.msg };
 
   if (op === "kv.get") {
-    const r = __sbSql(store, "SELECT value, expires_at, binary FROM kv WHERE ns = ? AND key = ?", [msg.ns, msg.key]);
+    const r = __sbSql(store, "SELECT value, expires_at, binary FROM kv WHERE ns = ? AND key = ?", [
+      msg.ns,
+      msg.key,
+    ]);
     if (!r.rows.length) return { ok: true, found: false, value: null };
     const expiresAt = r.rows[0][1];
     if (expiresAt != null && expiresAt <= Date.now()) {
@@ -2536,20 +2549,26 @@ function __sbEmbeddedDispatch(msg) {
     return { ok: true, entries };
   }
   if (op === "do.alarm.set") {
-    __sbSql(
-      store,
-      "INSERT INTO do_alarm (cls, id, at, attempts) VALUES (?1,?2,?3,0) ON CONFLICT (cls, id) DO UPDATE SET at = ?3, attempts = 0",
-      [msg.cls, msg.id, Math.trunc(Number(msg.at) || 0)],
-    );
-    return { ok: true };
+    __sbSql(store,"BEGIN IMMEDIATE",[]);
+    try {
+      __sbSql(store,"DELETE FROM do_alarm_delivery WHERE cls=? AND id=? AND expires<=?",[msg.cls,msg.id,Date.now()]);
+      __sbSql(store,"INSERT INTO do_alarm (cls,id,at,attempts) VALUES (?1,?2,?3,0) ON CONFLICT (cls,id) DO UPDATE SET at=?3,attempts=0",[msg.cls,msg.id,Math.trunc(Number(msg.at)||0)]);
+      __sbSql(store,"COMMIT",[]);
+    } catch (error) {__sbSql(store,"ROLLBACK",[]);throw error;}
+    return {ok:true};
   }
   if (op === "do.alarm.get") {
-    const r = __sbSql(store, "SELECT at FROM do_alarm WHERE cls = ? AND id = ?", [msg.cls, msg.id]);
+    const r = __sbSql(store, "SELECT at FROM do_alarm WHERE cls=?1 AND id=?2 UNION ALL SELECT at FROM do_alarm_delivery WHERE cls=?1 AND id=?2 AND expires<=?3 AND attempts<5 LIMIT 1", [msg.cls,msg.id,Date.now()+5000]);
     return { ok: true, at: r.rows.length ? Number(r.rows[0][0]) : null };
   }
   if (op === "do.alarm.delete") {
-    const r = __sbSql(store, "DELETE FROM do_alarm WHERE cls = ? AND id = ?", [msg.cls, msg.id]);
-    return { ok: true, deleted: r.changes > 0 };
+    __sbSql(store,"BEGIN IMMEDIATE",[]);
+    try {
+      const retry=__sbSql(store,"DELETE FROM do_alarm_delivery WHERE cls=? AND id=?",[msg.cls,msg.id]);
+      const pending=__sbSql(store,"DELETE FROM do_alarm WHERE cls=? AND id=?",[msg.cls,msg.id]);
+      __sbSql(store,"COMMIT",[]);
+      return {ok:true,deleted:Number(retry.changes)+Number(pending.changes)>0};
+    } catch (error) {__sbSql(store,"ROLLBACK",[]);throw error;}
   }
 
   if (op === "ae.write") {
@@ -2609,10 +2628,11 @@ function __sbEmbeddedDispatch(msg) {
 
   if (op === "cache.match") {
     const name = msg.name || "default";
-    const r = __sbSql(store, "SELECT status, headers_json, body, expires_at FROM cache WHERE name = ? AND cache_key = ?", [
-      name,
-      msg.key,
-    ]);
+    const r = __sbSql(
+      store,
+      "SELECT status, headers_json, body, expires_at FROM cache WHERE name = ? AND cache_key = ?",
+      [name, msg.key],
+    );
     if (!r.rows.length) return { ok: true, found: false };
     const [status, headersJson, body, expiresAt] = r.rows[0];
     if (expiresAt != null && expiresAt <= Date.now()) {
@@ -2625,10 +2645,16 @@ function __sbEmbeddedDispatch(msg) {
     const name = msg.name || "default";
     const status = Number(msg.status) || 200;
     const headers = msg.headers || {};
-    const cacheControl = String(headers["cache-control"] || headers["Cache-Control"] || "").toLowerCase();
+    const cacheControl = String(
+      headers["cache-control"] || headers["Cache-Control"] || "",
+    ).toLowerCase();
     // Mirrors Workers' own caches.default.put(): a 206 or an explicit
     // no-store/private is a silent no-op, not an error.
-    if (status === 206 || cacheControl.indexOf("no-store") !== -1 || cacheControl.indexOf("private") !== -1) {
+    if (
+      status === 206 ||
+      cacheControl.indexOf("no-store") !== -1 ||
+      cacheControl.indexOf("private") !== -1
+    ) {
       return { ok: true, stored: false };
     }
     const sMaxAge = /s-maxage=(\d+)/.exec(cacheControl);
@@ -2860,17 +2886,36 @@ globalThis.__sbStartLocalTriggers = function (handlers, bindings) {
       const now = Date.now();
       for (let q = 0; q < queues.length; q++) {
         const name = queues[q];
-        const due = __sbSql(
-          store,
-          "SELECT id, body, attempts FROM mq WHERE queue = ? AND dead = 0 AND visible_at <= ? ORDER BY visible_at LIMIT 10",
-          [name, now],
-        );
+        const claim = String(now) + ":" + String(Math.random());
+        __sbSql(store, "BEGIN IMMEDIATE", []);
+        let due;
+        try {
+          __sbSql(store, "UPDATE mq SET dead=1 WHERE queue=? AND visible_at<=? AND attempts>=5", [
+            name,
+            now,
+          ]);
+          due = __sbSql(
+            store,
+            "SELECT id,body,attempts FROM mq WHERE queue=? AND dead=0 AND visible_at<=? ORDER BY visible_at LIMIT 10",
+            [name, now],
+          );
+          for (let i = 0; i < due.rows.length; i++)
+            __sbSql(
+              store,
+              "UPDATE mq SET visible_at=?,claim_token=?,attempts=attempts+1 WHERE queue=? AND id=?",
+              [now + 30000, claim, name, due.rows[i][0]],
+            );
+          __sbSql(store, "COMMIT", []);
+        } catch (error) {
+          __sbSql(store, "ROLLBACK", []);
+          throw error;
+        }
         if (due.rows.length === 0) continue;
         // Hide the batch first, so a slow handler cannot have it delivered twice.
         const messages = [];
         for (let i = 0; i < due.rows.length; i++) {
           const row = due.rows[i];
-          __sbSql(store, "UPDATE mq SET visible_at = ? WHERE id = ?", [now + 30000, row[0]]);
+
           messages.push({ id: row[0], body: row[1], timestamp: now, attempts: Number(row[2]) + 1 });
         }
         // #171 — same ctx.waitUntil as the broker-delivered path, and the same
@@ -2887,13 +2932,17 @@ globalThis.__sbStartLocalTriggers = function (handlers, bindings) {
         if (result && __sbIsFn(result.then)) result = await result;
         if (__sbTasks.length) await __sbDrainWaitUntil(__sbTasks);
         for (let i = 0; i < result.ack.length; i++) {
-          __sbSql(store, "DELETE FROM mq WHERE id = ?", [result.ack[i]]);
+          __sbSql(
+            store,
+            "DELETE FROM mq WHERE queue=? AND id=? AND claim_token=? AND visible_at>?",
+            [name, result.ack[i], claim, Date.now()],
+          );
         }
         for (let i = 0; i < result.retry.length; i++) {
           __sbSql(
             store,
-            "UPDATE mq SET attempts = attempts + 1, visible_at = ?, dead = CASE WHEN attempts + 1 >= 5 THEN 1 ELSE 0 END WHERE id = ?",
-            [Date.now() + 5000, result.retry[i]],
+            "UPDATE mq SET visible_at=?,claim_token='',dead=CASE WHEN attempts>=5 THEN 1 ELSE 0 END WHERE queue=? AND id=? AND claim_token=? AND visible_at>?",
+            [Date.now() + 5000, name, result.retry[i], claim, Date.now()],
           );
         }
       }
@@ -2904,25 +2953,76 @@ globalThis.__sbStartLocalTriggers = function (handlers, bindings) {
     setInterval(async function () {
       __sbEnsureSchema();
       const now = Date.now();
-      const due = __sbSql(
-        store,
-        "SELECT cls, id, at, attempts FROM do_alarm WHERE at <= ? ORDER BY at LIMIT 10",
-        [now],
-      );
+      __sbSql(store, "BEGIN IMMEDIATE", []);
+      let due;
+      const claim = String(now) + ":" + String(Math.random());
+      try {
+        __sbSql(store,"DELETE FROM do_alarm_delivery WHERE expires<=? AND attempts>=5 AND EXISTS (SELECT 1 FROM do_alarm a WHERE a.cls=do_alarm_delivery.cls AND a.id=do_alarm_delivery.id)",[now]);
+        const pending = __sbSql(
+          store,
+          "SELECT cls,id,at,attempts FROM do_alarm WHERE at<=? AND NOT EXISTS (SELECT 1 FROM do_alarm_delivery d WHERE d.cls=do_alarm.cls AND d.id=do_alarm.id) ORDER BY at LIMIT 10",
+          [now],
+        );
+        for (let i = 0; i < pending.rows.length; i++) {
+          const r = pending.rows[i];
+          __sbSql(store, "INSERT INTO do_alarm_delivery VALUES (?,?,?,?,?,?)", [
+            r[0],
+            r[1],
+            r[2],
+            r[3],
+            "",
+            0,
+          ]);
+          __sbSql(store, "DELETE FROM do_alarm WHERE cls=? AND id=? AND at=?", [r[0], r[1], r[2]]);
+        }
+        due = __sbSql(
+          store,
+          "SELECT cls,id,at,attempts FROM do_alarm_delivery WHERE expires<=? AND attempts<5 LIMIT 10",
+          [now],
+        );
+        for (let i = 0; i < due.rows.length; i++)
+          __sbSql(
+            store,
+            "UPDATE do_alarm_delivery SET token=?,expires=?,attempts=attempts+1 WHERE cls=? AND id=?",
+            [claim, now + 30000, due.rows[i][0], due.rows[i][1]],
+          );
+        __sbSql(store, "COMMIT", []);
+      } catch (error) {
+        __sbSql(store, "ROLLBACK", []);
+        throw error;
+      }
       for (let i = 0; i < due.rows.length; i++) {
         const cls = due.rows[i][0];
         const id = due.rows[i][1];
-        // Claim before running: alarm() may schedule the next one, and deleting
-        // afterwards would erase it. Same rule as the broker (#125).
-        __sbSql(store, "DELETE FROM do_alarm WHERE cls = ? AND id = ?", [cls, id]);
-        const instance = __sbGetDOInstance(cls, id);
-        if (__sbIsFn(instance.alarm)) {
-          // #57 gap: this local path bypasses `__sbEntry`'s alarm dispatch
-          // entirely, so it kept the old fire-and-forget behaviour after that
-          // fix landed. Same treatment: await alarm() and drain its waitUntil.
-          const res = instance.alarm();
-          if (res && __sbIsFn(res.then)) await res;
-          if (instance.__sbTasks.length) await __sbDrainWaitUntil(instance.__sbTasks);
+        try {
+          const instance = __sbGetDOInstance(cls, id);
+          if (__sbIsFn(instance.alarm)) {
+            const res = instance.alarm();
+            if (res && __sbIsFn(res.then)) await res;
+            if (instance.__sbTasks.length) await __sbDrainWaitUntil(instance.__sbTasks);
+          }
+          __sbSql(
+            store,
+            "DELETE FROM do_alarm_delivery WHERE cls=? AND id=? AND token=? AND expires>?",
+            [cls, id, claim, Date.now()],
+          );
+        } catch {
+          const scheduled = __sbSql(store, "SELECT 1 FROM do_alarm WHERE cls=? AND id=?", [
+            cls,
+            id,
+          ]);
+          if (scheduled.rows.length)
+            __sbSql(
+              store,
+              "DELETE FROM do_alarm_delivery WHERE cls=? AND id=? AND token=? AND expires>?",
+              [cls, id, claim, Date.now()],
+            );
+          else
+            __sbSql(
+              store,
+              "UPDATE do_alarm_delivery SET expires=? WHERE cls=? AND id=? AND token=? AND expires>?",
+              [Date.now() + 5000, cls, id, claim, Date.now()],
+            );
         }
       }
     }, 500);
