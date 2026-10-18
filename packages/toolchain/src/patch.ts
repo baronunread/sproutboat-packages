@@ -1341,6 +1341,78 @@ export async function patchRenderJs(root: string): Promise<void> {
   if (changed) await writeFile(file, src);
 }
 
+/** Reclaim a burst's dead heap and oversized GC workspace after a quiet period. */
+export async function patchQuietCollection(root: string): Promise<void> {
+  const renderFile = resolve(root, "compiler/render.js");
+  const shimFile = resolve(root, "compiler/uwebsockets.js");
+  let render = await readFile(renderFile, "utf8");
+  let shim = await readFile(shimFile, "utf8");
+  const marker = "// sproutboat: reclaim large idle heaps";
+  if (!render.includes(marker)) {
+    const start = render.indexOf("void porf_native_fetch_collect_normal_from(void* stack_top) {");
+    const end = render.indexOf("\nint porf_native_fetch_should_collect(void)", start);
+    if (start < 0 || end < 0) throw new Error("Porffor quiet-GC renderer anchor missing");
+    const normal = render.slice(start, end);
+    if (
+      !normal.includes("porf_gc_collect_idle();") ||
+      !normal.includes("  porf_c_stack_top = prev_stack_top;")
+    )
+      throw new Error("Porffor quiet-GC collector changed");
+    const quiet = normal
+      .replace("collect_normal_from", "collect_quiet_from")
+      .replace(
+        "if (porf_heap_base == 0) return;",
+        "if (!porf_native_fetch_needs_quiet_collect()) return;",
+      )
+      .replace("porf_gc_collect_idle();", "porf_gc_collect(0);")
+      .replace(
+        "  porf_c_stack_top = prev_stack_top;",
+        `  // The mark queue is empty after collection; its capacity is scratch, not live roots.
+  if (porf_gc_mark_queue_len == 0 && porf_gc_mark_queue_cap > 4096) {
+    free(porf_gc_mark_queue);
+    porf_gc_mark_queue = NULL;
+    porf_gc_mark_queue_cap = 0;
+  }
+  porf_c_stack_top = prev_stack_top;`,
+      );
+    const needs = `int porf_native_fetch_needs_quiet_collect(void) {
+\${gcEnabled ? '  return porf_heap_base != 0 && ((u64)porf_heap_top - (u64)porf_heap_base > 8ull * 1024ull * 1024ull || porf_gc_mark_queue_cap > 65536);' : '  return 0;'}
+}
+`;
+    render = render.slice(0, end) + "\n" + marker + "\n" + needs + quiet + render.slice(end);
+  }
+  if (!shim.includes(marker)) {
+    const declaration = "void porf_native_fetch_collect_normal_from(void* stack_top);";
+    const start = shim.indexOf("static void collect_after_request(void) {");
+    const end = shim.indexOf("\n}\n", start);
+    if (!shim.includes(declaration) || start < 0 || end < 0)
+      throw new Error("Porffor quiet-GC native shim anchor missing");
+    const original = shim.slice(start, end);
+    if (!original.includes("porf_native_fetch_collect_normal_from((void*)&porf_stack_anchor);"))
+      throw new Error("Porffor normal request collection changed");
+    const timer = `${marker}
+static us_timer_t* sb_quiet_gc_timer = nullptr;
+static void sb_collect_quiet(struct us_timer_t*) {
+  volatile int stack_anchor = 0;
+  porf_native_fetch_collect_quiet_from((void*)&stack_anchor);
+}
+`;
+    // Preserve normal request collection unconditionally; only the extra timer is guarded.
+    const schedule = `
+  if (porf_native_fetch_needs_quiet_collect()) {
+    if (!sb_quiet_gc_timer) sb_quiet_gc_timer = us_create_timer((struct us_loop_t*)uWS::Loop::get(), 0, 0);
+    if (sb_quiet_gc_timer) us_timer_set(sb_quiet_gc_timer, sb_collect_quiet, 500, 0);
+  }`;
+    shim = shim.slice(0, start) + timer + original + schedule + shim.slice(end);
+    shim = shim.replace(
+      declaration,
+      declaration +
+        "\nvoid porf_native_fetch_collect_quiet_from(void* stack_top);\nint porf_native_fetch_needs_quiet_collect(void);",
+    );
+  }
+  await Promise.all([writeFile(renderFile, render), writeFile(shimFile, shim)]);
+}
+
 /**
  * Apply every patch to a Porffor checkout at `root` (the directory that holds
  * `compiler/` and `runtime/`). Idempotent per process and per marker, so it is
@@ -1353,6 +1425,7 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchClassSelfName(root);
   await patchUwebsockets(root);
   await patchRenderJs(root);
+  await patchQuietCollection(root);
   await patchDateParser(root);
   await patchPromiseResolveNull(root);
   await patchReplaceAll(root);
