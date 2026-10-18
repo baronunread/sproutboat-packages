@@ -27,7 +27,8 @@
     "test:native-model-resolver": "bun packages/runtime/test/native-model-resolver.ts",
     "test:native-base64": "bun packages/runtime/test/native-base64.ts",
     "test:native-timers": "bun packages/runtime/test/native-timers.ts",
-    "build:sql-budget": "bun packages/wire/src/build-d1-budget.ts"
+    "build:sql-budget": "bun packages/wire/src/build-d1-budget.ts",
+    "test:native-response-defaults": "bun packages/runtime/test/native-response-defaults.ts"
   },
   "devDependencies": {
     "@changesets/cli": "^3.0.2",

@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EMPTY_BINDINGS, wrapNativeFetchHandler } from "../../runtime/src/wrap";
-import { patchLocalFunctionTypes, patchUint8ArrayBase64, patchRenderJs, patchUwebsockets } from "./patch";
+import { patchLocalFunctionTypes, patchResponseDefaults, patchUint8ArrayBase64, patchRenderJs, patchUwebsockets } from "./patch";
 
 // The parts of Porffor's compiler/render.js the patch anchors to.
 const RENDER = `void porf_native_fetch_runtime_init(void) {
@@ -332,6 +332,24 @@ test("base64 patch preserves option tags and truncates full chunks, idempotently
     expect(patched).toContain("((len / 3) | 0) * 3");
     await patchUint8ArrayBase64(root);
     expect(await readFile(file, "utf8")).toBe(patched);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Response defaults patch types string bodies only, idempotently", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sb-response-defaults-"));
+  try {
+    await mkdir(join(root, "runtime"));
+    const file = join(root, "runtime/fetch-globals.js");
+    await writeFile(file, "class Response {\n  constructor(body = null, init = undefined) {\n    this.body = body;\n    this.status = Number(init?.status ?? 200);\n    this.headers = new Headers(init?.headers);\n  }\n}\n");
+    await patchResponseDefaults(root);
+    const patched = await readFile(file, "utf8");
+    expect(patched).toContain("if (typeof body === 'string' && !this.headers.has('content-type')) this.headers.set('content-type', 'text/plain;charset=UTF-8');");
+    await patchResponseDefaults(root);
+    expect(await readFile(file, "utf8")).toBe(patched);
+    await writeFile(file, "class Response {}\n");
+    await expect(patchResponseDefaults(root)).rejects.toThrow("anchor not found");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
