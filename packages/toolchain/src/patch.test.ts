@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EMPTY_BINDINGS, wrapNativeFetchHandler } from "../../runtime/src/wrap";
-import { patchLocalFunctionTypes, patchResponseDefaults, patchUint8ArrayBase64, patchRenderJs, patchUwebsockets } from "./patch";
+import { patchHeadersArrayInit, patchLocalFunctionTypes, patchResponseDefaults, patchUint8ArrayBase64, patchRenderJs, patchUwebsockets } from "./patch";
 
 // The parts of Porffor's compiler/render.js the patch anchors to.
 const RENDER = `void porf_native_fetch_runtime_init(void) {
@@ -350,6 +350,22 @@ test("Response defaults patch types string bodies only, idempotently", async () 
     expect(await readFile(file, "utf8")).toBe(patched);
     await writeFile(file, "class Response {}\n");
     await expect(patchResponseDefaults(root)).rejects.toThrow("anchor not found");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Headers array-init patch sends arrays to the sequence branch, idempotently", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sb-headers-array-"));
+  try {
+    await mkdir(join(root, "runtime"));
+    const file = join(root, "runtime/fetch-globals.js");
+    await writeFile(file, "    if (Porffor.type(init.entries) == Porffor.TYPES.function) {\n      this._entries = Porffor.array.new(8);\n      for (const entry of init.entries()) {\n");
+    await patchHeadersArrayInit(root);
+    const patched = await readFile(file, "utf8");
+    expect(patched).toContain("if (!Array.isArray(init) && Porffor.type(init.entries) == Porffor.TYPES.function) {");
+    await patchHeadersArrayInit(root);
+    expect(await readFile(file, "utf8")).toBe(patched);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

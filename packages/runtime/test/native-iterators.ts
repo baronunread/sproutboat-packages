@@ -10,6 +10,7 @@ const expected = {
   keys: ["a", "a", "b"], values: ["1", "2", "3"],
   live: ["x", "y", true], form: [["x", "1"], ["x", "2"]],
   formLive: ["x", "y", true], self: true,
+  headers: [["a", "1"], ["b", "2"]], headersMap: 2, headersFromEntries: { a: "1", b: "2" },
 };
 const handler = `export default { fetch(request) {
   if (new URL(request.url).pathname === "/null") return new Response(null);
@@ -27,9 +28,13 @@ const handler = `export default { fetch(request) {
   const liveForm = new FormData(); liveForm.append("x", "1");
   const formIterator = liveForm.keys(); const f1 = formIterator.next().value;
   liveForm.append("y", "2"); const f2 = formIterator.next().value;
+  // Sorted input: the spec also sorts and combines on iteration, which Porffor's
+  // Headers does not do yet (insertion order).
+  const h = new Headers([["a", "1"], ["b", "2"]]);
   return Response.json({ query, keys: Array.from(params.keys()), values: Array.from(params.values()),
     live: [first, second, done], form, formLive: [f1, f2, formIterator.next().done],
-    self: iterator[Symbol.iterator]() === iterator });
+    self: iterator[Symbol.iterator]() === iterator,
+    headers: [...h], headersMap: new Map(h).size, headersFromEntries: Object.fromEntries(h) });
 } };`;
 
 function freePort(): number {
