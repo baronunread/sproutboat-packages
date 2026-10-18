@@ -2549,6 +2549,10 @@ if (Response.json == null) {
   };
 }
 
+// Fetch: Headers iterates like entries(), so new Map(headers), [...headers] and
+// Object.fromEntries(headers) work. Porffor's Headers has entries() but no iterator.
+if (Headers.prototype[Symbol.iterator] == null) Headers.prototype[Symbol.iterator] = Headers.prototype.entries;
+
 // Porffor alpha-10 has no static Response.redirect().
 if (Response.redirect == null) {
   Response.redirect = function (url, status = 302) {

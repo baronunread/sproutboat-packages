@@ -1451,6 +1451,23 @@ export async function patchResponseDefaults(root: string): Promise<void> {
   );
 }
 
+const HEADERS_ARRAY_ANCHOR = "    if (Porffor.type(init.entries) == Porffor.TYPES.function) {\n      this._entries = Porffor.array.new(8);\n      for (const entry of init.entries()) {";
+const HEADERS_ARRAY_INJECT = "    if (!Array.isArray(init) && Porffor.type(init.entries) == Porffor.TYPES.function) {\n      this._entries = Porffor.array.new(8);\n      for (const entry of init.entries()) {";
+
+/**
+ * `new Headers([["a", "1"]])`: arrays also have entries() (yielding [index, pair]), and
+ * Porffor checked that first, so a list of pairs became headers named "0", "1"...
+ * Arrays now reach the sequence branch below it.
+ */
+export async function patchHeadersArrayInit(root: string): Promise<void> {
+  const file = resolve(root, "runtime/fetch-globals.js");
+  const src = await readFile(file, "utf8");
+  if (src.includes(HEADERS_ARRAY_INJECT)) return;
+  if (!src.includes(HEADERS_ARRAY_ANCHOR))
+    throw new Error(`could not patch Porffor's Headers array init: anchor not found in ${file}`);
+  await writeFile(file, src.replace(HEADERS_ARRAY_ANCHOR, HEADERS_ARRAY_INJECT));
+}
+
 export async function ensurePorfforPatched(root: string): Promise<void> {
   if (done.has(root)) return;
   await patchCompilerArgs(root);
@@ -1465,6 +1482,7 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchLocalFunctionTypes(root);
   await patchUint8ArrayBase64(root);
   await patchResponseDefaults(root);
+  await patchHeadersArrayInit(root);
   // Last of the builtin edits: its precompile picks up the date, promise and
   // replaceAll patches above too.
   await precompileBuiltins(root);
