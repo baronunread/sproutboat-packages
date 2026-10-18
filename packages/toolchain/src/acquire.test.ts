@@ -135,7 +135,9 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "  if (body_owned) free(body_owned);\n" +
       "}\n",
     "compiler/builtins/json.ts": "// sb_json_utf16_v1\n",
-    "runtime/fetch-globals.js": "// sb_text_encoder_scalar_v1\n",
+    "runtime/fetch-globals.js":
+      "// sb_text_encoder_scalar_v1\n" +
+      "class Response {\n  constructor(body = null, init = undefined) {\n    this.body = body;\n    this.status = Number(init?.status ?? 200);\n    this.headers = new Headers(init?.headers);\n  }\n}\n",
     "compiler/builtins/uint8array_base64.ts": "let alphabet: string = 'base64';\nlet lastChunkHandling: string = 'loose';\nconst fullChunks: i32 = (len / 3) * 3;\n",
     "compiler/codegen.js":
       "if (!hoistRead && directCallOnlyFunctionBinding(scope, kind, name, pattern, func)) {\n        return valUndefined();\n}\nconst func = resolveNamedFunction(scope, name) ?? funcByName(name);\n" +

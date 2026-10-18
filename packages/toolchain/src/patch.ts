@@ -1425,6 +1425,32 @@ static void sb_collect_quiet(struct us_timer_t*) {
  * safe to call on every build. Callers pass an explicit root — `ensurePorffor`
  * right after extraction, the compile path against its resolved checkout.
  */
+const RESPONSE_DEFAULTS_MARKER = "// sproutboat: Fetch default content type for text bodies";
+const RESPONSE_DEFAULTS_ANCHOR =
+  "class Response {\n  constructor(body = null, init = undefined) {\n    this.body = body;\n    this.status = Number(init?.status ?? 200);\n    this.headers = new Headers(init?.headers);\n";
+
+/**
+ * Fetch's extract-a-body step gives a string body `text/plain;charset=UTF-8` unless the
+ * caller set a content type (workerd does). Porffor's Response sent none, so
+ * `new Response("hi")` reached clients untyped.
+ */
+export async function patchResponseDefaults(root: string): Promise<void> {
+  const file = resolve(root, "runtime/fetch-globals.js");
+  const src = await readFile(file, "utf8");
+  if (src.includes(RESPONSE_DEFAULTS_MARKER)) return;
+  if (!src.includes(RESPONSE_DEFAULTS_ANCHOR))
+    throw new Error(`could not patch Porffor's Response defaults: anchor not found in ${file}`);
+  await writeFile(
+    file,
+    src.replace(
+      RESPONSE_DEFAULTS_ANCHOR,
+      RESPONSE_DEFAULTS_ANCHOR +
+        `    ${RESPONSE_DEFAULTS_MARKER}\n` +
+        "    if (typeof body === 'string' && !this.headers.has('content-type')) this.headers.set('content-type', 'text/plain;charset=UTF-8');\n",
+    ),
+  );
+}
+
 export async function ensurePorfforPatched(root: string): Promise<void> {
   if (done.has(root)) return;
   await patchCompilerArgs(root);
@@ -1438,6 +1464,7 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchTypedArrayStore(root);
   await patchLocalFunctionTypes(root);
   await patchUint8ArrayBase64(root);
+  await patchResponseDefaults(root);
   // Last of the builtin edits: its precompile picks up the date, promise and
   // replaceAll patches above too.
   await precompileBuiltins(root);

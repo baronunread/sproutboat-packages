@@ -2542,9 +2542,10 @@ if (!("searchParams" in URL.prototype)) {
 
 if (Response.json == null) {
   Response.json = function (data, init) {
-    const response = new Response(JSON.stringify(data), init);
-    if (!response.headers.has("content-type")) response.headers.set("content-type", "application/json;charset=utf-8");
-    return response;
+    // Typed before construction: a string body would otherwise default to text/plain.
+    const headers = new Headers(init?.headers);
+    if (!headers.has("content-type")) headers.set("content-type", "application/json");
+    return new Response(JSON.stringify(data), { status: init?.status ?? 200, statusText: init?.statusText, headers });
   };
 }
 
@@ -2554,7 +2555,8 @@ if (Response.redirect == null) {
     if (status !== 301 && status !== 302 && status !== 303 && status !== 307 && status !== 308) {
       throw new RangeError("invalid redirect status");
     }
-    return new Response("", { status, headers: { location: String(url) } });
+    // Serialized like the URL parser does (a bare origin gains its "/"); invalid URLs throw.
+    return new Response(null, { status, headers: { location: new URL(String(url)).href } });
   };
 }
 
