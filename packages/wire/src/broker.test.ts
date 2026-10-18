@@ -7,6 +7,7 @@ import {
   createBroker,
   cronMatches,
   encodeFrame,
+  frameOf,
   encodeV1,
   listen,
   listenTransfers,
@@ -15,6 +16,7 @@ import {
   type FetchLike,
 } from "./broker";
 import { createHash } from "node:crypto";
+import { createConnection } from "node:net";
 import { walkAssets, type AssetManifest } from "@sproutboat/assets";
 import { jsonObject, parseJsonValue, type JsonObject, type JsonValue } from "./json";
 
@@ -35,10 +37,76 @@ function make(opts: Parameters<typeof createBroker>[0] = {}): Broker {
   return b;
 }
 
+test("a stale queue acknowledgement cannot remove a newer delivery claim", async () => {
+  const root = mkdtempSync(join(tmpdir(), "sb-claim-fence-"));
+  const path = join(root,"state.sqlite");
+  const first = Promise.withResolvers<void>();
+  const second = Promise.withResolvers<void>();
+  const finishFirst = Promise.withResolvers<Response>();
+  const finishSecond = Promise.withResolvers<Response>();
+  let enabled = false;
+  const a = createBroker({db:path,bindings:{queues:["JOBS"]},sproutUrl:"http://127.0.0.1:1/",deliveryTimeoutMs:2_000,deliveryLeaseMs:3_000,fetchImpl:async()=>{first.resolve();return finishFirst.promise;}});
+  const b = createBroker({db:path,bindings:{queues:["JOBS"]},sproutUrl:"http://127.0.0.1:1/",dispatchEnabled:()=>enabled,deliveryTimeoutMs:2_000,deliveryLeaseMs:3_000,fetchImpl:async()=>{second.resolve();return finishSecond.promise;}});
+  const inspect = new Database(path);
+  try {
+    await a.dispatch({op:"queue.send",queue:"JOBS",body:"work"});
+    await first.promise;
+    const row=inspect.query<{id:string;claim_token:string},[]>("SELECT id,claim_token FROM mq").get()!;
+    inspect.query("UPDATE mq SET visible_at=0").run();
+    enabled=true;
+    await second.promise;
+    expect(inspect.query<{claim_token:string},[]>("SELECT claim_token FROM mq").get()!.claim_token).not.toBe(row.claim_token);
+    finishFirst.resolve(Response.json({ack:[row.id],retry:[]}));
+    await Bun.sleep(30);
+    expect(inspect.query<{count:number},[]>("SELECT count(*) AS count FROM mq").get()!.count).toBe(1);
+    finishSecond.resolve(Response.json({ack:[row.id],retry:[]}));
+    await Bun.sleep(30);
+    expect(inspect.query<{count:number},[]>("SELECT count(*) AS count FROM mq").get()!.count).toBe(0);
+  } finally {a.close();b.close();inspect.close();rmSync(root,{recursive:true,force:true});}
+},5_000);
+
 test("ping round-trips", async () => {
   const b = make();
   expect(await b.dispatch({ op: "ping", msg: "hi" })).toMatchObject({ ok: true, op: "pong", echo: "hi" });
 });
+
+test("a new alarm replaces exhausted delivery state and delete cancels durable retries", async () => {
+  const root=mkdtempSync(join(tmpdir(),"sb-alarm-replace-"));
+  const path=join(root,"state.sqlite");
+  const broker=createBroker({db:path,bindings:{do:[{binding:"COUNTER",className:"Counter"}]}});
+  const inspect=new Database(path);
+  try {
+    inspect.query("INSERT INTO do_alarm_delivery VALUES ('Counter','one',1,5,'old',0)").run();
+    await broker.dispatch({op:"do.alarm.set",cls:"Counter",id:"one",at:Date.now()+60_000});
+    expect(inspect.query<{count:number},[]>("SELECT count(*) AS count FROM do_alarm_delivery").get()!.count).toBe(0);
+    expect((await broker.dispatch({op:"do.alarm.get",cls:"Counter",id:"one"})).at).toBeGreaterThan(Date.now());
+    inspect.query("INSERT INTO do_alarm_delivery VALUES ('Counter','one',1,1,'active',9999999999999)").run();
+    expect((await broker.dispatch({op:"do.alarm.delete",cls:"Counter",id:"one"})).deleted).toBe(true);
+    expect(inspect.query<{count:number},[]>("SELECT count(*) AS count FROM do_alarm_delivery").get()!.count).toBe(0);
+    expect((await broker.dispatch({op:"do.alarm.get",cls:"Counter",id:"one"})).at).toBeNull();
+  } finally {inspect.close();broker.close();rmSync(root,{recursive:true,force:true});}
+});
+
+test("oversized queue acknowledgement bodies are cancelled and retried", async () => {
+  let cancelled=false;
+  const delivered=Promise.withResolvers<void>();
+  const root=mkdtempSync(join(tmpdir(),"sb-ack-bound-"));
+  const path=join(root,"state.sqlite");
+  const broker=createBroker({db:path,bindings:{queues:["JOBS"]},sproutUrl:"http://127.0.0.1:1/",fetchImpl:async()=>{
+    delivered.resolve();
+    return new Response(new ReadableStream({pull(controller){controller.enqueue(new Uint8Array(65_536));},cancel(){cancelled=true;}}));
+  }});
+  const inspect=new Database(path);
+  try {
+    await broker.dispatch({op:"queue.send",queue:"JOBS",body:"work"});
+    await delivered.promise;
+    await Bun.sleep(40);
+    expect(cancelled).toBe(true);
+    const row=inspect.query<{attempts:number;claim_token:string},[]>("SELECT attempts,claim_token FROM mq").get()!;
+    expect(row.attempts).toBe(1);
+    expect(row.claim_token).toBe("");
+  } finally {inspect.close();broker.close();rmSync(root,{recursive:true,force:true});}
+},3_000);
 
 test("#233: a KV value put as bytes is flagged binary and survives an existing store", async () => {
   const b = make({ bindings: { kv: ["CACHE"] } });
@@ -1344,4 +1412,67 @@ test("ratelimit: fixed window per key, limit/period from the message (#69)", asy
   await expect(b.dispatch({ op: "ratelimit.check", name: "NOPE", key: "x", limit: 1, period: 60 })).rejects.toThrow(
     "not bound",
   );
+});
+
+test("TCP: large replies survive backpressure and stay ordered with a pipelined request", async () => {
+  const bytes = Buffer.alloc(8 * 1024 * 1024);
+  for (let i = 0; i < bytes.length; i++) bytes[i] = i % 256;
+  const first = frameOf(encodeV1({ ok: true, id: 1 }, bytes));
+  const second = encodeFrame({ ok: true, id: 2 });
+  let calls = 0;
+  const broker = make();
+  const server = listen({ ...broker, async handleFrame() {
+    if (calls++ === 0) { await Bun.sleep(10); return first; }
+    return second;
+  } }, "127.0.0.1", 0);
+  const socket = createConnection({ host: "127.0.0.1", port: server.port });
+  let resume: ReturnType<typeof setTimeout> | undefined;
+  let next: ReturnType<typeof setTimeout> | undefined;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const received = await new Promise<Buffer>((done, reject) => {
+      const chunks: Buffer[] = [];
+      let size = 0;
+      timeout = setTimeout(() => reject(new Error("large broker reply stalled or truncated")), 3000);
+      socket.on("error", reject);
+      socket.on("data", (chunk: Buffer) => {
+        chunks.push(chunk); size += chunk.length;
+        if (size >= first.length + second.length) done(Buffer.concat(chunks));
+      });
+      socket.on("connect", () => {
+        socket.pause();
+        socket.write(frameOf(Buffer.from("first")));
+        next = setTimeout(() => socket.write(frameOf(Buffer.from("second"))), 2);
+        resume = setTimeout(() => socket.resume(), 50);
+      });
+    });
+    expect(received.length).toBe(first.length + second.length);
+    expect(received.subarray(0, first.length).equals(first)).toBe(true);
+    expect(received.subarray(first.length).equals(second)).toBe(true);
+    expect(calls).toBe(2);
+  } finally {
+    clearTimeout(timeout); clearTimeout(next); clearTimeout(resume);
+    socket.destroy(); server.stop();
+  }
+}, 10_000);
+
+test("R2 direct download: If-None-Match supports wildcard, lists and weak comparison", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "sb-transfer-condition-"));
+  const broker = make({ db: join(dir, "state.sqlite"), bindings: { r2: ["UPLOADS"] } });
+  try {
+    const put = await broker.dispatch({ op: "r2.put", bucket: "UPLOADS", key: "object", body: "content" });
+    const etag = `"${String(obj(put.object).etag)}"`;
+    const ticket = await broker.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "object", method: "download" });
+    const url = `http://127.0.0.1${ticket.url}`;
+    for (const value of ["*", etag, `W/${etag}`, `"other", W/${etag}`]) {
+      const response = await broker.transfer(new Request(url, { headers: { "if-none-match": value } }));
+      expect(response.status).toBe(304);
+      expect(response.headers.get("etag")).toBe(etag);
+      expect(await response.text()).toBe("");
+    }
+    const fresh = await broker.transfer(new Request(url, { headers: { "if-none-match": '"different"' } }));
+    expect(fresh.status).toBe(200);
+    expect(await fresh.text()).toBe("content");
+    expect((await broker.transfer(new Request(url))).status).toBe(410);
+  } finally { broker.close(); rmSync(dir, { recursive: true, force: true }); }
 });

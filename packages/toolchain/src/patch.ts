@@ -819,7 +819,7 @@ static bool try_handle_r2_transfer(uWS::HttpResponse<false>* res, uWS::HttpReque
     struct Download { sb_r2_transfer_ctx* ctx; uintmax_t base; uintmax_t size; uintmax_t sent = 0; bool closed = false; char chunk[65536]; };
     auto state = std::make_shared<Download>(Download{download, first, last - first + 1});
     auto pump = std::make_shared<std::function<bool()>>();
-    *pump = [res, state, pump]() {
+    *pump = [res, state]() {
       if (state->closed) return false;
       for (;;) {
         const size_t want = state->size - state->sent < sizeof(state->chunk) ? (size_t)(state->size - state->sent) : sizeof(state->chunk);
@@ -829,11 +829,14 @@ static bool try_handle_r2_transfer(uWS::HttpResponse<false>* res, uWS::HttpReque
         if (!result.first) {
           res->onWritable([res, state](uintmax_t offset) {
             if (state->closed) return true;
-            const size_t want = state->size - offset < sizeof(state->chunk) ? (size_t)(state->size - offset) : sizeof(state->chunk);
-            const size_t bytes = sb_r2_transfer_download_read(state->ctx, (size_t)(state->base + offset), state->chunk, want);
-            const auto resumed = res->tryEnd(std::string_view(state->chunk, bytes), state->size);
-            if (resumed.second || bytes == 0) { sb_r2_transfer_download_close(state->ctx); state->closed = true; return true; }
-            return resumed.first;
+            for (;;) {
+              const size_t want = state->size - offset < sizeof(state->chunk) ? (size_t)(state->size - offset) : sizeof(state->chunk);
+              const size_t bytes = sb_r2_transfer_download_read(state->ctx, (size_t)(state->base + offset), state->chunk, want);
+              const auto resumed = res->tryEnd(std::string_view(state->chunk, bytes), state->size);
+              if (resumed.second || bytes == 0) { sb_r2_transfer_download_close(state->ctx); state->closed = true; return true; }
+              if (!resumed.first) return false;
+              offset += bytes;
+            }
           });
           return false;
         }
@@ -920,7 +923,7 @@ const R2_DOWNLOAD_BRANCH_INJECT = `  // sb_r2_transfer_download_v1
     struct Download { sb_r2_transfer_ctx* ctx; uintmax_t base; uintmax_t size; uintmax_t sent = 0; bool closed = false; char chunk[65536]; };
     auto state = std::make_shared<Download>(Download{download, first, last - first + 1});
     auto pump = std::make_shared<std::function<bool()>>();
-    *pump = [res, state, pump]() {
+    *pump = [res, state]() {
       if (state->closed) return false;
       for (;;) {
         const size_t want = state->size - state->sent < sizeof(state->chunk) ? (size_t)(state->size - state->sent) : sizeof(state->chunk);
@@ -930,11 +933,14 @@ const R2_DOWNLOAD_BRANCH_INJECT = `  // sb_r2_transfer_download_v1
         if (!result.first) {
           res->onWritable([res, state](uintmax_t offset) {
             if (state->closed) return true;
-            const size_t want = state->size - offset < sizeof(state->chunk) ? (size_t)(state->size - offset) : sizeof(state->chunk);
-            const size_t bytes = sb_r2_transfer_download_read(state->ctx, (size_t)(state->base + offset), state->chunk, want);
-            const auto resumed = res->tryEnd(std::string_view(state->chunk, bytes), state->size);
-            if (resumed.second || bytes == 0) { sb_r2_transfer_download_close(state->ctx); state->closed = true; return true; }
-            return resumed.first;
+            for (;;) {
+              const size_t want = state->size - offset < sizeof(state->chunk) ? (size_t)(state->size - offset) : sizeof(state->chunk);
+              const size_t bytes = sb_r2_transfer_download_read(state->ctx, (size_t)(state->base + offset), state->chunk, want);
+              const auto resumed = res->tryEnd(std::string_view(state->chunk, bytes), state->size);
+              if (resumed.second || bytes == 0) { sb_r2_transfer_download_close(state->ctx); state->closed = true; return true; }
+              if (!resumed.first) return false;
+              offset += bytes;
+            }
           });
           return false;
         }

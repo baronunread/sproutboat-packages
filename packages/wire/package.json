@@ -18,9 +18,11 @@
     ".": "./src/index.ts",
     "./broker": "./src/broker.ts",
     "./package.json": "./package.json",
-    "./egress": "./src/egress.ts"
+    "./egress": "./src/egress.ts",
+    "./pool": "./src/pool.ts"
   },
   "scripts": {
-    "test": "bun test ./"
+    "test": "bun test ./",
+    "build:sql-budget": "bun src/build-d1-budget.ts"
   }
 }
