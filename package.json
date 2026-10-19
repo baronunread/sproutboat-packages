@@ -31,7 +31,8 @@
     "test:native-response-defaults": "bun packages/runtime/test/native-response-defaults.ts",
     "test:native-raw-body": "bun packages/runtime/test/native-raw-body.ts",
     "test:native-url": "bun packages/runtime/test/native-url.ts",
-    "test:native-json": "bun packages/runtime/test/native-json.ts"
+    "test:native-json": "bun packages/runtime/test/native-json.ts",
+    "test:native-errors": "bun packages/runtime/test/native-errors.ts"
   },
   "devDependencies": {
     "@changesets/cli": "^3.0.2",

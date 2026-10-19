@@ -2574,6 +2574,20 @@ if (Response.json == null) {
   };
 }
 
+// Error.stack: Porffor keeps no frames, so give V8's first line, "Name: message", rather
+// than undefined (code logs it or splits it on newlines).
+for (const E of [Error, TypeError, RangeError, ReferenceError, SyntaxError, EvalError, URIError]) {
+  if (!("stack" in E.prototype)) {
+    Object.defineProperty(E.prototype, "stack", {
+      configurable: true,
+      get() {
+        const message = String(this.message);
+        return message === "" ? String(this.name) : String(this.name) + ": " + message;
+      },
+    });
+  }
+}
+
 // Fetch: Headers iterates like entries(), so new Map(headers), [...headers] and
 // Object.fromEntries(headers) work. Porffor's Headers has entries() but no iterator.
 if (Headers.prototype[Symbol.iterator] == null) Headers.prototype[Symbol.iterator] = Headers.prototype.entries;
