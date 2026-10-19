@@ -16,6 +16,7 @@ import {
   patchCaseMapping,
   patchZeroDelayTimers,
   patchStreamingResponses,
+  patchSplitGlobals,
   patchBlobClass,
   patchFetchClasses,
   patchResponseBytes,
@@ -765,6 +766,43 @@ test("streaming patch adds the stream registry and attaches marked responses, id
     await expect(patchStreamingResponses(root)).rejects.toThrow("anchor not found");
     await writeFile(render, "export const x = 1;\n");
     await expect(patchStreamingResponses(root)).rejects.toThrow("streaming fallbacks: anchor not found");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("split globals patch prefixes module globals so none binds to libc, idempotently", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sb-split-globals-"));
+  try {
+    await mkdir(join(root, "compiler"));
+    const file = join(root, "compiler/render.js");
+    await writeFile(
+      file,
+      [
+        "  const st = split ? '' : 'static ';",
+        "      case K.Global:\n        cur.globals[node[N_A]] = true;\n      case K.Local:\n        return [sanitize(node[N_A]), P_PRIM];",
+        "        emit(`${ind()}${sanitize(node[N_A][N_A])} = ${rx(node[N_B], P_COMMA)};\\n`);",
+        "            ? `${sanitize(update[N_A][N_A])} = ${rx(update[N_B], P_COMMA)}`",
+        "    const t = sanitize(target[N_A]);",
+        "  for (const g of globals) link.push(`${st}${CT[g.type]} ${sanitize(g.name)};`);",
+        "      const name = sanitize(g.name);",
+        "          const buckets = sanitize(g.name.replace(/underlyingStore$/, 'underlyingBuckets'));",
+        "          const bucketsCap = sanitize(g.name.replace(/underlyingStore$/, 'underlyingBucketsCap'));",
+        "      for (const x of Object.keys(parts.globals).sort()) text.push(`extern ${CT[globalTypes[x]]} ${sanitize(x)};\\n`);",
+        "",
+      ].join("\n"),
+    );
+    await patchSplitGlobals(root);
+    const patched = await readFile(file, "utf8");
+    expect(patched).toContain("const gname = n => sanitize(split && !n.startsWith('__') ? 'pg_' + n : n);");
+    expect(patched).toContain("return [gname(node[N_A]), P_PRIM];\n      case K.Local:\n        return [sanitize(node[N_A]), P_PRIM];");
+    expect(patched).toContain("${st}${CT[g.type]} ${gname(g.name)}");
+    expect(patched).toContain("text.push(`extern ${CT[globalTypes[x]]} ${gname(x)};\\n`);");
+    expect(patched.match(/gname\(/g)?.length).toBe(9);
+    await patchSplitGlobals(root);
+    expect(await readFile(file, "utf8")).toBe(patched);
+    await writeFile(file, "export const x = 1;\n");
+    await expect(patchSplitGlobals(root)).rejects.toThrow("anchor not found");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

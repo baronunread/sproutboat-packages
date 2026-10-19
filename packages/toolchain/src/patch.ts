@@ -2085,6 +2085,54 @@ export async function patchZeroDelayTimers(root: string): Promise<void> {
   await writeFile(file, src.replace(ZERO_TIMER_ANCHOR, ZERO_TIMER_INJECT));
 }
 
+// sproutd links the shared runtime and each app's module as separate shared objects, so
+// Porffor's split output declares module globals without `static`, under their JS names.
+// A global named like a libc symbol then binds to libc: the structuredClone prelude's
+// `clone` made the runtime write a JS value into libc's clone() and every worker crashed
+// on start (SEGV_ACCERR). An app's `const hash` or `let search` would do the same.
+// Porffor's reserved-name list cannot keep up with libc, so split globals get a prefix;
+// Internal __ globals (Porffor's, the prelude's, sproutd's) keep their names: C refers to them.
+const SPLIT_GLOBALS_MARKER = "sproutboat: split globals are prefixed";
+const SPLIT_GLOBALS_EDITS: [string, string][] = [
+  [
+    "  const st = split ? '' : 'static ';\n",
+    "  const st = split ? '' : 'static ';\n" +
+      "  // " + SPLIT_GLOBALS_MARKER + ", so none binds to a libc symbol of the same name\n" +
+      "  const gname = n => sanitize(split && !n.startsWith('__') ? 'pg_' + n : n);\n",
+  ],
+  [
+    "      case K.Global:\n        cur.globals[node[N_A]] = true;\n      case K.Local:\n        return [sanitize(node[N_A]), P_PRIM];",
+    "      case K.Global:\n        cur.globals[node[N_A]] = true;\n        return [gname(node[N_A]), P_PRIM];\n      case K.Local:\n        return [sanitize(node[N_A]), P_PRIM];",
+  ],
+  [
+    "        emit(`${ind()}${sanitize(node[N_A][N_A])} = ${rx(node[N_B], P_COMMA)};\\n`);",
+    "        emit(`${ind()}${node[N_A][N_KIND] === K.Global ? gname(node[N_A][N_A]) : sanitize(node[N_A][N_A])} = ${rx(node[N_B], P_COMMA)};\\n`);",
+  ],
+  [
+    "            ? `${sanitize(update[N_A][N_A])} = ${rx(update[N_B], P_COMMA)}`",
+    "            ? `${update[N_A][N_KIND] === K.Global ? gname(update[N_A][N_A]) : sanitize(update[N_A][N_A])} = ${rx(update[N_B], P_COMMA)}`",
+  ],
+  ["    const t = sanitize(target[N_A]);", "    const t = target[N_KIND] === K.Global ? gname(target[N_A]) : sanitize(target[N_A]);"],
+  ["${st}${CT[g.type]} ${sanitize(g.name)}", "${st}${CT[g.type]} ${gname(g.name)}"],
+  ["      const name = sanitize(g.name);", "      const name = gname(g.name);"],
+  ["const buckets = sanitize(g.name.replace(", "const buckets = gname(g.name.replace("],
+  ["const bucketsCap = sanitize(g.name.replace(", "const bucketsCap = gname(g.name.replace("],
+  ["text.push(`extern ${CT[globalTypes[x]]} ${sanitize(x)};\\n`);", "text.push(`extern ${CT[globalTypes[x]]} ${gname(x)};\\n`);"],
+];
+
+/** Split (shared-object) output prefixes module globals, so none binds to libc. */
+export async function patchSplitGlobals(root: string): Promise<void> {
+  const file = resolve(root, "compiler/render.js");
+  let src = await readFile(file, "utf8");
+  if (src.includes(SPLIT_GLOBALS_MARKER)) return;
+  for (const [anchor, inject] of SPLIT_GLOBALS_EDITS) {
+    if (src.split(anchor).length !== 2)
+      throw new Error(`could not patch Porffor's split globals: anchor not found in ${file}`);
+    src = src.replace(anchor, inject);
+  }
+  await writeFile(file, src);
+}
+
 const FETCH_CLASSES_MARKER = "sproutboat: Fetch-spec Request and Response";
 /** Replaces Porffor's Request and Response (fetch-classes.ts); covers patchResponseDefaults. */
 export async function patchFetchClasses(root: string): Promise<void> {
@@ -2207,6 +2255,7 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchConsoleColors(root);
   await patchCaseMapping(root);
   await patchZeroDelayTimers(root);
+  await patchSplitGlobals(root);
   // Last of the builtin edits: its precompile picks up the date, promise and
   // replaceAll patches above too.
   await precompileBuiltins(root);
