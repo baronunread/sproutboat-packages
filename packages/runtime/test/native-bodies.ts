@@ -103,7 +103,10 @@ try {
   assert.deepEqual(await bytes("/blob"), { type: "text/x-test", bytes: [104, 195, 169, 33] });
   assert.deepEqual(await bytes("/stream"), { type: null, bytes: [104, 101, 108, 108, 111] });
   assert.deepEqual(await bytes("/stream-async"), { type: null, bytes: [0, 255] });
-  assert.equal((await fetch(`http://127.0.0.1:${port}/stream-strings`)).status, 500, "a stream of strings is not a body (TypeError, as in workerd)");
+  // A stream of strings is not a body (TypeError, as in workerd). Streamed, the status line is
+  // already out when the first chunk is read, so the response ends empty instead of a 500.
+  const strings = await fetch(`http://127.0.0.1:${port}/stream-strings`);
+  assert.equal(await strings.text(), "", "a stream of strings sends no body");
   const form = await fetch(`http://127.0.0.1:${port}/form`);
   const boundary = (form.headers.get("content-type") || "").split("boundary=")[1];
   assert(boundary, "multipart content type");

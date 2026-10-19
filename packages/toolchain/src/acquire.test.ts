@@ -279,6 +279,8 @@ test("the default call (no url/expectedSha256 override) never touches the networ
   const globals = await readFile(join(dir, "runtime/fetch-globals.js"), "utf8");
   expect(globals).toContain("sproutboat: WHATWG UTF-8 decoder");
   expect(globals).toContain("sproutboat: Fetch-spec Headers");
+  // B19: the native server streams ReadableStream bodies.
+  expect(await readFile(join(dir, "compiler/uwebsockets.js"), "utf8")).toContain("sproutboat B19: streamed responses");
   // console colours only on a terminal.
   expect(await readFile(join(dir, "compiler/builtins/console.ts"), "utf8")).toContain("__Porffor_consoleColors");
   // JSON.stringify throws on cycles; typed arrays have their own toString tag.
