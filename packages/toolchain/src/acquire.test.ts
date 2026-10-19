@@ -159,6 +159,8 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "    return Box(f, Const(T.i32, TYPES.number));\n" +
       "  };\n",
     "compiler/builtins/string.ts":
+      "  for (let i: i32 = 0; i < count; i++) {\n    Porffor.IR.copy(Porffor.IR.ptr(out) + 4 + i * thisLen, Porffor.IR.ptr(this) + 4, thisLen);\n  }\n" +
+      "  for (let i: i32 = 0; i < count; i++) {\n    Porffor.IR.copy(Porffor.IR.ptr(out) + 4 + i * thisLen, Porffor.IR.ptr(this) + 4, thisLen);\n  }\n" +
       "export const __Porffor_string_replaceAll = (str: any, searchValue: any, replaceValue: any) => {\n" +
       "  let out: any = __Porffor_string_emptyLike(str);\n  let appendIndex: i32 = 0;\n  let searchIndex: i32 = 0;\n  let matched: boolean = false;\n" +
       "    out = __Porffor_strcat(out, __Porffor_string_substringLike(str, appendIndex, matchIndex));\n    out = __Porffor_strcat(out, __Porffor_string_applyReplacer(str, match, matchIndex, replaceValue));\n" +
@@ -256,6 +258,8 @@ test("the default call (no url/expectedSha256 override) never touches the networ
   );
   // #238/#241 (out-of-range typed-array reads and writes) are upstream's own
   // integer-indexed element access since alpha-18; no codegen patch remains.
+  // B16: String.prototype.repeat doubles its copies.
+  expect(await readFile(join(dir, "compiler/builtins/string.ts"), "utf8")).toContain("sproutboat B16: doubling repeat");
   // #287: full collections under load keep their free pages; the idle collection returns them.
   expect(await readFile(join(dir, "compiler/render.js"), "utf8")).toContain("if (porf_gc_discard_now) porf_gc_discard_free_runs(); else porf_gc_discard_pending = 1;");
   // #286: Map.groupBy, and private fields installed as non-enumerable.

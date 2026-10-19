@@ -9,6 +9,7 @@ import {
   patchDeferredDiscard,
   patchMapGroupBy,
   patchPrivateFieldsHidden,
+  patchRepeatDoubling,
   patchResponseDefaults,
   patchURLClass,
   patchUint8ArrayBase64,
@@ -505,6 +506,29 @@ test("deferred discard patch moves page discard to the idle collection, idempote
     expect(await readFile(file, "utf8")).toBe(patched);
     await writeFile(file, "export const x = 1;\n");
     await expect(patchDeferredDiscard(root)).rejects.toThrow("anchor not found");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("repeat patch replaces both per-repetition loops once", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sb-repeat-patch-"));
+  try {
+    await mkdir(join(root, "compiler/builtins"), { recursive: true });
+    const file = join(root, "compiler/builtins/string.ts");
+    const loop =
+      "  for (let i: i32 = 0; i < count; i++) {\n" +
+      "    Porffor.IR.copy(Porffor.IR.ptr(out) + 4 + i * thisLen, Porffor.IR.ptr(this) + 4, thisLen);\n" +
+      "  }\n";
+    await writeFile(file, "a\n" + loop + "b\n" + loop);
+    await patchRepeatDoubling(root);
+    const patched = await readFile(file, "utf8");
+    expect(patched.split("sproutboat B16: doubling repeat").length).toBe(3);
+    expect(patched).not.toContain("i * thisLen");
+    await patchRepeatDoubling(root);
+    expect(await readFile(file, "utf8")).toBe(patched);
+    await writeFile(file, "a\n" + loop);
+    await expect(patchRepeatDoubling(root)).rejects.toThrow("anchor not found twice");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

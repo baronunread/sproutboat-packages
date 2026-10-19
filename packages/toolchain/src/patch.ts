@@ -1846,6 +1846,39 @@ export async function patchDeferredDiscard(root: string): Promise<void> {
   await writeFile(file, src);
 }
 
+// sproutd B16: String.prototype.repeat copied the source once per repetition, so
+// "ab".repeat(300000) made 300,000 two-byte copies (about 60 MB/s; a proof fixture
+// spent 64% of its load time here). Copy once, then double the filled prefix onto
+// itself: log2(count) copies. Same for the UTF-16 and Latin-1 variants, which
+// share the loop text.
+const REPEAT_LOOP =
+  "  for (let i: i32 = 0; i < count; i++) {\n" +
+  "    Porffor.IR.copy(Porffor.IR.ptr(out) + 4 + i * thisLen, Porffor.IR.ptr(this) + 4, thisLen);\n" +
+  "  }\n";
+const REPEAT_MARKER = "sproutboat B16: doubling repeat";
+const REPEAT_DOUBLING =
+  "  // sproutboat B16: doubling repeat\n" +
+  "  const total: i32 = thisLen * count;\n" +
+  "  if (total > 0) {\n" +
+  "    Porffor.IR.copy(Porffor.IR.ptr(out) + 4, Porffor.IR.ptr(this) + 4, thisLen);\n" +
+  "    let filled: i32 = thisLen;\n" +
+  "    while (filled * 2 <= total) {\n" +
+  "      Porffor.IR.copy(Porffor.IR.ptr(out) + 4 + filled, Porffor.IR.ptr(out) + 4, filled);\n" +
+  "      filled *= 2;\n" +
+  "    }\n" +
+  "    if (filled < total) Porffor.IR.copy(Porffor.IR.ptr(out) + 4 + filled, Porffor.IR.ptr(out) + 4, total - filled);\n" +
+  "  }\n";
+
+/** B16: doubling String.prototype.repeat. Before the precompile, which compiles it. */
+export async function patchRepeatDoubling(root: string): Promise<void> {
+  const file = resolve(root, "compiler/builtins/string.ts");
+  const src = await readFile(file, "utf8");
+  if (src.includes(REPEAT_MARKER)) return;
+  if (src.split(REPEAT_LOOP).length !== 3)
+    throw new Error(`could not patch Porffor's String.prototype.repeat: anchor not found twice in ${file}`);
+  await writeFile(file, src.replaceAll(REPEAT_LOOP, REPEAT_DOUBLING));
+}
+
 export async function ensurePorfforPatched(root: string): Promise<void> {
   if (done.has(root)) return;
   await patchCompilerArgs(root);
@@ -1864,6 +1897,7 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchURLClass(root);
   await patchMapGroupBy(root);
   await patchPrivateFieldsHidden(root);
+  await patchRepeatDoubling(root);
   // Last of the builtin edits: its precompile picks up the date, promise and
   // replaceAll patches above too.
   await precompileBuiltins(root);
