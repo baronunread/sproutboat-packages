@@ -2849,16 +2849,197 @@ if (globalThis.crypto.getRandomValues == null) {
     return view;
   };
 }
-// structuredClone: JSON round-trip. Lossy (no Map/Set/Date/typed arrays), but
-// covers the common "deep-copy a plain object" case Worker code relies on.
+/* oxlint-disable anti-slop/no-runtime-typeof -- these Web API polyfills branch on JavaScript types
+   exactly where their specs do (listener: function or { handleEvent }; structured clone: by value type). */
+// Event, CustomEvent, EventTarget, AbortSignal and AbortController, as workerd has
+// them (no DOM tree, so no bubbling or capture phases). Found missing by the W2
+// conformance suite; libraries use AbortController for fetch timeouts and EventTarget
+// for their own events.
+if (typeof globalThis.EventTarget !== "function") {
+  const namedError = (name, message) => {
+    const e = new Error(message);
+    e.name = name;
+    return e;
+  };
+  class Event {
+    constructor(type, init) {
+      if (arguments.length === 0) throw new TypeError("Event requires a type");
+      const options = init || {};
+      this.type = String(type);
+      this.bubbles = !!options.bubbles;
+      this.cancelable = !!options.cancelable;
+      this.composed = !!options.composed;
+      this.defaultPrevented = false;
+      this.target = null;
+      this.currentTarget = null;
+      this.eventPhase = 0;
+      this.isTrusted = false;
+      this.timeStamp = Date.now();
+      this.__sbStopped = false;
+    }
+    preventDefault() { if (this.cancelable) this.defaultPrevented = true; }
+    stopPropagation() {}
+    stopImmediatePropagation() { this.__sbStopped = true; }
+    composedPath() { return this.currentTarget ? [this.currentTarget] : []; }
+  }
+  class CustomEvent extends Event {
+    constructor(type, init) {
+      super(type, init);
+      this.detail = init && init.detail !== undefined ? init.detail : null;
+    }
+  }
+  class EventTarget {
+    constructor() { this.__sbListeners = {}; }
+    addEventListener(type, listener, options) {
+      if (listener == null) return;
+      const capture = typeof options === "boolean" ? options : !!(options && options.capture);
+      const once = !!(options && typeof options === "object" && options.once);
+      const signal = options && typeof options === "object" ? options.signal : undefined;
+      if (signal && signal.aborted) return;
+      const list = this.__sbListeners[type] || (this.__sbListeners[type] = []);
+      for (const entry of list) if (entry.listener === listener && entry.capture === capture) return;
+      const entry = { listener, capture, once, removed: false };
+      list.push(entry);
+      if (signal) signal.addEventListener("abort", () => this.removeEventListener(type, listener, capture));
+    }
+    removeEventListener(type, listener, options) {
+      const capture = typeof options === "boolean" ? options : !!(options && options.capture);
+      const list = this.__sbListeners[type];
+      if (!list) return;
+      for (let i = 0; i < list.length; i++) {
+        if (list[i].listener === listener && list[i].capture === capture) {
+          list[i].removed = true;
+          list.splice(i, 1);
+          return;
+        }
+      }
+    }
+    dispatchEvent(event) {
+      if (!(event instanceof Event)) throw new TypeError("dispatchEvent needs an Event");
+      event.target = this;
+      event.currentTarget = this;
+      event.eventPhase = 2;
+      const list = (this.__sbListeners[event.type] || []).slice();
+      for (const entry of list) {
+        if (entry.removed) continue;
+        if (entry.once) this.removeEventListener(event.type, entry.listener, entry.capture);
+        const fn = entry.listener;
+        if (typeof fn === "function") fn.call(this, event);
+        else if (fn && typeof fn.handleEvent === "function") fn.handleEvent(event);
+        if (event.__sbStopped) break;
+      }
+      event.currentTarget = null;
+      event.eventPhase = 0;
+      return !event.defaultPrevented;
+    }
+  }
+  class AbortSignal extends EventTarget {
+    constructor() {
+      super();
+      this.aborted = false;
+      this.reason = undefined;
+      this.onabort = null;
+    }
+    throwIfAborted() { if (this.aborted) throw this.reason; }
+    __sbAbort(reason) {
+      if (this.aborted) return;
+      this.aborted = true;
+      this.reason = reason === undefined ? namedError("AbortError", "This operation was aborted") : reason;
+      const event = new Event("abort");
+      if (typeof this.onabort === "function") this.onabort.call(this, event);
+      this.dispatchEvent(event);
+    }
+    static abort(reason) {
+      const signal = new AbortSignal();
+      signal.__sbAbort(reason);
+      return signal;
+    }
+    static timeout(ms) {
+      const signal = new AbortSignal();
+      setTimeout(() => signal.__sbAbort(namedError("TimeoutError", "The operation timed out")), ms);
+      return signal;
+    }
+    static any(signals) {
+      const signal = new AbortSignal();
+      for (const s of signals) {
+        if (s.aborted) {
+          signal.__sbAbort(s.reason);
+          return signal;
+        }
+      }
+      for (const s of signals) s.addEventListener("abort", () => signal.__sbAbort(s.reason));
+      return signal;
+    }
+  }
+  class AbortController {
+    constructor() { this.signal = new AbortSignal(); }
+    abort(reason) { this.signal.__sbAbort(reason); }
+  }
+  globalThis.Event = Event;
+  globalThis.CustomEvent = CustomEvent;
+  globalThis.EventTarget = EventTarget;
+  globalThis.AbortSignal = AbortSignal;
+  globalThis.AbortController = AbortController;
+}
+
+// structuredClone: the HTML structured-clone algorithm for the types Worker code
+// passes around. Keeps cycles and shared references (a memo per call), Date, RegExp,
+// Map, Set, ArrayBuffer, typed arrays, DataView, errors, arrays and plain objects;
+// functions and symbols throw DataCloneError. It replaced a JSON round-trip that lost
+// every non-JSON type and crashed on cycles (W2 conformance).
 if (globalThis.structuredClone == null) {
-  // The suggested fix (use structuredClone) is circular — this IS the polyfill,
-  // and Porffor exposes no other deep-clone primitive.
-  // react-doctor-disable-next-line react-doctor/no-json-parse-stringify-clone
+  const dataCloneError = (what) => {
+    const e = new Error(what + " could not be cloned");
+    e.name = "DataCloneError";
+    return e;
+  };
+  const errorTypes = { Error, EvalError, RangeError, ReferenceError, SyntaxError, TypeError, URIError };
+  const clone = (value, memo) => {
+    const type = typeof value;
+    if (type === "function") throw dataCloneError("function");
+    if (type === "symbol") throw dataCloneError("Symbol");
+    if (value === null || type !== "object") return value;
+    if (memo.has(value)) return memo.get(value);
+    let out;
+    if (value instanceof Date) out = new Date(value.getTime());
+    else if (value instanceof RegExp) out = new RegExp(value.source, value.flags);
+    else if (value instanceof ArrayBuffer) out = value.slice(0);
+    else if (ArrayBuffer.isView(value)) {
+      const buffer = clone(value.buffer, memo);
+      out = value instanceof DataView ? new DataView(buffer, value.byteOffset, value.byteLength) : new value.constructor(buffer, value.byteOffset, value.length);
+    } else if (value instanceof Map) {
+      out = new Map();
+      memo.set(value, out);
+      for (const [k, v] of value) out.set(clone(k, memo), clone(v, memo));
+      return out;
+    } else if (value instanceof Set) {
+      out = new Set();
+      memo.set(value, out);
+      for (const v of value) out.add(clone(v, memo));
+      return out;
+    } else if (value instanceof Error) {
+      const Ctor = errorTypes[value.name] || Error;
+      out = new Ctor(value.message);
+    } else if (Array.isArray(value)) {
+      out = new Array(value.length);
+      memo.set(value, out);
+      for (const k of Object.keys(value)) out[k] = clone(value[k], memo);
+      return out;
+    } else {
+      out = {};
+      memo.set(value, out);
+      for (const k of Object.keys(value)) out[k] = clone(value[k], memo);
+      return out;
+    }
+    memo.set(value, out);
+    return out;
+  };
   globalThis.structuredClone = function (value) {
-    return JSON.parse(JSON.stringify(value));
+    return clone(value, new Map());
   };
 }
+
+/* oxlint-enable anti-slop/no-runtime-typeof */
 
 if (globalThis.crypto.randomUUID == null) {
   globalThis.crypto.randomUUID = function () {
