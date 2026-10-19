@@ -17,6 +17,7 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
   const files = {
     "runtime/index.js": "fixture:runtime/index.js\n",
     "compiler/render.js": "// sb_native_utf8_scalar_v1\n" +
+      "static i32 porf_gc_mark_queue_cap = 0;\n    porf_gc_discard_free_runs();\n" +
       "void porf_native_fetch_collect_normal_from(void* stack_top) {\n" +
       "  if (porf_heap_base == 0) return;\n" +
       "  void* prev_stack_top = porf_c_stack_top;\n  porf_c_stack_top = stack_top;\n" +
@@ -255,6 +256,8 @@ test("the default call (no url/expectedSha256 override) never touches the networ
   );
   // #238/#241 (out-of-range typed-array reads and writes) are upstream's own
   // integer-indexed element access since alpha-18; no codegen patch remains.
+  // #287: full collections under load keep their free pages; the idle collection returns them.
+  expect(await readFile(join(dir, "compiler/render.js"), "utf8")).toContain("if (porf_gc_discard_now) porf_gc_discard_free_runs(); else porf_gc_discard_pending = 1;");
   // #286: Map.groupBy, and private fields installed as non-enumerable.
   expect(await readFile(join(dir, "compiler/builtins/map.ts"), "utf8")).toContain("export const __Map_groupBy");
   expect(await readFile(join(dir, "compiler/codegen.js"), "utf8")).toContain("sproutboat #286: private fields");
