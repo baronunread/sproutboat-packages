@@ -4044,14 +4044,20 @@ globalThis.__sbInstallBindings = function (target, bindings) {
 // prelude must not replace fetch just by being evaluated.
 globalThis.__sbInstallFetch = function () {
   globalThis.fetch = function (input, init) {
-    const url = __sbIsStr(input) ? input : String(input.url);
+    // A Request's method, headers and body apply unless init overrides them; a URL
+    // object stands for its href.
+    const req = input != null && !__sbIsStr(input) && input.url != null ? input : null;
+    const url = req ? String(req.url) : input != null && input.href != null ? String(input.href) : String(input);
     const opts = init || {};
+    const source = opts.headers != null ? opts.headers : req ? req.headers : null;
     const headers = [];
-    if (opts.headers) {
-      if (__sbIsFn(opts.headers.forEach)) opts.headers.forEach((v, k) => headers.push([k, v]));
-      else for (const k in opts.headers) headers.push([k, opts.headers[k]]);
+    if (source) {
+      if (__sbIsFn(source.forEach)) source.forEach((v, k) => headers.push([k, v]));
+      else for (const k in source) headers.push([k, source[k]]);
     }
-    const msg = { url, method: opts.method || "GET", headers, ...__sbRequestBody(opts.body) };
+    const body = opts.body !== undefined ? opts.body : req && req.body !== "" ? req.body : null;
+    const method = opts.method || (req && req.method) || "GET";
+    const msg = { url, method, headers, ...__sbRequestBody(body) };
     const respond = (r) => {
       const respHeaders = new Headers();
       for (let j = 0; j < (r.headers || []).length; j++) respHeaders.set(r.headers[j][0], r.headers[j][1]);
@@ -4462,7 +4468,10 @@ async function __sbFetchWithDrain(res, tasks) {
 // nothing on stderr, which hid #168 entirely.
 function __sbErrorResponse(error) {
   __sbLogUncaught("fetch", error);
-  return new Response("Internal Server Error", { status: 500 });
+  // Untyped, as workerd sends it: the text/plain default is for handlers' bodies.
+  const response = new Response("Internal Server Error", { status: 500 });
+  response.headers.delete("content-type");
+  return response;
 }
 
 function __sbLogUncaught(where, error) {

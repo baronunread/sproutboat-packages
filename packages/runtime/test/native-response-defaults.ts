@@ -13,6 +13,7 @@ const expected = {
   "/null": { type: null },
   "/bytes": { type: null },
   "/redirect": { type: null, location: "https://example.com/" },
+  "/throw": { type: null },
 } satisfies Record<string, { type: string | null; location?: string }>;
 const handler = `export default {fetch(request) {
   const path = new URL(request.url).pathname;
@@ -22,6 +23,7 @@ const handler = `export default {fetch(request) {
   if (path === "/null") return new Response(null, { status: 204 });
   if (path === "/bytes") return new Response(new Uint8Array([1, 2, 3]));
   if (path === "/redirect") return Response.redirect("https://example.com", 301);
+  if (path === "/throw") throw new Error("boom");
   return new Response("not found", { status: 404 });
 }};`;
 
