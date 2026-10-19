@@ -23,6 +23,9 @@ const CASES = [
   `["ÄÖÜ", "ΑΒΓ", "дж", "Ā", "Ωmega"].map((s) => s.toLowerCase() + s.toUpperCase()).join(",")`,
   `new Promise((resolve) => { const o = []; setTimeout(() => o.push("t"), 0); queueMicrotask(() => o.push("m")); setTimeout(() => resolve(o.join()), 5); })`,
   `new URL("http://münchen.test/x").host`,
+  `crypto.subtle.digest("SHA-1", new TextEncoder().encode("abc")).then((b) => Array.from(new Uint8Array(b), (x) => x.toString(16).padStart(2, "0")).join(""))`,
+  `crypto.subtle.importKey("raw", new TextEncoder().encode("key"), { name: "HMAC", hash: "SHA-1" }, true, ["sign"]).then(async (k) => [k.algorithm.hash.name, k.algorithm.length, Array.from(new Uint8Array(await crypto.subtle.sign("HMAC", k, new TextEncoder().encode("msg"))), (x) => x.toString(16).padStart(2, "0")).join(""), new Uint8Array(await crypto.subtle.exportKey("raw", k)).length].join())`,
+  `crypto.subtle.generateKey({ name: "HMAC", hash: "SHA-512" }, true, ["sign"]).then(async (k) => [k.type, k.algorithm.length, (await crypto.subtle.exportKey("raw", k)).byteLength].join())`,
 ];
 const handler = `export default {async fetch() {
   const cases = [

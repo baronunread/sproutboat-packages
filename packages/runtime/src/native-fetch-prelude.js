@@ -2863,7 +2863,12 @@ if (globalThis.crypto.getRandomValues == null) {
   globalThis.crypto.getRandomValues = function (view) {
     const n = view.length >>> 0;
     // WebCrypto caps a single call at 65536 bytes.
-    if (n > 65536) throw new RangeError("crypto.getRandomValues: byte length exceeds 65536");
+    if (n > 65536) {
+      // WebCrypto's error for an oversized request (a DOMException named QuotaExceededError).
+      const e = new Error("crypto.getRandomValues: byte length exceeds 65536");
+      e.name = "QuotaExceededError";
+      throw e;
+    }
     if (n === 0) return view;
     // One CSPRNG byte per element. Correct for Uint8Array (and randomUUID); a
     // wider view gets its low byte filled, matching the previous polyfill's shape.
@@ -3115,6 +3120,8 @@ if (globalThis.crypto.randomUUID == null) {
 // dependency, so it works on the broker transport too.
 function __sbHashBits(algo) {
   const n = String((algo && algo.name) || algo || "").toUpperCase();
+  if (n === "SHA-1" || n === "SHA1") return "1";
+  if (n === "MD5") return "5";
   if (n === "SHA-256" || n === "SHA256") return "256";
   if (n === "SHA-384" || n === "SHA384") return "384";
   if (n === "SHA-512" || n === "SHA512") return "512";
@@ -3341,41 +3348,76 @@ function __sbHexOrBytes(value) {
   return __sbToBytes(value);
 }
 
+// Errors as WebCrypto names them (DOMException names; plain Errors here).
+function __sbCryptoError(name, message) {
+  const e = new Error(message);
+  e.name = name;
+  return e;
+}
+// An HMAC key as importKey and generateKey return it. MD5 is digest-only, as in workerd.
+function __sbHmacKey(bytes, bits, extractable, usages) {
+  const hash = bits === "1" ? "SHA-1" : "SHA-" + bits;
+  return {
+    type: "secret",
+    extractable: !!extractable,
+    algorithm: { name: "HMAC", hash: { name: hash }, length: bytes.length * 8 },
+    usages: usages || [],
+    __sbKey: bytes,
+    __sbBits: bits,
+  };
+}
+function __sbHmacBits(algo) {
+  const bits = __sbHashBits((algo && algo.hash) || "SHA-256");
+  if (!bits || bits === "5") throw __sbCryptoError("NotSupportedError", "HMAC needs SHA-1, SHA-256, SHA-384 or SHA-512");
+  return bits;
+}
 if (globalThis.crypto.subtle == null) {
   globalThis.crypto.subtle = {
     async digest(algo, data) {
       const bits = __sbHashBits(algo);
-      if (!bits) throw new Error("crypto.subtle.digest: unsupported algorithm");
+      if (!bits) throw __sbCryptoError("NotSupportedError", "crypto.subtle.digest: unsupported algorithm");
       const out = __sbDigestRaw(bits, __sbToBytes(data));
       if (!out) throw new Error("crypto.subtle.digest failed");
       return __sbBufFrom(out);
     },
     async importKey(format, keyData, algo, extractable, usages) {
-      if (format !== "raw") throw new Error("crypto.subtle.importKey: only format 'raw' is supported");
+      if (format !== "raw") throw __sbCryptoError("NotSupportedError", "crypto.subtle.importKey: only format 'raw' is supported");
       const name = String((algo && algo.name) || algo || "").toUpperCase();
-      if (name !== "HMAC") throw new Error("crypto.subtle.importKey: only HMAC keys are supported");
-      const bits = __sbHashBits((algo && algo.hash) || "SHA-256");
-      if (!bits) throw new Error("crypto.subtle.importKey: unsupported hash");
-      return {
-        type: "secret",
-        extractable: !!extractable,
-        algorithm: { name: "HMAC", hash: { name: "SHA-" + bits } },
-        usages: usages || [],
-        __sbKey: __sbToBytes(keyData),
-        __sbBits: bits,
-      };
+      if (name !== "HMAC") throw __sbCryptoError("NotSupportedError", "crypto.subtle.importKey: only HMAC keys are supported");
+      return __sbHmacKey(__sbToBytes(keyData), __sbHmacBits(algo), extractable, usages);
+    },
+    async exportKey(format, key) {
+      if (!key || key.__sbKey == null) throw new TypeError("crypto.subtle.exportKey: not a key from this runtime");
+      if (format !== "raw") throw __sbCryptoError("NotSupportedError", "crypto.subtle.exportKey: only format 'raw' is supported");
+      if (!key.extractable) throw __sbCryptoError("InvalidAccessError", "crypto.subtle.exportKey: the key is not extractable");
+      return __sbBufFrom(key.__sbKey);
+    },
+    async generateKey(algo, extractable, usages) {
+      const name = String((algo && algo.name) || algo || "").toUpperCase();
+      if (name !== "HMAC") throw __sbCryptoError("NotSupportedError", "crypto.subtle.generateKey: only HMAC keys are supported");
+      const bits = __sbHmacBits(algo);
+      // The default length is the hash's block size: 512 bits, or 1024 for SHA-384/512.
+      const length = (algo && algo.length) || (bits === "384" || bits === "512" ? 1024 : 512);
+      const bytes = __sbRandomBytes(String(Math.ceil(length / 8)));
+      return __sbHmacKey(bytes, bits, extractable, usages);
     },
     async sign(algo, key, data) {
-      if (!key || key.__sbKey == null) throw new Error("crypto.subtle.sign: only HMAC keys from importKey are supported");
+      if (!key || key.__sbKey == null) throw __sbCryptoError("InvalidAccessError", "crypto.subtle.sign: only HMAC keys are supported");
       const out = __sbHmacRaw(key.__sbBits, key.__sbKey, __sbToBytes(data));
       if (!out) throw new Error("crypto.subtle.sign failed");
       return __sbBufFrom(out);
     },
     async verify(algo, key, signature, data) {
-      if (!key || key.__sbKey == null) throw new Error("crypto.subtle.verify: only HMAC keys are supported");
+      if (!key || key.__sbKey == null) throw __sbCryptoError("InvalidAccessError", "crypto.subtle.verify: only HMAC keys are supported");
       const mac = __sbHmacRaw(key.__sbBits, key.__sbKey, __sbToBytes(data));
       if (!mac) return false;
       return __sbEqCt(mac, __sbToBytes(signature));
+    },
+    // workerd's extension: constant-time comparison of two equal-length buffers.
+    timingSafeEqual(a, b) {
+      const x = __sbToBytes(a), y = __sbToBytes(b);
+      if (x.length !== y.length) throw new TypeError("crypto.subtle.timingSafeEqual: the buffers differ in length");
+      return __sbEqCt(x, y);
     },
   };
 }
@@ -3579,9 +3621,82 @@ static void sb_sha512_final(sb_sha512_ctx* c, unsigned char* out, int is384) {
     for (int j = 0; j < 8; j++) out[i*8+j] = (unsigned char)(c->h[i] >> (56 - j*8));
 }
 
-// One-shot digest. algo: 256 | 384 | 512. out must hold 32/48/64 bytes.
+// SHA-1 and MD5 (W2: workerd's digest has both; HMAC also takes SHA-1). One-shot over a
+// padded copy: inputs are request-sized, not streams.
+static uint32_t sb_rol32(uint32_t x, int n) { return (x << n) | (x >> (32 - n)); }
+static unsigned char* sb_md_pad(const unsigned char* msg, size_t len, size_t* total, int big_endian) {
+  *total = ((len + 8) / 64 + 1) * 64;
+  unsigned char* m = (unsigned char*)calloc(*total, 1);
+  if (!m) return 0;
+  memcpy(m, msg, len); m[len] = 0x80;
+  uint64_t bits = (uint64_t)len * 8;
+  for (int i = 0; i < 8; i++) m[big_endian ? *total - 1 - i : *total - 8 + i] = (unsigned char)(bits >> (8 * i));
+  return m;
+}
+static size_t sb_sha1(const unsigned char* msg, size_t len, unsigned char out[20]) {
+  size_t total; unsigned char* m = sb_md_pad(msg, len, &total, 1);
+  if (!m) return 0;
+  uint32_t h[5] = { 0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0 };
+  for (size_t off = 0; off < total; off += 64) {
+    uint32_t w[80];
+    for (int i = 0; i < 16; i++) w[i] = ((uint32_t)m[off + 4*i] << 24) | ((uint32_t)m[off + 4*i + 1] << 16) | ((uint32_t)m[off + 4*i + 2] << 8) | m[off + 4*i + 3];
+    for (int i = 16; i < 80; i++) w[i] = sb_rol32(w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16], 1);
+    uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
+    for (int i = 0; i < 80; i++) {
+      uint32_t f, k;
+      if (i < 20) { f = (b & c) | (~b & d); k = 0x5A827999; }
+      else if (i < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
+      else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
+      else { f = b ^ c ^ d; k = 0xCA62C1D6; }
+      uint32_t t = sb_rol32(a, 5) + f + e + k + w[i];
+      e = d; d = c; c = sb_rol32(b, 30); b = a; a = t;
+    }
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e;
+  }
+  free(m);
+  for (int i = 0; i < 5; i++) { out[4*i] = h[i] >> 24; out[4*i+1] = h[i] >> 16; out[4*i+2] = h[i] >> 8; out[4*i+3] = h[i]; }
+  return 20;
+}
+static size_t sb_md5(const unsigned char* msg, size_t len, unsigned char out[16]) {
+  static const uint32_t K[64] = {
+    0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+    0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+    0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+    0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+    0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+    0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+    0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+    0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391 };
+  static const int S[16] = { 7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21 };
+  size_t total; unsigned char* m = sb_md_pad(msg, len, &total, 0);
+  if (!m) return 0;
+  uint32_t h[4] = { 0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476 };
+  for (size_t off = 0; off < total; off += 64) {
+    uint32_t w[16];
+    for (int i = 0; i < 16; i++) w[i] = (uint32_t)m[off + 4*i] | ((uint32_t)m[off + 4*i + 1] << 8) | ((uint32_t)m[off + 4*i + 2] << 16) | ((uint32_t)m[off + 4*i + 3] << 24);
+    uint32_t a = h[0], b = h[1], c = h[2], d = h[3];
+    for (int i = 0; i < 64; i++) {
+      uint32_t f; int g;
+      if (i < 16) { f = (b & c) | (~b & d); g = i; }
+      else if (i < 32) { f = (d & b) | (~d & c); g = (5*i + 1) % 16; }
+      else if (i < 48) { f = b ^ c ^ d; g = (3*i + 5) % 16; }
+      else { f = c ^ (b | ~d); g = (7*i) % 16; }
+      f = f + a + K[i] + w[g];
+      a = d; d = c; c = b;
+      b = b + sb_rol32(f, S[(i / 16) * 4 + i % 4]);
+    }
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d;
+  }
+  free(m);
+  for (int i = 0; i < 4; i++) { out[4*i] = h[i]; out[4*i+1] = h[i] >> 8; out[4*i+2] = h[i] >> 16; out[4*i+3] = h[i] >> 24; }
+  return 16;
+}
+
+// One-shot digest. algo: 1 (SHA-1) | 5 (MD5) | 256 | 384 | 512. out must hold up to 64 bytes.
 // Returns the digest length, or 0 for an unknown algo.
 static size_t sb_digest(int algo, const unsigned char* msg, size_t mlen, unsigned char* out) {
+  if (algo == 1) return sb_sha1(msg, mlen, out);
+  if (algo == 5) return sb_md5(msg, mlen, out);
   if (algo == 256) { sb_sha256_ctx c; sb_sha256_init(&c); sb_sha256_update(&c, msg, mlen); sb_sha256_final(&c, out); return 32; }
   if (algo == 384) { sb_sha512_ctx c; sb_sha512_init(&c, 1); sb_sha512_update(&c, msg, mlen); sb_sha512_final(&c, out, 1); return 48; }
   if (algo == 512) { sb_sha512_ctx c; sb_sha512_init(&c, 0); sb_sha512_update(&c, msg, mlen); sb_sha512_final(&c, out, 0); return 64; }
@@ -3591,6 +3706,20 @@ static size_t sb_digest(int algo, const unsigned char* msg, size_t mlen, unsigne
 // HMAC(algo) per RFC 2104. Block size is 64 for SHA-256, 128 for SHA-384/512.
 static size_t sb_hmac(int algo, const unsigned char* key, size_t klen,
                       const unsigned char* msg, size_t mlen, unsigned char* out) {
+  if (algo == 1) {
+    // HMAC-SHA-1: block 64, over padded copies like the one-shot digest.
+    unsigned char k1[64], inner1[20];
+    memset(k1, 0, sizeof(k1));
+    if (klen > 64) sb_sha1(key, klen, k1); else memcpy(k1, key, klen);
+    unsigned char* buf = (unsigned char*)malloc(64 + (mlen > 20 ? mlen : 20));
+    if (!buf) return 0;
+    for (int i = 0; i < 64; i++) buf[i] = k1[i] ^ 0x36;
+    memcpy(buf + 64, msg, mlen); sb_sha1(buf, 64 + mlen, inner1);
+    for (int i = 0; i < 64; i++) buf[i] = k1[i] ^ 0x5c;
+    memcpy(buf + 64, inner1, 20); sb_sha1(buf, 84, out);
+    free(buf);
+    return 20;
+  }
   size_t bs = algo == 256 ? 64 : 128;
   unsigned char k[128], ipad[128], opad[128], inner[64];
   memset(k, 0, sizeof(k));
