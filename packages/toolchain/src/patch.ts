@@ -22,6 +22,7 @@ import { HEADERS_CLASS_SOURCE } from "./headers-class";
 import { BLOB_CLASS_SOURCE, REQUEST_CLASS_SOURCE, RESPONSE_BYTES_ANCHOR, RESPONSE_BYTES_INJECT, RESPONSE_CLASS_SOURCE } from "./fetch-classes";
 import * as streaming from "./streaming";
 import { PORFFOR_COMMIT_FULL } from "./pin";
+import { PATCH_FINGERPRINT } from "./fingerprint";
 import { version as TOOLCHAIN_VERSION } from "../package.json" with { type: "json" };
 
 // --- compiler/render.js: the native-fetch server, rendered as C text ---
@@ -2148,20 +2149,25 @@ export async function patchStreamingResponses(root: string): Promise<void> {
 }
 
 /**
- * True when root is a finished cache entry that this toolchain version patched
- * (ensurePorffor patches before it writes the manifest). The CLI calls
+ * True when root is a finished cache entry that this toolchain version and patch
+ * chain patched (ensurePorffor patches before it writes the manifest). The CLI calls
  * ensurePorfforPatched on every compile: re-running the patch chain there cost
  * ~1.3 s per build, and its precompile rewrote builtins_precompiled.js in place,
  * so parallel builds sharing the cache could import a half-written table.
  */
 async function patchedByThisVersion(root: string): Promise<boolean> {
   try {
-    // SAFETY: private manifest written by ensurePorffor; only two fields are read.
+    // SAFETY: private manifest written by ensurePorffor; only three fields are read.
     const manifest = JSON.parse(await readFile(resolve(root, ".sproutboat-complete"), "utf8")) as {
       commit?: string;
       toolchainVersion?: string;
+      patchFingerprint?: string;
     };
-    return manifest.commit === PORFFOR_COMMIT_FULL && manifest.toolchainVersion === TOOLCHAIN_VERSION;
+    return (
+      manifest.commit === PORFFOR_COMMIT_FULL &&
+      manifest.toolchainVersion === TOOLCHAIN_VERSION &&
+      manifest.patchFingerprint === PATCH_FINGERPRINT
+    );
   } catch {
     return false;
   }
