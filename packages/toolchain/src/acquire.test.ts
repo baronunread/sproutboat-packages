@@ -146,8 +146,11 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "class URL {\n  constructor(input) {\n    this.href = '';\n  }\n}\n\nclass Request {\n}\n" +
       "class Response {\n  constructor(body = null, init = undefined) {\n    this.body = body;\n    this.status = Number(init?.status ?? 200);\n    this.headers = new Headers(init?.headers);\n  }\n}\n",
     "compiler/builtins/uint8array_base64.ts": "let alphabet: string = 'base64';\nlet lastChunkHandling: string = 'loose';\nconst fullChunks: i32 = (len / 3) * 3;\n",
+    "compiler/builtins/map.ts": "export const Map = function (iterable: any): Map {\n};\n",
     "compiler/codegen.js":
       "if (!hoistRead && directCallOnlyFunctionBinding(scope, kind, name, pattern, func)) {\n        return valUndefined();\n}\nconst func = resolveNamedFunction(scope, name) ?? funcByName(name);\n" +
+      "        builtinCall(func, '__Porffor_object_class_value', [\n" +
+      "      if (kind === 'get' || kind === 'set') initKind = kind;\n" +
       "      stmt(scope, Store(ctype, addr, 4, ctype === 'f64' || ctype === 'f32' ? f : toUint32(scope, f)));\n" +
       "  const taGet = (ctype, size, signed = true) => () => {\n" +
       "    const loaded = Load(ctype, taAddr(size), 4);\n" +
@@ -252,6 +255,9 @@ test("the default call (no url/expectedSha256 override) never touches the networ
   );
   // #238/#241 (out-of-range typed-array reads and writes) are upstream's own
   // integer-indexed element access since alpha-18; no codegen patch remains.
+  // #286: Map.groupBy, and private fields installed as non-enumerable.
+  expect(await readFile(join(dir, "compiler/builtins/map.ts"), "utf8")).toContain("export const __Map_groupBy");
+  expect(await readFile(join(dir, "compiler/codegen.js"), "utf8")).toContain("sproutboat #286: private fields");
   // #256: named class expressions inside functions are rewritten at parse time.
   expect(await readFile(join(dir, "compiler/parse.js"), "utf8")).toContain("sbClassSelf(ast); // sproutboat #256");
   expect(await readFile(join(dir, "compiler/sb-class-self.js"), "utf8")).toContain("sproutboat #256");

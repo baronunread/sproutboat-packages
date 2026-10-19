@@ -6,6 +6,8 @@ import { EMPTY_BINDINGS, wrapNativeFetchHandler } from "../../runtime/src/wrap";
 import {
   patchHeadersArrayInit,
   patchLocalFunctionTypes,
+  patchMapGroupBy,
+  patchPrivateFieldsHidden,
   patchResponseDefaults,
   patchURLClass,
   patchUint8ArrayBase64,
@@ -439,3 +441,44 @@ test("URL patch replaces Porffor's URL class, idempotently", async () => {
   }
 });
 
+
+test("Map.groupBy patch appends the builtin once and refuses an upstream one", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sb-map-groupby-"));
+  try {
+    await mkdir(join(root, "compiler/builtins"), { recursive: true });
+    const file = join(root, "compiler/builtins/map.ts");
+    await writeFile(file, "export const Map = function (iterable: any): Map {\n};\n");
+    await patchMapGroupBy(root);
+    const patched = await readFile(file, "utf8");
+    expect(patched).toContain("export const __Map_groupBy = (items: any, callbackFn: any): Map => {");
+    await patchMapGroupBy(root);
+    expect(await readFile(file, "utf8")).toBe(patched);
+    await writeFile(file, "export const Map = function (iterable: any): Map {\n};\nexport const __Map_groupBy = 1;\n");
+    await expect(patchMapGroupBy(root)).rejects.toThrow("drop patchMapGroupBy");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("private field patch installs instance and static private fields as methods, idempotently", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sb-private-fields-"));
+  try {
+    await mkdir(join(root, "compiler"));
+    const file = join(root, "compiler/codegen.js");
+    await writeFile(
+      file,
+      "        builtinCall(func, '__Porffor_object_class_value', [\n" +
+        "      if (kind === 'get' || kind === 'set') initKind = kind;\n",
+    );
+    await patchPrivateFieldsHidden(root);
+    const patched = await readFile(file, "utf8");
+    expect(patched).toContain("x.key?.type === 'PrivateIdentifier' ? '__Porffor_object_class_method' : '__Porffor_object_class_value'");
+    expect(patched).toContain("if (initKind === 'value' && x.key?.type === 'PrivateIdentifier') initKind = 'method';");
+    await patchPrivateFieldsHidden(root);
+    expect(await readFile(file, "utf8")).toBe(patched);
+    await writeFile(file, "export const x = 1;\n");
+    await expect(patchPrivateFieldsHidden(root)).rejects.toThrow("anchor not found");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
