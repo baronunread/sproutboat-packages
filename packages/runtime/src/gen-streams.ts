@@ -16,6 +16,10 @@ if (!code.startsWith("(() => {") || !code.trimEnd().endsWith("})();")) {
   throw new Error("Unexpected streams bundle format");
 }
 code = code.slice("(() => {".length).trimEnd().slice(0, -"})();".length);
+// streams-entry.js installs each class with its own static assignment (see there).
+const exported = Object.keys(await import("web-streams-polyfill"));
+const missing = exported.filter((name) => !code.includes(`globalThis.${name} = `));
+if (!exported.length || missing.length) throw new Error(`streams-entry.js does not install: ${missing.join(", ") || "(no exports found)"}`);
 code = code.replace(/^\s*\/\/ .*streams-entry.js$/m, "// streams-entry.js");
 code = code.replace(/^\s*\/\/ .*web-streams-polyfill\/dist\/ponyfill.mjs$/m,
   "// web-streams-polyfill 4.3.0, MIT, copyright Mattias Buelens (see WEB_STREAMS_LICENSE)");

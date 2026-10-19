@@ -35,7 +35,18 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "    return 0;\n" +
       "  }\n" +
       "  return -1;\n" +
-      "}\n",
+      "}\n" +
+      // patchSplitGlobals' anchors.
+      "  const st = split ? '' : 'static ';\n" +
+      "      case K.Global:\n        cur.globals[node[N_A]] = true;\n      case K.Local:\n        return [sanitize(node[N_A]), P_PRIM];\n" +
+      "        emit(`${ind()}${sanitize(node[N_A][N_A])} = ${rx(node[N_B], P_COMMA)};\\n`);\n" +
+      "            ? `${sanitize(update[N_A][N_A])} = ${rx(update[N_B], P_COMMA)}`\n" +
+      "    const t = sanitize(target[N_A]);\n" +
+      "  for (const g of globals) link.push(`${st}${CT[g.type]} ${sanitize(g.name)};`);\n" +
+      "      const name = sanitize(g.name);\n" +
+      "          const buckets = sanitize(g.name.replace(/underlyingStore$/, 'underlyingBuckets'));\n" +
+      "          const bucketsCap = sanitize(g.name.replace(/underlyingStore$/, 'underlyingBucketsCap'));\n" +
+      "      for (const x of Object.keys(parts.globals).sort()) text.push(`extern ${CT[globalTypes[x]]} ${sanitize(x)};\\n`);\n",
     "compiler/parse.js":
       "import link from './modules.js';\n" +
       "export default (input) => {\n" +
