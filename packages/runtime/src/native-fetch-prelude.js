@@ -4655,14 +4655,17 @@ function __sbTrustedProxyHeader(request, name) {
 // own.
 const __SB_WAITUNTIL_TIMEOUT_MS = 25000;
 
-function __sbTimeout(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 async function __sbDrainWaitUntil(tasks) {
   if (!tasks.length) return;
   const pending = tasks.splice(0, tasks.length);
-  await Promise.race([__sbDrainAll(pending), __sbTimeout(__SB_WAITUNTIL_TIMEOUT_MS)]);
+  // Clear the cap's timer once the tasks finish: a pending timer kept the process
+  // busy for the full 25 s (sproutd will not reap a worker with timers left, B22).
+  let timer;
+  const cap = new Promise((resolve) => {
+    timer = setTimeout(resolve, __SB_WAITUNTIL_TIMEOUT_MS);
+  });
+  await Promise.race([__sbDrainAll(pending), cap]);
+  clearTimeout(timer);
 }
 
 async function __sbDrainAll(pending) {
@@ -4686,7 +4689,10 @@ async function __sbFetchWithDrain(res, tasks) {
     // #179 — a rejected handler promise must not take the process down with it.
     r = __sbErrorResponse(error);
   }
-  await __sbDrainWaitUntil(tasks);
+  // The response goes out now and ctx.waitUntil work keeps running after it, as in
+  // workerd; it was awaited first, so a 1.5 s background task delayed the response by
+  // 1.5 s. The 25 s cap still bounds it.
+  __sbDrainWaitUntil(tasks);
   return r;
 }
 
