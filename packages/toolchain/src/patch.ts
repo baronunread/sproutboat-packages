@@ -2064,6 +2064,24 @@ export async function patchHeadersClass(root: string): Promise<void> {
   await writeFile(file, src.slice(0, start) + HEADERS_CLASS_SOURCE + src.slice(end));
 }
 
+// setTimeout(fn, 0) never fired on Linux: uSockets arms timers with timerfd_settime, where
+// a zero first expiry disarms the timer (kqueue on macOS fires it at once). The same held
+// for setInterval(fn, 0), which also lost its repeat. Arm at least 1 ms.
+const ZERO_TIMER_ANCHOR =
+  "  porf_native_fetch_timer_start(id, (i32)delay_ms, timer->repeat ? (i32)delay_ms : 0);";
+const ZERO_TIMER_INJECT =
+  "  porf_native_fetch_timer_start(id, delay_ms < 1 ? 1 : (i32)delay_ms, timer->repeat ? (delay_ms < 1 ? 1 : (i32)delay_ms) : 0); /* sproutboat: zero-delay timers fire on Linux */";
+
+/** Zero-delay timers are armed at 1 ms, since a zero timerfd expiry disarms them. */
+export async function patchZeroDelayTimers(root: string): Promise<void> {
+  const file = resolve(root, "compiler/render.js");
+  const src = await readFile(file, "utf8");
+  if (src.includes("sproutboat: zero-delay timers fire on Linux")) return;
+  if (src.split(ZERO_TIMER_ANCHOR).length !== 2)
+    throw new Error(`could not patch Porffor's zero-delay timers: anchor not found in ${file}`);
+  await writeFile(file, src.replace(ZERO_TIMER_ANCHOR, ZERO_TIMER_INJECT));
+}
+
 /**
  * True when root is a finished cache entry that this toolchain version patched
  * (ensurePorffor patches before it writes the manifest). The CLI calls
@@ -2113,6 +2131,7 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchTypedArrayTag(root);
   await patchConsoleColors(root);
   await patchCaseMapping(root);
+  await patchZeroDelayTimers(root);
   // Last of the builtin edits: its precompile picks up the date, promise and
   // replaceAll patches above too.
   await precompileBuiltins(root);

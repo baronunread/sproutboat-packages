@@ -14,6 +14,7 @@ import {
   patchTypedArrayTag,
   patchConsoleColors,
   patchCaseMapping,
+  patchZeroDelayTimers,
   patchHeadersClass,
   patchTextDecoder,
   patchResponseDefaults,
@@ -669,6 +670,24 @@ test("case mapping patch adds the lookup and routes non-ASCII units through it, 
     expect(await readFile(file, "utf8")).toBe(patched);
     await writeFile(file, "export const x = 1;\n");
     await expect(patchCaseMapping(root)).rejects.toThrow("anchor not found");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("zero-delay timer patch arms timers at 1 ms, idempotently", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sb-zero-timers-"));
+  try {
+    await mkdir(join(root, "compiler"));
+    const file = join(root, "compiler/render.js");
+    await writeFile(file, "x\n  porf_native_fetch_timer_start(id, (i32)delay_ms, timer->repeat ? (i32)delay_ms : 0);\n");
+    await patchZeroDelayTimers(root);
+    const patched = await readFile(file, "utf8");
+    expect(patched).toContain("delay_ms < 1 ? 1 : (i32)delay_ms");
+    await patchZeroDelayTimers(root);
+    expect(await readFile(file, "utf8")).toBe(patched);
+    await writeFile(file, "export const x = 1;\n");
+    await expect(patchZeroDelayTimers(root)).rejects.toThrow("anchor not found");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

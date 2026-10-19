@@ -18,6 +18,7 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
     "runtime/index.js": "fixture:runtime/index.js\n",
     "compiler/render.js": "// sb_native_utf8_scalar_v1\n" +
       "static i32 porf_gc_mark_queue_cap = 0;\n    porf_gc_discard_free_runs();\n" +
+      "  porf_native_fetch_timer_start(id, (i32)delay_ms, timer->repeat ? (i32)delay_ms : 0);\n" +
       "void porf_native_fetch_collect_normal_from(void* stack_top) {\n" +
       "  if (porf_heap_base == 0) return;\n" +
       "  void* prev_stack_top = porf_c_stack_top;\n  porf_c_stack_top = stack_top;\n" +
