@@ -28,6 +28,8 @@ ${CASES.map((c) => `    () => (${c}),`).join("\n")}
   }
   return new Response(JSON.stringify(out));
 }};`;
+// SAFETY: a case that throws in Bun throws an Error (or subclass); only its name and
+// message are read, as the handler side does.
 const want = await Promise.all(CASES.map(async (c) => { try { return String(await new Function("return " + c)()); } catch (e) { return "THROWS " + (e as Error).message; } }));
 
 function freePort(): number {
