@@ -2435,6 +2435,12 @@ function __sbCollectionIterator(owner, kind, formData) {
 
 class __SproutboatURLSearchParams {
   constructor(init) {
+    this._url = null;
+    this._reset(init);
+  }
+  // A URL's searchParams writes back into it (_url), and is re-read when the URL's
+  // search is assigned (_reset).
+  _reset(init) {
     this._keys = [];
     this._vals = [];
     let raw = init == null ? "" : String(init);
@@ -2450,6 +2456,11 @@ class __SproutboatURLSearchParams {
       this._keys.push(decodeURIComponent(k.split("+").join(" ")));
       this._vals.push(decodeURIComponent(v.split("+").join(" ")));
     }
+  }
+  _update() {
+    if (this._url == null) return;
+    const s = this.toString();
+    this._url._query = s === "" ? null : s;
   }
   get(name) {
     for (let i = 0; i < this._keys.length; i++) if (this._keys[i] === name) return this._vals[i];
@@ -2467,12 +2478,10 @@ class __SproutboatURLSearchParams {
   forEach(cb) {
     for (let i = 0; i < this._keys.length; i++) cb(this._vals[i], this._keys[i], this);
   }
-  // Mutators: standalone `new URLSearchParams()` building works. They do NOT
-  // write back into a URL's `search` (Porffor's URL has no setter) — build the
-  // string with toString() and assign it yourself.
   append(name, value) {
     this._keys.push(String(name));
     this._vals.push(String(value));
+    this._update();
   }
   set(name, value) {
     let found = false;
@@ -2487,7 +2496,11 @@ class __SproutboatURLSearchParams {
         found = true;
       }
     }
-    if (!found) this.append(name, value);
+    if (!found) {
+      this._keys.push(String(name));
+      this._vals.push(String(value));
+    }
+    this._update();
   }
   delete(name) {
     for (let i = 0; i < this._keys.length; i++)
@@ -2496,13 +2509,15 @@ class __SproutboatURLSearchParams {
         this._vals.splice(i, 1);
         i--;
       }
+    this._update();
   }
   sort() {
     const idx = this._keys
       .map((_, i) => i)
-      .sort((a, b) => (this._keys[a] < this._keys[b] ? -1 : this._keys[a] > this._keys[b] ? 1 : 0));
+      .sort((a, b) => (this._keys[a] < this._keys[b] ? -1 : this._keys[a] > this._keys[b] ? 1 : a - b));
     this._keys = idx.map((i) => this._keys[i]);
     this._vals = idx.map((i) => this._vals[i]);
+    this._update();
   }
   keys() {
     return __sbCollectionIterator(this, 0, false);
@@ -2517,14 +2532,24 @@ class __SproutboatURLSearchParams {
   get size() {
     return this._keys.length;
   }
+  // application/x-www-form-urlencoded: space is "+", and ! ' ( ) ~ are escaped too.
   toString() {
     let out = "";
     for (let i = 0; i < this._keys.length; i++) {
       if (i > 0) out += "&";
-      out += encodeURIComponent(this._keys[i]) + "=" + encodeURIComponent(this._vals[i]);
+      out += __sbFormEncode(this._keys[i]) + "=" + __sbFormEncode(this._vals[i]);
     }
     return out;
   }
+}
+function __sbFormEncode(s) {
+  return encodeURIComponent(s)
+    .split("%20").join("+")
+    .split("!").join("%21")
+    .split("'").join("%27")
+    .split("(").join("%28")
+    .split(")").join("%29")
+    .split("~").join("%7E");
 }
 
 // URL and Response are always defined by Porffor's fetch-globals.js banner.

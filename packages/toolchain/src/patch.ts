@@ -15,6 +15,7 @@
 import { readFile, realpath, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { patchUnicode } from "./unicode";
+import { URL_CLASS_SOURCE } from "./url-class";
 
 // --- compiler/render.js: the native-fetch server, rendered as C text ---
 
@@ -1777,6 +1778,70 @@ export async function patchResponseDefaults(root: string): Promise<void> {
   );
 }
 
+const JSON_TOJSON_MARKER = "__Porffor_json_toJSON";
+// [anchor, replacement]: a helper before the serializer, then toJSON applied where a
+// value is picked (top level, array element, object property), so a toJSON that
+// returns undefined is skipped (or null in an array) the way the spec says.
+const JSON_TOJSON_EDITS: [string, string][] = [
+  [
+    "export const __Porffor_json_serialize = (",
+    "// sproutboat: toJSON (SerializeJSONProperty step 2), so Date and URL serialize as strings.\n" +
+      "export const __Porffor_json_toJSON = (value: any): any => {\n" +
+      "  if (Porffor.type(value) == Porffor.TYPES.date) return Porffor.callThis(__Date_prototype_toJSON, value);\n" +
+      "  if (Porffor.type(value) > 0x06) {\n" +
+      "    const toJSON: any = value.toJSON;\n" +
+      "    if (Porffor.type(toJSON) == Porffor.TYPES.function) return toJSON.call(value);\n" +
+      "  }\n" +
+      "  return value;\n" +
+      "};\n\n" +
+      "export const __Porffor_json_serialize = (",
+  ],
+  [
+    "    for (const x of (value as any[])) {\n",
+    "    for (const raw of (value as any[])) {\n      const x: any = __Porffor_json_toJSON(raw);\n",
+  ],
+  ["      const val: any = value[key];\n", "      const val: any = __Porffor_json_toJSON(value[key]);\n"],
+  [
+    "  let cap: i32 = 4096;\n",
+    "  value = __Porffor_json_toJSON(value);\n  let cap: i32 = 4096;\n",
+  ],
+];
+
+/**
+ * JSON.stringify ignored toJSON, so a Date serialized as {} and a URL as its fields.
+ * Values with a callable toJSON now serialize its result, as the spec says.
+ */
+export async function patchJsonToJSON(root: string): Promise<void> {
+  const file = resolve(root, "compiler/builtins/json.ts");
+  let src = await readFile(file, "utf8");
+  if (src.includes(JSON_TOJSON_MARKER)) return;
+  for (const [anchor, replacement] of JSON_TOJSON_EDITS) {
+    if (src.split(anchor).length !== 2)
+      throw new Error(`could not patch Porffor's JSON.stringify: anchor not found in ${file}`);
+    src = src.replace(anchor, replacement);
+  }
+  await writeFile(file, src);
+}
+
+const URL_CLASS_START = "class URL {\n  constructor(input) {\n";
+const URL_CLASS_END = "\nclass Request {";
+const URL_CLASS_MARKER = "sproutboat: WHATWG-style URL";
+
+/**
+ * Replaces Porffor's URL (href, origin, pathname and search only; no base argument, no
+ * setters but pathname, no hash) with the WHATWG-style class in url-class.ts.
+ */
+export async function patchURLClass(root: string): Promise<void> {
+  const file = resolve(root, "runtime/fetch-globals.js");
+  const src = await readFile(file, "utf8");
+  if (src.includes(URL_CLASS_MARKER)) return;
+  const start = src.indexOf(URL_CLASS_START);
+  const end = start === -1 ? -1 : src.indexOf(URL_CLASS_END, start);
+  if (end === -1)
+    throw new Error(`could not patch Porffor's URL: anchor not found in ${file}`);
+  await writeFile(file, src.slice(0, start) + URL_CLASS_SOURCE + src.slice(end + 1));
+}
+
 const HEADERS_ARRAY_ANCHOR =
   "    if (Porffor.type(init.entries) == Porffor.TYPES.function) {\n      this._entries = Porffor.array.new(8);\n      for (const entry of init.entries()) {";
 const HEADERS_ARRAY_INJECT =
@@ -1816,6 +1881,8 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchUint8ArrayBase64(root);
   await patchResponseDefaults(root);
   await patchHeadersArrayInit(root);
+  await patchURLClass(root);
+  await patchJsonToJSON(root);
   // Last of the builtin edits: its precompile picks up the date, promise and
   // replaceAll patches above too.
   await precompileBuiltins(root);

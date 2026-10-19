@@ -134,10 +134,16 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "\n" +
       "  if (body_owned) free(body_owned);\n" +
       "}\n",
-    "compiler/builtins/json.ts": "// sb_json_utf16_v1\n",
+    "compiler/builtins/json.ts":
+      "// sb_json_utf16_v1\n" +
+      "export const __Porffor_json_serialize = (_buffer: i32, value: any): i32 => {\n" +
+      "    for (const x of (value as any[])) {\n    }\n" +
+      "      const val: any = value[key];\n" +
+      "};\nexport const __JSON_stringify = (value: any) => {\n  let cap: i32 = 4096;\n};\n",
     "runtime/fetch-globals.js":
       "// sb_text_encoder_scalar_v1\n" +
       "    if (Porffor.type(init.entries) == Porffor.TYPES.function) {\n      this._entries = Porffor.array.new(8);\n      for (const entry of init.entries()) {\n" +
+      "class URL {\n  constructor(input) {\n    this.href = '';\n  }\n}\n\nclass Request {\n}\n" +
       "class Response {\n  constructor(body = null, init = undefined) {\n    this.body = body;\n    this.status = Number(init?.status ?? 200);\n    this.headers = new Headers(init?.headers);\n  }\n}\n",
     "compiler/builtins/uint8array_base64.ts": "let alphabet: string = 'base64';\nlet lastChunkHandling: string = 'loose';\nconst fullChunks: i32 = (len / 3) * 3;\n",
     "compiler/codegen.js":

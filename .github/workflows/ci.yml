@@ -27,3 +27,5 @@ jobs:
       - run: bun run test:native-utf8
       - run: bun run test:native-response-defaults
       - run: bun run test:native-raw-body
+      - run: bun run test:native-url
+      - run: bun run test:native-json
