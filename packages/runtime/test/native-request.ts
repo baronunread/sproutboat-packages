@@ -28,9 +28,7 @@ ${CASES.map((c) => `    () => (${c}),`).join("\n")}
   }
   return new Response(JSON.stringify(out));
 }};`;
-// SAFETY: a case that throws in Bun throws an Error (or subclass); only its name and
-// message are read, as the handler side does.
-const want = await Promise.all(CASES.map(async (c) => { try { return String(await new Function("return " + c)()); } catch (e) { return "THROWS " + (e as Error).message; } }));
+const want = await Promise.all(CASES.map(async (c) => { try { return String(await new Function("return " + c)()); } catch (e) { return "THROWS " + (e instanceof Error ? e.message : String(e)); } }));
 
 function freePort(): number {
   const listener = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
