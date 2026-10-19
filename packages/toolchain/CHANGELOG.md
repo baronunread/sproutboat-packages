@@ -1,5 +1,66 @@
 # @sproutboat/toolchain
 
+## 0.8.0
+
+### Minor Changes
+
+- 9fdf3fa: Upgrade the verified vendored Porffor pin to Alpha 18 (`deda494`). Alpha 18 brings spec BigInt arithmetic and bitwise operators, iterator helpers, Set methods, `Array.fromAsync`, Atomics, resizable ArrayBuffers, explicit resource management, a rewritten Temporal, an on-demand Intl polyfill, and many RegExp, Promise and Object spec fixes. Three downstream workarounds are dropped because upstream now covers them: the typed-array read and write bounds checks (#238, #241), the `toJSON` step in `JSON.stringify` (Alpha 18 also adds the replacer argument), and the Web Streams adapter for dynamic array iterator lookup. The remaining patches are unchanged.
+- 6e88627: Standalone sprouts stream `ReadableStream` response bodies. The status and headers go out as soon as the handler returns, and each chunk reaches the client as it is produced (chunked encoding), so Server-Sent Events, progress output and long responses work. A client that disconnects cancels the stream. Hosts without the streaming server (sproutd's workers, for now) still read the stream to the end and send it buffered.
+
+### Patch Changes
+
+- 6880f60: Add an opt-in bounded multi-session broker worker with private supervisor control.
+  Fence queue acknowledgements to durable delivery claims and retain recoverable alarm deliveries across process crashes in broker and embedded transports.
+  
+  Resume native R2 downloads until completion or renewed backpressure instead of leaving large responses stalled.
+  
+  Retain partially written TCP replies until drain and serialize pipelined replies so large broker-backed R2 reads cannot truncate or interleave frames.
+  
+  Honor wildcard, weak and list-based If-None-Match conditions on broker direct downloads.
+  
+  Move D1 queries, batches, exec and backups off the shared broker event loop into two lazy SQL threads per broker process. Preserve database affinity, transaction rollback and session isolation, and bound queued work with per-session admission and queue deadlines. Running SQLite statements remain non-preemptible; keep shared mode opt-in.
+  
+  Enforce shared D1 execution budgets through a capability-protected native SQLite progress hook. Interrupted batches roll back and lanes remain usable. A broker watchdog revokes all sessions if native work cannot be interrupted; uncertain SQL outcomes are never automatically retried. Build the small SQLite extension during host/image preparation.
+- 846519f: Fixes found by the new differential conformance suite against workerd:
+  
+  - `JSON.stringify` of a cyclic object throws `TypeError` instead of crashing the process (it recursed until the native stack overflowed), so one request can no longer take a worker down.
+  - `structuredClone` follows the structured-clone algorithm: cycles, `Map`, `Set`, `Date`, `RegExp`, typed arrays, `DataView` and errors survive the copy, and functions and symbols throw `DataCloneError`. It was a JSON round-trip that lost every non-JSON type and also crashed on cycles.
+  - `Event`, `CustomEvent`, `EventTarget`, `AbortSignal` (`abort`, `timeout`, `any`, `throwIfAborted`) and `AbortController` exist.
+  - `Object.prototype.toString` names typed arrays (`[object Uint8Array]`, not `[object Object]`).
+- 853f8c9: `console.log` colours values only when stdout is a terminal. Piped or redirected output, like sproutd's per-app logs or a standalone sprout's output collected by a service manager, no longer contains ANSI escape codes such as `\x1b[33m42\x1b[0m`.
+- 262690d: Allocation-heavy handlers are up to 4.5x faster in standalone sprouts (a regex scan went from 140 to 31 ms per request). Full garbage collections under load no longer return free pages to the OS, which made the next allocations fault them back in; the idle collection returns them instead, now also for small sprouts that never reach a full collection. Memory after 3 s idle is unchanged; during traffic a sprout keeps more of its heap (baronunread/sproutboat#287).
+- ddb0f9d: Response, Request and Blob follow the Fetch spec, and binary bodies reach the client intact:
+  
+  - A `Uint8Array` or `ArrayBuffer` response body is sent as its bytes. It was sent as text: `new Response(new Uint8Array([104, 105]))` reached the client as `104,105`, and an `ArrayBuffer` as `[object ArrayBuffer]`.
+  - `Response` has `statusText`, `type`, `bodyUsed` and `Response.error()`. A status outside 200–599 throws `RangeError`, a body with 101/204/205/304 throws `TypeError`, and `arrayBuffer()`/`text()` handle byte bodies (UTF-8 both ways).
+  - `Request` normalizes its URL and rejects relative or invalid ones, has `redirect` and `bodyUsed`, rejects a body on GET/HEAD, and sets the default content type for string and `URLSearchParams` bodies.
+  - A body can be read once: a second `text()`/`json()`/`arrayBuffer()`/`blob()` throws `TypeError`.
+  - `Blob` holds bytes, with `size`, `type`, `slice` (negative indices too), and promise-returning `text`/`arrayBuffer`/`bytes`. `File` exists. `FormData` stores a `Blob` value as a `File` named by its filename, and `new Response(formData)` sends multipart/form-data.
+- 50bea68: `Map.groupBy` works (it threw a TypeError), and private class fields (`#x`) no longer show up in `Object.keys`, `Object.entries`, `for...in` or `JSON.stringify`. Porffor stores a private field as an ordinary property named `__#x`; it is now installed non-enumerable, like a method, so `Object.getOwnPropertyNames` still lists the internal name (baronunread/sproutboat#286).
+- 6d6ae43: `Headers` is iterable (`new Map(headers)`, `[...headers]`, `Object.fromEntries(headers)`), and `new Headers([["name", "value"]])` reads the pairs instead of producing headers named "0", "1"...
+- 2a4d70d: Builds are about 1.3 s faster, and parallel builds no longer fail with `PrecompiledBuiltins.BuiltinFuncs is not a function`. Every compile re-ran the patch chain on the shared compiler cache, and its builtin precompile rewrote `builtins_precompiled.js` in place, so a concurrent build could import a half-written table. A cache entry patched by the same toolchain version is now used as is.
+- 4c25aa2: The Porffor cache entry is keyed by a fingerprint of the patch chain as well as the toolchain release. A patch edit that ships under the same version now gets a freshly patched compiler, instead of reusing an entry an older chain marked complete. Builds against such an entry failed to link once the runtime began calling `sb_stream_*`. Old entries stay on disk and are no longer used.
+- ec5d49f: A sprout that returns a `fetch()` response unchanged (`return fetch(url)`, or a proxy) sends its body again. The body could reach the server as a UTF-16 string, which the raw-bytes reader rejected, so the client got an empty body with the upstream's headers.
+- 5859a82: Reclaim large native heaps after 500 ms without a completed request, and release oversized GC mark-queue scratch storage. Preserve the existing request collector and live application state. Extra collection is limited to heaps over 8 MiB or mark queues over 65,536 entries.
+- 56b9ba6: `String.prototype.repeat` copies in doubling chunks instead of once per repetition: repeating a 600 KB string went from about 2.4 ms to under 0.1 ms.
+- 4c78d83: Match the Fetch spec and workerd for common responses: string bodies default to `text/plain;charset=UTF-8`, `Response.json` sets `application/json`, and `Response.redirect` serializes its URL (`https://example.com` becomes `https://example.com/`) with a null body.
+- 088cad0: Shared-object (split) builds no longer crash on start or lose the Web Streams classes.
+  
+  - **Toolchain:** split output prefixes module globals with `pg_`. A global named like a libc symbol (the prelude's `clone`, or an app's `hash` or `search`) bound to libc instead, so the runtime wrote into libc's code and every worker crashed. Internal `__` globals keep their names. Standalone builds are unchanged, because their globals are `static`.
+  - **Runtime:** the Web Streams polyfill installs each class with its own `globalThis.X =` assignment. Where the prelude is a separate unit, Porffor resolved `new ReadableStream()` in app code at compile time and, seeing only a dynamic install, compiled it to a ReferenceError. `gen-streams.ts` now fails if an export of the polyfill is not installed.
+- 28b0c39: `URL` behaves like the WHATWG URL: `new URL(path, base)`, setters for every part (`url.hostname = ...`, `port`, `protocol`, `host`, `search`, `hash`, `href`), default ports dropped, dot segments resolved, percent-encoding, `URL.canParse`, and `searchParams` changes written back into the URL. `JSON.stringify` calls `toJSON`, so a `Date` serializes as its ISO string (it was `{}`) and a `URL` as its href.
+- eec94f1: Web API fixes found by the conformance suite against workerd:
+  
+  - `Headers` follows the Fetch spec: `get` joins repeated values with `", "`, iteration is sorted by name with values combined (each `Set-Cookie` listed separately), `getSetCookie()` exists, values are trimmed, and invalid names or values throw `TypeError`. Each appended header still reaches the wire as its own line.
+  - `TextDecoder` is the WHATWG UTF-8 decoder. Characters outside the BMP (emoji) decode correctly, invalid bytes become U+FFFD (or throw with `fatal`), the BOM is stripped unless `ignoreBOM`, and `{ stream: true }` keeps an incomplete sequence for the next chunk.
+  - `toLowerCase`/`toUpperCase` map non-ASCII letters (Latin, Greek, Cyrillic and the rest of the BMP's simple mappings). They mapped ASCII only.
+  - `new URLSearchParams(init)` accepts a record, a sequence of pairs or another `URLSearchParams`. Only strings worked; `{ a: "1" }` gave `%5Bobject+Object%5D=`.
+  - `atob` ignores ASCII whitespace and throws `InvalidCharacterError` on invalid input, and `btoa` throws on characters above U+00FF.
+  - `queueMicrotask` exists.
+  - URL hosts are converted to ASCII (Punycode): `new URL("http://münchen.test").host` is `xn--mnchen-3ya.test`.
+  - `crypto.subtle.digest` supports SHA-1 and MD5, and HMAC works with SHA-1. `exportKey("raw")`, `generateKey` for HMAC and workerd's `crypto.subtle.timingSafeEqual` exist, and imported keys report `algorithm.length`. Errors carry WebCrypto's names (`NotSupportedError`, `InvalidAccessError`), and `getRandomValues` over 65,536 bytes throws `QuotaExceededError`.
+  - `setTimeout(fn, 0)` and `setInterval(fn, 0)` fire on Linux. uSockets arms timers with `timerfd_settime`, and a zero expiry disarms the timer, so a zero-delay timer never ran (macOS fired it). Timers are armed at 1 ms at least.
+
 ## 0.7.0
 
 ### Minor Changes
