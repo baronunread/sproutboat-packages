@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, readFile, readdir, rm, utimes, writeFile } from "node:f
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { ensurePorffor, PORFFOR_COMMIT_FULL, PorfforToolchainError } from "./index";
+import { PATCH_FINGERPRINT } from "./fingerprint";
 
 const temporary: string[] = [];
 afterEach(async () => {
@@ -361,13 +362,21 @@ test("a cache built by an older toolchain version is rebuilt, not silently reuse
   expect(requests).toBe(2);
   const rebuilt = JSON.parse(await readFile(manifestPath, "utf8"));
   expect(rebuilt.toolchainVersion).toBe(manifest.toolchainVersion);
+  // B19: an unreleased patch edit keeps the version; the patch fingerprint still rebuilds.
+  expect(rebuilt.patchFingerprint).toBe(PATCH_FINGERPRINT);
+  expect(root).toEndWith(`-${PATCH_FINGERPRINT}`);
+  await rm(manifestPath);
+  await writeFile(manifestPath, JSON.stringify({ ...rebuilt, patchFingerprint: "000000000000" }));
+  await ensurePorffor(options);
+  expect(requests).toBe(3);
+  expect(JSON.parse(await readFile(manifestPath, "utf8")).patchFingerprint).toBe(PATCH_FINGERPRINT);
 });
 
 test("an interrupted stale lock is recovered", async () => {
   const { archive, sha256 } = await fixture();
   const cacheRoot = await mkdtemp(join(tmpdir(), "sb-porffor-interrupted-"));
   temporary.push(cacheRoot);
-  const lock = join(cacheRoot, `porffor-${PORFFOR_COMMIT_FULL}.lock`);
+  const lock = join(cacheRoot, `porffor-${PORFFOR_COMMIT_FULL}-${PATCH_FINGERPRINT}.lock`);
   await mkdir(lock);
   const stale = new Date(Date.now() - 10 * 60_000);
   await utimes(lock, stale, stale);

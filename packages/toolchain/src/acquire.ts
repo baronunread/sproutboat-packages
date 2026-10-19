@@ -14,6 +14,9 @@ import { PORFFOR_ARCHIVE_SHA256, PORFFOR_ARCHIVE_URL, PORFFOR_COMMIT_FULL } from
 // to sit unused behind a still-"complete" cache keyed only on the upstream
 // Porffor commit).
 import { version as TOOLCHAIN_VERSION } from "../package.json" with { type: "json" };
+// The release is not enough: unreleased patch edits share its version. The
+// entry's directory and manifest carry the patch chain's fingerprint too.
+import { PATCH_FINGERPRINT } from "./fingerprint";
 
 export class PorfforToolchainError extends Error {
   constructor(
@@ -56,12 +59,14 @@ async function complete(dir: string, expectedArchive = PORFFOR_ARCHIVE_SHA256): 
       commit?: string;
       archiveSha256?: string;
       toolchainVersion?: string;
+      patchFingerprint?: string;
       files?: Record<string, string>;
     };
     if (
       manifest.commit !== PORFFOR_COMMIT_FULL ||
       manifest.archiveSha256 !== expectedArchive ||
-      manifest.toolchainVersion !== TOOLCHAIN_VERSION
+      manifest.toolchainVersion !== TOOLCHAIN_VERSION ||
+      manifest.patchFingerprint !== PATCH_FINGERPRINT
     )
       return false;
     for (const file of required)
@@ -145,7 +150,7 @@ export async function ensurePorffor(options: AcquireOptions = {}): Promise<strin
       process.env.SPROUTBOAT_TOOLCHAIN_CACHE ??
       resolve(homedir(), ".cache/sproutboat"),
   );
-  const dir = resolve(root, `porffor-${PORFFOR_COMMIT_FULL}`);
+  const dir = resolve(root, `porffor-${PORFFOR_COMMIT_FULL}-${PATCH_FINGERPRINT}`);
   const expected = options.expectedSha256 ?? PORFFOR_ARCHIVE_SHA256;
   if (await complete(dir, expected)) return dir;
   await mkdir(root, { recursive: true });
@@ -159,7 +164,7 @@ export async function ensurePorffor(options: AcquireOptions = {}): Promise<strin
   }
   const stage = resolve(
     root,
-    `.porffor-${PORFFOR_COMMIT_FULL}-${process.pid}-${crypto.randomUUID()}`,
+    `.porffor-${PORFFOR_COMMIT_FULL}-${PATCH_FINGERPRINT}-${process.pid}-${crypto.randomUUID()}`,
   );
   try {
     if (await complete(dir, expected)) return dir;
@@ -200,7 +205,7 @@ export async function ensurePorffor(options: AcquireOptions = {}): Promise<strin
     );
     await writeFile(
       resolve(stage, ".sproutboat-complete"),
-      JSON.stringify({ commit: PORFFOR_COMMIT_FULL, archiveSha256: actual, toolchainVersion: TOOLCHAIN_VERSION, files }),
+      JSON.stringify({ commit: PORFFOR_COMMIT_FULL, archiveSha256: actual, toolchainVersion: TOOLCHAIN_VERSION, patchFingerprint: PATCH_FINGERPRINT, files }),
       { mode: 0o444 },
     );
     await rename(stage, dir);
@@ -214,5 +219,5 @@ export async function ensurePorffor(options: AcquireOptions = {}): Promise<strin
 export function cachedPorfforRoot(
   root = process.env.SPROUTBOAT_TOOLCHAIN_CACHE ?? resolve(homedir(), ".cache/sproutboat"),
 ): string {
-  return resolve(root, `porffor-${PORFFOR_COMMIT_FULL}`);
+  return resolve(root, `porffor-${PORFFOR_COMMIT_FULL}-${PATCH_FINGERPRINT}`);
 }
