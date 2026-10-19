@@ -2542,14 +2542,23 @@ class __SproutboatURLSearchParams {
     return out;
   }
 }
+// One pass over encodeURIComponent's output (chained split/join doubled compile time).
 function __sbFormEncode(s) {
-  return encodeURIComponent(s)
-    .split("%20").join("+")
-    .split("!").join("%21")
-    .split("'").join("%27")
-    .split("(").join("%28")
-    .split(")").join("%29")
-    .split("~").join("%7E");
+  const e = encodeURIComponent(s);
+  let out = "";
+  for (let i = 0; i < e.length; i++) {
+    const c = e.charCodeAt(i);
+    if (c === 33) out += "%21";
+    else if (c === 39) out += "%27";
+    else if (c === 40) out += "%28";
+    else if (c === 41) out += "%29";
+    else if (c === 126) out += "%7E";
+    else if (c === 37 && e.charCodeAt(i + 1) === 50 && e.charCodeAt(i + 2) === 48) {
+      out += "+";
+      i += 2;
+    } else out += e[i];
+  }
+  return out;
 }
 
 // URL and Response are always defined by Porffor's fetch-globals.js banner.
