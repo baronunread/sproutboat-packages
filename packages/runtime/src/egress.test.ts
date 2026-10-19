@@ -178,6 +178,7 @@ test("SB_EGRESS_FD: the host connects, the sprout gets the socket", () => {
     writeFileSync(
       join(dir, "check.c"),
       `#include <errno.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -309,6 +310,87 @@ int main(void) { show(80, 80); show(8080, 80); show(443, 443); show(8443, 443); 
       "Host: example.com:8080",
       "Host: example.com",
       "Host: example.com:8443",
+    ]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("async fetch: requests run on threads and come back through the host", () => {
+  const source = readFileSync(transportFile, "utf8");
+  const block = source.slice(
+    source.indexOf("// ASYNC:BEGIN"),
+    source.indexOf("// ASYNC:END"),
+  );
+  const dir = mkdtempSync(join(tmpdir(), "sb-async-"));
+  try {
+    // Stand-ins: a client that takes 200 ms, and a host that records which timers fire.
+    writeFileSync(
+      join(dir, "check.c"),
+      `#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+#include <pthread.h>
+typedef unsigned int u32;
+static void sb_init_anchors(void) {}
+static char* sb_error_json(const char* a, const char* b) { char* s = malloc(256); snprintf(s, 256, "%s%s", a, b); return s; }
+static char* sb_http_request(const char* host, int port, const char* path, const char* method,
+                             const char* headers, const char* body, size_t body_len, int tls) {
+  (void)port; (void)method; (void)headers; (void)body_len; (void)tls;
+  usleep(200000);
+  char* s = malloc(256); snprintf(s, 256, "%s%s %s", host, path, body); return s;
+}
+static int fired = 0;
+void porf_native_fetch_timer_clear(u32 id) { (void)id; }
+const char* sb_async_reply(u32 id);
+void porf_native_fetch_fire_timer(u32 id) { printf("%u %s\\n", id, sb_async_reply(id)); fired++; }
+static char* copy(const char* s) { return strdup(s); }
+${block}
+int main(void) {
+  int fd = sb_async_enable();
+  if (fd < 0 || !sb_async_enabled()) return 1;
+  struct timespec a, b;
+  clock_gettime(CLOCK_MONOTONIC, &a);
+  for (u32 i = 1; i <= 16; i++) {
+    char path[16]; snprintf(path, sizeof(path), "/%u", i);
+    sb_async_submit(i, 80, 0, copy("h"), copy(path), copy("GET"), copy(""), copy("body"), 4);
+  }
+  while (fired < 16) { struct pollfd p = { fd, POLLIN, 0 }; poll(&p, 1, 5000); sb_async_drain(); }
+  clock_gettime(CLOCK_MONOTONIC, &b);
+  long ms = (b.tv_sec - a.tv_sec) * 1000 + (b.tv_nsec - a.tv_nsec) / 1000000;
+  printf("elapsed %s\\n", ms < 1000 ? "overlapped" : "serial");
+  printf("outside a callback %s\\n", sb_async_reply(1) ? "leaks" : "nothing");
+  return 0;
+}
+`,
+    );
+    const cc = Bun.spawnSync([
+      "cc",
+      "-Wall",
+      "-Werror",
+      "-Wno-unused-function",
+      "-pthread",
+      "-o",
+      join(dir, "check"),
+      join(dir, "check.c"),
+    ]);
+    expect(cc.stderr.toString()).toBe("");
+    const lines = Bun.spawnSync([join(dir, "check")])
+      .stdout.toString()
+      .trimEnd()
+      .split("\n");
+    // 16 requests of 200 ms on 8 threads: two rounds, not sixteen.
+    expect(lines.slice(0, 16).sort()).toEqual(
+      Array.from({ length: 16 }, (_, i) => `${i + 1} h/${i + 1} body`).sort(),
+    );
+    expect(lines.slice(16)).toEqual([
+      "elapsed overlapped",
+      "outside a callback nothing",
     ]);
   } finally {
     rmSync(dir, { recursive: true, force: true });

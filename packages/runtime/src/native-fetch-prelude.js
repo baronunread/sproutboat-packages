@@ -4051,19 +4051,35 @@ globalThis.__sbInstallFetch = function () {
       if (__sbIsFn(opts.headers.forEach)) opts.headers.forEach((v, k) => headers.push([k, v]));
       else for (const k in opts.headers) headers.push([k, opts.headers[k]]);
     }
-    const r = globalThis.__sbFetchUpstream("fetch", {
-      url,
-      method: opts.method || "GET",
-      headers,
-      ...__sbRequestBody(opts.body),
+    const msg = { url, method: opts.method || "GET", headers, ...__sbRequestBody(opts.body) };
+    const respond = (r) => {
+      const respHeaders = new Headers();
+      for (let j = 0; j < (r.headers || []).length; j++) respHeaders.set(r.headers[j][0], r.headers[j][1]);
+      // #176: bytes from an outbound HTTP response, not a string this handler
+      // built -- must not be re-encoded if the handler proxies it straight
+      // through (see the assets binding for the same reasoning).
+      if (r.body != null) respHeaders.set("x-sb-raw-body", "1");
+      return __sbRawBodyResponse(r.body, { status: r.status || 502, headers: respHeaders });
+    };
+    if (!__sbHttpAsyncEnabled()) return respond(globalThis.__sbFetchUpstream("fetch", msg));
+    // B18: the host runs the request off the event loop. Its reply fires a timer
+    // that never fires on its own; the timer table keeps the callback alive.
+    return new Promise((resolve, reject) => {
+      const id = setTimeout(() => {
+        try {
+          resolve(respond(__sbFetchReply(__sbHttpAsyncResult(id))));
+        } catch (e) {
+          reject(new Error("sproutboat fetch: " + ((e && e.message) || e)));
+        }
+      }, 2147483647);
+      try {
+        msg.asyncId = id;
+        globalThis.__sbFetchUpstream("fetch", msg);
+      } catch (e) {
+        clearTimeout(id);
+        reject(e);
+      }
     });
-    const respHeaders = new Headers();
-    for (let j = 0; j < (r.headers || []).length; j++) respHeaders.set(r.headers[j][0], r.headers[j][1]);
-    // #176: bytes from an outbound HTTP response, not a string this handler
-    // built -- must not be re-encoded if the handler proxies it straight
-    // through (see the assets binding for the same reasoning).
-    if (r.body != null) respHeaders.set("x-sb-raw-body", "1");
-    return __sbRawBodyResponse(r.body, { status: r.status || 502, headers: respHeaders });
   };
 };
 

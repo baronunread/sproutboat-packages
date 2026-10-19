@@ -407,6 +407,18 @@ globalThis.__sbFetchUpstream = function (op, msg) {
   return reply;
 };
 
+// Async fetch (a host that drives requests off its event loop, like sproutd) exists
+// only in the embedded transport. Here fetch() is always synchronous.
+function __sbHttpAsyncEnabled() {
+  return false;
+}
+function __sbHttpAsyncResult() {
+  return "";
+}
+function __sbFetchReply() {
+  throw new Error("async fetch needs the embedded transport");
+}
+
 /** Static asset metadata stays JSON; the response body uses the v1 byte tail. */
 globalThis.__sbAssetsGet = function (path) {
   const token = __sbEnv("SB_BROKER_TOKEN");
