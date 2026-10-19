@@ -1112,8 +1112,56 @@ static int sb_egress_refused(const char* host, const struct sockaddr* sa, char* 
 }
 // EGRESS:END
 
+// EGRESS-FD:BEGIN
+// SB_EGRESS_FD=N: a sandboxed host (sproutd) opens outbound connections for the
+// sprout, which may not open sockets itself. Ask on unix socket N with
+// "HOST PORT\n"; the host resolves, applies its policy and answers "ok\n" with the
+// connected socket attached (SCM_RIGHTS), or "no MESSAGE\n", which fetch() reports.
+// One question at a time; any broken exchange closes N for good, so a late answer
+// can never be taken for the next one.
+static int sb_egress_fd_connect(int via, const char* host, int port, char* refused, size_t refused_len) {
+  static int broken = 0;
+  if (broken) return -1;
+  char line[512];
+  int n = snprintf(line, sizeof(line), "%s %d\n", host, port);
+  if (n <= 0 || (size_t)n >= sizeof(line)) return -1;
+  struct timeval tv; tv.tv_sec = 60; tv.tv_usec = 0;
+  setsockopt(via, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  if (send(via, line, (size_t)n, 0) != n) { broken = 1; close(via); return -1; }
+  char answer[512];
+  union { struct cmsghdr align; char space[CMSG_SPACE(sizeof(int))]; } control;
+  struct iovec io = { answer, sizeof(answer) - 1 };
+  struct msghdr msg;
+  memset(&msg, 0, sizeof(msg));
+  msg.msg_iov = &io; msg.msg_iovlen = 1;
+  msg.msg_control = control.space; msg.msg_controllen = sizeof(control.space);
+  ssize_t got;
+  do { got = recvmsg(via, &msg, 0); } while (got < 0 && errno == EINTR);
+  int fd = -1;
+  struct cmsghdr* c = got > 0 ? CMSG_FIRSTHDR(&msg) : 0;
+  if (c && c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS && c->cmsg_len == CMSG_LEN(sizeof(int)))
+    memcpy(&fd, CMSG_DATA(c), sizeof(fd));
+  if (got <= 0 || answer[got - 1] != '\n' || (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC))) {
+    if (fd >= 0) close(fd);
+    broken = 1; close(via);
+    return -1;
+  }
+  answer[got - 1] = 0;
+  if (!strcmp(answer, "ok") && fd >= 0) {
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    return fd;
+  }
+  if (fd >= 0) close(fd);
+  if (!strncmp(answer, "no ", 3) && !refused[0]) snprintf(refused, refused_len, "%s", answer + 3);
+  return -1;
+}
+// EGRESS-FD:END
+
 // refused gets the first refusal; a caller reports it when nothing connected.
 static int sb_tcp_connect(const char* host, int port, char* refused, size_t refused_len) {
+  const char* via = getenv("SB_EGRESS_FD");
+  if (via && *via) return sb_egress_fd_connect(atoi(via), host, port, refused, refused_len);
   struct addrinfo hints, *res = 0, *it;
   memset(&hints, 0, sizeof(hints));
   hints.ai_family = AF_UNSPEC;
@@ -1151,10 +1199,13 @@ static int sb_tcp_connect(const char* host, int port, char* refused, size_t refu
 }
 
 // body_len, not strlen(body): a binary body can contain NUL bytes (#232).
-static void sb_build_request(sb_buf* req, const char* host, const char* path, const char* method,
+// Host carries the port unless it is the scheme's default (RFC 9110 7.2).
+static void sb_build_request(sb_buf* req, const char* host, int port, int default_port, const char* path, const char* method,
                              const char* headers, const char* body, size_t body_len) {
   sb_puts(req, method); sb_puts(req, " "); sb_puts(req, path); sb_puts(req, " HTTP/1.1\r\n");
-  sb_puts(req, "Host: "); sb_puts(req, host); sb_puts(req, "\r\n");
+  sb_puts(req, "Host: "); sb_puts(req, host);
+  if (port != default_port) { char p[16]; snprintf(p, sizeof(p), ":%d", port); sb_puts(req, p); }
+  sb_puts(req, "\r\n");
   sb_puts(req, "Connection: close\r\n");
   sb_puts(req, "Accept-Encoding: identity\r\n");
   if (headers && *headers) sb_puts(req, headers);
@@ -1268,7 +1319,7 @@ static char* sb_http_plain(const char* host, int port, const char* path, const c
   if (fd < 0) return refused[0] ? sb_error_json(refused, 0) : sb_error_json("could not connect to ", host);
 
   sb_buf req = { 0, 0, 0 };
-  sb_build_request(&req, host, path, method, headers, body, body_len);
+  sb_build_request(&req, host, port, 80, path, method, headers, body, body_len);
   size_t sent = 0;
   while (sent < req.len) {
     long n = write(fd, req.p + sent, req.len - sent);
@@ -1473,7 +1524,7 @@ static char* sb_https(const char* host, int port, const char* path, const char* 
   br_sslio_init(&ioc, &sc->eng, sb_sock_read, &fd, sb_sock_write, &fd);
 
   sb_buf req = { 0, 0, 0 };
-  sb_build_request(&req, host, path, method, headers, body, body_len);
+  sb_build_request(&req, host, port, 443, path, method, headers, body, body_len);
   int wrote = br_sslio_write_all(&ioc, req.p, req.len);
   free(req.p);
   if (wrote != 0) {
