@@ -25,7 +25,7 @@ const CASES = [
   `new URL("http://münchen.test/x").host`,
   `crypto.subtle.digest("SHA-1", new TextEncoder().encode("abc")).then((b) => Array.from(new Uint8Array(b), (x) => x.toString(16).padStart(2, "0")).join(""))`,
   `crypto.subtle.importKey("raw", new TextEncoder().encode("key"), { name: "HMAC", hash: "SHA-1" }, true, ["sign"]).then(async (k) => [k.algorithm.hash.name, k.algorithm.length, Array.from(new Uint8Array(await crypto.subtle.sign("HMAC", k, new TextEncoder().encode("msg"))), (x) => x.toString(16).padStart(2, "0")).join(""), new Uint8Array(await crypto.subtle.exportKey("raw", k)).length].join())`,
-  `crypto.subtle.generateKey({ name: "HMAC", hash: "SHA-512" }, true, ["sign"]).then(async (k) => [k.type, k.algorithm.length, (await crypto.subtle.exportKey("raw", k)).byteLength].join())`,
+  `crypto.subtle.generateKey({ name: "HMAC", hash: "SHA-512" }, true, ["sign"]).then(async (k) => [k.type, k.algorithm.length, (await crypto.subtle.exportKey("raw", k)).byteLength].join())`,  `(async () => { const collect = async (rs) => { const r = rs.getReader(); const out = []; for (;;) { const { value, done } = await r.read(); if (done) return out; out.push(value); } }; const bytes = new ReadableStream({ start(c) { c.enqueue(new Uint8Array([0x61, 0xe2])); c.enqueue(new Uint8Array([0x82, 0xac, 0xf0, 0x9f])); c.enqueue(new Uint8Array([0x98, 0x80])); c.close(); } }); const text = new ReadableStream({ start(c) { c.enqueue("a\\uD83D"); c.enqueue("\\uDE00b"); c.close(); } }); return (await collect(bytes.pipeThrough(new TextDecoderStream()))).join("|") + ";" + (await collect(text.pipeThrough(new TextEncoderStream()))).map((u) => Array.from(u).join(",")).join("|"); })()`,
 ];
 const handler = `export default {async fetch() {
   const cases = [
