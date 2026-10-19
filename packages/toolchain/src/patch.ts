@@ -1744,6 +1744,66 @@ export async function patchHeadersArrayInit(root: string): Promise<void> {
   );
 }
 
+// baronunread/sproutboat#286: Map.groupBy is missing (Object.groupBy exists). Same
+// shape as __Object_groupBy, keyed by SameValueZero through the Map itself.
+const MAP_GROUPBY_MARKER = "sproutboat #286: Map.groupBy";
+const MAP_GROUPBY_SOURCE =
+  "\n// sproutboat #286: Map.groupBy\n" +
+  "export const __Map_groupBy = (items: any, callbackFn: any): Map => {\n" +
+  "  const out: Map = __Porffor_hashtableNew(true);\n" +
+  "  Porffor.IR.gcBarrier(out, Porffor.TYPES.map);\n" +
+  "  let i: i32 = 0;\n" +
+  "  for (const x of items) {\n" +
+  "    const k: any = callbackFn(x, i++);\n" +
+  "    if (!Porffor.callThis(__Map_prototype_has, out, k)) Porffor.callThis(__Map_prototype_set, out, k, Porffor.array.new(4));\n" +
+  "    Porffor.array.fastPush(Porffor.callThis(__Map_prototype_get, out, k), x);\n" +
+  "  }\n" +
+  "  return out;\n" +
+  "};\n";
+
+/** #286: add Map.groupBy. Before the precompile, which compiles it with the other builtins. */
+export async function patchMapGroupBy(root: string): Promise<void> {
+  const file = resolve(root, "compiler/builtins/map.ts");
+  const src = await readFile(file, "utf8");
+  if (src.includes(MAP_GROUPBY_MARKER)) return;
+  if (!src.includes("export const Map = function (iterable: any): Map {"))
+    throw new Error(`could not patch Porffor's Map.groupBy: anchor not found in ${file}`);
+  if (src.includes("export const __Map_groupBy"))
+    throw new Error(`Porffor now defines Map.groupBy itself: drop patchMapGroupBy (${file})`);
+  await writeFile(file, src.trimEnd() + "\n" + MAP_GROUPBY_SOURCE);
+}
+
+// baronunread/sproutboat#286: a private field (#x) is stored as an ordinary property
+// named "__#x", installed like a public field, so Object.keys, for-in and
+// JSON.stringify listed it. Install private fields the way methods are installed:
+// writable and configurable but not enumerable. Object.getOwnPropertyNames still
+// sees the internal name.
+const PRIVATE_FIELD_MARKER = "sproutboat #286: private fields";
+const PRIVATE_FIELD_EDITS: [string, string][] = [
+  [
+    "        builtinCall(func, '__Porffor_object_class_value', [\n",
+    "        // sproutboat #286: private fields are not enumerable\n" +
+      "        builtinCall(func, x.key?.type === 'PrivateIdentifier' ? '__Porffor_object_class_method' : '__Porffor_object_class_value', [\n",
+  ],
+  [
+    "      if (kind === 'get' || kind === 'set') initKind = kind;\n",
+    "      if (kind === 'get' || kind === 'set') initKind = kind;\n" +
+      "      if (initKind === 'value' && x.key?.type === 'PrivateIdentifier') initKind = 'method'; // sproutboat #286: private fields\n",
+  ],
+];
+
+export async function patchPrivateFieldsHidden(root: string): Promise<void> {
+  const file = resolve(root, "compiler/codegen.js");
+  let src = await readFile(file, "utf8");
+  if (src.includes(PRIVATE_FIELD_MARKER)) return;
+  for (const [anchor, inject] of PRIVATE_FIELD_EDITS) {
+    if (src.split(anchor).length !== 2)
+      throw new Error(`could not patch Porffor's private fields: anchor not found in ${file}`);
+    src = src.replace(anchor, inject);
+  }
+  await writeFile(file, src);
+}
+
 export async function ensurePorfforPatched(root: string): Promise<void> {
   if (done.has(root)) return;
   await patchCompilerArgs(root);
@@ -1759,6 +1819,8 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchResponseDefaults(root);
   await patchHeadersArrayInit(root);
   await patchURLClass(root);
+  await patchMapGroupBy(root);
+  await patchPrivateFieldsHidden(root);
   // Last of the builtin edits: its precompile picks up the date, promise and
   // replaceAll patches above too.
   await precompileBuiltins(root);
