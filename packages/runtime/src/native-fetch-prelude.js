@@ -4619,7 +4619,7 @@ function __sbMakeDONamespace(binding, className) {
           }
           const inst = __sbGetDOInstance(className, idStr);
           const res = inst.fetch(req);
-          if (inst.__sbTasks.length || (res && __sbIsFn(res.then))) return __sbFetchWithDrain(res, inst.__sbTasks);
+          if (inst.__sbTasks.length || (res && __sbIsFn(res.then)) || __sbHasStreamBody(res)) return __sbFetchWithDrain(res, inst.__sbTasks);
           return res;
         },
       };
@@ -4928,10 +4928,43 @@ async function __sbDrainAll(pending) {
 // Tail-called from `__sbEntry`/DO dispatch so the promise this returns is the
 // one *this* async function creates, not a `.then()` derived from someone
 // else's — see the note below on why that distinction matters here.
+// B19 (first step): a ReadableStream response body is read to the end and sent buffered;
+// the native writer had sent "[object ReadableStream]". Chunks must be bytes, as in workerd
+// (a string chunk is a TypeError), and the whole body is capped like a fetched one.
+const __SB_STREAM_BODY_MAX = 32 * 1024 * 1024;
+async function __sbCollectBody(stream) {
+  const reader = stream.getReader();
+  const chunks = [];
+  let size = 0;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    let bytes;
+    if (value instanceof Uint8Array) bytes = value;
+    else if (value instanceof ArrayBuffer) bytes = new Uint8Array(value);
+    else if (ArrayBuffer.isView(value)) bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    else throw new TypeError("This ReadableStream did not return bytes.");
+    size += bytes.length;
+    if (size > __SB_STREAM_BODY_MAX) throw new RangeError("Response body stream exceeds 32 MiB");
+    chunks.push(bytes);
+  }
+  const out = new Uint8Array(size);
+  let at = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, at);
+    at += chunk.length;
+  }
+  return out;
+}
+function __sbHasStreamBody(res) {
+  return res != null && res.body instanceof ReadableStream;
+}
+
 async function __sbFetchWithDrain(res, tasks) {
   let r;
   try {
     r = res && __sbIsFn(res.then) ? await res : res;
+    if (__sbHasStreamBody(r)) r.body = await __sbCollectBody(r.body);
   } catch (error) {
     // #179 — a rejected handler promise must not take the process down with it.
     r = __sbErrorResponse(error);
@@ -5050,7 +5083,7 @@ globalThis.__sbEntry = function (handlers, request) {
     }
     // Same promise-identity rule as above applies to `__sbFetchWithDrain`'s
     // own return, which is why it's tail-called rather than chained on here.
-    if (__sbTasks.length || (__res && __sbIsFn(__res.then))) return __sbFetchWithDrain(__res, __sbTasks);
+    if (__sbTasks.length || (__res && __sbIsFn(__res.then)) || __sbHasStreamBody(__res)) return __sbFetchWithDrain(__res, __sbTasks);
     return __sbTagCpu(__res, __t0);
   }
   if (!__sbTriggerAuthed(request)) return new Response("forbidden", { status: 403 });

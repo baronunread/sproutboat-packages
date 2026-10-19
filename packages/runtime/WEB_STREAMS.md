@@ -9,9 +9,10 @@ Native regression tests cover default readers, locking, pending reads,
 cancellation, source errors, array conversion, writable sinks, pipeTo,
 pipeThrough, transforms, tee, pull sources, byte streams and BYOB reads.
 This is API support for streams in memory, not progressive HTTP transport.
-Request and Response bodies and outbound fetch remain buffered. Passing a
-ReadableStream as an HTTP body is not supported. TextEncoderStream,
-TextDecoderStream, CompressionStream and DecompressionStream are not included.
+A ReadableStream response body is read to the end and sent buffered (chunks must be
+bytes, at most 32 MiB in all); request bodies and outbound fetch remain buffered too.
+TextEncoderStream and TextDecoderStream are included; CompressionStream and
+DecompressionStream are not.
 BYOB buffer detachment requires transfer support from the underlying engine;
 the polyfill cannot supply that engine primitive. Full Web Platform Tests
 conformance has not been established for Porffor.

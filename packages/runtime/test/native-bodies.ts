@@ -13,6 +13,9 @@ const handler = `export default {async fetch(request) {
   if (path === "/u8") return new Response(new Uint8Array([104, 105, 0, 255]));
   if (path === "/ab") return new Response(new Uint8Array([1, 2, 3]).buffer);
   if (path === "/blob") return new Response(new Blob(["hé", new Uint8Array([33])], { type: "text/x-test" }));
+  if (path === "/stream") return new Response(new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode("he")); c.enqueue(new Uint8Array([108, 108, 111])); c.close(); } }));
+  if (path === "/stream-async") { await null; return new Response(new ReadableStream({ async pull(c) { await new Promise((r) => setTimeout(r, 5)); c.enqueue(new Uint8Array([0, 255])); c.close(); } }).pipeThrough(new TransformStream())); }
+  if (path === "/stream-strings") return new Response(new ReadableStream({ start(c) { c.enqueue("text"); c.close(); } }));
   if (path === "/form") { const f = new FormData(); f.append("a", "1"); f.append("f", new Blob(["xy"]), "n.txt"); return new Response(f); }
   const cases = [
     () => new Request("http://a.test/a/../b?x=1#f").url,
@@ -98,6 +101,9 @@ try {
   assert.deepEqual(await bytes("/u8"), { type: null, bytes: [104, 105, 0, 255] });
   assert.deepEqual(await bytes("/ab"), { type: null, bytes: [1, 2, 3] });
   assert.deepEqual(await bytes("/blob"), { type: "text/x-test", bytes: [104, 195, 169, 33] });
+  assert.deepEqual(await bytes("/stream"), { type: null, bytes: [104, 101, 108, 108, 111] });
+  assert.deepEqual(await bytes("/stream-async"), { type: null, bytes: [0, 255] });
+  assert.equal((await fetch(`http://127.0.0.1:${port}/stream-strings`)).status, 500, "a stream of strings is not a body (TypeError, as in workerd)");
   const form = await fetch(`http://127.0.0.1:${port}/form`);
   const boundary = (form.headers.get("content-type") || "").split("boundary=")[1];
   assert(boundary, "multipart content type");
