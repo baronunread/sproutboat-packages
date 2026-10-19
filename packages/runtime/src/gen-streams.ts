@@ -19,11 +19,6 @@ code = code.slice("(() => {".length).trimEnd().slice(0, -"})();".length);
 code = code.replace(/^\s*\/\/ .*streams-entry.js$/m, "// streams-entry.js");
 code = code.replace(/^\s*\/\/ .*web-streams-polyfill\/dist\/ponyfill.mjs$/m,
   "// web-streams-polyfill 4.3.0, MIT, copyright Mattias Buelens (see WEB_STREAMS_LICENSE)");
-// Alpha 16's direct array iterator works, but dynamic symbol lookup misses it.
-const lookup = "const r = e[t];\n    if (r != null)";
-if (!code.includes(lookup)) throw new Error("Streams iterator adapter target changed");
-code = code.replace(lookup,
-  "let r = e[t];\n    if (r == null && t === Symbol.iterator && Array.isArray(e)) r = () => e.values();\n    if (r != null)");
 const path = `${import.meta.dir}/native-fetch-prelude.js`;
 let prelude = await readFile(path, "utf8");
 const start = prelude.indexOf(marker);

@@ -381,58 +381,6 @@ const REPLACE_ALL_EDITS = [
 ] as const;
 const REPLACE_ALL_MARKER = "sproutboat #237: pieces joined once";
 
-// baronunread/sproutboat#238: typed-array element reads and writes had no
-// bounds check. A read past the end returned whatever sat in the next
-// allocation instead of undefined (uuid's SHA-1 reads past its buffer, so v5
-// UUIDs changed run to run) and a[-1] / a[1.5] broke outright. Reuse the
-// plain-array index check and compare against the typed array's length.
-// Builtins keep the unchecked read: they index within bounds, and the check
-// broke typed-array join/toString when compiled into them. Writes need the same
-// guard, but builtins such as the constructor and fill() store elements before
-// they set the length, so that is left for a follow-up.
-const TA_GET_ANCHOR =
-  "  const taGet = (ctype, size, signed = true) => () => {\n" +
-  "    const loaded = Load(ctype, taAddr(size), 4);\n" +
-  "    const f = ctype === 'f32' || ctype === 'f64' ? loaded : Convert(T.f64, loaded, signed ? CONVERT_SIGNED : 0);\n" +
-  "    return Box(f, Const(T.i32, TYPES.number));\n" +
-  "  };";
-const TA_GET_INJECT =
-  "  const taGet = (ctype, size, signed = true) => () => {\n" +
-  "    // sproutboat #238: only a valid in-range integer index reads; anything else is undefined.\n" +
-  "    // User code only: builtins (precompiled) index within bounds themselves and\n" +
-  "    // typed-array join/toString misbehave with the extra check.\n" +
-  "    if (globalThis.precompile) {\n" +
-  "      const raw = Load(ctype, taAddr(size), 4);\n" +
-  "      return Box(ctype === 'f32' || ctype === 'f64' ? raw : Convert(T.f64, raw, signed ? CONVERT_SIGNED : 0), Const(T.i32, TYPES.number));\n" +
-  "    }\n" +
-  "    const { idx, valid } = denseArrayIndexKey(scope, prop);\n" +
-  "    const loaded = Load(ctype, Bin('+', T.u32, Load('u32', JvPtr(obj), 4), size === 1 ? idx : Bin('*', T.u32, idx, Const(T.u32, size))), 4);\n" +
-  "    const f = ctype === 'f32' || ctype === 'f64' ? loaded : Convert(T.f64, loaded, signed ? CONVERT_SIGNED : 0);\n" +
-  "    return Select(Bin('&&', T.i32, valid, Bin('<', T.i32, idx, Load('u32', JvPtr(obj), 0))),\n" +
-  "      Box(f, Const(T.i32, TYPES.number)), valUndefined());\n" +
-  "  };";
-const TA_GET_MARKER =
-  "sproutboat #238: only a valid in-range integer index reads";
-// baronunread/sproutboat#241: a typed-array write outside the array stored into
-// whatever memory followed it (and a[-1] = x wrote a[0], via the saturating
-// index conversion). ECMA-262 ignores the write. Same check as taGet, in user
-// code only: builtins such as the constructor store elements before they set
-// the length, and they only write in bounds anyway. Alpha-14 fixed the store's
-// conversion upstream (ToUint32, which our #238 patch used to add); the bounds
-// check is still missing there.
-const TA_SET_BOUNDS_ANCHOR =
-  "      stmt(scope, Store(ctype, addr, 4, ctype === 'f64' || ctype === 'f32' ? f : toUint32(scope, f)));";
-const TA_SET_BOUNDS_INJECT =
-  "      const store = () => stmt(scope, Store(ctype, addr, 4, ctype === 'f64' || ctype === 'f32' ? f : toUint32(scope, f)));\n" +
-  "      // sproutboat #241: a write outside the array is ignored, not stored into the next allocation.\n" +
-  "      if (globalThis.precompile) store();\n" +
-  "      else {\n" +
-  "        const { idx: sbIdx, valid: sbValid } = denseArrayIndexKey(scope, prop);\n" +
-  "        emitIf(scope, Bin('&&', T.i32, sbValid, Bin('<', T.i32, sbIdx, Load('u32', JvPtr(obj), 0))), store);\n" +
-  "      }";
-const TA_SET_BOUNDS_MARKER =
-  "sproutboat #241: a write outside the array is ignored";
-
 // Porffor alpha 9 treats +02:00 as two milliseconds and adds offset hours
 // instead of subtracting them. Count fields even when they contain zero, and
 // apply the signed offset after parsing the local wall-clock fields.
@@ -1511,31 +1459,6 @@ export async function patchReplaceAll(root: string): Promise<void> {
   await writeFile(file, src);
 }
 
-/** #238: modular typed-array stores. Before the precompile so builtins get it too. */
-export async function patchTypedArrayStore(root: string): Promise<void> {
-  const file = resolve(root, "compiler/codegen.js");
-  let src = await readFile(file, "utf8");
-  let changed = false;
-  for (const [marker, anchor, inject, what] of [
-    [TA_GET_MARKER, TA_GET_ANCHOR, TA_GET_INJECT, "typed-array read bounds"],
-    [
-      TA_SET_BOUNDS_MARKER,
-      TA_SET_BOUNDS_ANCHOR,
-      TA_SET_BOUNDS_INJECT,
-      "typed-array write bounds",
-    ],
-  ] as const) {
-    if (src.includes(marker)) continue;
-    if (!src.includes(anchor))
-      throw new Error(
-        `could not patch Porffor's ${what}: anchor not found in ${file}`,
-      );
-    src = src.replace(anchor, inject);
-    changed = true;
-  }
-  if (changed) await writeFile(file, src);
-}
-
 /** Register elided local function expressions so inference uses their lexical binding. */
 export async function patchLocalFunctionTypes(root: string): Promise<void> {
   const file = resolve(root, "compiler/codegen.js");
@@ -1778,51 +1701,6 @@ export async function patchResponseDefaults(root: string): Promise<void> {
   );
 }
 
-const JSON_TOJSON_MARKER = "__Porffor_json_toJSON";
-// [anchor, replacement]: a helper before the serializer, then toJSON applied where a
-// value is picked (top level, array element, object property), so a toJSON that
-// returns undefined is skipped (or null in an array) the way the spec says.
-const JSON_TOJSON_EDITS: [string, string][] = [
-  [
-    "export const __Porffor_json_serialize = (",
-    "// sproutboat: toJSON (SerializeJSONProperty step 2), so Date and URL serialize as strings.\n" +
-      "export const __Porffor_json_toJSON = (value: any): any => {\n" +
-      "  if (Porffor.type(value) == Porffor.TYPES.date) return Porffor.callThis(__Date_prototype_toJSON, value);\n" +
-      "  if (Porffor.type(value) > 0x06) {\n" +
-      "    const toJSON: any = value.toJSON;\n" +
-      "    if (Porffor.type(toJSON) == Porffor.TYPES.function) return toJSON.call(value);\n" +
-      "  }\n" +
-      "  return value;\n" +
-      "};\n\n" +
-      "export const __Porffor_json_serialize = (",
-  ],
-  [
-    "    for (const x of (value as any[])) {\n",
-    "    for (const raw of (value as any[])) {\n      const x: any = __Porffor_json_toJSON(raw);\n",
-  ],
-  ["      const val: any = value[key];\n", "      const val: any = __Porffor_json_toJSON(value[key]);\n"],
-  [
-    "  let cap: i32 = 4096;\n",
-    "  value = __Porffor_json_toJSON(value);\n  let cap: i32 = 4096;\n",
-  ],
-];
-
-/**
- * JSON.stringify ignored toJSON, so a Date serialized as {} and a URL as its fields.
- * Values with a callable toJSON now serialize its result, as the spec says.
- */
-export async function patchJsonToJSON(root: string): Promise<void> {
-  const file = resolve(root, "compiler/builtins/json.ts");
-  let src = await readFile(file, "utf8");
-  if (src.includes(JSON_TOJSON_MARKER)) return;
-  for (const [anchor, replacement] of JSON_TOJSON_EDITS) {
-    if (src.split(anchor).length !== 2)
-      throw new Error(`could not patch Porffor's JSON.stringify: anchor not found in ${file}`);
-    src = src.replace(anchor, replacement);
-  }
-  await writeFile(file, src);
-}
-
 const URL_CLASS_START = "class URL {\n  constructor(input) {\n";
 const URL_CLASS_END = "\nclass Request {";
 const URL_CLASS_MARKER = "sproutboat: WHATWG-style URL";
@@ -1876,13 +1754,11 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchDateParser(root);
   await patchPromiseResolveNull(root);
   await patchReplaceAll(root);
-  await patchTypedArrayStore(root);
   await patchLocalFunctionTypes(root);
   await patchUint8ArrayBase64(root);
   await patchResponseDefaults(root);
   await patchHeadersArrayInit(root);
   await patchURLClass(root);
-  await patchJsonToJSON(root);
   // Last of the builtin edits: its precompile picks up the date, promise and
   // replaceAll patches above too.
   await precompileBuiltins(root);

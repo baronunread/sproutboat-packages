@@ -5,7 +5,6 @@ import { join } from "node:path";
 import { EMPTY_BINDINGS, wrapNativeFetchHandler } from "../../runtime/src/wrap";
 import {
   patchHeadersArrayInit,
-  patchJsonToJSON,
   patchLocalFunctionTypes,
   patchResponseDefaults,
   patchURLClass,
@@ -440,29 +439,3 @@ test("URL patch replaces Porffor's URL class, idempotently", async () => {
   }
 });
 
-test("JSON patch makes JSON.stringify honour toJSON, idempotently", async () => {
-  const root = await mkdtemp(join(tmpdir(), "sb-json-tojson-"));
-  try {
-    await mkdir(join(root, "compiler/builtins"), { recursive: true });
-    const file = join(root, "compiler/builtins/json.ts");
-    await writeFile(
-      file,
-      "export const __Porffor_json_serialize = (_buffer: i32, value: any): i32 => {\n" +
-        "    for (const x of (value as any[])) {\n    }\n" +
-        "      const val: any = value[key];\n" +
-        "};\nexport const __JSON_stringify = (value: any) => {\n  let cap: i32 = 4096;\n};\n",
-    );
-    await patchJsonToJSON(root);
-    const patched = await readFile(file, "utf8");
-    expect(patched).toContain("export const __Porffor_json_toJSON = (value: any): any => {");
-    expect(patched).toContain("const x: any = __Porffor_json_toJSON(raw);");
-    expect(patched).toContain("const val: any = __Porffor_json_toJSON(value[key]);");
-    expect(patched).toContain("value = __Porffor_json_toJSON(value);\n  let cap: i32 = 4096;");
-    await patchJsonToJSON(root);
-    expect(await readFile(file, "utf8")).toBe(patched);
-    await writeFile(file, "export const x = 1;\n");
-    await expect(patchJsonToJSON(root)).rejects.toThrow("anchor not found");
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});

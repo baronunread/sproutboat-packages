@@ -250,12 +250,8 @@ test("the default call (no url/expectedSha256 override) never touches the networ
   expect(await readFile(join(dir, "compiler/builtins/typedarray.js"), "utf8")).toContain(
     "const targetOffsetNum: number = ecma262.ToIntegerOrInfinity(offset);",
   );
-  // #238: out-of-range typed-array reads are undefined. (The store and `~`
-  // conversions #238 also patched are upstream's own code since alpha-14.)
-  const codegen = await readFile(join(dir, "compiler/codegen.js"), "utf8");
-  expect(codegen).toContain("Box(f, Const(T.i32, TYPES.number)), valUndefined());");
-  // #241: out-of-range typed-array writes are ignored in user code.
-  expect(codegen).toContain("if (globalThis.precompile) store();");
+  // #238/#241 (out-of-range typed-array reads and writes) are upstream's own
+  // integer-indexed element access since alpha-18; no codegen patch remains.
   // #256: named class expressions inside functions are rewritten at parse time.
   expect(await readFile(join(dir, "compiler/parse.js"), "utf8")).toContain("sbClassSelf(ast); // sproutboat #256");
   expect(await readFile(join(dir, "compiler/sb-class-self.js"), "utf8")).toContain("sproutboat #256");
