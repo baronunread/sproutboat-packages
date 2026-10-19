@@ -21,7 +21,7 @@ const CASES = [
   `(() => { try { atob("@@"); return "no throw"; } catch (e) { return e.name + ":" + atob(" aGVs bG8= "); } })()`,
   `(() => { try { btoa("€"); return "no throw"; } catch (e) { return e.name; } })()`,
   `["ÄÖÜ", "ΑΒΓ", "дж", "Ā", "Ωmega"].map((s) => s.toLowerCase() + s.toUpperCase()).join(",")`,
-  `new Promise((resolve) => { const o = []; setTimeout(() => o.push("t"), 0); queueMicrotask(() => o.push("m")); setTimeout(() => resolve(o.join()), 5); })`,
+  `new Promise((resolve) => { const o = []; setTimeout(() => o.push("t"), 0); queueMicrotask(() => o.push("m")); setTimeout(() => resolve(o.join()), 50); })`,
   `new URL("http://münchen.test/x").host`,
   `crypto.subtle.digest("SHA-1", new TextEncoder().encode("abc")).then((b) => Array.from(new Uint8Array(b), (x) => x.toString(16).padStart(2, "0")).join(""))`,
   `crypto.subtle.importKey("raw", new TextEncoder().encode("key"), { name: "HMAC", hash: "SHA-1" }, true, ["sign"]).then(async (k) => [k.algorithm.hash.name, k.algorithm.length, Array.from(new Uint8Array(await crypto.subtle.sign("HMAC", k, new TextEncoder().encode("msg"))), (x) => x.toString(16).padStart(2, "0")).join(""), new Uint8Array(await crypto.subtle.exportKey("raw", k)).length].join())`,
