@@ -1954,6 +1954,39 @@ export async function patchTypedArrayTag(root: string): Promise<void> {
   await writeFile(file, src.replace(TA_TAG_ANCHOR, TA_TAG_INJECT));
 }
 
+// console.log coloured numbers, booleans and objects with ANSI escapes even when
+// stdout was a file or pipe, so sproutd's per-app logs (B21) and piped sprout output
+// were full of \x1b[33m. Colour only when stdout is a terminal, as Node and Bun do.
+const CONSOLE_COLOR_MARKER = "sproutboat: console colours only on a terminal";
+const CONSOLE_COLOR_ANCHOR = "export const __Porffor_consolePrint = (arg: any): void => {\n";
+const CONSOLE_COLOR_PRINT = "  __Porffor_print(arg);\n};\n";
+const CONSOLE_COLOR_HELPER =
+  "// sproutboat: console colours only on a terminal\n" +
+  "let __Porffor_console_tty: i32 = -1;\n" +
+  "export const __Porffor_consoleColors = (): boolean => {\n" +
+  "  if (__Porffor_console_tty < 0) {\n" +
+  "    let tty: i32 = 0;\n" +
+  "    Porffor.c`tty = isatty(1) ? 1 : 0;`;\n" +
+  "    __Porffor_console_tty = tty;\n" +
+  "  }\n" +
+  "  return __Porffor_console_tty == 1;\n" +
+  "};\n\n";
+
+/** console colours only when stdout is a terminal. Before the precompile. */
+export async function patchConsoleColors(root: string): Promise<void> {
+  const file = resolve(root, "compiler/builtins/console.ts");
+  let src = await readFile(file, "utf8");
+  if (src.includes(CONSOLE_COLOR_MARKER)) return;
+  const at = src.indexOf(CONSOLE_COLOR_ANCHOR);
+  const print = at < 0 ? -1 : src.indexOf(CONSOLE_COLOR_PRINT, at);
+  if (at < 0 || print < 0 || src.split(CONSOLE_COLOR_ANCHOR).length !== 2)
+    throw new Error(`could not patch Porffor's console colours: anchor not found in ${file}`);
+  src =
+    src.slice(0, at) + CONSOLE_COLOR_HELPER + src.slice(at, print) +
+    "  __Porffor_print(arg, __Porffor_consoleColors());\n};\n" + src.slice(print + CONSOLE_COLOR_PRINT.length);
+  await writeFile(file, src);
+}
+
 /**
  * True when root is a finished cache entry that this toolchain version patched
  * (ensurePorffor patches before it writes the manifest). The CLI calls
@@ -1999,6 +2032,7 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchRepeatDoubling(root);
   await patchJsonCycles(root);
   await patchTypedArrayTag(root);
+  await patchConsoleColors(root);
   // Last of the builtin edits: its precompile picks up the date, promise and
   // replaceAll patches above too.
   await precompileBuiltins(root);

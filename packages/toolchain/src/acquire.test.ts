@@ -149,6 +149,7 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "class Response {\n  constructor(body = null, init = undefined) {\n    this.body = body;\n    this.status = Number(init?.status ?? 200);\n    this.headers = new Headers(init?.headers);\n  }\n}\n",
     "compiler/builtins/uint8array_base64.ts": "let alphabet: string = 'base64';\nlet lastChunkHandling: string = 'loose';\nconst fullChunks: i32 = (len / 3) * 3;\n",
     "compiler/builtins/object.ts": "  return '[object ' + builtinTag + ']';\n};\n",
+    "compiler/builtins/console.ts": "export const __Porffor_consolePrint = (arg: any): void => {\n  __Porffor_print(arg);\n};\n",
     "compiler/builtins/map.ts": "export const Map = function (iterable: any): Map {\n};\n",
     "compiler/codegen.js":
       "if (!hoistRead && directCallOnlyFunctionBinding(scope, kind, name, pattern, func)) {\n        return valUndefined();\n}\nconst func = resolveNamedFunction(scope, name) ?? funcByName(name);\n" +
@@ -260,6 +261,8 @@ test("the default call (no url/expectedSha256 override) never touches the networ
   );
   // #238/#241 (out-of-range typed-array reads and writes) are upstream's own
   // integer-indexed element access since alpha-18; no codegen patch remains.
+  // console colours only on a terminal.
+  expect(await readFile(join(dir, "compiler/builtins/console.ts"), "utf8")).toContain("__Porffor_consoleColors");
   // JSON.stringify throws on cycles; typed arrays have their own toString tag.
   expect(await readFile(join(dir, "compiler/builtins/json.ts"), "utf8")).toContain("sproutboat: JSON cycle check");
   expect(await readFile(join(dir, "compiler/builtins/object.ts"), "utf8")).toContain("sproutboat: typed array toStringTag");
