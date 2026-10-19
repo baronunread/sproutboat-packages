@@ -25,3 +25,5 @@ jobs:
       - run: bun run test:native-timers
       - run: bun run test:native-iterators
       - run: bun run test:native-utf8
+      - run: bun run test:native-response-defaults
+      - run: bun run test:native-raw-body

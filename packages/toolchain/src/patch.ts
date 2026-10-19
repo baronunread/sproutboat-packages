@@ -47,7 +47,12 @@ const CONSOLE_MARKER = "sproutboat #165";
 /** render.js edits: `[marker, anchor, inject, what]`, each inserted after its anchor. */
 const RENDER_EDITS = [
   [PORT_MARKER, PORT_ANCHOR, PORT_INJECT, "$PORT support"],
-  [CONSOLE_MARKER, CONSOLE_ANCHOR, CONSOLE_INJECT, "console output sink (#165)"],
+  [
+    CONSOLE_MARKER,
+    CONSOLE_ANCHOR,
+    CONSOLE_INJECT,
+    "console output sink (#165)",
+  ],
 ] as const;
 
 /**
@@ -131,15 +136,24 @@ const READ_RAW_INJECT =
   READ_RAW_ANCHOR;
 const READ_RAW_MARKER = "porf_native_fetch_read_raw_bytes(jsval value";
 
-
 /**
  * render.js full-block replacements: `[marker, anchor, inject, what]`, each a
  * complete swap of the matched region (unlike `RENDER_EDITS`, which only ever
  * inserts after its anchor).
  */
 const RENDER_REPLACEMENTS = [
-  [BYTESTRING_MARKER, BYTESTRING_ANCHOR, BYTESTRING_INJECT, "bytestring UTF-8 encoding (#172)"],
-  [READ_RAW_MARKER, READ_RAW_ANCHOR, READ_RAW_INJECT, "raw bytestring passthrough function (#176)"],
+  [
+    BYTESTRING_MARKER,
+    BYTESTRING_ANCHOR,
+    BYTESTRING_INJECT,
+    "bytestring UTF-8 encoding (#172)",
+  ],
+  [
+    READ_RAW_MARKER,
+    READ_RAW_ANCHOR,
+    READ_RAW_INJECT,
+    "raw bytestring passthrough function (#176)",
+  ],
 ] as const;
 
 // #15 — no `--port` flag: Porffor's native-fetch entry point calls
@@ -266,8 +280,10 @@ const CFLAGS_MARKER = "SB_EXTRA_CFLAGS";
 // into one FMA on arm64, rounding once where JavaScript rounds twice. A seeded
 // LCG (seed * 1103515245 + 12345, past 2^53) diverged from V8 at step 23.
 // Every compiled unit keeps JS's separate roundings with contraction off.
-const FP_CONTRACT_ANCHOR = "      '-fno-ident', '-ffunction-sections', '-fdata-sections',\n";
-const FP_CONTRACT_INJECT = "      '-ffp-contract=off', // sproutboat #235: JS rounds a * b + c twice\n";
+const FP_CONTRACT_ANCHOR =
+  "      '-fno-ident', '-ffunction-sections', '-fdata-sections',\n";
+const FP_CONTRACT_INJECT =
+  "      '-ffp-contract=off', // sproutboat #235: JS rounds a * b + c twice\n";
 const FP_CONTRACT_MARKER = "sproutboat #235";
 
 // baronunread/sproutboat#236: uWebSockets answers any request line that isn't
@@ -313,14 +329,17 @@ export const sbPatchHttp10 = uwsDir => {
 };
 `;
 const HTTP10_IMPORT_ANCHOR = "import { hashId } from './modules.js';\n";
-const HTTP10_IMPORT_INJECT = "import { sbPatchHttp10 } from './sb-http10.js'; // sproutboat #236\n";
+const HTTP10_IMPORT_INJECT =
+  "import { sbPatchHttp10 } from './sb-http10.js'; // sproutboat #236\n";
 const HTTP10_IMPORT_MARKER = "./sb-http10.js";
-const HTTP10_CALL_ANCHOR = "      const uwsDir = uwebsockets.ensureUWebSockets();\n";
+const HTTP10_CALL_ANCHOR =
+  "      const uwsDir = uwebsockets.ensureUWebSockets();\n";
 const HTTP10_CALL_INJECT = "      sbPatchHttp10(uwsDir);\n";
 const HTTP10_CALL_MARKER = "sbPatchHttp10(uwsDir)";
 // The shim is content-cached, so a header edit alone would never recompile it.
 // This line changes the shim once, which rebuilds it against the edited header.
-const HTTP10_SHIM_ANCHOR = 'export const makeUWebSocketsShimSource = () => `\n#include "App.h"\n';
+const HTTP10_SHIM_ANCHOR =
+  'export const makeUWebSocketsShimSource = () => `\n#include "App.h"\n';
 const HTTP10_SHIM_INJECT =
   'export const makeUWebSocketsShimSource = () => `\n#include "App.h"\n// sproutboat #236: built against an HttpParser.h that accepts HTTP/1.0\n';
 const HTTP10_SHIM_MARKER = "sproutboat #236: built against";
@@ -391,7 +410,8 @@ const TA_GET_INJECT =
   "    return Select(Bin('&&', T.i32, valid, Bin('<', T.i32, idx, Load('u32', JvPtr(obj), 0))),\n" +
   "      Box(f, Const(T.i32, TYPES.number)), valUndefined());\n" +
   "  };";
-const TA_GET_MARKER = "sproutboat #238: only a valid in-range integer index reads";
+const TA_GET_MARKER =
+  "sproutboat #238: only a valid in-range integer index reads";
 // baronunread/sproutboat#241: a typed-array write outside the array stored into
 // whatever memory followed it (and a[-1] = x wrote a[0], via the saturating
 // index conversion). ECMA-262 ignores the write. Same check as taGet, in user
@@ -409,7 +429,8 @@ const TA_SET_BOUNDS_INJECT =
   "        const { idx: sbIdx, valid: sbValid } = denseArrayIndexKey(scope, prop);\n" +
   "        emitIf(scope, Bin('&&', T.i32, sbValid, Bin('<', T.i32, sbIdx, Load('u32', JvPtr(obj), 0))), store);\n" +
   "      }";
-const TA_SET_BOUNDS_MARKER = "sproutboat #241: a write outside the array is ignored";
+const TA_SET_BOUNDS_MARKER =
+  "sproutboat #241: a write outside the array is ignored";
 
 // Porffor alpha 9 treats +02:00 as two milliseconds and adds offset hours
 // instead of subtracting them. Count fields even when they contain zero, and
@@ -512,7 +533,8 @@ const DATE_PARSER_INJECT = `  // sproutboat: ISO timezone offset
  * The default stays 1 MiB: a larger body is held in memory whole, so raising it
  * is a decision about this deployment's memory, not something to inherit.
  */
-const BODY_ANCHOR = "static const size_t REQUEST_BODY_MAX_BYTES = 1024u * 1024u;";
+const BODY_ANCHOR =
+  "static const size_t REQUEST_BODY_MAX_BYTES = 1024u * 1024u;";
 const BODY_INJECT = `static size_t sb_request_body_max(void) {
   static size_t cached = 0;
   if (cached == 0) {
@@ -538,7 +560,8 @@ const BODY_MARKER = "sb_request_body_max";
  * the sole caller feeds it straight to `writeStatus`, which copies synchronously).
  * Known codes keep their proper reason phrase.
  */
-const STATUS_SIG_ANCHOR = "static std::string_view lookup_status_line(i32 status) {";
+const STATUS_SIG_ANCHOR =
+  "static std::string_view lookup_status_line(i32 status) {";
 const STATUS_SIG_INJECT = "static std::string lookup_status_line(i32 status) {";
 const STATUS_SIG_MARKER = "static std::string lookup_status_line(i32 status) {";
 // 303 is the one this was reported for (POST-redirect-GET); give it the real
@@ -548,7 +571,8 @@ const STATUS_303_INJECT =
   '    case 302: return "302 Found";\n    case 303: return "303 See Other";\n';
 const STATUS_303_MARKER = 'case 303: return "303 See Other";';
 const STATUS_DEFAULT_ANCHOR = "    default: return {};";
-const STATUS_DEFAULT_INJECT = '    default: return std::to_string(status) + " Status";';
+const STATUS_DEFAULT_INJECT =
+  '    default: return std::to_string(status) + " Status";';
 const STATUS_DEFAULT_MARKER = 'std::to_string(status) + " Status"';
 
 /**
@@ -564,7 +588,8 @@ const STATUS_DEFAULT_MARKER = 'std::to_string(status) + " Status"';
 const HDR_SIG_ANCHOR = "static i32 collect_headers(uWS::HttpRequest* req) {\n";
 const HDR_SIG_INJECT =
   "static i32 collect_headers(uWS::HttpRequest* req, uWS::HttpResponse<false>* res) {\n";
-const HDR_SIG_MARKER = "collect_headers(uWS::HttpRequest* req, uWS::HttpResponse";
+const HDR_SIG_MARKER =
+  "collect_headers(uWS::HttpRequest* req, uWS::HttpResponse";
 
 const HDR_CALL_ANCHOR = "const i32 headers_ptr = collect_headers(req);";
 const HDR_CALL_INJECT = "const i32 headers_ptr = collect_headers(req, res);";
@@ -582,7 +607,8 @@ const HDR_SKIP_INJECT =
   '    if (key == "x-sb-remote-addr") continue; // #163: reserved, the server sets it below\n';
 const HDR_SKIP_MARKER = 'key == "x-sb-remote-addr"';
 
-const HDR_APPEND_ANCHOR = "  *((i32*)(porf_mem + headers_ptr)) = slot;\n\n  return headers_ptr;";
+const HDR_APPEND_ANCHOR =
+  "  *((i32*)(porf_mem + headers_ptr)) = slot;\n\n  return headers_ptr;";
 const HDR_APPEND_INJECT =
   "  {\n" +
   "    const std::string_view __sb_peer = res ? res->getRemoteAddressAsText() : std::string_view();\n" +
@@ -611,7 +637,8 @@ const READ_RAW_DECL_ANCHOR =
 const READ_RAW_DECL_INJECT =
   "int porf_native_fetch_read_value(struct jsval value, const char** out_buf, size_t* out_len, char** out_owned);\n" +
   "int porf_native_fetch_read_raw_bytes(struct jsval value, const char** out_buf, size_t* out_len);";
-const READ_RAW_DECL_MARKER = "porf_native_fetch_read_raw_bytes(struct jsval value";
+const READ_RAW_DECL_MARKER =
+  "porf_native_fetch_read_raw_bytes(struct jsval value";
 
 const FORBIDDEN_HDR_ANCHOR =
   "static bool is_forbidden_response_header(std::string_view key) {\n" +
@@ -707,8 +734,16 @@ const WRITE_RESPONSE_INJECT =
   "  const char* body_buf = nullptr;\n" +
   "  size_t body_len = 0;\n" +
   "  char* body_owned = nullptr;\n" +
-  "  if (raw_body) porf_native_fetch_read_raw_bytes(body_value, &body_buf, &body_len);\n" +
-  "  else porf_native_fetch_read_value(body_value, &body_buf, &body_len, &body_owned);\n" +
+  "  if (raw_body && porf_native_fetch_read_raw_bytes(body_value, &body_buf, &body_len) != 0 && body_value.type == 67) {\n" +
+  "    // Raw bytes can also arrive as a UTF-16 string (a fetch() response body parsed\n" +
+  "    // from JSON), one byte per unit: narrow each unit, as the R2 upload path does.\n" +
+  "    const u32 body_ptr = (u32)body_value.val;\n" +
+  "    body_len = (size_t)*((u32*)(porf_mem + body_ptr));\n" +
+  "    body_owned = (char*)malloc(body_len + 1);\n" +
+  "    const unsigned short* units = (const unsigned short*)(porf_mem + body_ptr + 4);\n" +
+  "    for (size_t i = 0; i < body_len; i++) body_owned[i] = (char)(units[i] & 0xff);\n" +
+  "    body_buf = body_owned;\n" +
+  "  } else if (!raw_body || !body_buf) porf_native_fetch_read_value(body_value, &body_buf, &body_len, &body_owned);\n" +
   "\n" +
   "  if (!aborted || !*aborted) {\n" +
   "    res->cork([res, status, headers_entries_ptr, body_buf, body_len]() {\n" +
@@ -751,7 +786,8 @@ const WRITE_RESPONSE_MARKER = "porf_native_fetch_read_raw_bytes(body_value";
 // #195: reserve a direct-transfer ticket before native-fetch allocates the
 // ordinary in-memory PendingRequest. uWS then gives each wire chunk directly
 // to the runtime C ABI, which owns the temporary object file.
-const R2_TRANSFER_ANCHOR = "static void on_request(uWS::HttpResponse<false>* res, uWS::HttpRequest* req) {\n";
+const R2_TRANSFER_ANCHOR =
+  "static void on_request(uWS::HttpResponse<false>* res, uWS::HttpRequest* req) {\n";
 const R2_TRANSFER_INJECT = `extern "C" {
   struct sb_r2_transfer_ctx;
   int sb_r2_transfer_open(const char*, const char*, size_t, sb_r2_transfer_ctx**);
@@ -873,16 +909,19 @@ static bool try_handle_r2_transfer(uWS::HttpResponse<false>* res, uWS::HttpReque
 static void on_request(uWS::HttpResponse<false>* res, uWS::HttpRequest* req) {
 `;
 const R2_TRANSFER_MARKER = "sb_r2_transfer_path(std::string_view path";
-const R2_TRANSFER_CALL_ANCHOR = "  __porffor_js_enter();\n  const i32 url_ptr = alloc_request_url(req);";
+const R2_TRANSFER_CALL_ANCHOR =
+  "  __porffor_js_enter();\n  const i32 url_ptr = alloc_request_url(req);";
 const R2_TRANSFER_CALL_INJECT =
-  "  if (try_handle_r2_transfer(res, req, method)) return;\n" + R2_TRANSFER_CALL_ANCHOR;
+  "  if (try_handle_r2_transfer(res, req, method)) return;\n" +
+  R2_TRANSFER_CALL_ANCHOR;
 const R2_TRANSFER_CALL_MARKER = "try_handle_r2_transfer(res, req, method)";
 const R2_DOWNLOAD_CACHE_MARKER = "sb_r2_transfer_download_v1";
 const R2_RANGE_CACHE_MARKER = "sb_r2_transfer_range_v1";
 const R2_CONDITIONAL_CACHE_MARKER = "sb_r2_transfer_conditional_v1";
 const R2_STREAMING_CACHE_MARKER = "sb_r2_transfer_streaming_v2";
 const R2_RANGE_HEADER_CACHE_MARKER = "sb_r2_transfer_range_header_v2";
-const R2_DOWNLOAD_DECL_ANCHOR = "  void sb_r2_transfer_abort(sb_r2_transfer_ctx*);\n}";
+const R2_DOWNLOAD_DECL_ANCHOR =
+  "  void sb_r2_transfer_abort(sb_r2_transfer_ctx*);\n}";
 const R2_DOWNLOAD_DECL_INJECT =
   "  void sb_r2_transfer_abort(sb_r2_transfer_ctx*);\n" +
   "  int sb_r2_transfer_download_open(const char*, const char*, sb_r2_transfer_ctx**);\n" +
@@ -890,7 +929,8 @@ const R2_DOWNLOAD_DECL_INJECT =
   "  const char* sb_r2_transfer_download_etag(sb_r2_transfer_ctx*);\n" +
   "  size_t sb_r2_transfer_download_read(sb_r2_transfer_ctx*, size_t, char*, size_t);\n" +
   "  void sb_r2_transfer_download_close(sb_r2_transfer_ctx*);\n}";
-const R2_DOWNLOAD_BRANCH_ANCHOR = '  if (method != "PUT") { respond_with_error(res, "405 Method Not Allowed", "R2 transfer requires PUT", true); return true; }';
+const R2_DOWNLOAD_BRANCH_ANCHOR =
+  '  if (method != "PUT") { respond_with_error(res, "405 Method Not Allowed", "R2 transfer requires PUT", true); return true; }';
 const R2_DOWNLOAD_BRANCH_INJECT = `  // sb_r2_transfer_download_v1
   // sb_r2_transfer_range_v1
   // sb_r2_transfer_range_header_v2
@@ -959,22 +999,67 @@ const done = new Set<string>();
 
 /** Edits to Porffor's uWebSockets shim: `[marker, anchor, inject, what]`. */
 const UWS_EDITS = [
-  [HTTP10_SHIM_MARKER, HTTP10_SHIM_ANCHOR, HTTP10_SHIM_INJECT, "shim rebuild for HTTP/1.0 (#236)"],
+  [
+    HTTP10_SHIM_MARKER,
+    HTTP10_SHIM_ANCHOR,
+    HTTP10_SHIM_INJECT,
+    "shim rebuild for HTTP/1.0 (#236)",
+  ],
   [BODY_MARKER, BODY_ANCHOR, BODY_INJECT, "request body limit"],
-  [STATUS_SIG_MARKER, STATUS_SIG_ANCHOR, STATUS_SIG_INJECT, "status-line return type (#156)"],
-  [STATUS_303_MARKER, STATUS_303_ANCHOR, STATUS_303_INJECT, "status-line 303 case (#156)"],
+  [
+    STATUS_SIG_MARKER,
+    STATUS_SIG_ANCHOR,
+    STATUS_SIG_INJECT,
+    "status-line return type (#156)",
+  ],
+  [
+    STATUS_303_MARKER,
+    STATUS_303_ANCHOR,
+    STATUS_303_INJECT,
+    "status-line 303 case (#156)",
+  ],
   [
     STATUS_DEFAULT_MARKER,
     STATUS_DEFAULT_ANCHOR,
     STATUS_DEFAULT_INJECT,
     "status-line fallback (#156)",
   ],
-  [HDR_SIG_MARKER, HDR_SIG_ANCHOR, HDR_SIG_INJECT, "collect_headers res arg (#163)"],
-  [HDR_CALL_MARKER, HDR_CALL_ANCHOR, HDR_CALL_INJECT, "collect_headers call site (#163)"],
-  [HDR_CAP_MARKER, HDR_CAP_ANCHOR, HDR_CAP_INJECT, "remote-addr header capacity (#163)"],
-  [HDR_SKIP_MARKER, HDR_SKIP_ANCHOR, HDR_SKIP_INJECT, "drop client-sent x-sb-remote-addr (#163)"],
-  [HDR_APPEND_MARKER, HDR_APPEND_ANCHOR, HDR_APPEND_INJECT, "append x-sb-remote-addr (#163)"],
-  [READ_RAW_DECL_MARKER, READ_RAW_DECL_ANCHOR, READ_RAW_DECL_INJECT, "read_raw_bytes decl (#176)"],
+  [
+    HDR_SIG_MARKER,
+    HDR_SIG_ANCHOR,
+    HDR_SIG_INJECT,
+    "collect_headers res arg (#163)",
+  ],
+  [
+    HDR_CALL_MARKER,
+    HDR_CALL_ANCHOR,
+    HDR_CALL_INJECT,
+    "collect_headers call site (#163)",
+  ],
+  [
+    HDR_CAP_MARKER,
+    HDR_CAP_ANCHOR,
+    HDR_CAP_INJECT,
+    "remote-addr header capacity (#163)",
+  ],
+  [
+    HDR_SKIP_MARKER,
+    HDR_SKIP_ANCHOR,
+    HDR_SKIP_INJECT,
+    "drop client-sent x-sb-remote-addr (#163)",
+  ],
+  [
+    HDR_APPEND_MARKER,
+    HDR_APPEND_ANCHOR,
+    HDR_APPEND_INJECT,
+    "append x-sb-remote-addr (#163)",
+  ],
+  [
+    READ_RAW_DECL_MARKER,
+    READ_RAW_DECL_ANCHOR,
+    READ_RAW_DECL_INJECT,
+    "read_raw_bytes decl (#176)",
+  ],
   [
     FORBIDDEN_HDR_MARKER,
     FORBIDDEN_HDR_ANCHOR,
@@ -987,8 +1072,18 @@ const UWS_EDITS = [
     WRITE_RESPONSE_INJECT,
     "detect x-sb-raw-body, steer the body read (#176)",
   ],
-  [R2_TRANSFER_MARKER, R2_TRANSFER_ANCHOR, R2_TRANSFER_INJECT, "native direct R2 transfer ingress (#195)"],
-  [R2_TRANSFER_CALL_MARKER, R2_TRANSFER_CALL_ANCHOR, R2_TRANSFER_CALL_INJECT, "direct R2 transfer dispatch (#195)"],
+  [
+    R2_TRANSFER_MARKER,
+    R2_TRANSFER_ANCHOR,
+    R2_TRANSFER_INJECT,
+    "native direct R2 transfer ingress (#195)",
+  ],
+  [
+    R2_TRANSFER_CALL_MARKER,
+    R2_TRANSFER_CALL_ANCHOR,
+    R2_TRANSFER_CALL_INJECT,
+    "direct R2 transfer dispatch (#195)",
+  ],
 ] as const;
 
 /** The uWebSockets shim source: body limit + the #156 status-line fix. Exported for tests. */
@@ -999,15 +1094,27 @@ export async function patchUwebsockets(root: string): Promise<void> {
   // Upgrade already-patched caches from the initial upload-only bridge. New
   // caches receive the full bridge below; old ones need declarations plus the
   // GET dispatch grafted onto their existing transfer handler.
-  if (src.includes(R2_TRANSFER_MARKER) && !src.includes(R2_DOWNLOAD_CACHE_MARKER)) {
-    if (!src.includes(R2_DOWNLOAD_DECL_ANCHOR) || !src.includes(R2_DOWNLOAD_BRANCH_ANCHOR))
-      throw new Error(`could not upgrade Porffor's direct R2 transfer bridge: anchor not found in ${file}.`);
+  if (
+    src.includes(R2_TRANSFER_MARKER) &&
+    !src.includes(R2_DOWNLOAD_CACHE_MARKER)
+  ) {
+    if (
+      !src.includes(R2_DOWNLOAD_DECL_ANCHOR) ||
+      !src.includes(R2_DOWNLOAD_BRANCH_ANCHOR)
+    )
+      throw new Error(
+        `could not upgrade Porffor's direct R2 transfer bridge: anchor not found in ${file}.`,
+      );
     src = src.replace(R2_DOWNLOAD_DECL_ANCHOR, R2_DOWNLOAD_DECL_INJECT);
     src = src.replace(R2_DOWNLOAD_BRANCH_ANCHOR, R2_DOWNLOAD_BRANCH_INJECT);
     changed = true;
   }
-  if (src.includes(R2_DOWNLOAD_CACHE_MARKER) && !src.includes(R2_RANGE_CACHE_MARKER)) {
-    const stateAnchor = "    struct Download { sb_r2_transfer_ctx* ctx; uintmax_t size; bool closed = false; };\n    auto state = std::make_shared<Download>(Download{download, sb_r2_transfer_download_size(download)});";
+  if (
+    src.includes(R2_DOWNLOAD_CACHE_MARKER) &&
+    !src.includes(R2_RANGE_CACHE_MARKER)
+  ) {
+    const stateAnchor =
+      "    struct Download { sb_r2_transfer_ctx* ctx; uintmax_t size; bool closed = false; };\n    auto state = std::make_shared<Download>(Download{download, sb_r2_transfer_download_size(download)});";
     const range = `    const uintmax_t full_size = sb_r2_transfer_download_size(download);
     uintmax_t first = 0, last = full_size ? full_size - 1 : 0;
     const std::string_view range = req->getHeader("range");
@@ -1023,18 +1130,36 @@ export async function patchUwebsockets(root: string): Promise<void> {
       res->writeStatus("206 Partial Content"); res->writeHeader("Content-Range", content_range);
     }
 `;
-    const state = "    struct Download { sb_r2_transfer_ctx* ctx; uintmax_t base; uintmax_t size; bool closed = false; };\n    auto state = std::make_shared<Download>(Download{download, first, last - first + 1});";
-    if (!src.includes(stateAnchor)) throw new Error(`could not upgrade Porffor's direct R2 range bridge: anchor not found in ${file}.`);
-    src = src.replace("  // sb_r2_transfer_download_v1\n", "  // sb_r2_transfer_download_v1\n  // sb_r2_transfer_range_v1\n");
+    const state =
+      "    struct Download { sb_r2_transfer_ctx* ctx; uintmax_t base; uintmax_t size; bool closed = false; };\n    auto state = std::make_shared<Download>(Download{download, first, last - first + 1});";
+    if (!src.includes(stateAnchor))
+      throw new Error(
+        `could not upgrade Porffor's direct R2 range bridge: anchor not found in ${file}.`,
+      );
+    src = src.replace(
+      "  // sb_r2_transfer_download_v1\n",
+      "  // sb_r2_transfer_download_v1\n  // sb_r2_transfer_range_v1\n",
+    );
     src = src.replace(stateAnchor, range + state);
-    src = src.replace("sb_r2_transfer_download_read(state->ctx, (size_t)offset, chunk, sizeof(chunk))", "sb_r2_transfer_download_read(state->ctx, (size_t)(state->base + offset), chunk, sizeof(chunk))");
+    src = src.replace(
+      "sb_r2_transfer_download_read(state->ctx, (size_t)offset, chunk, sizeof(chunk))",
+      "sb_r2_transfer_download_read(state->ctx, (size_t)(state->base + offset), chunk, sizeof(chunk))",
+    );
     changed = true;
   }
-  if (src.includes(R2_RANGE_CACHE_MARKER) && !src.includes(R2_CONDITIONAL_CACHE_MARKER)) {
-    const declaration = "  size_t sb_r2_transfer_download_size(sb_r2_transfer_ctx*);\n";
-    const declarationReplacement = declaration + "  const char* sb_r2_transfer_download_etag(sb_r2_transfer_ctx*);\n";
-    const anchor = "    const uintmax_t full_size = sb_r2_transfer_download_size(download);\n";
-    const inject = `    // sb_r2_transfer_conditional_v1
+  if (
+    src.includes(R2_RANGE_CACHE_MARKER) &&
+    !src.includes(R2_CONDITIONAL_CACHE_MARKER)
+  ) {
+    const declaration =
+      "  size_t sb_r2_transfer_download_size(sb_r2_transfer_ctx*);\n";
+    const declarationReplacement =
+      declaration +
+      "  const char* sb_r2_transfer_download_etag(sb_r2_transfer_ctx*);\n";
+    const anchor =
+      "    const uintmax_t full_size = sb_r2_transfer_download_size(download);\n";
+    const inject =
+      `    // sb_r2_transfer_conditional_v1
     const std::string etag = sb_r2_transfer_download_etag(download);
     res->writeHeader("ETag", etag); res->writeHeader("Accept-Ranges", "bytes");
     const std::string_view if_none_match = req->getHeader("if-none-match");
@@ -1042,11 +1167,19 @@ export async function patchUwebsockets(root: string): Promise<void> {
       sb_r2_transfer_download_close(download); res->writeStatus("304 Not Modified"); res->end(); return true;
     }
 ` + anchor;
-    if (!src.includes(declaration) || !src.includes(anchor)) throw new Error(`could not upgrade Porffor's direct R2 conditional bridge: anchor not found in ${file}.`);
-    src = src.replace(declaration, declarationReplacement).replace(anchor, inject);
+    if (!src.includes(declaration) || !src.includes(anchor))
+      throw new Error(
+        `could not upgrade Porffor's direct R2 conditional bridge: anchor not found in ${file}.`,
+      );
+    src = src
+      .replace(declaration, declarationReplacement)
+      .replace(anchor, inject);
     changed = true;
   }
-  if (src.includes(R2_CONDITIONAL_CACHE_MARKER) && !src.includes(R2_STREAMING_CACHE_MARKER)) {
+  if (
+    src.includes(R2_CONDITIONAL_CACHE_MARKER) &&
+    !src.includes(R2_STREAMING_CACHE_MARKER)
+  ) {
     const oldPump = `      const uintmax_t offset = res->getWriteOffset();
       char chunk[65536];
       const size_t bytes = sb_r2_transfer_download_read(state->ctx, (size_t)(state->base + offset), chunk, sizeof(chunk));
@@ -1061,15 +1194,28 @@ export async function patchUwebsockets(root: string): Promise<void> {
         if (result.second) { sb_r2_transfer_download_close(state->ctx); state->closed = true; return false; }
         if (!result.first) { res->onWritable([pump](uintmax_t) { return (*pump)(); }); return false; }
       }`;
-    if (!src.includes(oldPump)) throw new Error(`could not upgrade Porffor's direct R2 streaming bridge: anchor not found in ${file}.`);
-    src = src.replace("  // sb_r2_transfer_conditional_v1\n", "  // sb_r2_transfer_conditional_v1\n  // sb_r2_transfer_streaming_v2\n").replace(oldPump, newPump);
+    if (!src.includes(oldPump))
+      throw new Error(
+        `could not upgrade Porffor's direct R2 streaming bridge: anchor not found in ${file}.`,
+      );
+    src = src
+      .replace(
+        "  // sb_r2_transfer_conditional_v1\n",
+        "  // sb_r2_transfer_conditional_v1\n  // sb_r2_transfer_streaming_v2\n",
+      )
+      .replace(oldPump, newPump);
     changed = true;
   }
   // A short-lived v2 cache marker was written before its pump fix. Repair
   // those caches as well as applying the current form to future upgrades.
-  if (src.includes("state->base + offset") && src.includes("uintmax_t size; bool closed = false;")) {
-    const oldState = "struct Download { sb_r2_transfer_ctx* ctx; uintmax_t base; uintmax_t size; bool closed = false; };";
-    const newState = "struct Download { sb_r2_transfer_ctx* ctx; uintmax_t base; uintmax_t size; uintmax_t sent = 0; bool closed = false; };";
+  if (
+    src.includes("state->base + offset") &&
+    src.includes("uintmax_t size; bool closed = false;")
+  ) {
+    const oldState =
+      "struct Download { sb_r2_transfer_ctx* ctx; uintmax_t base; uintmax_t size; bool closed = false; };";
+    const newState =
+      "struct Download { sb_r2_transfer_ctx* ctx; uintmax_t base; uintmax_t size; uintmax_t sent = 0; bool closed = false; };";
     const oldPump = `      const uintmax_t offset = res->getWriteOffset(); char chunk[65536];
         const size_t bytes = sb_r2_transfer_download_read(state->ctx, (size_t)(state->base + offset), chunk, sizeof(chunk));
         const auto result = res->tryEnd(std::string_view(chunk, bytes), state->size);
@@ -1083,52 +1229,130 @@ export async function patchUwebsockets(root: string): Promise<void> {
         if (!result.first) { res->onWritable([pump, state](uintmax_t offset) { state->sent = offset; return (*pump)(); }); return false; }
         state->sent += bytes;
       }`;
-    if (!src.includes(oldState) || !src.includes(oldPump)) throw new Error(`could not repair Porffor's direct R2 streaming bridge: anchor not found in ${file}.`);
+    if (!src.includes(oldState) || !src.includes(oldPump))
+      throw new Error(
+        `could not repair Porffor's direct R2 streaming bridge: anchor not found in ${file}.`,
+      );
     src = src.replace(oldState, newState).replace(oldPump, newPump);
     changed = true;
   }
-  const duplicatePump = "      for (;;) {\n        char chunk[65536];\n      for (;;) {\n";
+  const duplicatePump =
+    "      for (;;) {\n        char chunk[65536];\n      for (;;) {\n";
   if (src.includes(duplicatePump)) {
-    src = src.replace(duplicatePump, "      for (;;) {\n        char chunk[65536];\n");
+    src = src.replace(
+      duplicatePump,
+      "      for (;;) {\n        char chunk[65536];\n",
+    );
     changed = true;
   }
   const unclosedPump = "        state->sent += bytes;\n    };\n";
   if (src.includes(unclosedPump)) {
-    src = src.replace(unclosedPump, "        state->sent += bytes;\n      }\n    };\n");
+    src = src.replace(
+      unclosedPump,
+      "        state->sent += bytes;\n      }\n    };\n",
+    );
     changed = true;
   }
-  if (src.includes(R2_STREAMING_CACHE_MARKER) && !src.includes(R2_RANGE_HEADER_CACHE_MARKER)) {
-    const rangeHeader = "    const std::string_view range = req->getHeader(\"range\");\n";
-    if (!src.includes(rangeHeader)) throw new Error(`could not upgrade Porffor's direct R2 range-header bridge: anchor not found in ${file}.`);
-    src = src.replace("  // sb_r2_transfer_range_v1\n", "  // sb_r2_transfer_range_v1\n  // sb_r2_transfer_range_header_v2\n");
-    src = src.replace(rangeHeader, "    std::string_view range = req->getHeader(\"range\"); if (range.empty()) range = req->getHeader(\"Range\");\n");
+  if (
+    src.includes(R2_STREAMING_CACHE_MARKER) &&
+    !src.includes(R2_RANGE_HEADER_CACHE_MARKER)
+  ) {
+    const rangeHeader =
+      '    const std::string_view range = req->getHeader("range");\n';
+    if (!src.includes(rangeHeader))
+      throw new Error(
+        `could not upgrade Porffor's direct R2 range-header bridge: anchor not found in ${file}.`,
+      );
+    src = src.replace(
+      "  // sb_r2_transfer_range_v1\n",
+      "  // sb_r2_transfer_range_v1\n  // sb_r2_transfer_range_header_v2\n",
+    );
+    src = src.replace(
+      rangeHeader,
+      '    std::string_view range = req->getHeader("range"); if (range.empty()) range = req->getHeader("Range");\n',
+    );
     changed = true;
   }
-  const earlyConditionalHeaders = "    res->writeHeader(\"ETag\", etag); res->writeHeader(\"Accept-Ranges\", \"bytes\");\n";
-  if (src.includes(earlyConditionalHeaders) && src.indexOf(earlyConditionalHeaders) < src.indexOf("    const uintmax_t full_size = sb_r2_transfer_download_size(download);")) {
-    const old304 = "      sb_r2_transfer_download_close(download); res->writeStatus(\"304 Not Modified\"); res->end(); return true;";
-    const new304 = "      sb_r2_transfer_download_close(download); res->writeStatus(\"304 Not Modified\"); res->writeHeader(\"ETag\", etag); res->end(); return true;";
-    const rangeEnd = "      res->writeStatus(\"206 Partial Content\"); res->writeHeader(\"Content-Range\", content_range);\n    }\n";
-    if (!src.includes(old304) || !src.includes(rangeEnd)) throw new Error(`could not repair Porffor's direct R2 response ordering: anchor not found in ${file}.`);
-    src = src.replace(earlyConditionalHeaders, "").replace(old304, new304).replace(rangeEnd, rangeEnd + "    res->writeHeader(\"ETag\", etag); res->writeHeader(\"Accept-Ranges\", \"bytes\");\n");
+  const earlyConditionalHeaders =
+    '    res->writeHeader("ETag", etag); res->writeHeader("Accept-Ranges", "bytes");\n';
+  if (
+    src.includes(earlyConditionalHeaders) &&
+    src.indexOf(earlyConditionalHeaders) <
+      src.indexOf(
+        "    const uintmax_t full_size = sb_r2_transfer_download_size(download);",
+      )
+  ) {
+    const old304 =
+      '      sb_r2_transfer_download_close(download); res->writeStatus("304 Not Modified"); res->end(); return true;';
+    const new304 =
+      '      sb_r2_transfer_download_close(download); res->writeStatus("304 Not Modified"); res->writeHeader("ETag", etag); res->end(); return true;';
+    const rangeEnd =
+      '      res->writeStatus("206 Partial Content"); res->writeHeader("Content-Range", content_range);\n    }\n';
+    if (!src.includes(old304) || !src.includes(rangeEnd))
+      throw new Error(
+        `could not repair Porffor's direct R2 response ordering: anchor not found in ${file}.`,
+      );
+    src = src
+      .replace(earlyConditionalHeaders, "")
+      .replace(old304, new304)
+      .replace(
+        rangeEnd,
+        rangeEnd +
+          '    res->writeHeader("ETag", etag); res->writeHeader("Accept-Ranges", "bytes");\n',
+      );
     changed = true;
   }
   if (src.includes("state->sent") && src.includes(R2_DOWNLOAD_CACHE_MARKER)) {
-    const stateStart = src.indexOf("    struct Download {", src.indexOf(R2_DOWNLOAD_CACHE_MARKER));
-    const stateEnd = src.indexOf("    res->writeHeader(\"Content-Type\"", stateStart);
-    const freshStart = R2_DOWNLOAD_BRANCH_INJECT.indexOf("    struct Download {");
-    const freshEnd = R2_DOWNLOAD_BRANCH_INJECT.indexOf("    res->writeHeader(\"Content-Type\"", freshStart);
-    if (stateStart < 0 || stateEnd < 0 || freshStart < 0 || freshEnd < 0) throw new Error(`could not replace Porffor's direct R2 stream pump: anchor not found in ${file}.`);
-    src = src.slice(0, stateStart) + R2_DOWNLOAD_BRANCH_INJECT.slice(freshStart, freshEnd) + src.slice(stateEnd);
+    const stateStart = src.indexOf(
+      "    struct Download {",
+      src.indexOf(R2_DOWNLOAD_CACHE_MARKER),
+    );
+    const stateEnd = src.indexOf(
+      '    res->writeHeader("Content-Type"',
+      stateStart,
+    );
+    const freshStart = R2_DOWNLOAD_BRANCH_INJECT.indexOf(
+      "    struct Download {",
+    );
+    const freshEnd = R2_DOWNLOAD_BRANCH_INJECT.indexOf(
+      '    res->writeHeader("Content-Type"',
+      freshStart,
+    );
+    if (stateStart < 0 || stateEnd < 0 || freshStart < 0 || freshEnd < 0)
+      throw new Error(
+        `could not replace Porffor's direct R2 stream pump: anchor not found in ${file}.`,
+      );
+    src =
+      src.slice(0, stateStart) +
+      R2_DOWNLOAD_BRANCH_INJECT.slice(freshStart, freshEnd) +
+      src.slice(stateEnd);
     changed = true;
   }
-  if (src.includes("writable_offset") && src.includes(R2_DOWNLOAD_CACHE_MARKER)) {
-    const stateStart = src.indexOf("    struct Download {", src.indexOf(R2_DOWNLOAD_CACHE_MARKER));
-    const stateEnd = src.indexOf("    res->writeHeader(\"Content-Type\"", stateStart);
+  if (
+    src.includes("writable_offset") &&
+    src.includes(R2_DOWNLOAD_CACHE_MARKER)
+  ) {
+    const stateStart = src.indexOf(
+      "    struct Download {",
+      src.indexOf(R2_DOWNLOAD_CACHE_MARKER),
+    );
+    const stateEnd = src.indexOf(
+      '    res->writeHeader("Content-Type"',
+      stateStart,
+    );
     const freshStart = R2_TRANSFER_INJECT.indexOf("    struct Download {");
-    const freshEnd = R2_TRANSFER_INJECT.indexOf("    res->writeHeader(\"Content-Type\"", freshStart);
-    if (stateStart < 0 || stateEnd < 0 || freshStart < 0 || freshEnd < 0) throw new Error(`could not restore Porffor's direct R2 stream pump: anchor not found in ${file}.`);
-    src = src.slice(0, stateStart) + R2_TRANSFER_INJECT.slice(freshStart, freshEnd) + src.slice(stateEnd);
+    const freshEnd = R2_TRANSFER_INJECT.indexOf(
+      '    res->writeHeader("Content-Type"',
+      freshStart,
+    );
+    if (stateStart < 0 || stateEnd < 0 || freshStart < 0 || freshEnd < 0)
+      throw new Error(
+        `could not restore Porffor's direct R2 stream pump: anchor not found in ${file}.`,
+      );
+    src =
+      src.slice(0, stateStart) +
+      R2_TRANSFER_INJECT.slice(freshStart, freshEnd) +
+      src.slice(stateEnd);
     changed = true;
   }
   for (const [marker, anchor, inject, what] of UWS_EDITS) {
@@ -1146,14 +1370,20 @@ export async function patchUwebsockets(root: string): Promise<void> {
 }
 
 const CLASS_SELF_IMPORT_ANCHOR = "import link from './modules.js';";
-const CLASS_SELF_IMPORT_INJECT = "import link from './modules.js';\nimport sbClassSelf from './sb-class-self.js';";
-const CLASS_SELF_CALL_ANCHOR = "  if (ast._ts) globalThis.typedInput = Prefs.optTypes;";
-const CLASS_SELF_CALL_INJECT = "  sbClassSelf(ast); // sproutboat #256\n  if (ast._ts) globalThis.typedInput = Prefs.optTypes;";
+const CLASS_SELF_IMPORT_INJECT =
+  "import link from './modules.js';\nimport sbClassSelf from './sb-class-self.js';";
+const CLASS_SELF_CALL_ANCHOR =
+  "  if (ast._ts) globalThis.typedInput = Prefs.optTypes;";
+const CLASS_SELF_CALL_INJECT =
+  "  sbClassSelf(ast); // sproutboat #256\n  if (ast._ts) globalThis.typedInput = Prefs.optTypes;";
 const CLASS_SELF_MARKER = "sproutboat #256";
 
 /** #256 — see CLASS_SELF_HELPER. */
 export async function patchClassSelfName(root: string): Promise<void> {
-  await writeFile(resolve(root, "compiler/sb-class-self.js"), CLASS_SELF_HELPER);
+  await writeFile(
+    resolve(root, "compiler/sb-class-self.js"),
+    CLASS_SELF_HELPER,
+  );
   const file = resolve(root, "compiler/parse.js");
   let src = await readFile(file, "utf8");
   if (src.includes(CLASS_SELF_MARKER)) return;
@@ -1161,9 +1391,14 @@ export async function patchClassSelfName(root: string): Promise<void> {
     [CLASS_SELF_IMPORT_ANCHOR, "import"],
     [CLASS_SELF_CALL_ANCHOR, "call"],
   ] as const) {
-    if (!src.includes(anchor)) throw new Error(`could not patch Porffor's class self-name rewrite (${what}): anchor not found in ${file}`);
+    if (!src.includes(anchor))
+      throw new Error(
+        `could not patch Porffor's class self-name rewrite (${what}): anchor not found in ${file}`,
+      );
   }
-  src = src.replace(CLASS_SELF_IMPORT_ANCHOR, CLASS_SELF_IMPORT_INJECT).replace(CLASS_SELF_CALL_ANCHOR, CLASS_SELF_CALL_INJECT);
+  src = src
+    .replace(CLASS_SELF_IMPORT_ANCHOR, CLASS_SELF_IMPORT_INJECT)
+    .replace(CLASS_SELF_CALL_ANCHOR, CLASS_SELF_CALL_INJECT);
   await writeFile(file, src);
 }
 
@@ -1175,9 +1410,24 @@ async function patchCompilerArgs(root: string): Promise<void> {
   for (const [marker, anchor, inject, what] of [
     [LINK_MARKER, LINK_ANCHOR, LINK_INJECT, "extra link args"],
     [CFLAGS_MARKER, CFLAGS_ANCHOR, CFLAGS_INJECT, "extra compiler flags"],
-    [FP_CONTRACT_MARKER, FP_CONTRACT_ANCHOR, FP_CONTRACT_INJECT, "floating-point contraction"],
-    [HTTP10_IMPORT_MARKER, HTTP10_IMPORT_ANCHOR, HTTP10_IMPORT_INJECT, "HTTP/1.0 helper import (#236)"],
-    [HTTP10_CALL_MARKER, HTTP10_CALL_ANCHOR, HTTP10_CALL_INJECT, "HTTP/1.0 parser edit (#236)"],
+    [
+      FP_CONTRACT_MARKER,
+      FP_CONTRACT_ANCHOR,
+      FP_CONTRACT_INJECT,
+      "floating-point contraction",
+    ],
+    [
+      HTTP10_IMPORT_MARKER,
+      HTTP10_IMPORT_ANCHOR,
+      HTTP10_IMPORT_INJECT,
+      "HTTP/1.0 helper import (#236)",
+    ],
+    [
+      HTTP10_CALL_MARKER,
+      HTTP10_CALL_ANCHOR,
+      HTTP10_CALL_INJECT,
+      "HTTP/1.0 parser edit (#236)",
+    ],
   ] as const) {
     if (src.includes(marker)) continue;
     const at = src.indexOf(anchor);
@@ -1191,7 +1441,9 @@ async function patchCompilerArgs(root: string): Promise<void> {
     // Porffor's module-build cache includes them in its compiler command.
     src =
       marker !== LINK_MARKER
-        ? src.slice(0, at + anchor.length) + inject + src.slice(at + anchor.length)
+        ? src.slice(0, at + anchor.length) +
+          inject +
+          src.slice(at + anchor.length)
         : src.slice(0, at) + inject + src.slice(at);
     changed = true;
   }
@@ -1203,12 +1455,23 @@ export async function patchDateParser(root: string): Promise<void> {
   const src = await readFile(file, "utf8");
   if (src.includes(DATE_PARSER_MARKER)) return;
   const start = src.indexOf("export const __ecma262_ParseDTSF");
-  const end = src.indexOf("// RFC 7231 or Date.prototype.toString() parser", start);
-  if (start < 0 || end < 0) throw new Error(`could not find Porffor's ISO date parser in ${file}`);
+  const end = src.indexOf(
+    "// RFC 7231 or Date.prototype.toString() parser",
+    start,
+  );
+  if (start < 0 || end < 0)
+    throw new Error(`could not find Porffor's ISO date parser in ${file}`);
   const parser = src.slice(start, end);
   if (!parser.includes(DATE_PARSER_ANCHOR))
-    throw new Error(`could not patch Porffor's ISO date parser: anchor not found in ${file}`);
-  await writeFile(file, src.slice(0, start) + parser.replace(DATE_PARSER_ANCHOR, DATE_PARSER_INJECT) + src.slice(end));
+    throw new Error(
+      `could not patch Porffor's ISO date parser: anchor not found in ${file}`,
+    );
+  await writeFile(
+    file,
+    src.slice(0, start) +
+      parser.replace(DATE_PARSER_ANCHOR, DATE_PARSER_INJECT) +
+      src.slice(end),
+  );
 }
 
 /** #168: keep a promise resolving to null out of the `then` probe. */
@@ -1217,7 +1480,9 @@ export async function patchPromiseResolveNull(root: string): Promise<void> {
   const src = await readFile(file, "utf8");
   if (src.includes(PROMISE_NULL_MARKER)) return;
   if (!src.includes(PROMISE_NULL_ANCHOR))
-    throw new Error(`could not patch Porffor's promise resolve for null: anchor not found in ${file}`);
+    throw new Error(
+      `could not patch Porffor's promise resolve for null: anchor not found in ${file}`,
+    );
   await writeFile(file, src.replace(PROMISE_NULL_ANCHOR, PROMISE_NULL_INJECT));
 }
 
@@ -1227,11 +1492,18 @@ export async function patchReplaceAll(root: string): Promise<void> {
   let src = await readFile(file, "utf8");
   if (src.includes(REPLACE_ALL_MARKER)) return;
   const start = src.indexOf("export const __Porffor_string_replaceAll = ");
-  const end = src.indexOf("export const __String_prototype_replaceAll = ", start);
-  if (start < 0 || end < 0) throw new Error(`could not find Porffor's replaceAll in ${file}`);
+  const end = src.indexOf(
+    "export const __String_prototype_replaceAll = ",
+    start,
+  );
+  if (start < 0 || end < 0)
+    throw new Error(`could not find Porffor's replaceAll in ${file}`);
   let body = src.slice(start, end);
   for (const [anchor, inject] of REPLACE_ALL_EDITS) {
-    if (!body.includes(anchor)) throw new Error(`could not patch Porffor's replaceAll: anchor not found in ${file}`);
+    if (!body.includes(anchor))
+      throw new Error(
+        `could not patch Porffor's replaceAll: anchor not found in ${file}`,
+      );
     body = body.replace(anchor, inject);
   }
   src = src.slice(0, start) + body + src.slice(end);
@@ -1245,10 +1517,18 @@ export async function patchTypedArrayStore(root: string): Promise<void> {
   let changed = false;
   for (const [marker, anchor, inject, what] of [
     [TA_GET_MARKER, TA_GET_ANCHOR, TA_GET_INJECT, "typed-array read bounds"],
-    [TA_SET_BOUNDS_MARKER, TA_SET_BOUNDS_ANCHOR, TA_SET_BOUNDS_INJECT, "typed-array write bounds"],
+    [
+      TA_SET_BOUNDS_MARKER,
+      TA_SET_BOUNDS_ANCHOR,
+      TA_SET_BOUNDS_INJECT,
+      "typed-array write bounds",
+    ],
   ] as const) {
     if (src.includes(marker)) continue;
-    if (!src.includes(anchor)) throw new Error(`could not patch Porffor's ${what}: anchor not found in ${file}`);
+    if (!src.includes(anchor))
+      throw new Error(
+        `could not patch Porffor's ${what}: anchor not found in ${file}`,
+      );
     src = src.replace(anchor, inject);
     changed = true;
   }
@@ -1259,19 +1539,33 @@ export async function patchTypedArrayStore(root: string): Promise<void> {
 export async function patchLocalFunctionTypes(root: string): Promise<void> {
   const file = resolve(root, "compiler/codegen.js");
   let src = await readFile(file, "utf8");
-  const marker = "sproutboat: preserve lexical types for direct-only local functions";
+  const marker =
+    "sproutboat: preserve lexical types for direct-only local functions";
   if (src.includes(marker)) return;
-  const anchor = "if (!hoistRead && directCallOnlyFunctionBinding(scope, kind, name, pattern, func)) {\n        return valUndefined();";
-  if (!src.includes(anchor)) throw new Error(`could not patch Porffor local function types: anchor not found in ${file}`);
-  src = src.replace(anchor,
+  const anchor =
+    "if (!hoistRead && directCallOnlyFunctionBinding(scope, kind, name, pattern, func)) {\n        return valUndefined();";
+  if (!src.includes(anchor))
+    throw new Error(
+      `could not patch Porffor local function types: anchor not found in ${file}`,
+    );
+  src = src.replace(
+    anchor,
     "if (!hoistRead && directCallOnlyFunctionBinding(scope, kind, name, pattern, func)) {\n" +
-    `        // ${marker}\n` +
-    "        bindNamedFunction(scope, name, func);\n        return valUndefined();");
+      `        // ${marker}\n` +
+      "        bindNamedFunction(scope, name, func);\n        return valUndefined();",
+  );
   // resolveNamedFunction already handles unambiguous global fallbacks. Falling
   // back again can infer a type from an unrelated same-named function.
-  const fallback = "const func = resolveNamedFunction(scope, name) ?? funcByName(name);";
-  if (!src.includes(fallback)) throw new Error(`could not patch Porffor local function type fallback: anchor not found in ${file}`);
-  src = src.replace(fallback, "const func = resolveNamedFunction(scope, name);");
+  const fallback =
+    "const func = resolveNamedFunction(scope, name) ?? funcByName(name);";
+  if (!src.includes(fallback))
+    throw new Error(
+      `could not patch Porffor local function type fallback: anchor not found in ${file}`,
+    );
+  src = src.replace(
+    fallback,
+    "const func = resolveNamedFunction(scope, name);",
+  );
   await writeFile(file, src);
 }
 
@@ -1284,10 +1578,16 @@ export async function patchUint8ArrayBase64(root: string): Promise<void> {
   const edits = [
     ["let alphabet: string =", "let alphabet: any ="],
     ["let lastChunkHandling: string =", "let lastChunkHandling: any ="],
-    ["const fullChunks: i32 = (len / 3) * 3;", "const fullChunks: i32 = ((len / 3) | 0) * 3;"],
+    [
+      "const fullChunks: i32 = (len / 3) * 3;",
+      "const fullChunks: i32 = ((len / 3) | 0) * 3;",
+    ],
   ] as const;
   for (const [anchor, replacement] of edits) {
-    if (!src.includes(anchor)) throw new Error(`could not patch Porffor base64: anchor not found in ${file}`);
+    if (!src.includes(anchor))
+      throw new Error(
+        `could not patch Porffor base64: anchor not found in ${file}`,
+      );
     src = src.replaceAll(anchor, replacement);
   }
   await writeFile(file, `// ${marker}\n${src}`);
@@ -1308,8 +1608,12 @@ export async function precompileBuiltins(root: string): Promise<void> {
     new Response(child.stdout).text(),
     new Response(child.stderr).text(),
   ]);
-  if (code !== 0) throw new Error(`could not precompile Porffor's patched builtins: ${stderr || stdout}`);
-  if ((await readFile(table)).length === 0) throw new Error(`Porffor precompile produced an empty ${table}`);
+  if (code !== 0)
+    throw new Error(
+      `could not precompile Porffor's patched builtins: ${stderr || stdout}`,
+    );
+  if ((await readFile(table)).length === 0)
+    throw new Error(`Porffor precompile produced an empty ${table}`);
 }
 
 /** The native-fetch server source: $PORT support + the #165 console sink. Exported for tests. */
@@ -1326,7 +1630,8 @@ export async function patchRenderJs(root: string): Promise<void> {
           "Porffor's native-fetch renderer changed. See https://github.com/baronunread/sproutboat/tree/main/patches/upstream.",
       );
     }
-    src = src.slice(0, at + anchor.length) + inject + src.slice(at + anchor.length);
+    src =
+      src.slice(0, at + anchor.length) + inject + src.slice(at + anchor.length);
     changed = true;
   }
 
@@ -1355,9 +1660,15 @@ export async function patchQuietCollection(root: string): Promise<void> {
   let shim = await readFile(shimFile, "utf8");
   const marker = "// sproutboat: reclaim large idle heaps";
   if (!render.includes(marker)) {
-    const start = render.indexOf("void porf_native_fetch_collect_normal_from(void* stack_top) {");
-    const end = render.indexOf("\nint porf_native_fetch_should_collect(void)", start);
-    if (start < 0 || end < 0) throw new Error("Porffor quiet-GC renderer anchor missing");
+    const start = render.indexOf(
+      "void porf_native_fetch_collect_normal_from(void* stack_top) {",
+    );
+    const end = render.indexOf(
+      "\nint porf_native_fetch_should_collect(void)",
+      start,
+    );
+    if (start < 0 || end < 0)
+      throw new Error("Porffor quiet-GC renderer anchor missing");
     const normal = render.slice(start, end);
     if (
       !normal.includes("porf_gc_collect_idle();") ||
@@ -1385,16 +1696,28 @@ export async function patchQuietCollection(root: string): Promise<void> {
 \${gcEnabled ? '  return porf_heap_base != 0 && ((u64)porf_heap_top - (u64)porf_heap_base > 8ull * 1024ull * 1024ull || porf_gc_mark_queue_cap > 65536);' : '  return 0;'}
 }
 `;
-    render = render.slice(0, end) + "\n" + marker + "\n" + needs + quiet + render.slice(end);
+    render =
+      render.slice(0, end) +
+      "\n" +
+      marker +
+      "\n" +
+      needs +
+      quiet +
+      render.slice(end);
   }
   if (!shim.includes(marker)) {
-    const declaration = "void porf_native_fetch_collect_normal_from(void* stack_top);";
+    const declaration =
+      "void porf_native_fetch_collect_normal_from(void* stack_top);";
     const start = shim.indexOf("static void collect_after_request(void) {");
     const end = shim.indexOf("\n}\n", start);
     if (!shim.includes(declaration) || start < 0 || end < 0)
       throw new Error("Porffor quiet-GC native shim anchor missing");
     const original = shim.slice(start, end);
-    if (!original.includes("porf_native_fetch_collect_normal_from((void*)&porf_stack_anchor);"))
+    if (
+      !original.includes(
+        "porf_native_fetch_collect_normal_from((void*)&porf_stack_anchor);",
+      )
+    )
       throw new Error("Porffor normal request collection changed");
     const timer = `${marker}
 static us_timer_t* sb_quiet_gc_timer = nullptr;
@@ -1425,7 +1748,8 @@ static void sb_collect_quiet(struct us_timer_t*) {
  * safe to call on every build. Callers pass an explicit root — `ensurePorffor`
  * right after extraction, the compile path against its resolved checkout.
  */
-const RESPONSE_DEFAULTS_MARKER = "// sproutboat: Fetch default content type for text bodies";
+const RESPONSE_DEFAULTS_MARKER =
+  "// sproutboat: Fetch default content type for text bodies";
 const RESPONSE_DEFAULTS_ANCHOR =
   "class Response {\n  constructor(body = null, init = undefined) {\n    this.body = body;\n    this.status = Number(init?.status ?? 200);\n    this.headers = new Headers(init?.headers);\n";
 
@@ -1439,7 +1763,9 @@ export async function patchResponseDefaults(root: string): Promise<void> {
   const src = await readFile(file, "utf8");
   if (src.includes(RESPONSE_DEFAULTS_MARKER)) return;
   if (!src.includes(RESPONSE_DEFAULTS_ANCHOR))
-    throw new Error(`could not patch Porffor's Response defaults: anchor not found in ${file}`);
+    throw new Error(
+      `could not patch Porffor's Response defaults: anchor not found in ${file}`,
+    );
   await writeFile(
     file,
     src.replace(
@@ -1451,8 +1777,10 @@ export async function patchResponseDefaults(root: string): Promise<void> {
   );
 }
 
-const HEADERS_ARRAY_ANCHOR = "    if (Porffor.type(init.entries) == Porffor.TYPES.function) {\n      this._entries = Porffor.array.new(8);\n      for (const entry of init.entries()) {";
-const HEADERS_ARRAY_INJECT = "    if (!Array.isArray(init) && Porffor.type(init.entries) == Porffor.TYPES.function) {\n      this._entries = Porffor.array.new(8);\n      for (const entry of init.entries()) {";
+const HEADERS_ARRAY_ANCHOR =
+  "    if (Porffor.type(init.entries) == Porffor.TYPES.function) {\n      this._entries = Porffor.array.new(8);\n      for (const entry of init.entries()) {";
+const HEADERS_ARRAY_INJECT =
+  "    if (!Array.isArray(init) && Porffor.type(init.entries) == Porffor.TYPES.function) {\n      this._entries = Porffor.array.new(8);\n      for (const entry of init.entries()) {";
 
 /**
  * `new Headers([["a", "1"]])`: arrays also have entries() (yielding [index, pair]), and
@@ -1464,8 +1792,13 @@ export async function patchHeadersArrayInit(root: string): Promise<void> {
   const src = await readFile(file, "utf8");
   if (src.includes(HEADERS_ARRAY_INJECT)) return;
   if (!src.includes(HEADERS_ARRAY_ANCHOR))
-    throw new Error(`could not patch Porffor's Headers array init: anchor not found in ${file}`);
-  await writeFile(file, src.replace(HEADERS_ARRAY_ANCHOR, HEADERS_ARRAY_INJECT));
+    throw new Error(
+      `could not patch Porffor's Headers array init: anchor not found in ${file}`,
+    );
+  await writeFile(
+    file,
+    src.replace(HEADERS_ARRAY_ANCHOR, HEADERS_ARRAY_INJECT),
+  );
 }
 
 export async function ensurePorfforPatched(root: string): Promise<void> {

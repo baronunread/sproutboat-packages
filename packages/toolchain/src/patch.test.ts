@@ -3,7 +3,14 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EMPTY_BINDINGS, wrapNativeFetchHandler } from "../../runtime/src/wrap";
-import { patchHeadersArrayInit, patchLocalFunctionTypes, patchResponseDefaults, patchUint8ArrayBase64, patchRenderJs, patchUwebsockets } from "./patch";
+import {
+  patchHeadersArrayInit,
+  patchLocalFunctionTypes,
+  patchResponseDefaults,
+  patchUint8ArrayBase64,
+  patchRenderJs,
+  patchUwebsockets,
+} from "./patch";
 
 // The parts of Porffor's compiler/render.js the patch anchors to.
 const RENDER = `void porf_native_fetch_runtime_init(void) {
@@ -159,9 +166,13 @@ test("#156: status-line fallback synthesizes a line for unlisted codes, idempote
     const once = await readFile(join(root, "compiler/uwebsockets.js"), "utf8");
 
     // Return type widened, empty fallback replaced, known cases untouched.
-    expect(once).toContain("static std::string lookup_status_line(i32 status) {");
+    expect(once).toContain(
+      "static std::string lookup_status_line(i32 status) {",
+    );
     expect(once).not.toContain("std::string_view lookup_status_line");
-    expect(once).toContain('default: return std::to_string(status) + " Status";');
+    expect(once).toContain(
+      'default: return std::to_string(status) + " Status";',
+    );
     expect(once).not.toContain("default: return {};");
     expect(once).toContain('case 302: return "302 Found";');
     // 303 gets its real phrase; the switch stays well-formed (302 still present once).
@@ -184,10 +195,14 @@ test("#156: status-line fallback synthesizes a line for unlisted codes, idempote
     expect(once).toContain(
       "static i32 collect_headers(uWS::HttpRequest* req, uWS::HttpResponse<false>* res) {",
     );
-    expect(once).toContain("const i32 headers_ptr = collect_headers(req, res);");
+    expect(once).toContain(
+      "const i32 headers_ptr = collect_headers(req, res);",
+    );
     expect(once).toContain('if (key == "x-sb-remote-addr") continue;');
     expect(once).toContain("res->getRemoteAddressAsText()");
-    expect(once).toContain('porf_native_fetch_alloc_bytestring("x-sb-remote-addr", 16)');
+    expect(once).toContain(
+      'porf_native_fetch_alloc_bytestring("x-sb-remote-addr", 16)',
+    );
     expect(once).toContain("header_capacity += 2;");
 
     // #176: a dedicated porf_native_fetch_read_raw_bytes, declared alongside
@@ -204,10 +219,12 @@ test("#156: status-line fallback synthesizes a line for unlisted codes, idempote
       'if (std::string_view(scan_buf, scan_bytes) == "x-sb-raw-body") raw_body = true;',
     );
     expect(once).toContain(
-      "if (raw_body) porf_native_fetch_read_raw_bytes(body_value, &body_buf, &body_len);",
+      "if (raw_body && porf_native_fetch_read_raw_bytes(body_value, &body_buf, &body_len) != 0 && body_value.type == 67) {",
     );
+    // A UTF-16 body (type 67) is narrowed unit by unit, never UTF-8 encoded.
+    expect(once).toContain("body_owned[i] = (char)(units[i] & 0xff);");
     expect(once).toContain(
-      "else porf_native_fetch_read_value(body_value, &body_buf, &body_len, &body_owned);",
+      "} else if (!raw_body || !body_buf) porf_native_fetch_read_value(body_value, &body_buf, &body_len, &body_owned);",
     );
     // Header reads are the original 4-arg call, unchanged.
     expect(once).toContain(
@@ -218,7 +235,9 @@ test("#156: status-line fallback synthesizes a line for unlisted codes, idempote
     );
 
     await patchUwebsockets(root);
-    expect(await readFile(join(root, "compiler/uwebsockets.js"), "utf8")).toBe(once);
+    expect(await readFile(join(root, "compiler/uwebsockets.js"), "utf8")).toBe(
+      once,
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -228,7 +247,10 @@ test("a drifted shim fails loudly instead of silently no-op'ing", async () => {
   const root = await mkdtemp(join(tmpdir(), "sb-patch-uws-drift-"));
   try {
     await mkdir(join(root, "compiler"), { recursive: true });
-    await writeFile(join(root, "compiler/uwebsockets.js"), "// nothing the patch recognizes\n");
+    await writeFile(
+      join(root, "compiler/uwebsockets.js"),
+      "// nothing the patch recognizes\n",
+    );
     await expect(patchUwebsockets(root)).rejects.toThrow(/anchor not found/);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -241,8 +263,11 @@ test("broker transport defines every direct R2 transfer symbol the patched shim 
     await patchUwebsockets(root);
     const shim = await readFile(join(root, "compiler/uwebsockets.js"), "utf8");
     const abi = shim.match(/extern "C" \{([\s\S]*?)\n\}/)?.[1];
-    if (abi === undefined) throw new Error("patched shim did not contain the R2 transfer ABI");
-    const required = [...abi.matchAll(/\b(sb_r2_transfer_[a-z_]+)\s*\(/g)].map((match) => match[1]);
+    if (abi === undefined)
+      throw new Error("patched shim did not contain the R2 transfer ABI");
+    const required = [...abi.matchAll(/\b(sb_r2_transfer_[a-z_]+)\s*\(/g)].map(
+      (match) => match[1],
+    );
     const wrapped = wrapNativeFetchHandler(
       "export default { fetch() { return new Response('ok'); } }",
       "",
@@ -274,7 +299,9 @@ test("#165: render.js routes console output to stderr, unbuffered, idempotently"
     expect(once).toContain("dup2(2, 1);");
     expect(once).toContain("setvbuf(stdout, NULL, _IONBF, 0);");
     // Injected inside runtime_init, right after the SIGPIPE line.
-    expect(once).toMatch(/signal\(SIGPIPE, SIG_IGN\);\n {2}\/\* sproutboat #165/);
+    expect(once).toMatch(
+      /signal\(SIGPIPE, SIG_IGN\);\n {2}\/\* sproutboat #165/,
+    );
     // The $PORT edit still lands too.
     expect(once).toContain('getenv("PORT")');
 
@@ -300,13 +327,15 @@ test("#165: render.js routes console output to stderr, unbuffered, idempotently"
   }
 });
 
-
 test("local function type patch registers lexical bindings and is idempotent", async () => {
   const root = await mkdtemp(join(tmpdir(), "sb-local-functions-"));
   try {
     await mkdir(join(root, "compiler"));
     const file = join(root, "compiler/codegen.js");
-    await writeFile(file, "if (!hoistRead && directCallOnlyFunctionBinding(scope, kind, name, pattern, func)) {\n        return valUndefined();\n}\nconst func = resolveNamedFunction(scope, name) ?? funcByName(name);");
+    await writeFile(
+      file,
+      "if (!hoistRead && directCallOnlyFunctionBinding(scope, kind, name, pattern, func)) {\n        return valUndefined();\n}\nconst func = resolveNamedFunction(scope, name) ?? funcByName(name);",
+    );
     await patchLocalFunctionTypes(root);
     const patched = await readFile(file, "utf8");
     expect(patched).toContain("bindNamedFunction(scope, name, func);");
@@ -318,13 +347,15 @@ test("local function type patch registers lexical bindings and is idempotent", a
   }
 });
 
-
 test("base64 patch preserves option tags and truncates full chunks, idempotently", async () => {
   const root = await mkdtemp(join(tmpdir(), "sb-base64-patch-"));
   try {
     await mkdir(join(root, "compiler/builtins"), { recursive: true });
     const file = join(root, "compiler/builtins/uint8array_base64.ts");
-    await writeFile(file, "let alphabet: string = 'base64';\nlet lastChunkHandling: string = 'loose';\nconst fullChunks: i32 = (len / 3) * 3;");
+    await writeFile(
+      file,
+      "let alphabet: string = 'base64';\nlet lastChunkHandling: string = 'loose';\nconst fullChunks: i32 = (len / 3) * 3;",
+    );
     await patchUint8ArrayBase64(root);
     const patched = await readFile(file, "utf8");
     expect(patched).toContain("let alphabet: any =");
@@ -342,14 +373,21 @@ test("Response defaults patch types string bodies only, idempotently", async () 
   try {
     await mkdir(join(root, "runtime"));
     const file = join(root, "runtime/fetch-globals.js");
-    await writeFile(file, "class Response {\n  constructor(body = null, init = undefined) {\n    this.body = body;\n    this.status = Number(init?.status ?? 200);\n    this.headers = new Headers(init?.headers);\n  }\n}\n");
+    await writeFile(
+      file,
+      "class Response {\n  constructor(body = null, init = undefined) {\n    this.body = body;\n    this.status = Number(init?.status ?? 200);\n    this.headers = new Headers(init?.headers);\n  }\n}\n",
+    );
     await patchResponseDefaults(root);
     const patched = await readFile(file, "utf8");
-    expect(patched).toContain("if (typeof body === 'string' && !this.headers.has('content-type')) this.headers.set('content-type', 'text/plain;charset=UTF-8');");
+    expect(patched).toContain(
+      "if (typeof body === 'string' && !this.headers.has('content-type')) this.headers.set('content-type', 'text/plain;charset=UTF-8');",
+    );
     await patchResponseDefaults(root);
     expect(await readFile(file, "utf8")).toBe(patched);
     await writeFile(file, "class Response {}\n");
-    await expect(patchResponseDefaults(root)).rejects.toThrow("anchor not found");
+    await expect(patchResponseDefaults(root)).rejects.toThrow(
+      "anchor not found",
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -360,10 +398,15 @@ test("Headers array-init patch sends arrays to the sequence branch, idempotently
   try {
     await mkdir(join(root, "runtime"));
     const file = join(root, "runtime/fetch-globals.js");
-    await writeFile(file, "    if (Porffor.type(init.entries) == Porffor.TYPES.function) {\n      this._entries = Porffor.array.new(8);\n      for (const entry of init.entries()) {\n");
+    await writeFile(
+      file,
+      "    if (Porffor.type(init.entries) == Porffor.TYPES.function) {\n      this._entries = Porffor.array.new(8);\n      for (const entry of init.entries()) {\n",
+    );
     await patchHeadersArrayInit(root);
     const patched = await readFile(file, "utf8");
-    expect(patched).toContain("if (!Array.isArray(init) && Porffor.type(init.entries) == Porffor.TYPES.function) {");
+    expect(patched).toContain(
+      "if (!Array.isArray(init) && Porffor.type(init.entries) == Porffor.TYPES.function) {",
+    );
     await patchHeadersArrayInit(root);
     expect(await readFile(file, "utf8")).toBe(patched);
   } finally {
