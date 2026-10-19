@@ -25,6 +25,7 @@ Porffor.c`
 #include <string.h>
 #include <strings.h>
 #include <sys/time.h>
+#include <pthread.h>
 #include <bearssl.h>
 
 // sqlite3 is linked in via SB_EXTRA_LINK (see patch-porffor.ts). Declared here
@@ -1117,9 +1118,18 @@ static int sb_egress_refused(const char* host, const struct sockaddr* sa, char* 
 // sprout, which may not open sockets itself. Ask on unix socket N with
 // "HOST PORT\n"; the host resolves, applies its policy and answers "ok\n" with the
 // connected socket attached (SCM_RIGHTS), or "no MESSAGE\n", which fetch() reports.
-// One question at a time; any broken exchange closes N for good, so a late answer
-// can never be taken for the next one.
+// One question at a time (a lock, for async requests on several threads); any
+// broken exchange closes N for good, so a late answer can never be taken for the
+// next one.
+static int sb_egress_fd_ask(int via, const char* host, int port, char* refused, size_t refused_len);
 static int sb_egress_fd_connect(int via, const char* host, int port, char* refused, size_t refused_len) {
+  static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+  pthread_mutex_lock(&lock);
+  int fd = sb_egress_fd_ask(via, host, port, refused, refused_len);
+  pthread_mutex_unlock(&lock);
+  return fd;
+}
+static int sb_egress_fd_ask(int via, const char* host, int port, char* refused, size_t refused_len) {
   static int broken = 0;
   if (broken) return -1;
   char line[512];
@@ -1578,6 +1588,129 @@ static char* sb_http_request(const char* host, int port, const char* path, const
   return tls ? sb_https(host, port, path, method, headers, body, body_len)
              : sb_http_plain(host, port, path, method, headers, body, body_len);
 }
+
+// ASYNC:BEGIN
+// Async outbound HTTP for a host with an event loop (sproutd, B18). The host calls
+// sb_async_enable() and watches the fd it returns. fetch() then queues each request
+// for a small pool of threads that run the blocking client above, and returns at
+// once. A finished request is queued and signalled on the fd; the host calls
+// sb_async_drain(), which fires the JS callback registered under the request's
+// timer id. Threads touch only their own malloc'd job, never the JS heap. Without
+// sb_async_enable() (standalone sprouts) nothing here runs.
+void porf_native_fetch_fire_timer(u32 id);
+void porf_native_fetch_timer_clear(u32 id);
+typedef struct sb_async_job {
+  struct sb_async_job* next;
+  u32 id;
+  int port, tls;
+  char *host, *path, *method, *headers, *body, *out;
+  size_t body_len;
+} sb_async_job;
+#define SB_ASYNC_THREADS 8
+static pthread_mutex_t sb_async_lock = PTHREAD_MUTEX_INITIALIZER;
+static sb_async_job *sb_async_queue = 0, *sb_async_queue_tail = 0, *sb_async_done = 0, *sb_async_current = 0;
+static int sb_async_pipe[2] = { -1, -1 };
+static int sb_async_threads = 0;
+
+int sb_async_enable(void) {
+  if (sb_async_pipe[0] >= 0) return sb_async_pipe[0];
+  if (pipe(sb_async_pipe) != 0) return -1;
+  for (int i = 0; i < 2; i++) {
+    fcntl(sb_async_pipe[i], F_SETFD, FD_CLOEXEC);
+    fcntl(sb_async_pipe[i], F_SETFL, fcntl(sb_async_pipe[i], F_GETFL) | O_NONBLOCK);
+  }
+  return sb_async_pipe[0];
+}
+int sb_async_enabled(void) { return sb_async_pipe[0] >= 0; }
+static void sb_async_free(sb_async_job* j) {
+  free(j->host); free(j->path); free(j->method); free(j->headers); free(j->body); free(j->out); free(j);
+}
+// Called with sb_async_lock held.
+static void sb_async_finish_locked(sb_async_job* j) {
+  j->next = sb_async_done;
+  sb_async_done = j;
+  char one = 1;
+  while (write(sb_async_pipe[1], &one, 1) < 0 && errno == EINTR) {}
+}
+static void* sb_async_thread(void* unused) {
+  (void)unused;
+  for (;;) {
+    pthread_mutex_lock(&sb_async_lock);
+    sb_async_job* j = sb_async_queue;
+    if (!j) { sb_async_threads--; pthread_mutex_unlock(&sb_async_lock); return 0; }
+    sb_async_queue = j->next;
+    if (!sb_async_queue) sb_async_queue_tail = 0;
+    pthread_mutex_unlock(&sb_async_lock);
+    j->out = sb_http_request(j->host, j->port, j->path, j->method, j->headers, j->body, j->body_len, j->tls);
+    pthread_mutex_lock(&sb_async_lock);
+    sb_async_finish_locked(j);
+    pthread_mutex_unlock(&sb_async_lock);
+  }
+}
+static void sb_async_start(sb_async_job* j) {
+  sb_init_anchors();  // built once, before any thread reads them
+  pthread_mutex_lock(&sb_async_lock);
+  j->next = 0;
+  if (sb_async_queue_tail) sb_async_queue_tail->next = j; else sb_async_queue = j;
+  sb_async_queue_tail = j;
+  int spawn = sb_async_threads < SB_ASYNC_THREADS;
+  if (spawn) sb_async_threads++;
+  pthread_mutex_unlock(&sb_async_lock);
+  if (!spawn) return;
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+  pthread_attr_setstacksize(&attr, 256 * 1024);
+  pthread_t thread;
+  int failed = pthread_create(&thread, &attr, sb_async_thread, 0);
+  pthread_attr_destroy(&attr);
+  if (!failed) return;
+  // No thread (a pids limit): a running thread takes the queue; with none, fail it.
+  pthread_mutex_lock(&sb_async_lock);
+  if (--sb_async_threads == 0) {
+    while (sb_async_queue) {
+      sb_async_job* q = sb_async_queue;
+      sb_async_queue = q->next;
+      q->out = sb_error_json("could not start a request: ", strerror(failed));
+      sb_async_finish_locked(q);
+    }
+    sb_async_queue_tail = 0;
+  }
+  pthread_mutex_unlock(&sb_async_lock);
+}
+// The inline C of __sbHttpRaw and __sbHttpAsyncResult calls these by prototype: Porffor
+// may emit a function's body before this block.
+void sb_async_submit(u32 id, int port, int tls, char* host, char* path, char* method, char* headers,
+                     char* body, size_t body_len) {
+  sb_async_job* j = (sb_async_job*)calloc(1, sizeof(sb_async_job));
+  if (!j) abort();
+  j->id = id; j->port = port; j->tls = tls;
+  j->host = host; j->path = path; j->method = method; j->headers = headers;
+  j->body = body; j->body_len = body_len;
+  sb_async_start(j);
+}
+const char* sb_async_reply(u32 id) {
+  return sb_async_current && sb_async_current->id == id ? sb_async_current->out : 0;
+}
+// Host: the fd became readable. Fires each finished request's callback.
+void sb_async_drain(void) {
+  char buf[64];
+  while (read(sb_async_pipe[0], buf, sizeof(buf)) > 0) {}
+  pthread_mutex_lock(&sb_async_lock);
+  sb_async_job* done = sb_async_done;
+  sb_async_done = 0;
+  pthread_mutex_unlock(&sb_async_lock);
+  while (done) {
+    sb_async_job* j = done;
+    done = j->next;
+    porf_native_fetch_timer_clear(j->id);  // the host's placeholder timer
+    sb_async_current = j;                  // read by __sbHttpAsyncResult in the callback
+    porf_native_fetch_fire_timer(j->id);
+    sb_async_current = 0;
+    sb_async_free(j);
+  }
+}
+// ASYNC:END
 `;
 
 // R2 put: the body is its own parameter, so it never gets escaped.
@@ -1861,8 +1994,10 @@ function __sbD1BackupRaw(src, dest) {
 // Outbound HTTP. String params so C can read each directly; the JS side has
 // already split the URL; the connect refuses private addresses. `tlsFlag` is "1" or "0" —
 // a string like the rest, so the marshalling stays uniform.
+// asyncId > 0 (B18): queue the request under that timer id and return "" at once;
+// its callback reads the reply with __sbHttpAsyncResult.
 // oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
-function __sbHttpRaw(host, portStr, path, method, headersText, body, tlsFlag) {
+function __sbHttpRaw(host, portStr, path, method, headersText, body, tlsFlag, asyncId) {
   let res = "";
   // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
   Porffor.c`
@@ -1918,14 +2053,57 @@ function __sbHttpRaw(host, portStr, path, method, headersText, body, tlsFlag) {
     char* __body = (char*)malloc(__bl + 1); memcpy(__body, __b, __bl); __body[__bl] = 0;
     if (__bo) free(__bo);
 
-    char* __out = sb_http_request(__host, atoi(__portbuf), __path, __method, __hdrs, __body, __bl, __tls);
-    free(__host); free(__path); free(__method); free(__hdrs); free(__body);
-    if (__out) {
-      res = porf_box((f64)porf_native_fetch_alloc_bytestring(__out, strlen(__out)), 195);
-      free(__out);
+    const u32 __async = asyncId.type == 1 && asyncId.val > 0 ? (u32)asyncId.val : 0;
+    if (__async) {
+      void sb_async_submit(u32, int, int, char*, char*, char*, char*, char*, size_t);
+      sb_async_submit(__async, atoi(__portbuf), __tls, __host, __path, __method, __hdrs, __body, __bl);
+    } else {
+      char* __out = sb_http_request(__host, atoi(__portbuf), __path, __method, __hdrs, __body, __bl, __tls);
+      free(__host); free(__path); free(__method); free(__hdrs); free(__body);
+      if (__out) {
+        res = porf_box((f64)porf_native_fetch_alloc_bytestring(__out, strlen(__out)), 195);
+        free(__out);
+      }
     }
   `;
   return res;
+}
+
+// The reply of the async request now firing its callback (B18), or "".
+// oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
+function __sbHttpAsyncResult(asyncId) {
+  let res = "";
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    const char* sb_async_reply(u32);
+    const char* __r = asyncId.type == 1 ? sb_async_reply((u32)asyncId.val) : 0;
+    if (__r) res = porf_box((f64)porf_native_fetch_alloc_bytestring(__r, strlen(__r)), 195);
+  `;
+  return res;
+}
+
+// Whether the host runs async requests (sb_async_enable was called).
+function __sbHttpAsyncEnabled() {
+  let res = false;
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    int sb_async_enabled(void);
+    if (sb_async_enabled()) res = porf_box(1, 2);
+  `;
+  return res;
+}
+
+// The outbound client's JSON reply -> the fetch op's result.
+function __sbFetchReply(raw) {
+  const reply = JSON.parse(raw);
+  if (reply.ok === false) throw new Error(reply.error);
+  // A TLS peer that closed without close_notify is normal on Connection:
+  // close, and also what a truncation attack looks like. Accept it only when
+  // Content-Length says the body arrived whole.
+  if (reply.unclean && !reply.complete) {
+    throw new Error("connection closed before the response was complete");
+  }
+  return { ok: true, status: reply.status, headers: reply.headers, body: reply.body };
 }
 
 // One statement in, one JSON reply out. `path`, `sql` and `paramsJson` are
@@ -2230,25 +2408,20 @@ function __sbEmbeddedDispatch(msg) {
       headerText += pairs[i][0] + ": " + pairs[i][1] + "\r\n";
     }
     const port = url.port ? url.port : tls ? "443" : "80";
-    const reply = JSON.parse(
-      __sbHttpRaw(
-        url.hostname,
-        port,
-        url.pathname + url.search,
-        String(msg.method || "GET").toUpperCase(),
-        headerText,
-        msg.body == null ? "" : String(msg.body),
-        (tls ? "1" : "0") + (msg.bodyBinary === true ? "b" : ""),
-      ),
+    const asyncId = msg.asyncId > 0 ? msg.asyncId : 0;
+    const raw = __sbHttpRaw(
+      url.hostname,
+      port,
+      url.pathname + url.search,
+      String(msg.method || "GET").toUpperCase(),
+      headerText,
+      msg.body == null ? "" : String(msg.body),
+      (tls ? "1" : "0") + (msg.bodyBinary === true ? "b" : ""),
+      asyncId,
     );
-    if (reply.ok === false) throw new Error(reply.error);
-    // A TLS peer that closed without close_notify is normal on Connection:
-    // close, and also what a truncation attack looks like. Accept it only when
-    // Content-Length says the body arrived whole.
-    if (reply.unclean && !reply.complete) {
-      throw new Error("connection closed before the response was complete");
-    }
-    return { ok: true, status: reply.status, headers: reply.headers, body: reply.body };
+    // B18: queued; the reply reaches the callback registered under asyncId.
+    if (asyncId) return { ok: true, pending: true };
+    return __sbFetchReply(raw);
   }
 
   if (op === "secret.get") {
