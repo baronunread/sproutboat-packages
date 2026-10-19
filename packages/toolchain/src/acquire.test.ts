@@ -143,8 +143,11 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "    for (const x of (value as any[])) {\n    }\n" +
       "      const val: any = value[key];\n" +
       "};\nexport const __JSON_stringify = (value: any) => {\n  let cap: i32 = 4096;\n};\n",
+    "runtime/native-fetch.js":
+      "export function finalize(response) {\n  const body = response.body == null ? '' : String(response.body);\n  const headersEntries = response.headers._entries;\n}\n",
     "runtime/fetch-globals.js":
       "// sb_text_encoder_scalar_v1\n" +
+      "class Blob {\n}\nclass TextEncoder {\n}\n" +
       "class Headers {\n" +
       "    if (Porffor.type(init.entries) == Porffor.TYPES.function) {\n      this._entries = Porffor.array.new(8);\n      for (const entry of init.entries()) {\n" +
       "}\nfunction setTimeout() {}\nclass TextDecoder {\n}\n" +
@@ -269,6 +272,8 @@ test("the default call (no url/expectedSha256 override) never touches the networ
   );
   // #238/#241 (out-of-range typed-array reads and writes) are upstream's own
   // integer-indexed element access since alpha-18; no codegen patch remains.
+  // Request, Response, Blob and File to the Fetch spec; byte bodies sent as bytes.
+  expect(await readFile(join(dir, "runtime/native-fetch.js"), "utf8")).toContain("sproutboat: byte bodies go out as their bytes");
   // Unicode case mapping, the WHATWG TextDecoder and Fetch-spec Headers.
   expect(await readFile(join(dir, "compiler/builtins/string.ts"), "utf8")).toContain("sproutboat: Unicode case mapping");
   const globals = await readFile(join(dir, "runtime/fetch-globals.js"), "utf8");

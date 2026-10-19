@@ -19,6 +19,7 @@ import { URL_CLASS_SOURCE } from "./url-class";
 import { TEXT_DECODER_SOURCE } from "./text-decoder";
 import { CASE_LOWER_RUNS, CASE_UPPER_RUNS } from "./case-map";
 import { HEADERS_CLASS_SOURCE } from "./headers-class";
+import { BLOB_CLASS_SOURCE, REQUEST_CLASS_SOURCE, RESPONSE_BYTES_ANCHOR, RESPONSE_BYTES_INJECT, RESPONSE_CLASS_SOURCE } from "./fetch-classes";
 import { PORFFOR_COMMIT_FULL } from "./pin";
 import { version as TOOLCHAIN_VERSION } from "../package.json" with { type: "json" };
 
@@ -1690,7 +1691,7 @@ const RESPONSE_DEFAULTS_ANCHOR =
 export async function patchResponseDefaults(root: string): Promise<void> {
   const file = resolve(root, "runtime/fetch-globals.js");
   const src = await readFile(file, "utf8");
-  if (src.includes(RESPONSE_DEFAULTS_MARKER)) return;
+  if (src.includes(RESPONSE_DEFAULTS_MARKER) || src.includes("sproutboat: Fetch-spec Request and Response")) return;
   if (!src.includes(RESPONSE_DEFAULTS_ANCHOR))
     throw new Error(
       `could not patch Porffor's Response defaults: anchor not found in ${file}`,
@@ -2082,6 +2083,40 @@ export async function patchZeroDelayTimers(root: string): Promise<void> {
   await writeFile(file, src.replace(ZERO_TIMER_ANCHOR, ZERO_TIMER_INJECT));
 }
 
+const FETCH_CLASSES_MARKER = "sproutboat: Fetch-spec Request and Response";
+/** Replaces Porffor's Request and Response (fetch-classes.ts); covers patchResponseDefaults. */
+export async function patchFetchClasses(root: string): Promise<void> {
+  const file = resolve(root, "runtime/fetch-globals.js");
+  const src = await readFile(file, "utf8");
+  if (src.includes(FETCH_CLASSES_MARKER)) return;
+  const request = src.indexOf("class Request {");
+  const response = src.indexOf("class Response {");
+  if (request < 0 || response < request || src.indexOf("\nclass ", response + 1) >= 0)
+    throw new Error(`could not patch Porffor's Request and Response: anchor not found in ${file}`);
+  await writeFile(file, src.slice(0, request) + REQUEST_CLASS_SOURCE + RESPONSE_CLASS_SOURCE);
+}
+
+/** The native response finalizer sends byte bodies as bytes (fetch-classes.ts). */
+export async function patchResponseBytes(root: string): Promise<void> {
+  const file = resolve(root, "runtime/native-fetch.js");
+  const src = await readFile(file, "utf8");
+  if (src.includes("sproutboat: byte bodies go out as their bytes")) return;
+  if (src.split(RESPONSE_BYTES_ANCHOR).length !== 2)
+    throw new Error(`could not patch Porffor's response finalizer: anchor not found in ${file}`);
+  await writeFile(file, src.replace(RESPONSE_BYTES_ANCHOR, RESPONSE_BYTES_INJECT));
+}
+
+/** Replaces Porffor's Blob with a byte-backed Blob and File (fetch-classes.ts). */
+export async function patchBlobClass(root: string): Promise<void> {
+  const file = resolve(root, "runtime/fetch-globals.js");
+  const src = await readFile(file, "utf8");
+  if (src.includes("sproutboat: byte-backed Blob and File")) return;
+  const start = src.indexOf("class Blob {");
+  const end = start < 0 ? -1 : src.indexOf("\nclass TextEncoder {", start);
+  if (start < 0 || end < 0) throw new Error(`could not patch Porffor's Blob: anchor not found in ${file}`);
+  await writeFile(file, src.slice(0, start) + BLOB_CLASS_SOURCE + src.slice(end));
+}
+
 /**
  * True when root is a finished cache entry that this toolchain version patched
  * (ensurePorffor patches before it writes the manifest). The CLI calls
@@ -2122,6 +2157,9 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchResponseDefaults(root);
   await patchHeadersArrayInit(root);
   await patchHeadersClass(root);
+  await patchFetchClasses(root);
+  await patchBlobClass(root);
+  await patchResponseBytes(root);
   await patchURLClass(root);
   await patchTextDecoder(root);
   await patchMapGroupBy(root);
