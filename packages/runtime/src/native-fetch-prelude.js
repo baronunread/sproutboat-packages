@@ -3051,6 +3051,60 @@ if (typeof globalThis.EventTarget !== "function") {
   globalThis.AbortController = AbortController;
 }
 
+// TextEncoderStream and TextDecoderStream over the Web Streams ponyfill (W2 conformance).
+// The encoder holds back a lone high surrogate at the end of a chunk until the next one;
+// the decoder is TextDecoder in streaming mode, so a character split across chunks decodes.
+if (globalThis.TextEncoderStream == null) {
+  class TextEncoderStream {
+    constructor() {
+      const encoder = new TextEncoder();
+      let pending = "";
+      const transform = new TransformStream({
+        transform(chunk, controller) {
+          let text = pending + String(chunk);
+          pending = "";
+          const last = text.charCodeAt(text.length - 1);
+          if (last >= 0xd800 && last <= 0xdbff) {
+            pending = text.slice(-1);
+            text = text.slice(0, -1);
+          }
+          if (text.length > 0) controller.enqueue(encoder.encode(text));
+        },
+        flush(controller) {
+          if (pending.length > 0) controller.enqueue(encoder.encode(pending));
+        },
+      });
+      this.readable = transform.readable;
+      this.writable = transform.writable;
+    }
+    get encoding() {
+      return "utf-8";
+    }
+  }
+  class TextDecoderStream {
+    constructor(label = "utf-8", options = undefined) {
+      const decoder = new TextDecoder(label, options);
+      this.encoding = decoder.encoding;
+      this.fatal = decoder.fatal;
+      this.ignoreBOM = decoder.ignoreBOM;
+      const transform = new TransformStream({
+        transform(chunk, controller) {
+          const text = decoder.decode(chunk, { stream: true });
+          if (text.length > 0) controller.enqueue(text);
+        },
+        flush(controller) {
+          const text = decoder.decode();
+          if (text.length > 0) controller.enqueue(text);
+        },
+      });
+      this.readable = transform.readable;
+      this.writable = transform.writable;
+    }
+  }
+  globalThis.TextEncoderStream = TextEncoderStream;
+  globalThis.TextDecoderStream = TextDecoderStream;
+}
+
 // structuredClone: the HTML structured-clone algorithm for the types Worker code
 // passes around. Keeps cycles and shared references (a memo per call), Date, RegExp,
 // Map, Set, ArrayBuffer, typed arrays, DataView, errors, arrays and plain objects;
