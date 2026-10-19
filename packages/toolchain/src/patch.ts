@@ -1804,6 +1804,48 @@ export async function patchPrivateFieldsHidden(root: string): Promise<void> {
   await writeFile(file, src);
 }
 
+// baronunread/sproutboat#287 (sproutd B9/B13): native-fetch mode runs frequent full
+// collections, and each returned its free pages to the OS (porf_gc_discard_free_runs),
+// so the next large allocation faulted them back in: allocation-heavy handlers ran up
+// to 4x slower than plain Porffor. Full collections under load now keep their free
+// pages, and the idle quiet collection returns them. The idle gate also opens when
+// anything was claimed or promoted since the last full collection, so a small sprout
+// that never reaches the 16 MiB / 8 MiB full-collection triggers still gives back its
+// promoted garbage. Same edits as sproutd's deferred discard and idle return.
+const DEFERRED_DISCARD_MARKER = "static i32 porf_gc_discard_pending = 0;";
+const DEFERRED_DISCARD_EDITS: [string, string][] = [
+  [
+    "static i32 porf_gc_mark_queue_cap = 0;",
+    "static i32 porf_gc_mark_queue_cap = 0;\n// sproutboat #287: discard free runs only in the idle collection\nstatic i32 porf_gc_discard_now = 0;\n" +
+      DEFERRED_DISCARD_MARKER,
+  ],
+  [
+    "    porf_gc_discard_free_runs();\n",
+    "    if (porf_gc_discard_now) porf_gc_discard_free_runs(); else porf_gc_discard_pending = 1;\n",
+  ],
+  [
+    "porf_gc_mark_queue_cap > 65536);' : '  return 0;'",
+    "porf_gc_mark_queue_cap > 65536 || porf_gc_discard_pending || porf_gc_claimed_since_full > 0 || porf_gc_promoted_since_full > 0);' : '  return 0;'",
+  ],
+  [
+    "  porf_c_stack_top = stack_top;\n  porf_gc_collect(0);\n  // The mark queue is empty",
+    "  porf_c_stack_top = stack_top;\n  porf_gc_discard_now = 1;\n  porf_gc_collect(0);\n  porf_gc_discard_now = 0;\n  porf_gc_discard_pending = 0;\n  // The mark queue is empty",
+  ],
+];
+
+/** #287: deferred discard and idle return. After patchQuietCollection, which adds the quiet collector. */
+export async function patchDeferredDiscard(root: string): Promise<void> {
+  const file = resolve(root, "compiler/render.js");
+  let src = await readFile(file, "utf8");
+  if (src.includes(DEFERRED_DISCARD_MARKER)) return;
+  for (const [anchor, inject] of DEFERRED_DISCARD_EDITS) {
+    if (src.split(anchor).length !== 2)
+      throw new Error(`could not patch Porffor's deferred discard: anchor not found in ${file}`);
+    src = src.replace(anchor, inject);
+  }
+  await writeFile(file, src);
+}
+
 export async function ensurePorfforPatched(root: string): Promise<void> {
   if (done.has(root)) return;
   await patchCompilerArgs(root);
@@ -1811,6 +1853,7 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchUwebsockets(root);
   await patchRenderJs(root);
   await patchQuietCollection(root);
+  await patchDeferredDiscard(root);
   await patchDateParser(root);
   await patchPromiseResolveNull(root);
   await patchReplaceAll(root);

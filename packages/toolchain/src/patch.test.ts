@@ -6,6 +6,7 @@ import { EMPTY_BINDINGS, wrapNativeFetchHandler } from "../../runtime/src/wrap";
 import {
   patchHeadersArrayInit,
   patchLocalFunctionTypes,
+  patchDeferredDiscard,
   patchMapGroupBy,
   patchPrivateFieldsHidden,
   patchResponseDefaults,
@@ -478,6 +479,32 @@ test("private field patch installs instance and static private fields as methods
     expect(await readFile(file, "utf8")).toBe(patched);
     await writeFile(file, "export const x = 1;\n");
     await expect(patchPrivateFieldsHidden(root)).rejects.toThrow("anchor not found");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("deferred discard patch moves page discard to the idle collection, idempotently", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sb-deferred-discard-"));
+  try {
+    await mkdir(join(root, "compiler"));
+    const file = join(root, "compiler/render.js");
+    await writeFile(
+      file,
+      "static i32 porf_gc_mark_queue_cap = 0;\n" +
+        "    porf_gc_discard_free_runs();\n" +
+        "porf_gc_mark_queue_cap > 65536);' : '  return 0;'\n" +
+        "  porf_c_stack_top = stack_top;\n  porf_gc_collect(0);\n  // The mark queue is empty\n",
+    );
+    await patchDeferredDiscard(root);
+    const patched = await readFile(file, "utf8");
+    expect(patched).toContain("if (porf_gc_discard_now) porf_gc_discard_free_runs(); else porf_gc_discard_pending = 1;");
+    expect(patched).toContain("porf_gc_discard_pending || porf_gc_claimed_since_full > 0 || porf_gc_promoted_since_full > 0);");
+    expect(patched).toContain("  porf_gc_discard_now = 1;\n  porf_gc_collect(0);\n  porf_gc_discard_now = 0;\n  porf_gc_discard_pending = 0;");
+    await patchDeferredDiscard(root);
+    expect(await readFile(file, "utf8")).toBe(patched);
+    await writeFile(file, "export const x = 1;\n");
+    await expect(patchDeferredDiscard(root)).rejects.toThrow("anchor not found");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
