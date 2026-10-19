@@ -2442,6 +2442,30 @@ class __SproutboatURLSearchParams {
   _reset(init) {
     this._keys = [];
     this._vals = [];
+    // The URLSearchParams init forms: another URLSearchParams, a sequence of [name, value]
+    // pairs, a record of own string keys, or a query string. Only strings were read, so
+    // new URLSearchParams({ a: "1" }) serialized as "%5Bobject+Object%5D=" (W2).
+    if (init instanceof __SproutboatURLSearchParams) {
+      this._keys = init._keys.slice();
+      this._vals = init._vals.slice();
+      return;
+    }
+    if (init != null && Object(init) === init) {
+      if (__sbIsFn(init[Symbol.iterator])) {
+        for (const pair of init) {
+          const items = Array.from(pair);
+          if (items.length !== 2) throw new TypeError("URLSearchParams: each pair must have exactly two items");
+          this._keys.push(String(items[0]));
+          this._vals.push(String(items[1]));
+        }
+        return;
+      }
+      for (const key of Object.keys(init)) {
+        this._keys.push(key);
+        this._vals.push(String(init[key]));
+      }
+      return;
+    }
     let raw = init == null ? "" : String(init);
     if (raw.charCodeAt(0) === 63) raw = raw.slice(1); // strip a leading '?'
     if (raw.length === 0) return;
@@ -2849,6 +2873,36 @@ if (globalThis.crypto.getRandomValues == null) {
     return view;
   };
 }
+// queueMicrotask, and atob/btoa input checks as the HTML spec has them: atob drops ASCII
+// whitespace and rejects anything that is not base64, btoa rejects characters above
+// U+00FF. Both threw nothing and returned garbage before (W2 conformance).
+{
+  const invalidCharacter = (message) => {
+    const e = new Error(message);
+    e.name = "InvalidCharacterError";
+    return e;
+  };
+  if (globalThis.queueMicrotask == null) {
+    globalThis.queueMicrotask = function (callback) {
+      if (!__sbIsFn(callback)) throw new TypeError("queueMicrotask needs a function");
+      Promise.resolve().then(() => callback());
+    };
+  }
+  const nativeAtob = globalThis.atob, nativeBtoa = globalThis.btoa;
+  globalThis.atob = function (data) {
+    let text = String(data).replace(/[\t\n\f\r ]/g, "");
+    if (text.length % 4 === 0) text = text.replace(/==?$/, "");
+    if (text.length % 4 === 1 || !/^[A-Za-z0-9+/]*$/.test(text)) throw invalidCharacter("atob: the string is not valid base64");
+    while (text.length % 4 !== 0) text += "=";
+    return nativeAtob(text);
+  };
+  globalThis.btoa = function (data) {
+    const text = String(data);
+    for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) > 0xff) throw invalidCharacter("btoa: the string has characters outside Latin-1");
+    return nativeBtoa(text);
+  };
+}
+
 /* oxlint-disable anti-slop/no-runtime-typeof -- these Web API polyfills branch on JavaScript types
    exactly where their specs do (listener: function or { handleEvent }; structured clone: by value type). */
 // Event, CustomEvent, EventTarget, AbortSignal and AbortController, as workerd has

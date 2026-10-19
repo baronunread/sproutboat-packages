@@ -144,7 +144,9 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "};\nexport const __JSON_stringify = (value: any) => {\n  let cap: i32 = 4096;\n};\n",
     "runtime/fetch-globals.js":
       "// sb_text_encoder_scalar_v1\n" +
+      "class Headers {\n" +
       "    if (Porffor.type(init.entries) == Porffor.TYPES.function) {\n      this._entries = Porffor.array.new(8);\n      for (const entry of init.entries()) {\n" +
+      "}\nfunction setTimeout() {}\nclass TextDecoder {\n}\n" +
       "class URL {\n  constructor(input) {\n    this.href = '';\n  }\n}\n\nclass Request {\n}\n" +
       "class Response {\n  constructor(body = null, init = undefined) {\n    this.body = body;\n    this.status = Number(init?.status ?? 200);\n    this.headers = new Headers(init?.headers);\n  }\n}\n",
     "compiler/builtins/uint8array_base64.ts": "let alphabet: string = 'base64';\nlet lastChunkHandling: string = 'loose';\nconst fullChunks: i32 = (len / 3) * 3;\n",
@@ -162,6 +164,11 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "    return Box(f, Const(T.i32, TYPES.number));\n" +
       "  };\n",
     "compiler/builtins/string.ts":
+      "export const __String_prototype_toUpperCase = function (this: string) {\n" +
+      "    if (chr >= 97) if (chr <= 122) chr -= 32;\n\n    Porffor.IR.storeU16(j, 4, chr);\n" +
+      "    if (chr >= 97) if (chr <= 122) chr -= 32;\n\n    Porffor.IR.storeU8(j++, 4, chr);\n" +
+      "    if (chr >= 65) if (chr <= 90) chr += 32;\n\n    Porffor.IR.storeU16(j, 4, chr);\n" +
+      "    if (chr >= 65) if (chr <= 90) chr += 32;\n\n    Porffor.IR.storeU8(j++, 4, chr);\n" +
       "  for (let i: i32 = 0; i < count; i++) {\n    Porffor.IR.copy(Porffor.IR.ptr(out) + 4 + i * thisLen, Porffor.IR.ptr(this) + 4, thisLen);\n  }\n" +
       "  for (let i: i32 = 0; i < count; i++) {\n    Porffor.IR.copy(Porffor.IR.ptr(out) + 4 + i * thisLen, Porffor.IR.ptr(this) + 4, thisLen);\n  }\n" +
       "export const __Porffor_string_replaceAll = (str: any, searchValue: any, replaceValue: any) => {\n" +
@@ -261,6 +268,11 @@ test("the default call (no url/expectedSha256 override) never touches the networ
   );
   // #238/#241 (out-of-range typed-array reads and writes) are upstream's own
   // integer-indexed element access since alpha-18; no codegen patch remains.
+  // Unicode case mapping, the WHATWG TextDecoder and Fetch-spec Headers.
+  expect(await readFile(join(dir, "compiler/builtins/string.ts"), "utf8")).toContain("sproutboat: Unicode case mapping");
+  const globals = await readFile(join(dir, "runtime/fetch-globals.js"), "utf8");
+  expect(globals).toContain("sproutboat: WHATWG UTF-8 decoder");
+  expect(globals).toContain("sproutboat: Fetch-spec Headers");
   // console colours only on a terminal.
   expect(await readFile(join(dir, "compiler/builtins/console.ts"), "utf8")).toContain("__Porffor_consoleColors");
   // JSON.stringify throws on cycles; typed arrays have their own toString tag.

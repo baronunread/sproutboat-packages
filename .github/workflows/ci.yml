@@ -33,3 +33,4 @@ jobs:
       - run: bun run test:native-events
       - run: bun run test:native-request
       - run: bun run test:native-waituntil
+      - run: bun run test:native-web-apis
