@@ -15,6 +15,7 @@ import {
   patchConsoleColors,
   patchCaseMapping,
   patchZeroDelayTimers,
+  patchStreamingResponses,
   patchBlobClass,
   patchFetchClasses,
   patchResponseBytes,
@@ -722,6 +723,44 @@ test("Request/Response, Blob and finalizer patches replace their targets once", 
     await expect(patchFetchClasses(root)).rejects.toThrow("anchor not found");
     await expect(patchBlobClass(root)).rejects.toThrow("anchor not found");
     await expect(patchResponseBytes(root)).rejects.toThrow("anchor not found");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("streaming patch adds the stream registry and attaches marked responses, idempotently", async () => {
+  const streaming = await import("./streaming");
+  const root = await mkdtemp(join(tmpdir(), "sb-streaming-"));
+  try {
+    await mkdir(join(root, "compiler"));
+    const file = join(root, "compiler/uwebsockets.js");
+    const render = join(root, "compiler/render.js");
+    await writeFile(render, "f64 x;\n" + streaming.STREAM_STUBS_ANCHOR + " for a bytestring\n");
+    await writeFile(
+      file,
+      streaming.STREAM_FORBIDDEN_ANCHOR +
+        streaming.STREAM_REGISTRY_ANCHOR +
+        streaming.STREAM_FLAG_ANCHOR +
+        streaming.STREAM_SCAN_ANCHOR +
+        streaming.STREAM_CORK_ANCHOR +
+        streaming.STREAM_END_ANCHOR,
+    );
+    await patchStreamingResponses(root);
+    const patched = await readFile(file, "utf8");
+    expect(patched).toContain('extern "C" u32 sb_stream_open(void) {');
+    expect(patched).toContain("if (stream_id) sb_stream_attach(stream_id, res);");
+    expect(patched).toContain('key == "x-sb-stream"; // sproutboat B19');
+    expect(patched.indexOf("sproutboat B19: streamed responses")).toBeLessThan(patched.indexOf("static void write_response_value"));
+    const stubs = await readFile(render, "utf8");
+    expect(stubs).toContain("__attribute__((weak)) int sb_stream_supported(void) { return 0; }");
+    expect(stubs.indexOf("streaming fallbacks")).toBeLessThan(stubs.indexOf(streaming.STREAM_STUBS_ANCHOR));
+    await patchStreamingResponses(root);
+    expect(await readFile(file, "utf8")).toBe(patched);
+    expect(await readFile(render, "utf8")).toBe(stubs);
+    await writeFile(file, "export const x = 1;\n");
+    await expect(patchStreamingResponses(root)).rejects.toThrow("anchor not found");
+    await writeFile(render, "export const x = 1;\n");
+    await expect(patchStreamingResponses(root)).rejects.toThrow("streaming fallbacks: anchor not found");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

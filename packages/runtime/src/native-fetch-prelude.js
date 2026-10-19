@@ -4960,11 +4960,90 @@ function __sbHasStreamBody(res) {
   return res != null && res.body instanceof ReadableStream;
 }
 
+// B19: on a host that streams (a standalone sprout's native server defines sb_stream_*), a
+// stream body goes out as it is produced: the response is marked with the internal
+// x-sb-stream header, the native writer sends the status and headers and holds the
+// connection open, and each chunk is written as it arrives. Hosts that do not stream
+// (sproutd's workers, for now) link the weak fallbacks, report unsupported and keep buffering.
+// op: "s" supported, "o" open, "w" write data, "e" end. Returns a short string.
+// oxlint-disable-next-line no-unused-vars -- read inside the RawC block, not by JS.
+function __sbStreamOp(op, id, data) {
+  let out = "";
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    extern int sb_stream_supported(void);
+    extern unsigned int sb_stream_open(void);
+    extern int sb_stream_write(unsigned int, const char*, size_t);
+    extern void sb_stream_end(unsigned int);
+    const char* __o; size_t __ol; char* __oo = 0;
+    porf_native_fetch_read_value(op, &__o, &__ol, &__oo);
+    char __op = __ol ? __o[0] : 0;
+    if (__oo) free(__oo);
+    const char* __i; size_t __il; char* __io = 0;
+    porf_native_fetch_read_value(id, &__i, &__il, &__io);
+    char __ib[16]; size_t __ik = __il < 15 ? __il : 15;
+    memcpy(__ib, __i, __ik); __ib[__ik] = 0;
+    if (__io) free(__io);
+    unsigned int __id = (unsigned int)strtoul(__ib, 0, 10);
+    char __r[24]; __r[0] = 0;
+    if (sb_stream_supported()) {
+      if (__op == 's') snprintf(__r, sizeof(__r), "1");
+      else if (__op == 'o') snprintf(__r, sizeof(__r), "%u", sb_stream_open());
+      else if (__op == 'w') {
+        const char* __d = 0; size_t __dl = 0;
+        int __w = -1;
+        if (porf_native_fetch_read_raw_bytes(data, &__d, &__dl) == 0) __w = sb_stream_write(__id, __d, __dl);
+        snprintf(__r, sizeof(__r), "%d", __w);
+      } else if (__op == 'e') { sb_stream_end(__id); snprintf(__r, sizeof(__r), "0"); }
+    }
+    out = porf_box((f64)porf_native_fetch_alloc_bytestring(__r, strlen(__r)), 195);
+  `;
+  return out;
+}
+let __sbStreaming = -1;
+function __sbStreamingSupported() {
+  if (__sbStreaming < 0) __sbStreaming = __sbStreamOp("s", "0", "") === "1" ? 1 : 0;
+  return __sbStreaming === 1;
+}
+function __sbStreamResponse(response) {
+  const stream = response.body;
+  const id = __sbStreamOp("o", "0", "");
+  response.headers.set("x-sb-stream", id);
+  response.body = "";
+  (async () => {
+    const reader = stream.getReader();
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        let bytes;
+        if (value instanceof Uint8Array) bytes = value;
+        else if (value instanceof ArrayBuffer) bytes = new Uint8Array(value);
+        else if (ArrayBuffer.isView(value)) bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+        else throw new TypeError("This ReadableStream did not return bytes.");
+        if (bytes.length > 0 && __sbStreamOp("w", id, __sbToBytes(bytes)) !== "0") {
+          // The client went away: stop the source.
+          reader.cancel();
+          break;
+        }
+      }
+    } catch (error) {
+      // The status line is already out; log and end what was sent.
+      __sbLogUncaught("fetch", error);
+    }
+    __sbStreamOp("e", id, "");
+  })();
+  return response;
+}
+
 async function __sbFetchWithDrain(res, tasks) {
   let r;
   try {
     r = res && __sbIsFn(res.then) ? await res : res;
-    if (__sbHasStreamBody(r)) r.body = await __sbCollectBody(r.body);
+    if (__sbHasStreamBody(r)) {
+      if (__sbStreamingSupported()) __sbStreamResponse(r);
+      else r.body = await __sbCollectBody(r.body);
+    }
   } catch (error) {
     // #179 — a rejected handler promise must not take the process down with it.
     r = __sbErrorResponse(error);

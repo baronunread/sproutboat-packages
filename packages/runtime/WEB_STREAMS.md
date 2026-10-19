@@ -9,8 +9,11 @@ Native regression tests cover default readers, locking, pending reads,
 cancellation, source errors, array conversion, writable sinks, pipeTo,
 pipeThrough, transforms, tee, pull sources, byte streams and BYOB reads.
 This is API support for streams in memory, not progressive HTTP transport.
-A ReadableStream response body is read to the end and sent buffered (chunks must be
-bytes, at most 32 MiB in all); request bodies and outbound fetch remain buffered too.
+A ReadableStream response body is streamed by a standalone sprout's native server:
+the status and headers go out at once and each chunk is written as it is produced
+(chunked encoding), so Server-Sent Events and long responses work. Chunks must be bytes.
+Hosts that do not stream yet (sproutd's workers) read the stream to the end and send it
+buffered, at most 32 MiB. Request bodies and outbound fetch remain buffered.
 TextEncoderStream and TextDecoderStream are included; CompressionStream and
 DecompressionStream are not.
 BYOB buffer detachment requires transfer support from the underlying engine;
