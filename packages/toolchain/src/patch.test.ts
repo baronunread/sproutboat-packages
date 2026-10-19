@@ -12,6 +12,7 @@ import {
   patchRepeatDoubling,
   patchJsonCycles,
   patchTypedArrayTag,
+  patchConsoleColors,
   patchResponseDefaults,
   patchURLClass,
   patchUint8ArrayBase64,
@@ -594,6 +595,25 @@ test("typed array tag patch names every typed array before toString returns, ide
     expect(await readFile(file, "utf8")).toBe(patched);
     await writeFile(file, "export const x = 1;\n");
     await expect(patchTypedArrayTag(root)).rejects.toThrow("anchor not found");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("console colour patch colours only on a terminal, idempotently", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sb-console-colors-"));
+  try {
+    await mkdir(join(root, "compiler/builtins"), { recursive: true });
+    const file = join(root, "compiler/builtins/console.ts");
+    await writeFile(file, "export const __Porffor_consolePrint = (arg: any): void => {\n  if (x) return;\n  __Porffor_print(arg);\n};\n");
+    await patchConsoleColors(root);
+    const patched = await readFile(file, "utf8");
+    expect(patched).toContain("Porffor.c`tty = isatty(1) ? 1 : 0;`;");
+    expect(patched).toContain("  __Porffor_print(arg, __Porffor_consoleColors());\n};");
+    await patchConsoleColors(root);
+    expect(await readFile(file, "utf8")).toBe(patched);
+    await writeFile(file, "export const x = 1;\n");
+    await expect(patchConsoleColors(root)).rejects.toThrow("anchor not found");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
