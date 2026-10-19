@@ -35,7 +35,8 @@
     "test:native-errors": "bun packages/runtime/test/native-errors.ts",
     "test:native-events": "bun packages/runtime/test/native-events.ts",
     "test:native-request": "bun packages/runtime/test/native-request.ts",
-    "test:native-waituntil": "bun packages/runtime/test/native-waituntil.ts"
+    "test:native-waituntil": "bun packages/runtime/test/native-waituntil.ts",
+    "test:native-web-apis": "bun packages/runtime/test/native-web-apis.ts"
   },
   "devDependencies": {
     "@changesets/cli": "^3.0.2",

@@ -16,6 +16,9 @@ import { readFile, realpath, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { patchUnicode } from "./unicode";
 import { URL_CLASS_SOURCE } from "./url-class";
+import { TEXT_DECODER_SOURCE } from "./text-decoder";
+import { CASE_LOWER_RUNS, CASE_UPPER_RUNS } from "./case-map";
+import { HEADERS_CLASS_SOURCE } from "./headers-class";
 import { PORFFOR_COMMIT_FULL } from "./pin";
 import { version as TOOLCHAIN_VERSION } from "../package.json" with { type: "json" };
 
@@ -1735,7 +1738,7 @@ const HEADERS_ARRAY_INJECT =
 export async function patchHeadersArrayInit(root: string): Promise<void> {
   const file = resolve(root, "runtime/fetch-globals.js");
   const src = await readFile(file, "utf8");
-  if (src.includes(HEADERS_ARRAY_INJECT)) return;
+  if (src.includes(HEADERS_ARRAY_INJECT) || src.includes("sproutboat: Fetch-spec Headers")) return;
   if (!src.includes(HEADERS_ARRAY_ANCHOR))
     throw new Error(
       `could not patch Porffor's Headers array init: anchor not found in ${file}`,
@@ -1987,6 +1990,98 @@ export async function patchConsoleColors(root: string): Promise<void> {
   await writeFile(file, src);
 }
 
+const TEXT_DECODER_MARKER = "sproutboat: WHATWG UTF-8 decoder";
+/** Replaces Porffor's TextDecoder (text-decoder.ts). After patchURLClass, whose class ends it. */
+export async function patchTextDecoder(root: string): Promise<void> {
+  const file = resolve(root, "runtime/fetch-globals.js");
+  const src = await readFile(file, "utf8");
+  if (src.includes(TEXT_DECODER_MARKER)) return;
+  const start = src.indexOf("class TextDecoder {");
+  const end = start < 0 ? -1 : src.indexOf("\nclass URL {", start);
+  if (start < 0 || end < 0 || src.indexOf("class TextDecoder {", start + 1) >= 0)
+    throw new Error(`could not patch Porffor's TextDecoder: anchor not found in ${file}`);
+  await writeFile(file, src.slice(0, start) + TEXT_DECODER_SOURCE + src.slice(end));
+}
+
+// String.prototype.toLowerCase/toUpperCase mapped ASCII only ("todo: unicode" upstream), so
+// "ÄÖÜ", Greek and Cyrillic came back unchanged, and URL hosts lowercased wrongly (W2).
+// Simple one-to-one BMP mappings from case-map.ts, looked up by binary search for units
+// >= 128. Latin-1 strings keep their own range (À-Þ, à-þ); one-to-many special casing
+// (ß to SS) and Latin-1 µ/ÿ uppercase (which leave Latin-1) are not handled.
+const CASE_MARKER = "sproutboat: Unicode case mapping";
+const caseLiteral = (runs: string) =>
+  "'" + Array.from(runs, (c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0")).join("") + "'";
+const CASE_HELPERS =
+  "// sproutboat: Unicode case mapping\n" +
+  "export const __Porffor_caseFind = (chr: i32, runs: string): i32 => {\n" +
+  "  let lo: i32 = 0, hi: i32 = runs.length / 4 - 1, found: i32 = -1;\n" +
+  "  while (lo <= hi) {\n" +
+  "    const mid: i32 = (lo + hi) >> 1;\n" +
+  "    if (runs.charCodeAt(mid * 4) <= chr) { found = mid; lo = mid + 1; } else hi = mid - 1;\n" +
+  "  }\n" +
+  "  if (found < 0) return chr;\n" +
+  "  const start: i32 = runs.charCodeAt(found * 4);\n" +
+  "  if (chr > runs.charCodeAt(found * 4 + 1)) return chr;\n" +
+  "  if ((chr - start) % runs.charCodeAt(found * 4 + 3) != 0) return chr;\n" +
+  "  return runs.charCodeAt(found * 4 + 2) + (chr - start);\n" +
+  "};\n" +
+  "export const __Porffor_caseLower = (chr: i32): i32 => __Porffor_caseFind(chr, " + caseLiteral(CASE_LOWER_RUNS) + ");\n" +
+  "export const __Porffor_caseUpper = (chr: i32): i32 => __Porffor_caseFind(chr, " + caseLiteral(CASE_UPPER_RUNS) + ");\n\n";
+const CASE_EDITS: [string, string][] = [
+  ["    if (chr >= 97) if (chr <= 122) chr -= 32;\n\n    Porffor.IR.storeU16(j, 4, chr);",
+   "    if (chr < 128) { if (chr >= 97) if (chr <= 122) chr -= 32; } else chr = __Porffor_caseUpper(chr);\n\n    Porffor.IR.storeU16(j, 4, chr);"],
+  ["    if (chr >= 65) if (chr <= 90) chr += 32;\n\n    Porffor.IR.storeU16(j, 4, chr);",
+   "    if (chr < 128) { if (chr >= 65) if (chr <= 90) chr += 32; } else chr = __Porffor_caseLower(chr);\n\n    Porffor.IR.storeU16(j, 4, chr);"],
+  ["    if (chr >= 97) if (chr <= 122) chr -= 32;\n\n    Porffor.IR.storeU8(j++, 4, chr);",
+   "    if (chr >= 97) { if (chr <= 122) chr -= 32; else if (chr >= 224) if (chr <= 254) if (chr != 247) chr -= 32; }\n\n    Porffor.IR.storeU8(j++, 4, chr);"],
+  ["    if (chr >= 65) if (chr <= 90) chr += 32;\n\n    Porffor.IR.storeU8(j++, 4, chr);",
+   "    if (chr >= 65) { if (chr <= 90) chr += 32; else if (chr >= 192) if (chr <= 222) if (chr != 215) chr += 32; }\n\n    Porffor.IR.storeU8(j++, 4, chr);"],
+];
+
+/** Unicode simple case mapping for toLowerCase/toUpperCase. Before the precompile. */
+export async function patchCaseMapping(root: string): Promise<void> {
+  const file = resolve(root, "compiler/builtins/string.ts");
+  let src = await readFile(file, "utf8");
+  if (src.includes(CASE_MARKER)) return;
+  const at = src.indexOf("export const __String_prototype_toUpperCase = function (this: string) {");
+  if (at < 0) throw new Error(`could not patch Porffor's case mapping: anchor not found in ${file}`);
+  for (const [anchor, inject] of CASE_EDITS) {
+    if (src.split(anchor).length !== 2) throw new Error(`could not patch Porffor's case mapping: anchor not found in ${file}`);
+    src = src.replace(anchor, inject);
+  }
+  await writeFile(file, src.slice(0, at) + CASE_HELPERS + src.slice(at));
+}
+
+const HEADERS_CLASS_MARKER = "sproutboat: Fetch-spec Headers";
+/** Replaces Porffor's Headers (headers-class.ts), which also covers patchHeadersArrayInit's fix. */
+export async function patchHeadersClass(root: string): Promise<void> {
+  const file = resolve(root, "runtime/fetch-globals.js");
+  const src = await readFile(file, "utf8");
+  if (src.includes(HEADERS_CLASS_MARKER)) return;
+  const start = src.indexOf("class Headers {");
+  const end = start < 0 ? -1 : src.indexOf("\nfunction setTimeout(", start);
+  if (start < 0 || end < 0) throw new Error(`could not patch Porffor's Headers: anchor not found in ${file}`);
+  await writeFile(file, src.slice(0, start) + HEADERS_CLASS_SOURCE + src.slice(end));
+}
+
+// setTimeout(fn, 0) never fired on Linux: uSockets arms timers with timerfd_settime, where
+// a zero first expiry disarms the timer (kqueue on macOS fires it at once). The same held
+// for setInterval(fn, 0), which also lost its repeat. Arm at least 1 ms.
+const ZERO_TIMER_ANCHOR =
+  "  porf_native_fetch_timer_start(id, (i32)delay_ms, timer->repeat ? (i32)delay_ms : 0);";
+const ZERO_TIMER_INJECT =
+  "  porf_native_fetch_timer_start(id, delay_ms < 1 ? 1 : (i32)delay_ms, timer->repeat ? (delay_ms < 1 ? 1 : (i32)delay_ms) : 0); /* sproutboat: zero-delay timers fire on Linux */";
+
+/** Zero-delay timers are armed at 1 ms, since a zero timerfd expiry disarms them. */
+export async function patchZeroDelayTimers(root: string): Promise<void> {
+  const file = resolve(root, "compiler/render.js");
+  const src = await readFile(file, "utf8");
+  if (src.includes("sproutboat: zero-delay timers fire on Linux")) return;
+  if (src.split(ZERO_TIMER_ANCHOR).length !== 2)
+    throw new Error(`could not patch Porffor's zero-delay timers: anchor not found in ${file}`);
+  await writeFile(file, src.replace(ZERO_TIMER_ANCHOR, ZERO_TIMER_INJECT));
+}
+
 /**
  * True when root is a finished cache entry that this toolchain version patched
  * (ensurePorffor patches before it writes the manifest). The CLI calls
@@ -2026,13 +2121,17 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchUint8ArrayBase64(root);
   await patchResponseDefaults(root);
   await patchHeadersArrayInit(root);
+  await patchHeadersClass(root);
   await patchURLClass(root);
+  await patchTextDecoder(root);
   await patchMapGroupBy(root);
   await patchPrivateFieldsHidden(root);
   await patchRepeatDoubling(root);
   await patchJsonCycles(root);
   await patchTypedArrayTag(root);
   await patchConsoleColors(root);
+  await patchCaseMapping(root);
+  await patchZeroDelayTimers(root);
   // Last of the builtin edits: its precompile picks up the date, promise and
   // replaceAll patches above too.
   await precompileBuiltins(root);

@@ -128,8 +128,73 @@ export const URL_CLASS_SOURCE = String.raw`class URL {
   _setHost(host) {
     const close = host.charCodeAt(0) == 91 ? host.indexOf(']') : -1;
     const colon = host.indexOf(':', close == -1 ? 0 : close);
-    this._hostname = (colon == -1 ? host : host.slice(0, colon)).toLowerCase();
+    this._hostname = URL._toASCII((colon == -1 ? host : host.slice(0, colon)).toLowerCase());
     if (colon != -1) this.port = host.slice(colon + 1);
+  }
+
+  // An internationalized host in its ASCII form: each non-ASCII label as xn-- plus its
+  // Punycode (RFC 3492), as fetch and DNS need it. Lowercased first; no full UTS 46 mapping.
+  static _toASCII(host) {
+    if (host.charCodeAt(0) == 91) return host;
+    let ascii = true;
+    for (let i = 0; i < host.length; i++) if (host.charCodeAt(i) > 127) { ascii = false; break; }
+    if (ascii) return host;
+    const labels = host.split('.');
+    for (let i = 0; i < labels.length; i++) {
+      const label = labels[i];
+      for (let j = 0; j < label.length; j++) if (label.charCodeAt(j) > 127) { labels[i] = 'xn--' + URL._punycode(label); break; }
+    }
+    return labels.join('.');
+  }
+
+  static _punycode(input) {
+    const base = 36, tMin = 1, tMax = 26, skew = 38, damp = 700;
+    const points = [];
+    for (let i = 0; i < input.length; i++) {
+      const c = input.codePointAt(i);
+      points.push(c);
+      if (c > 0xffff) i++;
+    }
+    let out = '';
+    for (let i = 0; i < points.length; i++) if (points[i] < 0x80) out += String.fromCharCode(points[i]);
+    const basic = out.length;
+    let handled = basic;
+    if (basic > 0) out += '-';
+    const digit = (d) => String.fromCharCode(d < 26 ? d + 97 : d + 22);
+    const adapt = (delta, count, first) => {
+      delta = first ? Math.floor(delta / damp) : delta >> 1;
+      delta += Math.floor(delta / count);
+      let k = 0;
+      while (delta > ((base - tMin) * tMax) >> 1) { delta = Math.floor(delta / (base - tMin)); k += base; }
+      return k + Math.floor(((base - tMin + 1) * delta) / (delta + skew));
+    };
+    let n = 128, delta = 0, bias = 72;
+    while (handled < points.length) {
+      let m = 0x110000;
+      for (let i = 0; i < points.length; i++) if (points[i] >= n && points[i] < m) m = points[i];
+      delta += (m - n) * (handled + 1);
+      n = m;
+      for (let i = 0; i < points.length; i++) {
+        const c = points[i];
+        if (c < n) delta++;
+        if (c == n) {
+          let q = delta;
+          for (let k = base; ; k += base) {
+            const t = k <= bias ? tMin : k >= bias + tMax ? tMax : k - bias;
+            if (q < t) break;
+            out += digit(t + ((q - t) % (base - t)));
+            q = Math.floor((q - t) / (base - t));
+          }
+          out += digit(q);
+          bias = adapt(delta, handled + 1, handled == basic);
+          delta = 0;
+          handled++;
+        }
+      }
+      delta++;
+      n++;
+    }
+    return out;
   }
 
   // Dot segments resolved, spaces escaped.
@@ -191,7 +256,7 @@ export const URL_CLASS_SOURCE = String.raw`class URL {
   get hostname() { return this._hostname; }
   set hostname(value) {
     const v = String(value);
-    if (v != '' && this._hostname != '') this._hostname = v.toLowerCase();
+    if (v != '' && this._hostname != '') this._hostname = URL._toASCII(v.toLowerCase());
   }
 
   get port() { return this._port; }

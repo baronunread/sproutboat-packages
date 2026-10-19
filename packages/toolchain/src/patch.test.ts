@@ -13,6 +13,10 @@ import {
   patchJsonCycles,
   patchTypedArrayTag,
   patchConsoleColors,
+  patchCaseMapping,
+  patchZeroDelayTimers,
+  patchHeadersClass,
+  patchTextDecoder,
   patchResponseDefaults,
   patchURLClass,
   patchUint8ArrayBase64,
@@ -614,6 +618,76 @@ test("console colour patch colours only on a terminal, idempotently", async () =
     expect(await readFile(file, "utf8")).toBe(patched);
     await writeFile(file, "export const x = 1;\n");
     await expect(patchConsoleColors(root)).rejects.toThrow("anchor not found");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("TextDecoder and Headers patches replace Porffor's classes once", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sb-web-classes-"));
+  try {
+    await mkdir(join(root, "runtime"));
+    const file = join(root, "runtime/fetch-globals.js");
+    await writeFile(file, "class Headers {\n  old() {}\n}\nfunction setTimeout() {}\nclass TextDecoder {\n  old() {}\n}\nclass URL {\n}\n");
+    await patchHeadersClass(root);
+    await patchTextDecoder(root);
+    const patched = await readFile(file, "utf8");
+    expect(patched).toContain("sproutboat: Fetch-spec Headers");
+    expect(patched).toContain("sproutboat: WHATWG UTF-8 decoder");
+    expect(patched).not.toContain("old() {}");
+    expect(patched).toContain("\nfunction setTimeout() {}\nclass TextDecoder {");
+    await patchHeadersClass(root);
+    await patchTextDecoder(root);
+    expect(await readFile(file, "utf8")).toBe(patched);
+    await writeFile(file, "export const x = 1;\n");
+    await expect(patchHeadersClass(root)).rejects.toThrow("anchor not found");
+    await expect(patchTextDecoder(root)).rejects.toThrow("anchor not found");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("case mapping patch adds the lookup and routes non-ASCII units through it, idempotently", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sb-case-map-"));
+  try {
+    await mkdir(join(root, "compiler/builtins"), { recursive: true });
+    const file = join(root, "compiler/builtins/string.ts");
+    await writeFile(
+      file,
+      "export const __String_prototype_toUpperCase = function (this: string) {\n" +
+        "    if (chr >= 97) if (chr <= 122) chr -= 32;\n\n    Porffor.IR.storeU16(j, 4, chr);\n" +
+        "    if (chr >= 97) if (chr <= 122) chr -= 32;\n\n    Porffor.IR.storeU8(j++, 4, chr);\n" +
+        "    if (chr >= 65) if (chr <= 90) chr += 32;\n\n    Porffor.IR.storeU16(j, 4, chr);\n" +
+        "    if (chr >= 65) if (chr <= 90) chr += 32;\n\n    Porffor.IR.storeU8(j++, 4, chr);\n",
+    );
+    await patchCaseMapping(root);
+    const patched = await readFile(file, "utf8");
+    expect(patched).toContain("export const __Porffor_caseFind = (chr: i32, runs: string): i32 => {");
+    expect(patched).toContain("else chr = __Porffor_caseUpper(chr);");
+    expect(patched).toContain("else chr = __Porffor_caseLower(chr);");
+    expect(patched).toContain("if (chr != 247) chr -= 32;");
+    await patchCaseMapping(root);
+    expect(await readFile(file, "utf8")).toBe(patched);
+    await writeFile(file, "export const x = 1;\n");
+    await expect(patchCaseMapping(root)).rejects.toThrow("anchor not found");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("zero-delay timer patch arms timers at 1 ms, idempotently", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sb-zero-timers-"));
+  try {
+    await mkdir(join(root, "compiler"));
+    const file = join(root, "compiler/render.js");
+    await writeFile(file, "x\n  porf_native_fetch_timer_start(id, (i32)delay_ms, timer->repeat ? (i32)delay_ms : 0);\n");
+    await patchZeroDelayTimers(root);
+    const patched = await readFile(file, "utf8");
+    expect(patched).toContain("delay_ms < 1 ? 1 : (i32)delay_ms");
+    await patchZeroDelayTimers(root);
+    expect(await readFile(file, "utf8")).toBe(patched);
+    await writeFile(file, "export const x = 1;\n");
+    await expect(patchZeroDelayTimers(root)).rejects.toThrow("anchor not found");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
