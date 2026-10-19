@@ -2703,11 +2703,21 @@ if (globalThis.FormData == null) {
     constructor() {
       this._entries = [];
     }
+    // A Blob value is stored as a File named by filename ("blob" by default); anything
+    // else as a string, as the FormData spec's entry list does.
+    static _entryValue(value, filename) {
+      if (value instanceof Blob) {
+        if (filename === undefined && value instanceof File) return value;
+        return new File([value], filename === undefined ? "blob" : String(filename), { type: value.type });
+      }
+      return String(value);
+    }
     append(name, value, filename) {
-      this._entries.push([String(name), value, filename]);
+      this._entries.push([String(name), __SproutboatFormData._entryValue(value, filename), filename]);
     }
     set(name, value, filename) {
       name = String(name);
+      value = __SproutboatFormData._entryValue(value, filename);
       let replaced = false;
       this._entries = this._entries.filter((e) => {
         if (e[0] !== name) return true;

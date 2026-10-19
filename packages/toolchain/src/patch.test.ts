@@ -15,6 +15,9 @@ import {
   patchConsoleColors,
   patchCaseMapping,
   patchZeroDelayTimers,
+  patchBlobClass,
+  patchFetchClasses,
+  patchResponseBytes,
   patchHeadersClass,
   patchTextDecoder,
   patchResponseDefaults,
@@ -688,6 +691,37 @@ test("zero-delay timer patch arms timers at 1 ms, idempotently", async () => {
     expect(await readFile(file, "utf8")).toBe(patched);
     await writeFile(file, "export const x = 1;\n");
     await expect(patchZeroDelayTimers(root)).rejects.toThrow("anchor not found");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Request/Response, Blob and finalizer patches replace their targets once", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sb-fetch-classes-"));
+  try {
+    await mkdir(join(root, "runtime"));
+    const globals = join(root, "runtime/fetch-globals.js"), entry = join(root, "runtime/native-fetch.js");
+    await writeFile(globals, "class Blob {\n  old() {}\n}\nclass TextEncoder {\n}\nclass Request {\n  old() {}\n}\nclass Response {\n  old() {}\n}\n");
+    await writeFile(entry, "x\n  const body = response.body == null ? '' : String(response.body);\n  const headersEntries = response.headers._entries;\n");
+    await patchFetchClasses(root);
+    await patchBlobClass(root);
+    await patchResponseBytes(root);
+    const g = await readFile(globals, "utf8"), e = await readFile(entry, "utf8");
+    expect(g).toContain("sproutboat: Fetch-spec Request and Response");
+    expect(g).toContain("sproutboat: byte-backed Blob and File");
+    expect(g).toContain("class File extends Blob {");
+    expect(g).not.toContain("old() {}");
+    expect(e).toContain("headersEntries.push('x-sb-raw-body', '1');");
+    await patchFetchClasses(root);
+    await patchBlobClass(root);
+    await patchResponseBytes(root);
+    expect(await readFile(globals, "utf8")).toBe(g);
+    expect(await readFile(entry, "utf8")).toBe(e);
+    await writeFile(globals, "export const x = 1;\n");
+    await writeFile(entry, "export const x = 1;\n");
+    await expect(patchFetchClasses(root)).rejects.toThrow("anchor not found");
+    await expect(patchBlobClass(root)).rejects.toThrow("anchor not found");
+    await expect(patchResponseBytes(root)).rejects.toThrow("anchor not found");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
