@@ -1881,6 +1881,79 @@ export async function patchRepeatDoubling(root: string): Promise<void> {
   await writeFile(file, src.replaceAll(REPEAT_LOOP, REPEAT_DOUBLING));
 }
 
+// JSON.stringify of a cyclic object recursed until the native stack overflowed: the
+// process died (SIGBUS/SIGSEGV) instead of throwing, so one request could take a
+// worker down (found by the W2 conformance suite). The replacer path already checks
+// cycles; the plain serializer now keeps its own ancestor stack and throws the same
+// TypeError. Arrays and objects push on entry and pop on exit; JSON.stringify clears
+// the stack first, so a throw mid-serialization leaves nothing behind.
+const JSON_CYCLE_MARKER = "sproutboat: JSON cycle check";
+const JSON_CYCLE_EDITS: [string, string, number][] = [
+  [
+    "let __Porffor_json_bufLimit: i32 = 0;\n",
+    "let __Porffor_json_bufLimit: i32 = 0;\n" +
+      "// sproutboat: JSON cycle check\n" +
+      "let __Porffor_json_ancestors: any = 0;\n" +
+      "export const __Porffor_json_enter = (value: any): void => {\n" +
+      "  if (__Porffor_json_ancestors === 0) __Porffor_json_ancestors = Porffor.array.new(8);\n" +
+      "  const stack: any[] = __Porffor_json_ancestors;\n" +
+      "  if (stack.includes(value)) {\n" +
+      "    stack.length = 0;\n" +
+      "    throw new TypeError('Converting circular structure to JSON');\n" +
+      "  }\n" +
+      "  Porffor.array.fastPush(stack, value);\n" +
+      "};\n" +
+      "export const __Porffor_json_leave = (): void => {\n" +
+      "  const stack: any[] = __Porffor_json_ancestors;\n" +
+      "  stack.length = stack.length - 1;\n" +
+      "};\n",
+    1,
+  ],
+  ["    depth += 1;\n", "    depth += 1;\n    __Porffor_json_enter(value);\n", 2],
+  ["    depth -= 1;\n", "    __Porffor_json_leave();\n    depth -= 1;\n", 2],
+  [
+    "  let out: i32 = __Porffor_json_serialize(buffer, value, 0, space);\n",
+    "  if (__Porffor_json_ancestors !== 0) (__Porffor_json_ancestors as any[]).length = 0;\n" +
+      "  let out: i32 = __Porffor_json_serialize(buffer, value, 0, space);\n",
+    1,
+  ],
+];
+
+/** JSON.stringify throws on cycles instead of overflowing the stack. Before the precompile. */
+export async function patchJsonCycles(root: string): Promise<void> {
+  const file = resolve(root, "compiler/builtins/json.ts");
+  let src = await readFile(file, "utf8");
+  if (src.includes(JSON_CYCLE_MARKER)) return;
+  for (const [anchor, inject, count] of JSON_CYCLE_EDITS) {
+    if (src.split(anchor).length !== count + 1)
+      throw new Error(`could not patch Porffor's JSON cycle check: anchor not found ${count}x in ${file}`);
+    src = src.replaceAll(anchor, inject);
+  }
+  await writeFile(file, src);
+}
+
+// Object.prototype.toString gave "[object Object]" for typed arrays: their lazily
+// built prototypes have no toStringTag, and the fallback list of builtin tags left
+// them out (W2 conformance; V8 gives "[object Uint8Array]").
+const TA_TAG_MARKER = "sproutboat: typed array toStringTag";
+const TA_TAG_ANCHOR = "  return '[object ' + builtinTag + ']';\n};\n";
+const TA_TAG_INJECT =
+  "  // sproutboat: typed array toStringTag\n" +
+  "  if (Porffor.fastAnd(tag === undefined, t >= Porffor.TYPES.uint8clampedarray, t <= Porffor.TYPES.float64array)) {\n" +
+  "    if (t == Porffor.TYPES.uint8clampedarray) builtinTag = 'Uint8ClampedArray';\n    else if (t == Porffor.TYPES.uint8array) builtinTag = 'Uint8Array';\n    else if (t == Porffor.TYPES.int8array) builtinTag = 'Int8Array';\n    else if (t == Porffor.TYPES.uint16array) builtinTag = 'Uint16Array';\n    else if (t == Porffor.TYPES.int16array) builtinTag = 'Int16Array';\n    else if (t == Porffor.TYPES.uint32array) builtinTag = 'Uint32Array';\n    else if (t == Porffor.TYPES.int32array) builtinTag = 'Int32Array';\n    else if (t == Porffor.TYPES.biguint64array) builtinTag = 'BigUint64Array';\n    else if (t == Porffor.TYPES.bigint64array) builtinTag = 'BigInt64Array';\n    else if (t == Porffor.TYPES.float32array) builtinTag = 'Float32Array';\n    else if (t == Porffor.TYPES.float64array) builtinTag = 'Float64Array';\n" +
+  "  }\n" +
+  TA_TAG_ANCHOR;
+
+/** Typed arrays get their own toString tag. Before the precompile. */
+export async function patchTypedArrayTag(root: string): Promise<void> {
+  const file = resolve(root, "compiler/builtins/object.ts");
+  const src = await readFile(file, "utf8");
+  if (src.includes(TA_TAG_MARKER)) return;
+  if (src.split(TA_TAG_ANCHOR).length !== 2)
+    throw new Error(`could not patch Porffor's typed array toStringTag: anchor not found in ${file}`);
+  await writeFile(file, src.replace(TA_TAG_ANCHOR, TA_TAG_INJECT));
+}
+
 /**
  * True when root is a finished cache entry that this toolchain version patched
  * (ensurePorffor patches before it writes the manifest). The CLI calls
@@ -1924,6 +1997,8 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchMapGroupBy(root);
   await patchPrivateFieldsHidden(root);
   await patchRepeatDoubling(root);
+  await patchJsonCycles(root);
+  await patchTypedArrayTag(root);
   // Last of the builtin edits: its precompile picks up the date, promise and
   // replaceAll patches above too.
   await precompileBuiltins(root);

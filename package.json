@@ -33,6 +33,7 @@
     "test:native-url": "bun packages/runtime/test/native-url.ts",
     "test:native-json": "bun packages/runtime/test/native-json.ts",
     "test:native-errors": "bun packages/runtime/test/native-errors.ts",
+    "test:native-events": "bun packages/runtime/test/native-events.ts",
     "test:native-request": "bun packages/runtime/test/native-request.ts"
   },
   "devDependencies": {

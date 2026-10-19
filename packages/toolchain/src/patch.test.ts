@@ -10,6 +10,8 @@ import {
   patchMapGroupBy,
   patchPrivateFieldsHidden,
   patchRepeatDoubling,
+  patchJsonCycles,
+  patchTypedArrayTag,
   patchResponseDefaults,
   patchURLClass,
   patchUint8ArrayBase64,
@@ -550,6 +552,48 @@ test("ensurePorfforPatched trusts a cache entry this toolchain version patched, 
     } finally {
       await rm(stale, { recursive: true, force: true });
     }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("JSON cycle patch adds an ancestor stack around arrays and objects, idempotently", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sb-json-cycles-"));
+  try {
+    await mkdir(join(root, "compiler/builtins"), { recursive: true });
+    const file = join(root, "compiler/builtins/json.ts");
+    await writeFile(
+      file,
+      "let __Porffor_json_bufLimit: i32 = 0;\n    depth += 1;\n    depth -= 1;\n    depth += 1;\n    depth -= 1;\n" +
+        "  let out: i32 = __Porffor_json_serialize(buffer, value, 0, space);\n",
+    );
+    await patchJsonCycles(root);
+    const patched = await readFile(file, "utf8");
+    expect(patched.split("__Porffor_json_enter(value);").length).toBe(3);
+    expect(patched.split("__Porffor_json_leave();").length).toBe(3);
+    expect(patched).toContain("throw new TypeError('Converting circular structure to JSON');");
+    await patchJsonCycles(root);
+    expect(await readFile(file, "utf8")).toBe(patched);
+    await writeFile(file, "let __Porffor_json_bufLimit: i32 = 0;\n");
+    await expect(patchJsonCycles(root)).rejects.toThrow("anchor not found");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("typed array tag patch names every typed array before toString returns, idempotently", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sb-ta-tag-"));
+  try {
+    await mkdir(join(root, "compiler/builtins"), { recursive: true });
+    const file = join(root, "compiler/builtins/object.ts");
+    await writeFile(file, "  return '[object ' + builtinTag + ']';\n};\n");
+    await patchTypedArrayTag(root);
+    const patched = await readFile(file, "utf8");
+    for (const name of ["Uint8Array", "Uint8ClampedArray", "BigInt64Array", "Float64Array"]) expect(patched).toContain(`builtinTag = '${name}';`);
+    await patchTypedArrayTag(root);
+    expect(await readFile(file, "utf8")).toBe(patched);
+    await writeFile(file, "export const x = 1;\n");
+    await expect(patchTypedArrayTag(root)).rejects.toThrow("anchor not found");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -136,6 +136,7 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "  if (body_owned) free(body_owned);\n" +
       "}\n",
     "compiler/builtins/json.ts":
+      "let __Porffor_json_bufLimit: i32 = 0;\n    depth += 1;\n    depth -= 1;\n    depth += 1;\n    depth -= 1;\n  let out: i32 = __Porffor_json_serialize(buffer, value, 0, space);\n" +
       "// sb_json_utf16_v1\n" +
       "export const __Porffor_json_serialize = (_buffer: i32, value: any): i32 => {\n" +
       "    for (const x of (value as any[])) {\n    }\n" +
@@ -147,6 +148,7 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "class URL {\n  constructor(input) {\n    this.href = '';\n  }\n}\n\nclass Request {\n}\n" +
       "class Response {\n  constructor(body = null, init = undefined) {\n    this.body = body;\n    this.status = Number(init?.status ?? 200);\n    this.headers = new Headers(init?.headers);\n  }\n}\n",
     "compiler/builtins/uint8array_base64.ts": "let alphabet: string = 'base64';\nlet lastChunkHandling: string = 'loose';\nconst fullChunks: i32 = (len / 3) * 3;\n",
+    "compiler/builtins/object.ts": "  return '[object ' + builtinTag + ']';\n};\n",
     "compiler/builtins/map.ts": "export const Map = function (iterable: any): Map {\n};\n",
     "compiler/codegen.js":
       "if (!hoistRead && directCallOnlyFunctionBinding(scope, kind, name, pattern, func)) {\n        return valUndefined();\n}\nconst func = resolveNamedFunction(scope, name) ?? funcByName(name);\n" +
@@ -258,6 +260,9 @@ test("the default call (no url/expectedSha256 override) never touches the networ
   );
   // #238/#241 (out-of-range typed-array reads and writes) are upstream's own
   // integer-indexed element access since alpha-18; no codegen patch remains.
+  // JSON.stringify throws on cycles; typed arrays have their own toString tag.
+  expect(await readFile(join(dir, "compiler/builtins/json.ts"), "utf8")).toContain("sproutboat: JSON cycle check");
+  expect(await readFile(join(dir, "compiler/builtins/object.ts"), "utf8")).toContain("sproutboat: typed array toStringTag");
   // B16: String.prototype.repeat doubles its copies.
   expect(await readFile(join(dir, "compiler/builtins/string.ts"), "utf8")).toContain("sproutboat B16: doubling repeat");
   // #287: full collections under load keep their free pages; the idle collection returns them.

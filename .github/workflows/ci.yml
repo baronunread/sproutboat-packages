@@ -30,4 +30,5 @@ jobs:
       - run: bun run test:native-url
       - run: bun run test:native-json
       - run: bun run test:native-errors
+      - run: bun run test:native-events
       - run: bun run test:native-request
