@@ -533,3 +533,24 @@ test("repeat patch replaces both per-repetition loops once", async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("ensurePorfforPatched trusts a cache entry this toolchain version patched, and nothing else", async () => {
+  const { ensurePorfforPatched } = await import("./patch");
+  const { PORFFOR_COMMIT_FULL } = await import("./pin");
+  const { version } = await import("../package.json");
+  const root = await mkdtemp(join(tmpdir(), "sb-patched-stamp-"));
+  try {
+    // An empty tree: running the chain would throw on the first missing file.
+    await writeFile(join(root, ".sproutboat-complete"), JSON.stringify({ commit: PORFFOR_COMMIT_FULL, toolchainVersion: version }));
+    await ensurePorfforPatched(root);
+    const stale = await mkdtemp(join(tmpdir(), "sb-patched-stale-"));
+    try {
+      await writeFile(join(stale, ".sproutboat-complete"), JSON.stringify({ commit: PORFFOR_COMMIT_FULL, toolchainVersion: "0.0.0" }));
+      await expect(ensurePorfforPatched(stale)).rejects.toThrow();
+    } finally {
+      await rm(stale, { recursive: true, force: true });
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

@@ -16,6 +16,8 @@ import { readFile, realpath, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { patchUnicode } from "./unicode";
 import { URL_CLASS_SOURCE } from "./url-class";
+import { PORFFOR_COMMIT_FULL } from "./pin";
+import { version as TOOLCHAIN_VERSION } from "../package.json" with { type: "json" };
 
 // --- compiler/render.js: the native-fetch server, rendered as C text ---
 
@@ -1879,8 +1881,32 @@ export async function patchRepeatDoubling(root: string): Promise<void> {
   await writeFile(file, src.replaceAll(REPEAT_LOOP, REPEAT_DOUBLING));
 }
 
+/**
+ * True when root is a finished cache entry that this toolchain version patched
+ * (ensurePorffor patches before it writes the manifest). The CLI calls
+ * ensurePorfforPatched on every compile: re-running the patch chain there cost
+ * ~1.3 s per build, and its precompile rewrote builtins_precompiled.js in place,
+ * so parallel builds sharing the cache could import a half-written table.
+ */
+async function patchedByThisVersion(root: string): Promise<boolean> {
+  try {
+    // SAFETY: private manifest written by ensurePorffor; only two fields are read.
+    const manifest = JSON.parse(await readFile(resolve(root, ".sproutboat-complete"), "utf8")) as {
+      commit?: string;
+      toolchainVersion?: string;
+    };
+    return manifest.commit === PORFFOR_COMMIT_FULL && manifest.toolchainVersion === TOOLCHAIN_VERSION;
+  } catch {
+    return false;
+  }
+}
+
 export async function ensurePorfforPatched(root: string): Promise<void> {
   if (done.has(root)) return;
+  if (await patchedByThisVersion(root)) {
+    done.add(root);
+    return;
+  }
   await patchCompilerArgs(root);
   await patchClassSelfName(root);
   await patchUwebsockets(root);
