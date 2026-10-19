@@ -332,8 +332,7 @@
     return ue(n, 0, e, t, o), n;
   }
   function he(e, t) {
-    let r = e[t];
-    if (r == null && t === Symbol.iterator && Array.isArray(e)) r = () => e.values();
+    const r = e[t];
     if (r != null) {
       if (typeof r != "function")
         throw new TypeError(`${String(t)} is not a function`);
