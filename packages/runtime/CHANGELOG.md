@@ -1,5 +1,11 @@
 # @sproutboat/runtime
 
+## 0.17.1
+
+### Patch Changes
+
+- 3dabc97: Scheduled, queue and Durable Object alarm triggers answer `204` with no body again. The prelude built that reply as `new Response("", { status: 204 })`, which the Fetch-spec `Response` of 0.17.0 rejects (an empty string is still a body), so the first cron or alarm failed, and on the alarm path the error took the server down.
+
 ## 0.17.0
 
 ### Minor Changes
