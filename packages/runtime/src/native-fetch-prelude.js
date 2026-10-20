@@ -2626,6 +2626,379 @@ if (globalThis.CompressionStream == null) globalThis.CompressionStream = Compres
 if (globalThis.DecompressionStream == null) globalThis.DecompressionStream = DecompressionStream;
 // END COMPRESSION STREAMS
 
+// HTML REWRITER: Cloudflare's HTMLRewriter in JavaScript (workerd uses lol-html). It reads
+// the whole body, then tokenizes it once: elements, text and comments are matched against
+// the selectors given to on() and onDocument(), handlers run in document order (and may be
+// async), and the changes they ask for are written as the document is re-emitted.
+// Selectors: type, *, #id, .class, [attr], [attr=v], [attr~=v], [attr^=v], [attr$=v],
+// [attr*=v], [attr|=v], descendant and child combinators, and lists. Not :nth-child and
+// other pseudo-classes, which throw a TypeError on on(), as an unsupported selector does.
+
+const __sbVoidTags = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"]);
+const __sbRawTextTags = new Set(["script", "style", "textarea", "title", "xmp", "iframe", "noembed", "noframes", "plaintext"]);
+function __sbEscapeText(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+function __sbEscapeAttr(s) { return String(s).replace(/&/g, "&amp;").replace(/"/g, "&quot;"); }
+function __sbContent(content, options) { return options && options.html ? String(content) : __sbEscapeText(content); }
+
+// One compound selector: [{ tag, id, classes, attrs }] joined by combinators.
+function __sbParseSelector(text) {
+  const list = [];
+  for (const part of String(text).split(",")) {
+    const steps = [];
+    let s = part.trim(), combinator = " ";
+    if (!s) throw new TypeError("Invalid selector: " + text);
+    while (s.length) {
+      const step = { tag: null, id: null, classes: [], attrs: [], combinator };
+      let m;
+      let star = false;
+      if ((m = /^(\*|[a-zA-Z][\w-]*)/.exec(s))) { if (m[1] != "*") step.tag = m[1].toLowerCase(); else star = true; s = s.slice(m[0].length); }
+      for (;;) {
+        if ((m = /^#([\w-]+)/.exec(s))) { step.id = m[1]; s = s.slice(m[0].length); continue; }
+        if ((m = /^\.([\w-]+)/.exec(s))) { step.classes.push(m[1]); s = s.slice(m[0].length); continue; }
+        if ((m = /^\[\s*([\w:-]+)\s*(?:([~^$*|]?=)\s*(?:"([^"]*)"|'([^']*)'|([^\]\s]+))\s*)?(i)?\s*\]/.exec(s))) {
+          step.attrs.push({ name: m[1].toLowerCase(), op: m[2] || null, value: m[3] ?? m[4] ?? m[5] ?? "", ci: !!m[6] });
+          s = s.slice(m[0].length);
+          continue;
+        }
+        break;
+      }
+      if (s.length && s[0] == ":") throw new TypeError("Unsupported pseudo-class selector: " + text);
+      if (step.tag == null && step.id == null && !step.classes.length && !step.attrs.length && !star)
+        throw new TypeError("Invalid selector: " + text);
+      steps.push(step);
+      const ws = /^\s*/.exec(s)[0];
+      s = s.slice(ws.length);
+      if (!s.length) break;
+      if (s[0] == ">") { combinator = ">"; s = s.slice(1).trimStart(); }
+      else if (ws.length) combinator = " ";
+      else throw new TypeError("Invalid selector: " + text);
+    }
+    list.push(steps);
+  }
+  return list;
+}
+function __sbStepMatches(step, el) {
+  if (step.tag != null && step.tag != el.tag) return false;
+  if (step.id != null && el.attr("id") !== step.id) return false;
+  if (step.classes.length) {
+    const have = (el.attr("class") || "").split(/\s+/);
+    for (const c of step.classes) if (!have.includes(c)) return false;
+  }
+  for (const a of step.attrs) {
+    let v = el.attr(a.name);
+    if (v == null) return false;
+    if (!a.op) continue;
+    let want = a.value;
+    if (a.ci) { v = v.toLowerCase(); want = want.toLowerCase(); }
+    if (a.op == "=" && v !== want) return false;
+    if (a.op == "~=" && !v.split(/\s+/).includes(want)) return false;
+    if (a.op == "^=" && (!want || !v.startsWith(want))) return false;
+    if (a.op == "$=" && (!want || !v.endsWith(want))) return false;
+    if (a.op == "*=" && (!want || !v.includes(want))) return false;
+    if (a.op == "|=" && v !== want && !v.startsWith(want + "-")) return false;
+  }
+  return true;
+}
+// stack: the open elements, outermost first; the last is the candidate.
+function __sbSelectorMatches(steps, stack) {
+  const match = (si, ei) => {
+    if (!__sbStepMatches(steps[si], stack[ei])) return false;
+    if (si == 0) return true;
+    if (steps[si].combinator == ">") return ei > 0 && match(si - 1, ei - 1);
+    for (let k = ei - 1; k >= 0; k--) if (match(si - 1, k)) return true;
+    return false;
+  };
+  return match(steps.length - 1, stack.length - 1);
+}
+
+// Content to write around a node, from before/after/prepend/append/replace calls.
+class __sbEdits {
+  constructor() { this.before = ""; this.after = ""; this.replaced = null; this.removed = false; }
+}
+class __sbElement {
+  constructor(state) { this._s = state; }
+  get tagName() { return this._s.tag; }
+  set tagName(name) { this._s.tag = String(name).toLowerCase(); this._s.renamed = true; }
+  get namespaceURI() { return "http://www.w3.org/1999/xhtml"; }
+  get attributes() { return this._s.attrs.map((a) => [a[0], a[1]])[Symbol.iterator](); }
+  get removed() { return this._s.edits.removed; }
+  get selfClosing() { return this._s.selfClosing; }
+  get canHaveContent() { return !__sbVoidTags.has(this._s.tag); }
+  getAttribute(name) { return this._s.attr(String(name).toLowerCase()); }
+  hasAttribute(name) { return this._s.attr(String(name).toLowerCase()) != null; }
+  setAttribute(name, value) {
+    const n = String(name).toLowerCase();
+    const at = this._s.attrs.findIndex((a) => a[0] == n);
+    if (at >= 0) this._s.attrs[at] = [n, String(value), null]; else this._s.attrs.push([n, String(value), null]);
+    this._s.attrsChanged = true;
+    return this;
+  }
+  removeAttribute(name) {
+    const n = String(name).toLowerCase();
+    this._s.attrs = this._s.attrs.filter((a) => a[0] != n);
+    this._s.attrsChanged = true;
+    return this;
+  }
+  before(content, options) { this._s.edits.before += __sbContent(content, options); return this; }
+  after(content, options) { this._s.edits.after = __sbContent(content, options) + this._s.edits.after; return this; }
+  prepend(content, options) { this._s.prepend = __sbContent(content, options) + this._s.prepend; return this; }
+  append(content, options) { this._s.append += __sbContent(content, options); return this; }
+  setInnerContent(content, options) { this._s.inner = __sbContent(content, options); this._s.prepend = ""; this._s.append = ""; return this; }
+  replace(content, options) { this._s.edits.replaced = __sbContent(content, options); this._s.edits.removed = true; return this; }
+  remove() { this._s.edits.removed = true; this._s.edits.replaced = ""; return this; }
+  removeAndKeepContent() { this._s.keepContent = true; this._s.edits.removed = true; return this; }
+  onEndTag(handler) { this._s.endHandlers.push(handler); }
+}
+class __sbEndTag {
+  constructor(state) { this._s = state; }
+  get name() { return this._s.tag; }
+  set name(n) { this._s.tag = String(n).toLowerCase(); }
+  before(content, options) { this._s.endBefore += __sbContent(content, options); return this; }
+  after(content, options) { this._s.endAfter = __sbContent(content, options) + this._s.endAfter; return this; }
+  remove() { this._s.endRemoved = true; return this; }
+}
+class __sbTextChunk {
+  constructor(text, last) { this.text = text; this.lastInTextNode = last; this._e = new __sbEdits(); }
+  get removed() { return this._e.removed; }
+  before(content, options) { this._e.before += __sbContent(content, options); return this; }
+  after(content, options) { this._e.after = __sbContent(content, options) + this._e.after; return this; }
+  replace(content, options) { this._e.replaced = __sbContent(content, options); this._e.removed = true; return this; }
+  remove() { this._e.removed = true; this._e.replaced = ""; return this; }
+}
+class __sbComment {
+  constructor(text) { this.text = text; this._e = new __sbEdits(); }
+  get removed() { return this._e.removed; }
+  before(content, options) { this._e.before += __sbContent(content, options); return this; }
+  after(content, options) { this._e.after = __sbContent(content, options) + this._e.after; return this; }
+  replace(content, options) { this._e.replaced = __sbContent(content, options); this._e.removed = true; return this; }
+  remove() { this._e.removed = true; this._e.replaced = ""; return this; }
+}
+class __sbDocEnd {
+  constructor(out) { this._out = out; }
+  append(content, options) { this._out.push(__sbContent(content, options)); return this; }
+}
+
+class __sbRewriteRun {
+  constructor(handlers, documentHandlers, html) {
+    this.handlers = handlers;
+    this.documentHandlers = documentHandlers;
+    this.html = html;
+    this.out = [];
+    this.stack = [];
+    // Inner content of an element replaced by setInnerContent, remove or replace is skipped:
+    // the depth in the stack below which output is suppressed, or -1.
+    this.skipBelow = -1;
+  }
+  emit(s) { if (this.skipBelow < 0) this.out.push(s); }
+  async call(handler, method, arg) {
+    const f = handler && handler[method];
+    if (__sbIsFn(f)) await f.call(handler, arg);
+  }
+  // Text and comment handlers run for content anywhere inside a matched element.
+  inside(steps) {
+    for (let i = 0; i < this.stack.length; i++) if (steps.some((s) => __sbSelectorMatches(s, this.stack.slice(0, i + 1)))) return true;
+    return false;
+  }
+  // A text node arrives as its text, then an empty chunk with lastInTextNode, as lol-html does.
+  async text(raw) {
+    if (!raw.length || this.skipBelow >= 0) return;
+    for (const [text, last] of [[raw, false], ["", true]]) {
+      const chunk = new __sbTextChunk(text, last);
+      for (const h of this.documentHandlers) await this.call(h, "text", chunk);
+      for (const [steps, h] of this.handlers) if (this.inside(steps)) await this.call(h, "text", chunk);
+      this.emit(chunk._e.removed ? chunk._e.before + (chunk._e.replaced ?? "") + chunk._e.after : chunk._e.before + text + chunk._e.after);
+    }
+  }
+  async comment(raw) {
+    if (this.skipBelow >= 0) return;
+    const c = new __sbComment(raw);
+    for (const h of this.documentHandlers) await this.call(h, "comments", c);
+    for (const [steps, h] of this.handlers) if (this.inside(steps)) await this.call(h, "comments", c);
+    this.emit(c._e.removed ? c._e.before + (c._e.replaced ?? "") + c._e.after : c._e.before + "<!--" + c.text + "-->" + c._e.after);
+  }
+  async doctype(raw) {
+    const m = /^<!doctype\s+([^\s>]+)?/i.exec(raw);
+    const d = { name: m && m[1] ? m[1].toLowerCase() : null, publicId: null, systemId: null };
+    for (const h of this.documentHandlers) await this.call(h, "doctype", d);
+    this.emit(raw);
+  }
+  startTag(state) {
+    let s = "<" + (state.renamed ? state.tag : state.rawName);
+    for (const [n, v, raw] of state.attrs) s += raw != null ? " " + raw : " " + n + '="' + __sbEscapeAttr(v) + '"';
+    return s + (state.selfClosing ? " />" : ">");
+  }
+  async element(tag, rawName, attrs, selfClosing, rawStart) {
+    const state = {
+      tag, rawName, attrs, selfClosing, rawStart,
+      attr(name) { const a = this.attrs.find((x) => x[0] == name); return a ? a[1] : null; },
+      edits: new __sbEdits(), prepend: "", append: "", inner: null, keepContent: false, renamed: false, attrsChanged: false,
+      endHandlers: [], endBefore: "", endAfter: "", endRemoved: false,
+    };
+    const skipped = this.skipBelow >= 0;
+    this.stack.push(state);
+    if (!skipped) {
+      const el = new __sbElement(state);
+      for (const [steps, h] of this.handlers) if (steps.some((s) => __sbSelectorMatches(s, this.stack))) await this.call(h, "element", el);
+    }
+    const e = state.edits;
+    this.emit(e.before);
+    const unchanged = !state.renamed && !state.attrsChanged;
+    if (!e.removed || state.keepContent) {
+      if (!e.removed) this.emit(unchanged ? rawStart : this.startTag(state));
+    } else this.emit(e.replaced ?? "");
+    const isVoid = __sbVoidTags.has(tag) || selfClosing;
+    if (isVoid) {
+      this.stack.pop();
+      this.emit(e.after);
+      return null;
+    }
+    if (!e.removed || state.keepContent) this.emit(state.prepend);
+    if (state.inner != null) { this.emit(state.inner); if (this.skipBelow < 0) this.skipBelow = this.stack.length; }
+    else if (e.removed && !state.keepContent && this.skipBelow < 0) this.skipBelow = this.stack.length;
+    return state;
+  }
+  async endTag(state, rawEnd) {
+    if (this.skipBelow == this.stack.length) this.skipBelow = -1;
+    this.stack.pop();
+    const e = state.edits;
+    if (!e.removed || state.keepContent) this.emit(state.append);
+    if (!e.removed) {
+      const end = new __sbEndTag(state);
+      for (const handler of state.endHandlers) await handler(end);
+      this.emit(state.endBefore);
+      if (!state.endRemoved) this.emit(state.renamed || end.name != state.tag ? "</" + state.tag + ">" : rawEnd);
+      this.emit(state.endAfter);
+    }
+    this.emit(e.after);
+  }
+  async run() {
+    const html = this.html;
+    let i = 0, textStart = 0;
+    const flushText = async (to) => { if (to > textStart) await this.text(html.slice(textStart, to)); };
+    const open = [];
+    while (i < html.length) {
+      const lt = html.indexOf("<", i);
+      if (lt < 0) break;
+      const next = html[lt + 1];
+      if (html.startsWith("<!--", lt)) {
+        await flushText(lt);
+        const end = html.indexOf("-->", lt + 4);
+        const stop = end < 0 ? html.length : end;
+        await this.comment(html.slice(lt + 4, stop));
+        i = textStart = end < 0 ? html.length : end + 3;
+        continue;
+      }
+      if (next == "!" || next == "?") {
+        await flushText(lt);
+        const end = html.indexOf(">", lt);
+        const raw = html.slice(lt, end < 0 ? html.length : end + 1);
+        if (/^<!doctype/i.test(raw)) await this.doctype(raw); else this.emit(raw);
+        i = textStart = lt + raw.length;
+        continue;
+      }
+      if (next == "/" && /[a-zA-Z]/.test(html[lt + 2] || "")) {
+        await flushText(lt);
+        const end = html.indexOf(">", lt);
+        const raw = html.slice(lt, end < 0 ? html.length : end + 1);
+        const name = /^<\/([^\s/>]+)/.exec(raw)[1].toLowerCase();
+        // Close up to the matching open element; unmatched end tags pass through.
+        let at = -1;
+        for (let k = open.length - 1; k >= 0; k--) if (open[k].rawName.toLowerCase() == name) { at = k; break; }
+        if (at < 0) this.emit(raw);
+        else {
+          while (open.length > at + 1) { const inner = open.pop(); await this.endTag(inner, ""); }
+          await this.endTag(open.pop(), raw);
+        }
+        i = textStart = lt + raw.length;
+        continue;
+      }
+      if (!/[a-zA-Z]/.test(next || "")) { i = lt + 1; continue; }
+      await flushText(lt);
+      // A start tag: name, then attributes (quoted, unquoted or bare) up to > or />.
+      let p = lt + 1;
+      while (p < html.length && !/[\s/>]/.test(html[p])) p++;
+      const rawName = html.slice(lt + 1, p);
+      const tag = rawName.toLowerCase();
+      const attrs = [];
+      let selfClosing = false;
+      for (;;) {
+        while (p < html.length && /\s/.test(html[p])) p++;
+        if (p >= html.length) break;
+        if (html[p] == ">") { p++; break; }
+        if (html[p] == "/" && html[p + 1] == ">") { selfClosing = true; p += 2; break; }
+        if (html[p] == "/") { p++; continue; }
+        const start = p;
+        let q = p;
+        while (q < html.length && !/[\s=/>]/.test(html[q])) q++;
+        const name = html.slice(p, q).toLowerCase();
+        p = q;
+        while (p < html.length && /\s/.test(html[p])) p++;
+        if (html[p] == "=") {
+          p++;
+          while (p < html.length && /\s/.test(html[p])) p++;
+          let value;
+          if (html[p] == '"' || html[p] == "'") {
+            const quote = html[p], close = html.indexOf(quote, p + 1);
+            value = html.slice(p + 1, close < 0 ? html.length : close);
+            p = close < 0 ? html.length : close + 1;
+          } else {
+            let r = p;
+            while (r < html.length && !/[\s>]/.test(html[r])) r++;
+            value = html.slice(p, r);
+            p = r;
+          }
+          attrs.push([name, value.replace(/&amp;/g, "&").replace(/&quot;/g, '"'), html.slice(start, p)]);
+        } else attrs.push([name, "", html.slice(start, p)]);
+      }
+      const rawStart = html.slice(lt, p);
+      const state = await this.element(tag, rawName, attrs, selfClosing && !__sbVoidTags.has(tag) ? false : selfClosing, rawStart);
+      if (state) open.push(state);
+      i = textStart = p;
+      // Raw text elements hold their content verbatim up to their own end tag.
+      if (state && __sbRawTextTags.has(tag)) {
+        const close = html.toLowerCase().indexOf("</" + tag, p);
+        const stop = close < 0 ? html.length : close;
+        await this.text(html.slice(p, stop));
+        i = textStart = stop;
+      }
+    }
+    await flushText(html.length);
+    // An element whose end tag never came has not ended: nothing appended to it is written
+    // (lol-html does not imply end tags).
+    open.length = 0;
+    const tail = [];
+    for (const h of this.documentHandlers) if (__sbIsFn(h.end)) await h.end(new __sbDocEnd(tail));
+    return this.out.join("") + tail.join("");
+  }
+}
+
+class HTMLRewriter {
+  constructor() { this._handlers = []; this._documentHandlers = []; }
+  on(selector, handlers) { this._handlers.push([__sbParseSelector(selector), handlers]); return this; }
+  onDocument(handlers) { this._documentHandlers.push(handlers); return this; }
+  transform(response) {
+    const handlers = this._handlers, documentHandlers = this._documentHandlers;
+    const headers = new Headers(response.headers);
+    headers.delete("content-length");
+    const body = new ReadableStream({
+      async start(controller) {
+        try {
+          const html = await response.text();
+          const out = await new __sbRewriteRun(handlers, documentHandlers, html).run();
+          controller.enqueue(new TextEncoder().encode(out));
+          controller.close();
+        } catch (error) {
+          controller.error(error);
+        }
+      },
+    });
+    return new Response(body, { status: response.status, statusText: response.statusText, headers });
+  }
+}
+// A static install, so app code sees the name when it is compiled apart (see streams-entry.js).
+if (globalThis.HTMLRewriter == null) globalThis.HTMLRewriter = HTMLRewriter;
+// END HTML REWRITER
+
 // Porffor exposes native timers lexically. Libraries also access them through
 // globalThis, including noble hashes 2.4's host-task yields.
 if (globalThis.setTimeout == null) globalThis.setTimeout = setTimeout;

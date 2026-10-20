@@ -18,6 +18,15 @@ const handler = `export default {async fetch(request) {
   if (path === "/stream-strings") return new Response(new ReadableStream({ start(c) { c.enqueue("text"); c.close(); } }));
   if (path === "/form") { const f = new FormData(); f.append("a", "1"); f.append("f", new Blob(["xy"]), "n.txt"); return new Response(f); }
   const cases = [
+    // HTMLRewriter, against Bun's (lol-html, as in workerd): the W2 cases and more.
+    () => typeof HTMLRewriter,
+    () => new HTMLRewriter().on("h1", { element(e) { e.setInnerContent("x"); } }).transform(new Response("<h1>a</h1><p>b</p>")).text(),
+    () => new HTMLRewriter().on("a", { element(e) { e.setAttribute("href", "/n"); } }).transform(new Response('<a href="/o" data-x=1>l</a>')).text(),
+    () => new HTMLRewriter().on("script", { element(e) { e.remove(); } }).transform(new Response("<p>a</p><script>if (a < b) x()</script>")).text(),
+    async () => { let t = ""; await new HTMLRewriter().on("p", { text(c) { t += c.text + (c.lastInTextNode ? "|" : ""); } }).transform(new Response("<p>hi <b>there</b></p>")).text(); return t; },
+    () => new HTMLRewriter().on("body", { element(e) { e.append("<i>z</i>", { html: true }).prepend("<&>"); } }).transform(new Response("<body>a</body>")).text(),
+    () => new HTMLRewriter().on("div > span.k, #m", { element(e) { e.replace("R"); } }).on("p", { comments(c) { c.remove(); } }).transform(new Response('<div><span class="k">1</span><p><!--c-->2<span class="k">3</span></p></div><i id="m">4</i>')).text(),
+    () => new HTMLRewriter().on("li", { async element(e) { await null; e.removeAndKeepContent(); } }).onDocument({ end(d) { d.append("<!--e-->", { html: true }); } }).transform(new Response("<ul><li>a</li><li>b</li></ul>")).text(),
     // CompressionStream and DecompressionStream: our output round-trips, and zlib's decodes.
     async () => { const out = []; for (const f of ["gzip", "deflate", "deflate-raw"]) out.push(await new Response(new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode("hello ".repeat(200))); c.close(); } }).pipeThrough(new CompressionStream(f)).pipeThrough(new DecompressionStream(f))).text() === "hello ".repeat(200)); return out.join(","); },
     async () => new Response(new ReadableStream({ start(c) { c.enqueue(Uint8Array.from(atob("H4sIAAAAAAACEysuKMovLUnKTyxRKB5uTACdCbks3AAAAA=="), (ch) => ch.charCodeAt(0))); c.close(); } }).pipeThrough(new DecompressionStream("gzip"))).text(),
