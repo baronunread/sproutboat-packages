@@ -1,5 +1,46 @@
 # @sproutboat/wire
 
+## 0.13.0
+
+### Minor Changes
+
+- 6880f60: Add an opt-in bounded multi-session broker worker with private supervisor control.
+  Fence queue acknowledgements to durable delivery claims and retain recoverable alarm deliveries across process crashes in broker and embedded transports.
+  
+  Resume native R2 downloads until completion or renewed backpressure instead of leaving large responses stalled.
+  
+  Retain partially written TCP replies until drain and serialize pipelined replies so large broker-backed R2 reads cannot truncate or interleave frames.
+  
+  Honor wildcard, weak and list-based If-None-Match conditions on broker direct downloads.
+  
+  Move D1 queries, batches, exec and backups off the shared broker event loop into two lazy SQL threads per broker process. Preserve database affinity, transaction rollback and session isolation, and bound queued work with per-session admission and queue deadlines. Running SQLite statements remain non-preemptible; keep shared mode opt-in.
+  
+  Enforce shared D1 execution budgets through a capability-protected native SQLite progress hook. Interrupted batches roll back and lanes remain usable. A broker watchdog revokes all sessions if native work cannot be interrupted; uncertain SQL outcomes are never automatically retried. Build the small SQLite extension during host/image preparation.
+- a96a443: Apply static asset redirects and header rules in dev and standalone asset bindings, preserving binary response bodies.
+
+### Patch Changes
+
+- Updated dependencies [5d4d40b]
+- Updated dependencies [6880f60]
+- Updated dependencies [846519f]
+- Updated dependencies [b47aad4]
+- Updated dependencies [f19ca0d]
+- Updated dependencies [ddb0f9d]
+- Updated dependencies [f201b58]
+- Updated dependencies [08d0192]
+- Updated dependencies [6d6ae43]
+- Updated dependencies [9fdf3fa]
+- Updated dependencies [4c78d83]
+- Updated dependencies [088cad0]
+- Updated dependencies [a96a443]
+- Updated dependencies [6e42051]
+- Updated dependencies [6e88627]
+- Updated dependencies [9dc109d]
+- Updated dependencies [28b0c39]
+- Updated dependencies [6b64985]
+- Updated dependencies [eec94f1]
+  - @sproutboat/runtime@0.17.0
+
 ## 0.12.2
 
 ### Patch Changes
