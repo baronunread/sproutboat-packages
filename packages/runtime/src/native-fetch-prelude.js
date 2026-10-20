@@ -2321,13 +2321,19 @@ const __sbCrcTable = (() => {
   }
   return table;
 })();
+// c starts as the parameter itself. In split builds (sproutd) a prelude function may be
+// called from app code, so Porffor cannot type its parameters; it typed c as a number
+// from the loop but boxed ~crc (crc might be a BigInt), and the C did not compile.
 function __sbCrc32(crc, bytes) {
-  let c = ~crc;
+  let c = crc;
+  c = ~c;
   for (let i = 0; i < bytes.length; i++) c = __sbCrcTable[(c ^ bytes[i]) & 255] ^ (c >>> 8);
   return ~c >>> 0;
 }
 function __sbAdler32(adler, bytes) {
-  let a = adler & 0xffff, b = adler >>> 16;
+  let a = adler, b = adler;
+  a = a & 0xffff;
+  b = b >>> 16;
   for (let i = 0; i < bytes.length; ) {
     const end = Math.min(i + 3800, bytes.length);
     for (; i < end; i++) { a += bytes[i]; b += a; }
