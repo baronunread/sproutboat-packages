@@ -3092,7 +3092,7 @@ function __sbCpuMs() {
 function __sbTagCpu(res, t0) {
   const cpu = __sbCpuMs() - t0;
   try {
-    const body = res && res.body;
+    const body = __sbRawBody(res);
     if (__sbIsStr(body) && !res.headers.has("set-cookie")) {
       const headers = {};
       res.headers.forEach(function (value, name) {
@@ -5189,7 +5189,7 @@ globalThis.__sbInstallBindings = function (target, bindings) {
           url,
           method: opts.method || "GET",
           headers,
-          ...__sbRequestBody(opts.body),
+          ...__sbRequestBody(opts instanceof Request ? __sbRawBody(opts) : opts.body),
         });
         const respHeaders = new Headers();
         for (let j = 0; j < (r.headers || []).length; j++) respHeaders.set(r.headers[j][0], r.headers[j][1]);
@@ -5221,7 +5221,7 @@ globalThis.__sbInstallFetch = function () {
       if (__sbIsFn(source.forEach)) source.forEach((v, k) => headers.push([k, v]));
       else for (const k in source) headers.push([k, source[k]]);
     }
-    const body = opts.body !== undefined ? opts.body : req && req.body !== "" ? req.body : null;
+    const body = opts.body !== undefined && !(opts instanceof Request) ? opts.body : req && __sbRawBody(req) !== "" ? __sbRawBody(req) : null;
     const method = opts.method || (req && req.method) || "GET";
     const msg = { url, method, headers, ...__sbRequestBody(body) };
     const respond = (r) => {
@@ -5647,8 +5647,14 @@ async function __sbCollectBody(stream) {
   }
   return out;
 }
+// The body as given (a string, bytes or a ReadableStream), not the stream the Fetch-spec
+// body getter makes over it; plain objects keep their body as is.
+function __sbRawBody(message) {
+  if (message == null) return null;
+  return message._bodyInit !== undefined ? message._bodyInit : message.body;
+}
 function __sbHasStreamBody(res) {
-  return res != null && res.body instanceof ReadableStream;
+  return res != null && __sbRawBody(res) instanceof ReadableStream;
 }
 
 // B19: on a host that streams (a standalone sprout's native server defines sb_stream_*), a
@@ -5697,7 +5703,7 @@ function __sbStreamingSupported() {
   return __sbStreaming === 1;
 }
 function __sbStreamResponse(response) {
-  const stream = response.body;
+  const stream = __sbRawBody(response);
   const id = __sbStreamOp("o", "0", "");
   response.headers.set("x-sb-stream", id);
   response.body = "";
@@ -5733,7 +5739,7 @@ async function __sbFetchWithDrain(res, tasks) {
     r = res && __sbIsFn(res.then) ? await res : res;
     if (__sbHasStreamBody(r)) {
       if (__sbStreamingSupported()) __sbStreamResponse(r);
-      else r.body = await __sbCollectBody(r.body);
+      else r.body = await __sbCollectBody(__sbRawBody(r));
     }
   } catch (error) {
     // #179 — a rejected handler promise must not take the process down with it.
@@ -5794,7 +5800,7 @@ async function __sbQueueWithDrain(result, tasks) {
 // handing the request to user code. Request.text() in Porffor otherwise treats
 // the raw bytes as already-decoded characters and corrupts Unicode/HMAC input.
 function __sbDecodeIngress(request) {
-  const raw = request.body;
+  const raw = __sbRawBody(request);
   if (raw == null) return;
   let decoded = null;
   request.text = function () {
@@ -5986,7 +5992,8 @@ async function __sbRunQueueBatch(handlers, body, ctx) {
 
 function __sbReadJson(request) {
   try {
-    return JSON.parse(request.body == null ? "{}" : String(request.body));
+    const body = __sbRawBody(request);
+    return JSON.parse(body == null ? "{}" : String(body));
   } catch {
     return {};
   }

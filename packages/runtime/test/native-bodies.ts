@@ -18,6 +18,13 @@ const handler = `export default {async fetch(request) {
   if (path === "/stream-strings") return new Response(new ReadableStream({ start(c) { c.enqueue("text"); c.close(); } }));
   if (path === "/form") { const f = new FormData(); f.append("a", "1"); f.append("f", new Blob(["xy"]), "n.txt"); return new Response(f); }
   const cases = [
+    // body is a ReadableStream for every body type (Fetch), and readers still work.
+    () => [new Response("hi").body instanceof ReadableStream, new Response(new Uint8Array([1])).body instanceof ReadableStream, new Response(null).body, new Request("http://a.test", { method: "POST", body: "q" }).body instanceof ReadableStream].join(","),
+    async () => new Response(new Response("abc").body).text(),
+    async () => { const r = new Response("x"); const b = r.body; return (b === r.body) + ":" + (await r.text()); },
+    async () => { const r = new Response("x"); r.body.getReader(); try { await r.text(); return "no throw"; } catch (e) { return e.name; } },
+    async () => { const reader = new Response("chunk").body.getReader(); const { value, done } = await reader.read(); return new TextDecoder().decode(value) + ":" + done + ":" + (await reader.read()).done; },
+    async () => { const r = new Response("cloned"); return (await r.clone().text()) + "|" + (await r.text()); },
     // HTMLRewriter, against Bun's (lol-html, as in workerd): the W2 cases and more.
     () => typeof HTMLRewriter,
     () => new HTMLRewriter().on("h1", { element(e) { e.setInnerContent("x"); } }).transform(new Response("<h1>a</h1><p>b</p>")).text(),

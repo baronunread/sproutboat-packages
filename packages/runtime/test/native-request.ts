@@ -18,7 +18,9 @@ const CASES = [
   `new Request(new URL("http://a.test/u")).url`,
   `new Request("http://a.test/x", { method: "post" }).method`,
 ];
-const handler = `export default {async fetch() {
+const handler = `export default {async fetch(request) {
+  // The incoming request: its body is a ReadableStream, and text() still reads it.
+  if (request.method === "POST") return new Response((request.body instanceof ReadableStream) + ":" + (await request.text()));
   const cases = [
 ${CASES.map((c) => `    () => (${c}),`).join("\n")}
   ];
@@ -91,7 +93,9 @@ try {
   const got = JSON.parse(await (await fetch(`http://127.0.0.1:${port}/`)).text()) as string[];
   const diffs = CASES.flatMap((c, i) => (got[i] === want[i] ? [] : [`${c}\n    want ${JSON.stringify(want[i])}\n    got  ${JSON.stringify(got[i])}`]));
   assert.deepEqual(diffs, [], `Request copies differ from Bun in ${diffs.length} of ${CASES.length} cases:\n${diffs.join("\n")}`);
-  console.log(`Native Request copies match Bun in all ${CASES.length} cases`);
+  const posted = await (await fetch(`http://127.0.0.1:${port}/`, { method: "POST", body: "posted é" })).text();
+  assert.equal(posted, "true:posted é", "the incoming request body is a stream and text() reads it");
+  console.log(`Native Request copies match Bun in all ${CASES.length} cases; the incoming body is a stream`);
 } finally {
   if (server) {
     server.kill(9);

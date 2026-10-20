@@ -6,9 +6,10 @@ const ingress = src.slice(
   src.indexOf("function __sbDecodeIngress("),
   src.indexOf("globalThis.__sbEntry ="),
 );
-if (!decoder || !ingress) throw new Error("Ingress decoder source not found");
+const rawBody = src.slice(src.indexOf("function __sbRawBody("), src.indexOf("function __sbHasStreamBody("));
+if (!decoder || !ingress || !rawBody) throw new Error("Ingress decoder source not found");
 // oxlint-disable-next-line no-function-constructor -- Exercise the text-only runtime prelude.
-const load = new Function(`${decoder}\n${ingress}\nreturn __sbDecodeIngress;`);
+const load = new Function(`${decoder}\n${rawBody}\n${ingress}\nreturn __sbDecodeIngress;`);
 const decode = load();
 const raw = (text) =>
   Array.from(new TextEncoder().encode(text), (byte) => String.fromCharCode(byte)).join("");

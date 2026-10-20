@@ -65,7 +65,22 @@ export const REQUEST_CLASS_SOURCE = String.raw`class Request {
   static _consume(message) {
     if (message._bodyUsed === true) throw new TypeError('Body has already been used');
     message._bodyUsed = true;
-    return message.body;
+    // A stream the body getter handed out is what the reader reads: a locked one throws.
+    return message._bodyStream != null ? message._bodyStream : message._bodyInit;
+  }
+
+  // body is a ReadableStream, as in Fetch: a stream body itself, else a stream made once over
+  // the bytes. The value as given stays in _bodyInit, which the native writer, streaming and
+  // the prelude read; assigning body (the native ingress does) sets it.
+  static _bodyAsStream(message) {
+    const init = message._bodyInit;
+    if (init == null) return null;
+    if (Request._isStream(init)) return init;
+    if (message._bodyStream == null) {
+      const bytes = Request._bodyBytes(init);
+      message._bodyStream = new globalThis.ReadableStream({ start(c) { if (bytes.length) c.enqueue(bytes); c.close(); } });
+    }
+    return message._bodyStream;
   }
 
   static _bodyText(body) {
@@ -119,7 +134,7 @@ export const REQUEST_CLASS_SOURCE = String.raw`class Request {
       url = input.url;
       method = input.method;
       headers = input.headers;
-      body = input.body;
+      body = input._bodyStream != null ? input._bodyStream : input._bodyInit;
       redirect = input.redirect;
     } else if (input != null && Porffor.type(input) == Porffor.TYPES.object && input.href != null) url = input.href;
 
@@ -142,11 +157,13 @@ export const REQUEST_CLASS_SOURCE = String.raw`class Request {
     if (init != null && init.body != null && init.body !== '' && (this.method == 'GET' || this.method == 'HEAD'))
       throw new TypeError('Request with GET/HEAD method cannot have body.');
     this.headers = new Headers(headers);
-    this.body = Request._extractBody(body, this.headers);
+    this._bodyInit = Request._extractBody(body, this.headers);
     if (redirect != null) this._redirect = String(redirect);
   }
 
   get redirect() { return this._redirect ?? 'follow'; }
+  get body() { return Request._bodyAsStream(this); }
+  set body(value) { this._bodyInit = value; this._bodyStream = null; }
   get bodyUsed() { return this._bodyUsed === true; }
 
   arrayBuffer() { return Request._read(this, (bytes) => bytes.buffer); }
@@ -179,7 +196,7 @@ export const RESPONSE_CLASS_SOURCE = String.raw`class Response {
       throw new TypeError('Response with null body status cannot have body');
     if (init?.statusText != null) this._statusText = String(init.statusText);
     this.headers = new Headers(init?.headers);
-    this.body = Request._extractBody(body, this.headers);
+    this._bodyInit = Request._extractBody(body, this.headers);
   }
 
   static error() {
@@ -192,6 +209,8 @@ export const RESPONSE_CLASS_SOURCE = String.raw`class Response {
   get statusText() { return this._statusText ?? ''; }
   get type() { return this._type ?? 'default'; }
   get ok() { return this.status >= 200 && this.status < 300; }
+  get body() { return Request._bodyAsStream(this); }
+  set body(value) { this._bodyInit = value; this._bodyStream = null; }
   get bodyUsed() { return this._bodyUsed === true; }
 
   arrayBuffer() { return Request._read(this, (bytes) => bytes.buffer); }
@@ -199,7 +218,7 @@ export const RESPONSE_CLASS_SOURCE = String.raw`class Response {
   clone() {
     if (this._bodyUsed === true) throw new TypeError('Body has already been used');
     const copy = new Response(null, { status: this.status == 0 ? 200 : this.status, statusText: this._statusText, headers: this.headers });
-    copy.body = this.body;
+    copy._bodyInit = this._bodyInit;
     copy.status = this.status;
     if (this._type != null) copy._type = this._type;
     return copy;
@@ -223,7 +242,7 @@ export const RESPONSE_BYTES_ANCHOR =
 export const RESPONSE_BYTES_INJECT =
   "  // sproutboat: byte bodies go out as their bytes. A Latin-1 string, one character per byte,\n" +
   "  // built in windows (concatenating one long string is quadratic), sent raw by the writer.\n" +
-  "  let body = response.body;\n" +
+  "  let body = response._bodyInit !== undefined ? response._bodyInit : response.body;\n" +
   "  let headersEntries = response.headers._entries;\n" +
   "  if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {\n" +
   "    const view = body instanceof ArrayBuffer ? new Uint8Array(body) : new Uint8Array(body.buffer, body.byteOffset, body.byteLength);\n" +
