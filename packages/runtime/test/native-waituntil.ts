@@ -15,7 +15,11 @@ const handler = `export default {async fetch(request, env, ctx) {
     return new Response("scheduled");
   }
   if (path === "/state") return new Response(String(globalThis.__done));
+  if (path === "/cron") return new Response(String(globalThis.__cron));
   return new Response("ok");
+},
+async scheduled(event, env, ctx) {
+  ctx.waitUntil(new Promise((resolve) => setTimeout(() => { globalThis.__cron = event.cron; resolve(); }, 50)));
 }};`;
 
 function freePort(): number {
@@ -59,7 +63,7 @@ try {
   const port = freePort();
   server = Bun.spawn([binary], {
     cwd: workdir,
-    env: { ...process.env, PORT: String(port) },
+    env: { ...process.env, PORT: String(port), SB_BROKER_TOKEN: "native-test-token" },
     stdout: "ignore",
     stderr: "inherit",
   });
@@ -82,7 +86,18 @@ try {
   assert.equal(await (await fetch(`http://127.0.0.1:${port}/state`)).text(), "pending");
   await Bun.sleep(700);
   assert.equal(await (await fetch(`http://127.0.0.1:${port}/state`)).text(), "done");
-  console.log(`Native waitUntil runs after the response (${Math.round(elapsed)} ms) and completes`);
+  // A trigger answers 204 with no body. new Response("", { status: 204 }) throws under the
+  // Fetch-spec Response, and the prelude used it: the first cron or alarm took the server down.
+  const cron = await fetch(`http://127.0.0.1:${port}/`, {
+    method: "POST",
+    headers: { "x-sb-trigger": "scheduled", "x-sb-token": "native-test-token", "content-type": "application/json" },
+    body: JSON.stringify({ cron: "*/5 * * * *", scheduledTime: Date.now() }),
+  });
+  assert.equal(cron.status, 204);
+  assert.equal(await cron.text(), "");
+  assert.equal(await (await fetch(`http://127.0.0.1:${port}/cron`)).text(), "*/5 * * * *");
+  assert.equal(server.exitCode, null, "the server exited after a scheduled trigger");
+  console.log(`Native waitUntil runs after the response (${Math.round(elapsed)} ms) and completes; scheduled() answers 204`);
 } finally {
   if (server) {
     server.kill(9);
