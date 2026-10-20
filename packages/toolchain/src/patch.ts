@@ -1938,6 +1938,55 @@ export async function patchJsonCycles(root: string): Promise<void> {
   await writeFile(file, src);
 }
 
+// JSON.parse ignored its reviver (W2 conformance: json/reviver). The parser keeps its body
+// under a new name, and __JSON_parse walks the result as the spec's InternalizeJSONProperty
+// does: children first, a reviver answer of undefined deletes the property.
+const JSON_REVIVER_MARKER = "sproutboat: JSON.parse reviver";
+// Porffor declares (_: bytestring); patchUnicode widens it to any later, on the renamed parser.
+const JSON_PARSE_ANCHOR = /export const __JSON_parse = \(_: (bytestring|any)\) => \{\n/;
+const JSON_REVIVER_SOURCE = `
+// ${JSON_REVIVER_MARKER}
+export const __Porffor_json_revive = (holder: any, key: any, reviver: any): any => {
+  const value: any = holder[key];
+  if (Porffor.type(value) == Porffor.TYPES.array) {
+    const len: i32 = value.length;
+    for (let i: i32 = 0; i < len; i++) {
+      const next: any = __Porffor_json_revive(value, ecma262.ToString(i), reviver);
+      if (next === undefined) delete value[i];
+      else value[i] = next;
+    }
+  } else if (Porffor.type(value) == Porffor.TYPES.object) {
+    for (const k: any in value) {
+      const next: any = __Porffor_json_revive(value, k, reviver);
+      if (next === undefined) delete value[k];
+      else value[k] = next;
+    }
+  }
+  return reviver.call(holder, key, value);
+};
+
+export const __JSON_parse = (text: any, reviver: any) => {
+  const value: any = __Porffor_json_parseText(text);
+  if (Porffor.type(reviver) != Porffor.TYPES.function) return value;
+  const root: object = {};
+  root[''] = value;
+  return __Porffor_json_revive(root, '', reviver);
+};
+`;
+
+/** JSON.parse applies its reviver, as InternalizeJSONProperty does. */
+export async function patchJsonReviver(root: string): Promise<void> {
+  const file = resolve(root, "compiler/builtins/json.ts");
+  const src = await readFile(file, "utf8");
+  if (src.includes(JSON_REVIVER_MARKER)) return;
+  if ((src.match(new RegExp(JSON_PARSE_ANCHOR, "g")) ?? []).length !== 1)
+    throw new Error(`could not patch Porffor's JSON.parse reviver: anchor not found in ${file}`);
+  await writeFile(
+    file,
+    src.replace(JSON_PARSE_ANCHOR, (_line, type) => `export const __Porffor_json_parseText = (_: ${type}) => {\n`).trimEnd() + "\n" + JSON_REVIVER_SOURCE,
+  );
+}
+
 // Object.prototype.toString gave "[object Object]" for typed arrays: their lazily
 // built prototypes have no toStringTag, and the fallback list of builtin tags left
 // them out (W2 conformance; V8 gives "[object Uint8Array]").
@@ -2251,6 +2300,7 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchPrivateFieldsHidden(root);
   await patchRepeatDoubling(root);
   await patchJsonCycles(root);
+  await patchJsonReviver(root);
   await patchTypedArrayTag(root);
   await patchConsoleColors(root);
   await patchCaseMapping(root);

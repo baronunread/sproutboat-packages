@@ -110,4 +110,6 @@ test("native Unicode JSON and UTF-8 encoding preserve code points and buffer bou
     }
     await rm(work, { recursive: true, force: true });
   }
-}, 60_000);
+  // An optimised native build of the whole prelude: about 17 s warm, but 50 to 110 s cold
+  // (a new patch fingerprint or prelude recompiles everything), which 60 s did not cover.
+}, 180_000);

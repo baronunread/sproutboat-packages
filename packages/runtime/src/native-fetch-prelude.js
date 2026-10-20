@@ -2305,6 +2305,327 @@
 /* oxlint-enable */
 // END WEB STREAMS
 
+// COMPRESSION STREAMS: CompressionStream and DecompressionStream ("gzip", "deflate",
+// "deflate-raw"), in JavaScript: the native runtime links no zlib. Compression is LZ77 with
+// fixed Huffman codes, one block per written chunk, so output follows input as it arrives;
+// it is smaller than the input for text, not as small as zlib's. Decompression inflates
+// stored, fixed and dynamic blocks once the input ends, and checks the CRC-32 or Adler-32.
+// A malformed or truncated stream errors with a TypeError, as in workerd.
+
+const __sbCrcTable = (() => {
+  const table = new Int32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c;
+  }
+  return table;
+})();
+function __sbCrc32(crc, bytes) {
+  let c = ~crc;
+  for (let i = 0; i < bytes.length; i++) c = __sbCrcTable[(c ^ bytes[i]) & 255] ^ (c >>> 8);
+  return ~c >>> 0;
+}
+function __sbAdler32(adler, bytes) {
+  let a = adler & 0xffff, b = adler >>> 16;
+  for (let i = 0; i < bytes.length; ) {
+    const end = Math.min(i + 3800, bytes.length);
+    for (; i < end; i++) { a += bytes[i]; b += a; }
+    a %= 65521; b %= 65521;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
+// Length and distance codes (RFC 1951 3.2.5).
+const __sbLenBase = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+const __sbLenExtra = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+const __sbDistBase = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+const __sbDistExtra = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+
+class __sbBitWriter {
+  constructor() { this.out = new Uint8Array(1024); this.length = 0; this.bits = 0; this.count = 0; }
+  byte(b) {
+    if (this.length == this.out.length) { const grown = new Uint8Array(this.out.length * 2); grown.set(this.out); this.out = grown; }
+    this.out[this.length++] = b;
+  }
+  // Values go out least significant bit first.
+  write(value, n) {
+    this.bits |= value << this.count;
+    this.count += n;
+    while (this.count >= 8) { this.byte(this.bits & 255); this.bits >>>= 8; this.count -= 8; }
+  }
+  // Huffman codes go out most significant bit first.
+  code(code, n) {
+    let reversed = 0;
+    for (let i = 0; i < n; i++) { reversed = (reversed << 1) | (code & 1); code >>= 1; }
+    this.write(reversed, n);
+  }
+  align() { if (this.count > 0) { this.byte(this.bits & 255); this.bits = 0; this.count = 0; } }
+  take() { const out = this.out.slice(0, this.length); this.length = 0; return out; }
+}
+function __sbFixedLiteral(w, v) {
+  if (v < 144) w.code(0x30 + v, 8);
+  else if (v < 256) w.code(0x190 + v - 144, 9);
+  else if (v < 280) w.code(v - 256, 7);
+  else w.code(0xc0 + v - 280, 8);
+}
+// One fixed-Huffman block for data, matching within it (a hash chain of 3-byte prefixes).
+function __sbDeflateBlock(w, data, last) {
+  w.write(last ? 1 : 0, 1);
+  w.write(1, 2);
+  const head = new Int32Array(1 << 15).fill(-1);
+  const prev = new Int32Array(Math.max(data.length, 1));
+  const hash = (i) => ((data[i] << 10) ^ (data[i + 1] << 5) ^ data[i + 2]) & 0x7fff;
+  let i = 0;
+  while (i < data.length) {
+    let bestLen = 0, bestDist = 0;
+    if (i + 2 < data.length) {
+      const h = hash(i);
+      let candidate = head[h], chain = 32;
+      while (candidate >= 0 && i - candidate <= 32768 && chain-- > 0) {
+        let len = 0;
+        const max = Math.min(258, data.length - i);
+        while (len < max && data[candidate + len] == data[i + len]) len++;
+        if (len > bestLen) { bestLen = len; bestDist = i - candidate; if (len == max) break; }
+        candidate = prev[candidate];
+      }
+      prev[i] = head[h];
+      head[h] = i;
+    }
+    if (bestLen >= 3) {
+      let code = 0;
+      while (code < 28 && __sbLenBase[code + 1] <= bestLen) code++;
+      __sbFixedLiteral(w, 257 + code);
+      if (__sbLenExtra[code]) w.write(bestLen - __sbLenBase[code], __sbLenExtra[code]);
+      let dcode = 0;
+      while (dcode < 29 && __sbDistBase[dcode + 1] <= bestDist) dcode++;
+      w.code(dcode, 5);
+      if (__sbDistExtra[dcode]) w.write(bestDist - __sbDistBase[dcode], __sbDistExtra[dcode]);
+      // Index the skipped positions so later matches can start inside this one.
+      for (let k = 1; k < bestLen && i + k + 2 < data.length; k++) { const h = hash(i + k); prev[i + k] = head[h]; head[h] = i + k; }
+      i += bestLen;
+    } else {
+      __sbFixedLiteral(w, data[i]);
+      i++;
+    }
+  }
+  __sbFixedLiteral(w, 256);
+}
+
+class __sbHuffman {
+  // Canonical code from code lengths, decoded bit by bit (RFC 1951 3.2.2).
+  constructor(lengths) {
+    this.counts = new Int32Array(16);
+    this.symbols = new Int32Array(lengths.length);
+    for (let i = 0; i < lengths.length; i++) this.counts[lengths[i]]++;
+    this.counts[0] = 0;
+    const offsets = new Int32Array(16);
+    for (let i = 1; i < 16; i++) offsets[i] = offsets[i - 1] + this.counts[i - 1];
+    for (let i = 0; i < lengths.length; i++) if (lengths[i]) this.symbols[offsets[lengths[i]]++] = i;
+  }
+}
+class __sbBitReader {
+  constructor(data, at) { this.data = data; this.at = at; this.bits = 0; this.count = 0; }
+  need(n) {
+    while (this.count < n) {
+      if (this.at >= this.data.length) throw new TypeError("Decompression failed: unexpected end of data");
+      this.bits |= this.data[this.at++] << this.count;
+      this.count += 8;
+    }
+  }
+  read(n) {
+    if (n == 0) return 0;
+    this.need(n);
+    const v = this.bits & ((1 << n) - 1);
+    this.bits >>>= n;
+    this.count -= n;
+    return v;
+  }
+  decode(h) {
+    let code = 0, first = 0, index = 0;
+    for (let len = 1; len < 16; len++) {
+      code |= this.read(1);
+      const count = h.counts[len];
+      if (code - count < first) return h.symbols[index + (code - first)];
+      index += count;
+      first += count;
+      first <<= 1;
+      code <<= 1;
+    }
+    throw new TypeError("Decompression failed: invalid Huffman code");
+  }
+  // The byte after the last bit read; stored blocks and trailers start on a byte.
+  byteAt() { return this.at - (this.count >> 3); }
+  align() { this.bits = 0; this.count = 0; }
+}
+const __sbFixedLit = (() => {
+  const l = new Uint8Array(288);
+  for (let i = 0; i < 288; i++) l[i] = i < 144 ? 8 : i < 256 ? 9 : i < 280 ? 7 : 8;
+  return new __sbHuffman(l);
+})();
+const __sbFixedDist = new __sbHuffman(new Uint8Array(30).fill(5));
+const __sbClOrder = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+function __sbGrow(out, used, n) {
+  let size = out.length * 2;
+  while (size < used + n) size *= 2;
+  const grown = new Uint8Array(size);
+  grown.set(out.subarray(0, used));
+  return grown;
+}
+// Inflates raw deflate data from at; answers the output and the byte after the last block.
+function __sbInflate(data, at) {
+  const r = new __sbBitReader(data, at);
+  // Not named length: Porffor loses writes to a local of that name (Alpha 18).
+  let out = new Uint8Array(Math.max(1024, data.length * 4));
+  let used = 0;
+  let last = 0;
+  while (!last) {
+    last = r.read(1);
+    const type = r.read(2);
+    if (type == 0) {
+      r.align();
+      const p = r.at;
+      if (p + 4 > data.length) throw new TypeError("Decompression failed: unexpected end of data");
+      const len = data[p] | (data[p + 1] << 8), nlen = data[p + 2] | (data[p + 3] << 8);
+      if ((len ^ 0xffff) != nlen) throw new TypeError("Decompression failed: invalid stored block");
+      if (p + 4 + len > data.length) throw new TypeError("Decompression failed: unexpected end of data");
+      if (used + len > out.length) out = __sbGrow(out, used, len);
+      out.set(data.subarray(p + 4, p + 4 + len), used); used += len;
+      r.at = p + 4 + len;
+      continue;
+    }
+    let lit = __sbFixedLit, dist = __sbFixedDist;
+    if (type == 2) {
+      const hlit = r.read(5) + 257, hdist = r.read(5) + 1, hclen = r.read(4) + 4;
+      const cl = new Uint8Array(19);
+      for (let i = 0; i < hclen; i++) cl[__sbClOrder[i]] = r.read(3);
+      const clh = new __sbHuffman(cl);
+      const lengths = new Uint8Array(hlit + hdist);
+      for (let i = 0; i < hlit + hdist; ) {
+        const sym = r.decode(clh);
+        if (sym < 16) lengths[i++] = sym;
+        else {
+          let repeat = 0, value = 0;
+          if (sym == 16) { if (i == 0) throw new TypeError("Decompression failed: invalid code lengths"); value = lengths[i - 1]; repeat = 3 + r.read(2); }
+          else if (sym == 17) repeat = 3 + r.read(3);
+          else repeat = 11 + r.read(7);
+          if (i + repeat > hlit + hdist) throw new TypeError("Decompression failed: invalid code lengths");
+          while (repeat--) lengths[i++] = value;
+        }
+      }
+      lit = new __sbHuffman(lengths.subarray(0, hlit));
+      dist = new __sbHuffman(lengths.subarray(hlit));
+    } else if (type != 1) throw new TypeError("Decompression failed: invalid block type");
+    for (;;) {
+      const sym = r.decode(lit);
+      if (sym < 256) { if (used + 1 > out.length) out = __sbGrow(out, used, 1); out[used++] = sym; continue; }
+      if (sym == 256) break;
+      const code = sym - 257;
+      if (code >= 29) throw new TypeError("Decompression failed: invalid used code");
+      const len = __sbLenBase[code] + r.read(__sbLenExtra[code]);
+      const dcode = r.decode(dist);
+      if (dcode >= 30) throw new TypeError("Decompression failed: invalid distance code");
+      const d = __sbDistBase[dcode] + r.read(__sbDistExtra[dcode]);
+      if (d > used) throw new TypeError("Decompression failed: distance too far back");
+      if (used + len > out.length) out = __sbGrow(out, used, len);
+      for (let k = 0; k < len; k++) { out[used] = out[used - d]; used++; }
+    }
+  }
+  return { out: out.slice(0, used), end: r.byteAt() };
+}
+
+function __sbFormat(format, what) {
+  const f = String(format);
+  if (f != "gzip" && f != "deflate" && f != "deflate-raw") throw new TypeError("Unsupported " + what + " format: " + f);
+  return f;
+}
+function __sbChunkBytes(chunk) {
+  if (chunk instanceof Uint8Array) return chunk;
+  if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
+  if (ArrayBuffer.isView(chunk)) return new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+  throw new TypeError("The provided value is not of type '(ArrayBuffer or ArrayBufferView)'");
+}
+
+class CompressionStream {
+  constructor(format) {
+    const kind = __sbFormat(format, "compression");
+    const w = new __sbBitWriter();
+    let check = kind == "deflate" ? 1 : 0, size = 0;
+    if (kind == "gzip") for (const b of [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff]) w.byte(b);
+    else if (kind == "deflate") { w.byte(0x78); w.byte(0x9c); }
+    const t = new TransformStream({
+      transform(chunk, controller) {
+        const bytes = __sbChunkBytes(chunk);
+        if (!bytes.length) return;
+        if (kind == "gzip") check = __sbCrc32(check, bytes);
+        else if (kind == "deflate") check = __sbAdler32(check, bytes);
+        size = (size + bytes.length) >>> 0;
+        __sbDeflateBlock(w, bytes, false);
+        const out = w.take();
+        if (out.length) controller.enqueue(out);
+      },
+      flush(controller) {
+        __sbDeflateBlock(w, new Uint8Array(0), true);
+        w.align();
+        if (kind == "gzip") for (const v of [check, size]) for (let k = 0; k < 4; k++) w.byte((v >>> (8 * k)) & 255);
+        else if (kind == "deflate") for (let k = 3; k >= 0; k--) w.byte((check >>> (8 * k)) & 255);
+        controller.enqueue(w.take());
+      },
+    });
+    this._t = t;
+  }
+  get readable() { return this._t.readable; }
+  get writable() { return this._t.writable; }
+}
+
+class DecompressionStream {
+  constructor(format) {
+    const kind = __sbFormat(format, "decompression");
+    const parts = [];
+    let total = 0;
+    const t = new TransformStream({
+      transform(chunk) { const bytes = __sbChunkBytes(chunk); parts.push(bytes.slice()); total += bytes.length; },
+      flush(controller) {
+        const data = new Uint8Array(total);
+        let at = 0;
+        for (const p of parts) { data.set(p, at); at += p.length; }
+        let start = 0;
+        if (kind == "gzip") {
+          if (data.length < 18 || data[0] != 0x1f || data[1] != 0x8b || data[2] != 8) throw new TypeError("Decompression failed: not gzip data");
+          const flags = data[3];
+          start = 10;
+          if (flags & 4) start += 2 + (data[start] | (data[start + 1] << 8));
+          if (flags & 8) { while (start < data.length && data[start]) start++; start++; }
+          if (flags & 16) { while (start < data.length && data[start]) start++; start++; }
+          if (flags & 2) start += 2;
+        } else if (kind == "deflate") {
+          if (data.length < 6 || (data[0] & 15) != 8 || ((data[0] << 8) | data[1]) % 31 != 0 || data[1] & 32) throw new TypeError("Decompression failed: not zlib data");
+          start = 2;
+        }
+        const { out, end } = __sbInflate(data, start);
+        if (kind == "gzip") {
+          if (end + 8 > data.length) throw new TypeError("Decompression failed: unexpected end of data");
+          const crc = (data[end] | (data[end + 1] << 8) | (data[end + 2] << 16) | (data[end + 3] << 24)) >>> 0;
+          const isize = (data[end + 4] | (data[end + 5] << 8) | (data[end + 6] << 16) | (data[end + 7] << 24)) >>> 0;
+          if (crc != __sbCrc32(0, out) || isize != out.length >>> 0) throw new TypeError("Decompression failed: gzip checksum mismatch");
+        } else if (kind == "deflate") {
+          if (end + 4 > data.length) throw new TypeError("Decompression failed: unexpected end of data");
+          const adler = ((data[end] << 24) | (data[end + 1] << 16) | (data[end + 2] << 8) | data[end + 3]) >>> 0;
+          if (adler != __sbAdler32(1, out)) throw new TypeError("Decompression failed: deflate checksum mismatch");
+        }
+        if (out.length) controller.enqueue(out);
+      },
+    });
+    this._t = t;
+  }
+  get readable() { return this._t.readable; }
+  get writable() { return this._t.writable; }
+}
+// Static installs, so app code sees the names when it is compiled apart (see streams-entry.js).
+if (globalThis.CompressionStream == null) globalThis.CompressionStream = CompressionStream;
+if (globalThis.DecompressionStream == null) globalThis.DecompressionStream = DecompressionStream;
+// END COMPRESSION STREAMS
+
 // Porffor exposes native timers lexically. Libraries also access them through
 // globalThis, including noble hashes 2.4's host-task yields.
 if (globalThis.setTimeout == null) globalThis.setTimeout = setTimeout;

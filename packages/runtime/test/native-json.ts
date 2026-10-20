@@ -17,6 +17,11 @@ const CASES = [
   `JSON.stringify({ n: { toJSON() { return 42; } } })`,
   `JSON.stringify({ nested: { at: new Date(0), list: [new Date(0)] } })`,
   `JSON.stringify({ plain: { x: 1 } })`,
+  // The reviver: children first, undefined deletes, `this` is the holder, arrays by index.
+  `JSON.stringify(JSON.parse('{"a":1,"b":{"c":2}}', (k, v) => (typeof v === "number" ? v * 10 : v)))`,
+  `JSON.stringify(JSON.parse('{"a":1,"drop":2,"l":[1,2,3]}', (k, v) => (k === "drop" ? undefined : v)))`,
+  `JSON.stringify(JSON.parse('[5,6]', function (k, v) { return k === "" ? v : k + ":" + v + ":" + Array.isArray(this); }))`,
+  `JSON.stringify(JSON.parse('{"x":1}', (k, v) => (k === "" ? "root:" + typeof v : v)))`,
 ];
 const handler = `export default {fetch() {
   const U = URL;

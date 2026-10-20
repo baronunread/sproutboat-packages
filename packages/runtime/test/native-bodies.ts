@@ -18,6 +18,22 @@ const handler = `export default {async fetch(request) {
   if (path === "/stream-strings") return new Response(new ReadableStream({ start(c) { c.enqueue("text"); c.close(); } }));
   if (path === "/form") { const f = new FormData(); f.append("a", "1"); f.append("f", new Blob(["xy"]), "n.txt"); return new Response(f); }
   const cases = [
+    // CompressionStream and DecompressionStream: our output round-trips, and zlib's decodes.
+    async () => { const out = []; for (const f of ["gzip", "deflate", "deflate-raw"]) out.push(await new Response(new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode("hello ".repeat(200))); c.close(); } }).pipeThrough(new CompressionStream(f)).pipeThrough(new DecompressionStream(f))).text() === "hello ".repeat(200)); return out.join(","); },
+    async () => new Response(new ReadableStream({ start(c) { c.enqueue(Uint8Array.from(atob("H4sIAAAAAAACEysuKMovLUnKTyxRKB5uTACdCbks3AAAAA=="), (ch) => ch.charCodeAt(0))); c.close(); } }).pipeThrough(new DecompressionStream("gzip"))).text(),
+    async () => new Response(new ReadableStream({ start(c) { c.enqueue(Uint8Array.from(atob("eJxLqcxLzM1MVsgoTUvLTcxTSBnlj4ZHJv3SQ2peCgCxCfLI"), (ch) => ch.charCodeAt(0))); c.close(); } }).pipeThrough(new DecompressionStream("deflate"))).text(),
+    async () => { const s = new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode("hello hello")); c.close(); } }).pipeThrough(new CompressionStream("gzip")).pipeThrough(new DecompressionStream("gzip")).pipeThrough(new TextDecoderStream()); let t = ""; for (const r = s.getReader(); ;) { const { value, done } = await r.read(); if (done) break; t += value; } return t; },
+    // workerd knows gzip, deflate and deflate-raw; Bun (the reference) also brotli.
+    () => { try { new CompressionStream("brotli"); return "workerd:no throw"; } catch (e) { return "workerd:" + e.name; } },
+    // A ReadableStream body is read to its end by text(), arrayBuffer(), json() and blob().
+    async () => new Response(new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode("hé")); c.enqueue(new Uint8Array([33])); c.close(); } })).text(),
+    async () => Array.from(new Uint8Array(await new Response(new ReadableStream({ start(c) { c.enqueue(new Uint8Array([1, 2])); c.close(); } })).arrayBuffer())).join(","),
+    async () => JSON.stringify(await new Response(new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode('{"a":[1]}')); c.close(); } })).json()),
+    async () => (await new Response(new ReadableStream({ start(c) { c.enqueue(new Uint8Array([120])); c.close(); } })).blob()).size,
+    async () => new Request("http://a.test", { method: "POST", body: new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode("req")); c.close(); } }), duplex: "half" }).text(),
+    // Chunks must be bytes: workerd throws a TypeError, where Bun (the reference below) reads a
+    // string chunk as text. "workerd:" marks the answer to expect from workerd instead.
+    async () => { try { await new Response(new ReadableStream({ start(c) { c.enqueue("s"); c.close(); } })).text(); return "workerd:no throw"; } catch (e) { return "workerd:" + e.name; } },
     () => new Request("http://a.test/a/../b?x=1#f").url,
     async () => { const r = new Request("http://a.test", { method: "POST", body: "x" }); await r.text(); try { await r.text(); return "no throw"; } catch (e) { return r.bodyUsed + ":" + e.name; } },
     () => new Request("http://a.test").redirect,
@@ -125,7 +141,7 @@ try {
   for (const run of reference) {
     try { want.push(String(await run())); } catch (e) { want.push("THROWS " + (e instanceof Error ? e.name : String(e))); }
   }
-  assert.deepEqual(got, want);
+  assert.deepEqual(got, want.map((w) => (w.startsWith("workerd:") ? "workerd:TypeError" : w)));
   console.log(`Native bodies are sent as bytes and ${want.length} Fetch class cases match Bun`);
 } finally {
   if (server) {
