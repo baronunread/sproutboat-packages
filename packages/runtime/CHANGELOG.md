@@ -1,5 +1,27 @@
 # @sproutboat/runtime
 
+## 0.18.0
+
+### Minor Changes
+
+- 145e3dc: `HTMLRewriter`, matching Cloudflare's API and lol-html's output.
+  
+  - **Handlers:** `on(selector, { element, text, comments })` and `onDocument({ doctype, text, comments, end })`.
+  - **Element methods:** attributes, `tagName`, `before`/`after`/`prepend`/`append`/`replace`/`setInnerContent` with `{ html }`, `remove`, `removeAndKeepContent` and `onEndTag`.
+  - **Selectors:** type, `*`, `#id`, `.class`, the attribute operators, descendant and child combinators, and lists.
+  - **Async:** handlers may be async.
+  
+  It reads the whole body before rewriting rather than streaming it. 37 cases are checked against Bun's lol-html-based HTMLRewriter, including where lol-html keeps attributes byte for byte and does not imply end tags.
+- 2541458: More of the Web platform, from sproutd's W2 conformance suite against workerd:
+  
+  - `CompressionStream` and `DecompressionStream` for `gzip`, `deflate` and `deflate-raw`, in JavaScript, because the native runtime links no zlib. Output decompresses with zlib, and zlib's output (stored, fixed and dynamic blocks) decompresses here. A corrupt or truncated input errors with a `TypeError`.
+  - A `Response` or `Request` whose body is a `ReadableStream` is read to the end by `text()`, `json()`, `arrayBuffer()` and `blob()`. Before, these returned `"[object ReadableStream]"`. Chunks must be bytes, as in workerd.
+  - `JSON.parse` applies its reviver: children first, `undefined` deletes the property, and `this` is the holder.
+
+### Patch Changes
+
+- 116ee47: sproutd builds the runtime again. In split builds Porffor cannot type a prelude function's parameters, and the compression checksums' `let c = ~crc` compiled to C that assigned a boxed value to a number. The checksums now start from the parameter itself.
+
 ## 0.17.1
 
 ### Patch Changes
