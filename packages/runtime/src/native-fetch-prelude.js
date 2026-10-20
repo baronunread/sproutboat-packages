@@ -5080,7 +5080,7 @@ async function __sb204WithDrain(res, tasks) {
     __sbLogUncaught("scheduled/alarm", error);
   }
   await __sbDrainWaitUntil(tasks);
-  return new Response("", { status: 204 });
+  return new Response(null, { status: 204 });
 }
 
 async function __sbQueueWithDrain(result, tasks) {
@@ -5179,10 +5179,10 @@ globalThis.__sbEntry = function (handlers, request) {
     } catch (error) {
       // #179 — same rule as fetch: don't let a throw here crash the process.
       __sbLogUncaught("scheduled", error);
-      return new Response("", { status: 204 });
+      return new Response(null, { status: 204 });
     }
     if (__sbTasks.length || (__sres && __sbIsFn(__sres.then))) return __sb204WithDrain(__sres, __sbTasks);
-    return new Response("", { status: 204 });
+    return new Response(null, { status: 204 });
   }
 
   if (trigger === "queue") {
@@ -5214,12 +5214,12 @@ globalThis.__sbEntry = function (handlers, request) {
     } catch (error) {
       // #179 — same rule as fetch: don't let a throw here crash the process.
       __sbLogUncaught("alarm", error);
-      return new Response("", { status: 204 });
+      return new Response(null, { status: 204 });
     }
     // Was fire-and-forget before: an async `alarm()` and any `state.waitUntil()`
     // it queued were both dropped the moment 204 went out. Await both.
     if (inst.__sbTasks.length || (__ares && __sbIsFn(__ares.then))) return __sb204WithDrain(__ares, inst.__sbTasks);
-    return new Response("", { status: 204 });
+    return new Response(null, { status: 204 });
   }
 
   return new Response("unknown trigger", { status: 400 });
