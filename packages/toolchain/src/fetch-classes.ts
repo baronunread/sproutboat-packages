@@ -74,6 +74,40 @@ export const REQUEST_CLASS_SOURCE = String.raw`class Request {
     return (Porffor.type(body) | 0b10000000) == Porffor.TYPES.bytestring ? body : String(body);
   }
 
+  // A ReadableStream body is read to its end, and its chunks must be bytes, as in Fetch and
+  // workerd. Readers of such a body answer with a promise; other bodies keep answering at
+  // once, since the prelude reads them synchronously. The prelude defines ReadableStream on
+  // globalThis after this file is compiled.
+  static _isStream(body) {
+    const Stream = globalThis.ReadableStream;
+    return Stream != null && body instanceof Stream;
+  }
+  static async _streamBytes(stream) {
+    const reader = stream.getReader();
+    const chunks = [];
+    let size = 0;
+    for (;;) {
+      const step = await reader.read();
+      if (step.done) break;
+      const value = step.value;
+      if (!(value instanceof Uint8Array)) throw new TypeError('This ReadableStream did not return bytes.');
+      chunks.push(value);
+      size += value.length;
+    }
+    const out = new Uint8Array(size);
+    let at = 0;
+    for (const chunk of chunks) {
+      out.set(chunk, at);
+      at += chunk.length;
+    }
+    return out;
+  }
+  static _read(message, finish) {
+    const body = Request._consume(message);
+    if (Request._isStream(body)) return Request._streamBytes(body).then(finish);
+    return finish(Request._bodyBytes(body));
+  }
+
   constructor(input, init = undefined) {
     let url = input;
     let method = 'GET';
@@ -115,14 +149,22 @@ export const REQUEST_CLASS_SOURCE = String.raw`class Request {
   get redirect() { return this._redirect ?? 'follow'; }
   get bodyUsed() { return this._bodyUsed === true; }
 
-  arrayBuffer() { return Request._bodyBytes(Request._consume(this)).buffer; }
-  blob() { return new Blob([Request._bodyBytes(Request._consume(this))]); }
+  arrayBuffer() { return Request._read(this, (bytes) => bytes.buffer); }
+  blob() { return Request._read(this, (bytes) => new Blob([bytes])); }
   clone() {
     if (this._bodyUsed === true) throw new TypeError('Body has already been used');
     return new Request(this);
   }
-  json() { return JSON.parse(Request._bodyText(Request._consume(this))); }
-  text() { return Request._bodyText(Request._consume(this)); }
+  json() {
+    const body = Request._consume(this);
+    if (Request._isStream(body)) return Request._streamBytes(body).then((bytes) => JSON.parse(new TextDecoder().decode(bytes)));
+    return JSON.parse(Request._bodyText(body));
+  }
+  text() {
+    const body = Request._consume(this);
+    if (Request._isStream(body)) return Request._streamBytes(body).then((bytes) => new TextDecoder().decode(bytes));
+    return Request._bodyText(body);
+  }
 }
 
 `;
@@ -152,8 +194,8 @@ export const RESPONSE_CLASS_SOURCE = String.raw`class Response {
   get ok() { return this.status >= 200 && this.status < 300; }
   get bodyUsed() { return this._bodyUsed === true; }
 
-  arrayBuffer() { return Request._bodyBytes(Request._consume(this)).buffer; }
-  blob() { return new Blob([Request._bodyBytes(Request._consume(this))]); }
+  arrayBuffer() { return Request._read(this, (bytes) => bytes.buffer); }
+  blob() { return Request._read(this, (bytes) => new Blob([bytes])); }
   clone() {
     if (this._bodyUsed === true) throw new TypeError('Body has already been used');
     const copy = new Response(null, { status: this.status == 0 ? 200 : this.status, statusText: this._statusText, headers: this.headers });
@@ -162,8 +204,16 @@ export const RESPONSE_CLASS_SOURCE = String.raw`class Response {
     if (this._type != null) copy._type = this._type;
     return copy;
   }
-  json() { return JSON.parse(Request._bodyText(Request._consume(this))); }
-  text() { return Request._bodyText(Request._consume(this)); }
+  json() {
+    const body = Request._consume(this);
+    if (Request._isStream(body)) return Request._streamBytes(body).then((bytes) => JSON.parse(new TextDecoder().decode(bytes)));
+    return JSON.parse(Request._bodyText(body));
+  }
+  text() {
+    const body = Request._consume(this);
+    if (Request._isStream(body)) return Request._streamBytes(body).then((bytes) => new TextDecoder().decode(bytes));
+    return Request._bodyText(body);
+  }
 }
 `;
 
