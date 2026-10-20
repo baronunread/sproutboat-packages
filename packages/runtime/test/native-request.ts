@@ -20,7 +20,7 @@ const CASES = [
 ];
 const handler = `export default {async fetch(request) {
   // The incoming request: its body is a ReadableStream, and text() still reads it.
-  if (request.method === "POST") return new Response((request.body instanceof ReadableStream) + ":" + (await request.text()));
+  if (request.method === "POST") { const viaStream = await new Response(request.body).text(); return new Response((request.body instanceof ReadableStream) + ":" + viaStream); }
   const cases = [
 ${CASES.map((c) => `    () => (${c}),`).join("\n")}
   ];

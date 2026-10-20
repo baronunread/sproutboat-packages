@@ -4045,7 +4045,14 @@ function __sbFromUtf8(bytes) {
 // #232 — a fetch() request body for the wire: text as-is, and an ArrayBuffer or
 // any view as its bytes (one char per byte) flagged bodyBinary, instead of
 // String(view), which sent "0,1,2,...".
+// A body stream the runtime made over a value (Response/Request body): that value. Bindings
+// that take a body at once (R2 and KV put, outbound fetch) read it without draining the
+// stream, so put(key, request.body) works as in Workers. Other values pass through.
+function __sbUnwrapBody(value) {
+  return value != null && value._sbBody !== undefined ? value._sbBody : value;
+}
 function __sbRequestBody(body) {
+  body = __sbUnwrapBody(body);
   if (body == null) return { body: null };
   if (!__sbIsStr(body) && body.byteLength !== undefined) {
     const bytes = body.buffer !== undefined ? new Uint8Array(body.buffer, body.byteOffset, body.byteLength) : body;
@@ -4966,6 +4973,7 @@ globalThis.__sbInstallBindings = function (target, bindings) {
         return type === "json" ? JSON.parse(text) : text;
       },
       put(key, value, options) {
+        value = __sbUnwrapBody(value);
         const msg = { ns, key: String(key), value: "" };
         if (value != null && !__sbIsStr(value) && value.byteLength !== undefined) {
           // ArrayBuffer or any ArrayBufferView: its bytes, not String(view) ("0,1,2,...").
@@ -5011,12 +5019,15 @@ globalThis.__sbInstallBindings = function (target, bindings) {
     const name = bindings.r2[i];
     target[name] = {
       put(key, value, options) {
+        value = __sbUnwrapBody(value);
         const o = options || {};
         // #56 — the body goes out of band where the transport allows it.
+        // Bytes go in as bytes: a byte view or the bytes of a body stream (request.body).
+        const raw = value == null ? "" : !__sbIsStr(value) && value.byteLength !== undefined ? __sbToBytes(value.buffer !== undefined ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength) : value) : String(value);
         return __sbR2Put(
           name,
           String(key),
-          value == null ? "" : String(value),
+          raw,
           o.httpMetadata || {},
           o.customMetadata || {},
         ).object;
@@ -5802,6 +5813,8 @@ async function __sbQueueWithDrain(result, tasks) {
 function __sbDecodeIngress(request) {
   const raw = __sbRawBody(request);
   if (raw == null) return;
+  // Raw bytes, one character each: arrayBuffer(), blob() and body read them as bytes.
+  request._bodyLatin1 = true;
   let decoded = null;
   request.text = function () {
     if (decoded === null) decoded = __sbFromUtf8(raw);

@@ -17,7 +17,14 @@ const text = "/café/日本/😀/x";
 const handler = `
 const URL = "shadowed";
 export default {
-  async fetch() {
+  async fetch(request) {
+    // put(key, request.body) and fetch(url, { body: request.body }) are the Workers idiom:
+    // body is a ReadableStream, and the bindings take the value it was made from.
+    if (request.method === "POST") {
+      env.UPLOADS.put("upload", request.body);
+      await env.KV.put("upload", request.body);
+      return Response.json({ r2: env.UPLOADS.get("upload").text(), kv: await env.KV.get("upload") });
+    }
     await env.KV.put("k", ${JSON.stringify(text)});
     const kv = await env.KV.get("k");
     await env.DB.prepare("CREATE TABLE t (v TEXT)").run();
@@ -38,7 +45,7 @@ function freePort(): number {
 }
 
 const workdir = await mkdtemp(join(tmpdir(), "sb-native-utf8-"));
-const bindings = { ...EMPTY_BINDINGS, kv: ["KV"], d1: ["DB"] };
+const bindings = { ...EMPTY_BINDINGS, kv: ["KV"], d1: ["DB"], r2: ["UPLOADS"] };
 const broker = createBroker({
   db: ":memory:",
   token: "native-utf8",
@@ -113,7 +120,9 @@ try {
   );
   assert.match(body.error, /tabellà/);
   assert.equal(body.url, "shadowed");
-  console.log("Non-ASCII KV, D1 and error text round-trip through the broker; a handler-level URL stays scoped");
+  const stored = await (await fetch(`http://127.0.0.1:${port}/`, { method: "POST", body: "uploaded é" })).json();
+  assert.deepEqual(stored, { r2: "uploaded é", kv: "uploaded é" }, "put(key, request.body) stores the request body");
+  console.log("Non-ASCII KV, D1 and error text round-trip through the broker; a handler-level URL stays scoped; put(key, request.body) stores the body");
 } finally {
   if (server) {
     server.kill(9);

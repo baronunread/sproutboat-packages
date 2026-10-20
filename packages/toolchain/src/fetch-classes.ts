@@ -77,8 +77,11 @@ export const REQUEST_CLASS_SOURCE = String.raw`class Request {
     if (init == null) return null;
     if (Request._isStream(init)) return init;
     if (message._bodyStream == null) {
-      const bytes = Request._bodyBytes(init);
+      const bytes = Request._messageBytes(message, init);
       message._bodyStream = new globalThis.ReadableStream({ start(c) { if (bytes.length) c.enqueue(bytes); c.close(); } });
+      // The value the stream was made from, for the bindings that take a body at once
+      // (R2 and KV put, outbound fetch): put(key, request.body) is the Workers idiom.
+      message._bodyStream._sbBody = message._bodyLatin1 === true ? bytes : init;
     }
     return message._bodyStream;
   }
@@ -120,7 +123,17 @@ export const REQUEST_CLASS_SOURCE = String.raw`class Request {
   static _read(message, finish) {
     const body = Request._consume(message);
     if (Request._isStream(body)) return Request._streamBytes(body).then(finish);
-    return finish(Request._bodyBytes(body));
+    return finish(Request._messageBytes(message, body));
+  }
+  // A body the native ingress delivered is its raw bytes, one character each
+  // (_bodyLatin1): those bytes, not the string UTF-8 encoded again.
+  static _messageBytes(message, body) {
+    if (message._bodyLatin1 === true && typeof body == 'string') {
+      const out = new Uint8Array(body.length);
+      for (let i = 0; i < body.length; i++) out[i] = body.charCodeAt(i) & 255;
+      return out;
+    }
+    return Request._bodyBytes(body);
   }
 
   constructor(input, init = undefined) {
