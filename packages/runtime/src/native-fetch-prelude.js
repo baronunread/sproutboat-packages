@@ -5218,24 +5218,19 @@ globalThis.__sbInstallBindings = function (target, bindings) {
 
   // #48 — worker-to-worker. Same wire shape as outbound fetch, but the broker
   // resolves the target itself and forwards it internally, so this is not
-  // egress and is not subject to the private-address block. Always a promise, as
-  // in Workers; on an async host the caller keeps serving while the call runs,
-  // which is also what lets a deployment call itself without deadlocking.
+  // egress and is not subject to the private-address block. From compatibility date
+  // 2026-10-22 a promise, as in Workers: on an async host the caller keeps serving
+  // while the call runs, which is also what lets a deployment call itself without
+  // deadlocking. Before it, the Response comes back at once, as it always did, so a
+  // handler that uses it without awaiting keeps working.
   for (let i = 0; i < (bindings.services || []).length; i++) {
     const binding = bindings.services[i].binding;
     const fetcher = {
-      async fetch(input, init) {
+      fetch(input, init) {
+        if (globalThis.__sbCompat >= "2026-10-22") return __sbServiceFetch(binding, input, init);
         const parts = __sbFetchParts(input, init);
-        if (parts.signal) parts.signal.throwIfAborted();
-        // A stream body is read to the end first: the wire carries a whole body.
-        let body = __sbUnwrapBody(parts.body);
-        if (body instanceof ReadableStream) body = await __sbCollectBody(body);
-        const msg = { binding, url: parts.url, method: parts.method, headers: parts.headers, ...__sbRequestBody(body) };
-        const response = await __sbFetchFollowing("service.fetch", msg, "sproutboat service " + binding, parts.redirect, parts.signal);
-        // The callee threw: as in workerd, its error is thrown here.
-        const uncaught = response.headers.get("x-sb-uncaught");
-        if (uncaught != null) throw __sbRemoteError(uncaught);
-        return response;
+        const msg = { binding, url: parts.url, method: parts.method, headers: parts.headers, ...__sbRequestBody(parts.body) };
+        return __sbUpstreamResponse(globalThis.__sbFetchUpstream("service.fetch", msg));
       },
     };
     // Any other name is an RPC method of the callee's WorkerEntrypoint (see __sbRpcCall).
@@ -5248,8 +5243,23 @@ globalThis.__sbInstallBindings = function (target, bindings) {
       },
     });
   }
-
 };
+
+// A service-binding fetch from compatibility date 2026-10-22: a promise, off the event
+// loop on an async host, following redirects, and throwing the callee's error.
+async function __sbServiceFetch(binding, input, init) {
+  const parts = __sbFetchParts(input, init);
+  if (parts.signal) parts.signal.throwIfAborted();
+  // A stream body is read to the end first: the wire carries a whole body.
+  let body = __sbUnwrapBody(parts.body);
+  if (body instanceof ReadableStream) body = await __sbCollectBody(body);
+  const msg = { binding, url: parts.url, method: parts.method, headers: parts.headers, ...__sbRequestBody(body) };
+  const response = await __sbFetchFollowing("service.fetch", msg, "sproutboat service " + binding, parts.redirect, parts.signal);
+  // The callee threw: as in workerd, its error is thrown here.
+  const uncaught = response.headers.get("x-sb-uncaught");
+  if (uncaught != null) throw __sbRemoteError(uncaught);
+  return response;
+}
 
 // The error a service-binding callee threw, from its x-sb-uncaught marker: the same
 // standard class where there is one, else an Error with the original name.
@@ -5381,7 +5391,7 @@ async function __sbRpcCall(binding, method, args) {
     ],
     body,
   };
-  const response = await __sbUpstream("service.fetch", msg, label, null);
+  const response = await __sbUpstream("service.fetch", msg, label, null, true);
   const uncaught = response.headers.get("x-sb-uncaught");
   if (uncaught != null) throw __sbRemoteError(uncaught);
   if (response.headers.get("x-sb-rpc-result") !== "1") {
@@ -5462,8 +5472,8 @@ function __sbUpstreamResponse(r) {
   return response;
 }
 
-// A streamed upstream response (from compatibility date 2026-10-21, where body is a
-// stream anyway): the call resolves as soon as the head arrives, and the body is a
+// A streamed upstream response (from compatibility date 2026-10-22, with the other
+// asynchronous fetch() behaviour; body is a stream from 2026-10-21 anyway): the call resolves as soon as the head arrives, and the body is a
 // ReadableStream fed chunk by chunk as the broker passes them on. Each frame fires the
 // same callback, so it is an interval that the last frame clears. A reply that comes
 // whole (a broker from before streaming, or sproutd's embedded transport) is handled
@@ -5587,10 +5597,15 @@ function __sbFollowHop(op, msg, label, mode, signal, hops) {
 // callback alive until then. An aborted `signal` rejects with its reason and cancels
 // the exchange, which closes its broker connection: the broker stops the upstream
 // request, and the edge in turn stops the callee's.
-function __sbUpstream(op, msg, label, signal) {
+// Promises from compatibility date 2026-10-22. Before it, a transport that always
+// answered at once (the broker's) still does, so handlers that use fetch()'s result
+// without awaiting keep working; sproutd's answered with promises at any date
+// (__sbAsyncAtAnyDate). `always` is for RPC, which has no older behaviour to keep.
+function __sbUpstream(op, msg, label, signal, always) {
   if (signal) signal.throwIfAborted();
-  if (!__sbHttpAsyncEnabled()) return __sbUpstreamResponse(globalThis.__sbFetchUpstream(op, msg));
-  if (globalThis.__sbCompat >= "2026-10-21") return __sbUpstreamStreamed(op, msg, label, signal);
+  const promised = always || globalThis.__sbCompat >= "2026-10-22" || __sbAsyncAtAnyDate();
+  if (!__sbHttpAsyncEnabled() || !promised) return __sbUpstreamResponse(globalThis.__sbFetchUpstream(op, msg));
+  if (globalThis.__sbCompat >= "2026-10-22") return __sbUpstreamStreamed(op, msg, label, signal);
   return new Promise((resolve, reject) => {
     let onAbort = null;
     const settled = () => {
@@ -6164,7 +6179,8 @@ function __sbBindingCallIngress(request) {
   const vouched = !!want && headers.get("x-sb-binding-call") === "1" && __sbEqCt(headers.get("x-sb-edge-token") || "", want);
   if (vouched) {
     const url = headers.get("x-sb-url");
-    if (url && URL.canParse(url)) request.url = url;
+    // The callee sees its caller's URL from compatibility date 2026-10-22, as in workerd.
+    if (url && URL.canParse(url) && globalThis.__sbCompat >= "2026-10-22") request.url = url;
     headers.delete("x-sb-remote-addr");
   }
   for (const name of ["x-sb-binding-call", "x-sb-url", "x-sb-edge-token"]) {

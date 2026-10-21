@@ -2086,6 +2086,11 @@ function __sbHttpAsyncResult(asyncId) {
 // placeholder timer cleared, the reply is dropped when it arrives.
 function __sbCancelAsync() {}
 
+// sproutd ran fetch() off its loop, as a promise, at every compatibility date (B18).
+function __sbAsyncAtAnyDate() {
+  return true;
+}
+
 // Whether the host runs async requests (sb_async_enable was called).
 function __sbHttpAsyncEnabled() {
   let res = false;

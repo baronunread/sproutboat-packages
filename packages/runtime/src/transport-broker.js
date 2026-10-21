@@ -895,6 +895,11 @@ function __sbCancelAsync(asyncId) {
   `;
 }
 
+// Before compatibility date 2026-10-22, fetch() through the broker answered at once.
+function __sbAsyncAtAnyDate() {
+  return false;
+}
+
 // Whether the host runs exchanges off its loop (it installed a waker).
 function __sbHttpAsyncEnabled() {
   let res = false;
