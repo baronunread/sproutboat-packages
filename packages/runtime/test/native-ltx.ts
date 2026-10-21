@@ -238,6 +238,25 @@ try {
   const db = new Database(restored);
   assert.equal(db.query("PRAGMA integrity_check").get()?.integrity_check, "ok");
   db.close();
+  const cleanPosition = await readFile(root + "/position", "utf8");
+  assert(cleanPosition.split("\n")[2].startsWith("C "));
+  const finishedBefore = await readdir(join(root, epoch));
+  for (let n = 0; n < 5; n++) {
+    await run(path, "SELECT 1;\n");
+    assert.equal(await readFile(root + "/position", "utf8"), cleanPosition, "idle restart must not rewrite position");
+    assert.deepEqual(await readdir(join(root, epoch)), finishedBefore, "idle restart must not rewrite a base");
+    assert.equal((await readdir(root)).filter((n) => n.startsWith("epoch-")).length, 1);
+  }
+  // Size alone is not enough: an offline committed change must invalidate a clean marker.
+  const offline = new Database(path);
+  offline.exec("UPDATE t SET value='changed-offline' WHERE id=1");
+  offline.close();
+  await run(path, "SELECT 1;\n");
+  const offlineEpoch = (await readFile(root + "/position", "utf8")).split("\n")[1];
+  assert.notEqual(offlineEpoch, epoch);
+  const offlineRestore = join(work, "offline.sqlite");
+  await restore(join(root, offlineEpoch), offlineRestore);
+  assert.deepEqual(await readFile(offlineRestore), await readFile(path));
   const bounded = join(work, "bounded.sqlite");
   const boundedReplies = await run(
     bounded,
@@ -290,6 +309,8 @@ try {
     "position-published",
     "before-checkpoint",
     "after-checkpoint",
+    "checkpoint-record-fsynced",
+    "checkpoint-record-published",
   ];
   for (const phase of phases) {
     const crashPath = join(work, "crash-" + phase + ".sqlite");
@@ -302,10 +323,10 @@ try {
     assert.equal(beforeDb.query("PRAGMA integrity_check").get()?.integrity_check, "ok");
     const durableRows = beforeDb.query("SELECT count(*) n FROM events").get()?.n;
     beforeDb.close();
-    assert.equal(durableRows, before > 1 ? 1 : 0);
+    assert.equal(durableRows, before > 2 ? 1 : 0);
     await run(crashPath, "SELECT 1;\n");
     const position = (await readFile(crashPath + ".ltx/position", "utf8")).split("\n");
-    if (phase === "position-published" || phase === "before-checkpoint")
+    if (phase === "position-published" || phase === "before-checkpoint" || phase === "checkpoint-record-published")
       assert.equal(position[1], epoch, "matching WAL must resume");
     else assert.notEqual(position[1], epoch, "mismatched position must make a fresh base");
     const recovered = join(work, "recovered-" + phase + ".sqlite");
@@ -322,13 +343,13 @@ try {
   assert.equal((await readFile(pending + ".ltx/position", "utf8")).split("\n")[1], pendingEpoch);
   const pendingRestore = join(work, "pending-restored.sqlite");
   const pendingResult = await restore(pending + ".ltx/" + pendingEpoch, pendingRestore);
-  assert.equal(pendingResult.files, 3);
+  assert.equal(pendingResult.files, 4); // Base, schema commit and both recovered inserts.
   const pdb = new Database(pendingRestore);
   assert.equal(pdb.query("SELECT count(*) n FROM events").get()?.n, 2);
   assert.equal(pdb.query("PRAGMA integrity_check").get()?.integrity_check, "ok");
   pdb.close();
   console.log(
-    "PASS restart: 8 SIGKILL durability boundaries, matching-prefix resume, orphan/missing/reset fallback, pending committed WAL tail captured before serving",
+    "PASS restart: 10 SIGKILL durability boundaries, matching-prefix resume, orphan/missing/reset fallback, pending committed WAL tail captured before serving",
   );
   console.log(
     "PASS native LTX: 102-file chain, independent CRC/index checks, byte-exact restore, integrity, hard WAL ceiling and oversized transaction rollback",

@@ -308,7 +308,7 @@ static int sb_ltx_register(void) {
 typedef struct {
   sqlite3 *db;
   char path[SB_LTX_PATH], root[SB_LTX_PATH], epoch[64];
-  int lock, failed, read_fd;
+  int lock, failed, read_fd, checkpointed;
   uint32_t page_size, commit, salt1, salt2, wal_c1, wal_c2;
   uint64_t txid, offset, checksum;
 } sb_ltx_state;
@@ -520,10 +520,10 @@ static int sb_ltx_position(sb_ltx_state *s) {
   if (snprintf(path, sizeof(path), "%s/position", s->root) >= sizeof(path) ||
       snprintf(tmp, sizeof(tmp), "%s/position.tmp", s->root) >= sizeof(tmp))
     return -1;
-  int n =
-      snprintf(body, sizeof(body), "LTXPOS1\n%s\n%llu %u %u %llu %016llx %u %u %u %u\n", s->epoch,
-               (unsigned long long)s->txid, s->salt1, s->salt2, (unsigned long long)s->offset,
-               (unsigned long long)s->checksum, s->wal_c1, s->wal_c2, s->page_size, s->commit);
+  int n = snprintf(body, sizeof(body), "LTXPOS2\n%s\n%c %llu %u %u %llu %016llx %u %u %u %u\n",
+                   s->epoch, s->checkpointed ? 'C' : 'W', (unsigned long long)s->txid, s->salt1,
+                   s->salt2, (unsigned long long)s->offset, (unsigned long long)s->checksum,
+                   s->wal_c1, s->wal_c2, s->page_size, s->commit);
   if (n < 0 || n >= (int)sizeof(body))
     return -1;
   FILE *f = fopen(tmp, "wb");
@@ -536,13 +536,13 @@ static int sb_ltx_position(sb_ltx_state *s) {
     rc = -1;
   if (rc)
     return -1;
-  sb_ltx_phase("position-fsynced");
+  sb_ltx_phase(s->checkpointed ? "checkpoint-record-fsynced" : "position-fsynced");
   if (rename(tmp, path) || sb_ltx_sync_dir(s->root))
     return -1;
-  sb_ltx_phase("position-published");
+  sb_ltx_phase(s->checkpointed ? "checkpoint-record-published" : "position-published");
   return 0;
 }
-static int sb_ltx_checkpoint(sb_ltx_state *s) {
+static int sb_ltx_checkpoint(sb_ltx_state *s, int persist) {
   int a, b;
   sb_ltx_phase("before-checkpoint");
   int rc = sqlite3_wal_checkpoint_v2(s->db, "main", 3, &a, &b);
@@ -551,10 +551,16 @@ static int sb_ltx_checkpoint(sb_ltx_state *s) {
     s->salt1 = s->salt2 = s->wal_c1 = s->wal_c2 = 0;
   }
   sb_ltx_phase("after-checkpoint");
+  // The WAL record remains authoritative until checkpoint has completed. A
+  // crash before this second atomic record write retains conservative recovery.
+  if (!rc && persist && !s->checkpointed) {
+    s->checkpointed = 1;
+    rc = sb_ltx_position(s);
+  }
   return rc;
 }
 static int sb_ltx_snapshot(sb_ltx_state *s) {
-  if (sb_ltx_checkpoint(s))
+  if (sb_ltx_checkpoint(s, 0))
     return -1;
   // EXCLUSIVE SQLite locking mode excludes other connections. BEGIN pins the
   // checkpointed live pages while they are read; no VACUUM or page rewriting.
@@ -603,8 +609,10 @@ static int sb_ltx_snapshot(sb_ltx_state *s) {
   sb_ltx_writer_close(&w);
   if (!rc)
     rc = sb_ltx_publish(tmp, final, dir);
-  if (!rc)
+  if (!rc) {
+    s->checkpointed = 1;
     rc = sb_ltx_position(s);
+  }
 done:
   if (sqlite3_exec(s->db, "COMMIT", 0, 0, 0))
     rc = -1;
@@ -747,6 +755,7 @@ static int sb_ltx_capture(sb_ltx_state *s, uint32_t frames) {
   if (!rc)
     rc = sb_ltx_publish(tmp, final, dir);
   if (!rc) {
+    s->checkpointed = 0;
     s->txid++;
     s->commit = commit;
     s->offset = 32 + (uint64_t)frames * (ps + 24);
@@ -801,7 +810,7 @@ static int sb_ltx_after(int idx) {
     return -1;
   // SQLITE_BUSY can occur with an explicit transaction holding a read lock.
   // Keep the validated WAL and position; the VFS still imposes the hard ceiling.
-  int rc = sb_ltx_checkpoint(s);
+  int rc = sb_ltx_checkpoint(s, 1);
   if (rc && rc != 5 && rc != 6) {
     s->failed = 1;
     return -1;
@@ -906,10 +915,12 @@ static int sb_ltx_load_position(sb_ltx_state *s) {
   text[n] = 0;
   sb_ltx_state candidate = *s;
   unsigned long long txid, offset, checksum, digest;
+  char mode;
   int used = 0, tail = 0;
-  if (sscanf(text, "LTXPOS1\n%63s\n%llu %u %u %llu %16llx %u %u %u %u\n%n", candidate.epoch, &txid,
-             &candidate.salt1, &candidate.salt2, &offset, &checksum, &candidate.wal_c1,
-             &candidate.wal_c2, &candidate.page_size, &candidate.commit, &used) != 10)
+  if (sscanf(text, "LTXPOS2\n%63s\n%c %llu %u %u %llu %16llx %u %u %u %u\n%n", candidate.epoch,
+             &mode, &txid, &candidate.salt1, &candidate.salt2, &offset, &checksum,
+             &candidate.wal_c1, &candidate.wal_c2, &candidate.page_size, &candidate.commit,
+             &used) != 11)
     return 0;
   if (!used || sscanf(text + used, "%16llx\n%n", &digest, &tail) != 1 ||
       (size_t)(used + tail) != n || digest != ~sb_ltx_crc(UINT64_MAX, text, (size_t)used))
@@ -920,9 +931,14 @@ static int sb_ltx_load_position(sb_ltx_state *s) {
       !txid || txid == UINT64_MAX || !(checksum & SB_LTX_FLAG) || !candidate.commit)
     return 0;
   uint32_t ps = candidate.page_size;
-  if (ps < 512 || ps > 65536 || (ps & (ps - 1)) || offset < 32 || offset > sb_ltx_max_bytes ||
-      (offset - 32) % (ps + 24))
+  if (ps < 512 || ps > 65536 || (ps & (ps - 1)))
     return 0;
+  if (mode == 'C') {
+    if (offset || candidate.salt1 || candidate.salt2 || candidate.wal_c1 || candidate.wal_c2)
+      return 0;
+  } else if (mode != 'W' || offset < 32 || offset > sb_ltx_max_bytes || (offset - 32) % (ps + 24))
+    return 0;
+  candidate.checkpointed = mode == 'C';
   candidate.txid = txid;
   candidate.offset = offset;
   candidate.checksum = checksum;
@@ -936,12 +952,45 @@ static int sb_ltx_load_position(sb_ltx_state *s) {
   *s = candidate;
   return 1;
 }
+// A clean marker means the checkpointed file is the entire captured state.
+// Verify its full page checksum before trusting an absent/empty WAL. Opening no
+// additional database fd preserves SQLite's process-level POSIX locks.
+static int sb_ltx_verify_database(sb_ltx_state *s) {
+  struct stat st;
+  if (fstat(s->read_fd, &st) || (uint64_t)st.st_size != (uint64_t)s->commit * s->page_size)
+    return 0;
+  unsigned char *page = malloc(s->page_size);
+  if (!page)
+    return 0;
+  uint64_t checksum = SB_LTX_FLAG;
+  int valid = 1;
+  for (uint32_t p = 1; p <= s->commit; p++) {
+    if (p == (0x40000000u / s->page_size) + 1)
+      continue;
+    if (sb_ltx_read(s->read_fd, page, s->page_size, (uint64_t)(p - 1) * s->page_size)) {
+      valid = 0;
+      break;
+    }
+    checksum = SB_LTX_FLAG | (checksum ^ sb_ltx_page_crc(p, page, s->page_size));
+  }
+  free(page);
+  return valid && checksum == s->checksum;
+}
 static int sb_ltx_resume(sb_ltx_state *s) {
   if (!sb_ltx_load_position(s))
     return 0;
   char path[SB_LTX_PATH];
   if (snprintf(path, sizeof(path), "%s-wal", s->path) >= sizeof(path))
     return 0;
+  if (s->checkpointed) {
+    struct stat wal;
+    if (stat(path, &wal) == 0) {
+      if (wal.st_size != 0)
+        return 0;
+    } else if (errno != ENOENT)
+      return 0;
+    return sb_ltx_verify_database(s);
+  }
   int fd = open(path, O_RDONLY);
   unsigned char h[32], fh[24];
   unsigned char *page = malloc(s->page_size);
@@ -990,7 +1039,7 @@ done:
     if (sb_ltx_capture(s, last))
       return -1;
   }
-  if (sb_ltx_checkpoint(s))
+  if (sb_ltx_checkpoint(s, 1))
     return -1;
   return 1;
 }

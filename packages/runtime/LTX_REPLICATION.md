@@ -65,7 +65,10 @@ For every LTX file:
    rename it to `position`, and fsync the root directory. The record includes
    generation, TXID, salts, next WAL byte offset, database checksum, WAL checksum
    state, page size and committed page count.
-4. Only then checkpoint the source database.
+4. Only then checkpoint the source database. After checkpoint TRUNCATE succeeds,
+   atomically persist a second position record marking the database checkpointed.
+   The same file/directory fsync sequence applies to that record. A crash between
+   checkpoint and publication of the marker retains the conservative fallback.
 
 Capture, fsync and publication failures latch the database closed to subsequent
 operations until restart. The SQL commit has already happened when a hook error
@@ -84,14 +87,26 @@ header/salts, commit frame and cumulative frame checksum. A matching prefix
 resumes in the same generation; any later complete commits are captured before
 serving. Incomplete/torn trailing WAL frames are excluded. An orphan finished
 file ahead of position forces a new generation, preserving the old files.
-Missing, truncated, reset or mismatched WAL takes a fresh page-exact base.
-A checkpointed/empty WAL therefore deliberately causes a new generation on the
-next start. This is conservative and may duplicate a full base on restart.
+Missing, truncated, reset or mismatched WAL takes a fresh page-exact base when
+it contradicts the recorded state. Position format LTXPOS2 distinguishes W
+(captured WAL prefix) from C (checkpoint complete, expected absent/empty WAL).
+A C record also requires a valid completed LTX, unchanged file size and matching
+full database page checksum before the generation is reused. Clean restarts do
+not create a base or rewrite the position. Any unexpected nonempty WAL, offline
+database modification or record mismatch retains the fresh-base fallback.
+Older LTXPOS1 records are conservatively replaced by a new base on first start.
+All state and file descriptors are still created lazily on first DB open.
 
-The regression SIGKILLs at eight durability boundaries, verifies matching-prefix
-resume and fallback cases, and recovers a committed tail beyond the durable
-cursor. The full Porffor executable passed 200 seeded random SIGKILL iterations on macOS
-arm64: 1,310 acknowledged writes retained, 26 same-generation resumes and 174
+Verification is a bounded streaming read, but it is O(database size), not constant
+time. It also checks the last LTX file. Five native restarts each at 4.2 MB and
+51.1 MB retained the same generation and unchanged base inode/mtime and position.
+The 51.1 MB verification took 399 to 446 ms on macOS arm64 (plus about 13 ms to
+health readiness); this is not a 9 ms cold-start claim for large databases.
+
+The regression SIGKILLs at ten durability boundaries, including both sides of
+clean-marker publication, and verifies matching-prefix resume and fallback cases.
+It also recovers a committed tail beyond the durable cursor. The full Porffor executable passed 200 seeded random SIGKILL iterations on macOS
+arm64: 1,675 acknowledged writes retained, 88 same-generation resumes and 112
 fresh-base recoveries. Every finished chain passed file/database CRC verification,
 integrity_check, deterministic source comparison at the last durable TXID, and
 comparison after restart. The test also recovered commits whose HTTP response
