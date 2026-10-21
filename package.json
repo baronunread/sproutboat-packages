@@ -2,7 +2,6 @@
   "name": "sproutboat-packages",
   "version": "0.0.0",
   "private": true,
-  "type": "module",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -11,13 +10,17 @@
   "workspaces": [
     "packages/*"
   ],
+  "type": "module",
   "scripts": {
+    "prepare": "lefthook install || true",
     "test": "bun run build:sql-budget && bun test packages/",
     "test:native": "bun scripts/test-native.ts",
     "test:native-crypto": "bun packages/runtime/test/native-crypto.ts",
     "test:native-utf8": "bun packages/runtime/test/native-utf8.ts",
     "scorecard": "bun scripts/porffor-scorecard.ts",
     "lint": "oxlint .",
+    "fmt": "oxfmt .",
+    "fmt:check": "oxfmt --check .",
     "typecheck": "tsc --noEmit",
     "changeset": "changeset",
     "version-packages": "changeset version",
@@ -46,6 +49,8 @@
     "@changesets/cli": "^3.0.2",
     "@oxlint/plugins": "1.82.0",
     "bun-types": "^1.4.2",
+    "lefthook": "2.1.14",
+    "oxfmt": "0.70.0",
     "oxlint": "1.82.0",
     "typescript": "^7.0.2",
     "web-streams-polyfill": "4.3.0"
