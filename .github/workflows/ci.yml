@@ -1,9 +1,34 @@
 name: ci
 on:
   pull_request:
+    # The changesets bot's "Version Packages" PR only deletes .changeset/*.md and
+    # bumps versions and CHANGELOGs. GitHub opens it as github-actions[bot], so
+    # every ci run it triggers waits for a maintainer's approval
+    # (action_required), and the one still waiting when the PR is merged is
+    # closed as a failure with no jobs, which GitHub reports as "workflow file
+    # issue". That PR changes no code: main already passed every job below in
+    # the PRs that were merged into it, and release.yml reran typecheck, lint
+    # and the unit and native tests on it before opening the PR. So ci skips a
+    # PR that touches only these files.
+    # A human PR that changes nothing else is skipped too: run ci by touching
+    # any other file, or with workflow_dispatch.
+    paths-ignore:
+      - ".changeset/*.md"
+      - "packages/*/CHANGELOG.md"
+      - "packages/*/package.json"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   check:
+    # Same skip as paths-ignore above, for a release PR that ever touches more.
+    if: github.head_ref != 'changeset-release/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -18,22 +43,82 @@ jobs:
       - run: bun run typecheck
       - run: bun run lint
       - run: bun run test
-      - run: bun run test:native-crypto
-      - run: bun run test:native-base64
-      - run: bun run test:native-model-resolver
-      - run: bun run test:native-streams
-      - run: bun run test:native-timers
-      - run: bun run test:native-iterators
-      - run: bun run test:native-utf8
-      - run: bun run test:native-response-defaults
-      - run: bun run test:native-raw-body
-      - run: bun run test:native-url
-      - run: bun run test:native-json
-      - run: bun run test:native-errors
-      - run: bun run test:native-events
-      - run: bun run test:native-request
-      - run: bun run test:native-waituntil
-      - run: bun run test:native-web-apis
-      - run: bun run test:native-bodies
-      - run: bun run test:native-streaming
-      - run: bun run test:native-service-bindings
+
+  native:
+    if: github.head_ref != 'changeset-release/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc libsqlite3-dev
+      - run: bun install --frozen-lockfile
+      # The patched Porffor toolchain, and the uWebSockets checkout and uSockets.a
+      # its native compiles build on first use. The toolchain's directory is
+      # named after the patch fingerprint, so a stale entry is never used.
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/sproutboat/porffor-*
+            ~/.cache/porffor/deps
+          key: porffor-${{ runner.os }}-${{ hashFiles('packages/toolchain/package.json', 'packages/toolchain/src/*.ts', 'packages/toolchain/vendor/**') }}
+      # Every test:native-* script, 4 at a time (scripts/test-native.ts).
+      - run: bun run test:native
+
+  # The published packages' consumer: sproutboat-cli's kitchen-sink app, built
+  # against this PR's packages. Its compatibility_date is 2026-08-26, so it is
+  # the "an app written before a behaviour change keeps working" check that
+  # caught the last three regressions only after they were published.
+  downstream:
+    name: downstream (sproutboat-cli kitchen-sink)
+    if: github.head_ref != 'changeset-release/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: baronunread/sproutboat-cli
+          # Set the SPROUTBOAT_CLI_REF repository variable to test against a CLI
+          # branch, e.g. one already adapted to a breaking change in this PR.
+          ref: ${{ vars.SPROUTBOAT_CLI_REF || 'main' }}
+          path: sproutboat-cli
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc libsqlite3-dev
+      - run: bun install --frozen-lockfile
+      - run: bun install --frozen-lockfile
+        working-directory: sproutboat-cli
+      - name: Point the CLI's @sproutboat packages at this PR
+        working-directory: sproutboat-cli
+        run: |
+          for dir in "$GITHUB_WORKSPACE"/packages/*; do
+            name="$(jq -r .name "$dir/package.json")"
+            target="node_modules/$name"
+            [ -e "$target" ] || continue
+            rm -rf "$target"
+            ln -s "$dir" "$target"
+            resolved="$(bun -e "console.log(Bun.resolveSync('$name', process.cwd()))")"
+            echo "$name -> $resolved"
+            case "$resolved" in
+              "$dir"/*) ;;
+              *) echo "::error::$name still resolves outside this PR: $resolved"; exit 1 ;;
+            esac
+          done
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/sproutboat/porffor-*
+            ~/.cache/porffor/deps
+          key: porffor-${{ runner.os }}-${{ hashFiles('packages/toolchain/package.json', 'packages/toolchain/src/*.ts', 'packages/toolchain/vendor/**') }}
+      - run: bun run kitchen-sink
+        working-directory: sproutboat-cli
+      - run: bun run kitchen-sink:standalone
+        working-directory: sproutboat-cli

@@ -1,0 +1,28 @@
+pre-commit:
+  parallel: false
+  commands:
+    # Format first, so lint sees the same code a human would after `bun run fmt`,
+    # with no back-and-forth where a lint fix reintroduces a format issue or vice
+    # versa. Scoped to staged files only.
+    #
+    # Most of the tree predates this hook and is not oxfmt-formatted yet, so the
+    # first commit that touches such a file reformats all of it. Keep that in its
+    # own commit when the diff would bury your change (`bunx oxfmt --write <file>`,
+    # commit, then make the change), or skip this hook once with
+    # `LEFTHOOK_EXCLUDE=format git commit ...`.
+    #
+    # .oxfmtrc.json leaves out the runtime JavaScript that Porffor compiles (the
+    # prelude, transports and streams entry): tests slice functions out of that
+    # source by text, and its generated blocks are rewritten by gen scripts.
+    # It also turns off .md, .yml/.yaml and .css, so this glob stays the
+    # JS/TS/JSON family. Widen both together or not at all.
+    format:
+      glob: "*.{js,cjs,mjs,jsx,ts,cts,mts,tsx,json,jsonc}"
+      run: bunx oxfmt --write --no-error-on-unmatched-pattern {staged_files}
+      stage_fixed: true
+    # Whole-tree, not staged-file-scoped: oxlint takes about a second here, and a
+    # lint issue anywhere should block every commit, not just ones that happen
+    # to touch the file it's in.
+    lint:
+      glob: "*.{js,cjs,mjs,jsx,ts,cts,mts,tsx}"
+      run: bun run lint
