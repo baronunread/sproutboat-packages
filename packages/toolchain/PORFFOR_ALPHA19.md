@@ -5,7 +5,7 @@ https://github.com/CanadaHonk/porffor/releases/tag/alpha-19
 
 Pinned commit: `0c135ce2f36fdd3467d5a58daa92283810705a51`.
 Vendored archive SHA256:
-`4bca6f61472196cf384575b8497260b23c9971757256eebf114bc0e0285b9cec`.
+`b54da2297ad9e03c5bbac0e0d156f1179ac3a09a2a6fd702475cef605bab97b9`.
 `compiler/uwebsockets.js` is unchanged, so uWebSockets stays on `360c276d` and the
 vendored uWebSockets archive is unchanged.
 

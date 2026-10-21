@@ -410,3 +410,12 @@ test("download failures are classified without publishing partial state", async 
   expect(attempts).toBe(2);
   expect(await readdir(cacheRoot)).toEqual([]);
 });
+
+test("the vendored archive is the one PORFFOR_ARCHIVE_URL serves: its root is porffor-<full commit>", () => {
+  // codeload names the root after the ref in the URL, so an archive fetched by the short
+  // commit has another root and digest than the pinned URL's, though the same files.
+  const archive = join(import.meta.dir, `../vendor/porffor-${PORFFOR_COMMIT_FULL.slice(0, 7)}.tar.gz`);
+  const list = Bun.spawnSync(["tar", "-tzf", archive], { stdout: "pipe" });
+  expect(list.exitCode).toBe(0);
+  expect(list.stdout.toString().split("\n")[0]).toBe(`porffor-${PORFFOR_COMMIT_FULL}/`);
+});
