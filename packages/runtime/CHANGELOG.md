@@ -1,5 +1,36 @@
 # @sproutboat/runtime
 
+## 0.21.0
+
+### Minor Changes
+
+- 6f253b9: Service bindings support Workers RPC.
+  
+  **Callee.** A deployment whose default export extends `WorkerEntrypoint`, imported from `cloudflare:workers`, exposes its methods:
+  
+  - `env.SERVICE.add(2, 3)` runs `add(2, 3)` on a fresh instance, with `this.env` and `this.ctx` set, and resolves to its result.
+  - Arguments and results are copied as structured clone does: `undefined`, `NaN`, `-0`, `Date`, `RegExp`, binary data, `Map`, `Set` and errors survive the trip.
+  - An error the method throws rejects the call with the same class and message.
+  - An unknown method rejects with workerd's `TypeError`.
+  - Passing functions or RPC stubs is not supported yet.
+  
+  **Where it works.** RPC travels over the service-binding calls a platform edge vouches for, so no client can invoke a method.
+  
+  **Imports.** `cloudflare:workers` provides `WorkerEntrypoint`, `DurableObject`, `RpcTarget` and `env`. The runtime turns the import into globals, so a handler that imports it runs both bundled and as plain ESM.
+  
+  **Default exports.**
+  - A class default export is instantiated per request, for `fetch`, `scheduled` and `queue`.
+  - A `WorkerEntrypoint` may have no `fetch` at all.
+
+### Patch Changes
+
+- 581c2f4: `atob()` and `btoa()` give the right result for any string. They used Porffor's own implementations, which read how a string is stored, so they went wrong on strings held as UTF-16, such as ones from `JSON.parse` or `TextDecoder`:
+  
+  - `atob(JSON.parse('"AQL/"'))` returned two wrong bytes instead of `01 02 ff`;
+  - `btoa` of a parsed `"héllo"` encoded the UTF-16 storage.
+  
+  Both are now plain JavaScript, with the same validation and errors as before.
+
 ## 0.20.0
 
 ### Minor Changes
