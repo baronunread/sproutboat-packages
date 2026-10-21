@@ -67,6 +67,20 @@ export default {
       if (depth >= 30) return new Response("bottom " + depth);
       return new Response(await (await env.SELF.fetch("https://self/self?depth=" + (depth + 1))).text());
     }
+    if (url.pathname === "/whoami") {
+      return Response.json({ url: request.url, internal: [...request.headers.keys()].filter((k) => k.startsWith("x-sb-")) });
+    }
+    if (url.pathname === "/boom") throw new RangeError("kaboom");
+    if (url.pathname === "/callself") {
+      const who = await (await env.SELF.fetch("https://self.example/whoami?q=1")).json();
+      let thrown = null;
+      try {
+        await env.SELF.fetch("https://self.example/boom");
+      } catch (e) {
+        thrown = [e.name, e.message, e instanceof RangeError];
+      }
+      return Response.json({ who, thrown });
+    }
     return new Response("no route", { status: 404 });
   },
 };
@@ -80,6 +94,8 @@ function freePort(): number {
 }
 
 const port = freePort();
+const EDGE_SECRET = "native-services-edge-secret";
+const EDGE_TOKEN = "native-services-edge-token";
 // Upstream requests whose client went away before the answer: a cancelled call must
 // stop here, not only be ignored by the caller.
 let slowAbandoned = 0;
@@ -91,7 +107,17 @@ const edge = Bun.serve({
     const url = new URL(request.url);
     const host = request.headers.get("host");
     if (host === "self.test") {
-      return fetch(`http://127.0.0.1:${port}${url.pathname}${url.search}`, { method: request.method, headers: request.headers });
+      // Vouch for the call as the platform's edge does: the broker's secret in, the
+      // sprout's own token out, and the caller's URL passed along.
+      const headers = new Headers(request.headers);
+      for (const name of ["x-sb-edge-secret", "x-sb-edge-token", "x-sb-binding-call", "x-sb-url"]) headers.delete(name);
+      if (request.headers.get("x-sb-edge-secret") === EDGE_SECRET) {
+        headers.set("x-sb-binding-call", "1");
+        headers.set("x-sb-edge-token", EDGE_TOKEN);
+        const callerUrl = request.headers.get("x-sb-url");
+        if (callerUrl) headers.set("x-sb-url", callerUrl);
+      }
+      return fetch(`http://127.0.0.1:${port}${url.pathname}${url.search}`, { method: request.method, headers });
     }
     if (url.pathname === "/echo") {
       return Response.json({
@@ -135,6 +161,7 @@ const broker = createBroker({
   token: "native-services",
   bindings: { ...bindings, resources: {} },
   edgeUrl: `http://127.0.0.1:${edge.port}/`,
+  edgeSecret: EDGE_SECRET,
   services: { PEER: "peer.test", SELF: "self.test" },
 });
 const brokerServer = listen(broker, "127.0.0.1", 0);
@@ -177,6 +204,7 @@ try {
       PORT: String(port),
       SB_BROKER_PORT: String(brokerServer.port),
       SB_BROKER_TOKEN: "native-services",
+      SB_EDGE_TOKEN: EDGE_TOKEN,
     },
     stdout: "ignore",
     stderr: "inherit",
@@ -239,12 +267,28 @@ try {
   await Bun.sleep(300);
   assert.equal(slowAbandoned - abandonedBefore, 2, "both in-flight calls were stopped upstream");
 
+  // A call the edge vouched for sees the caller's URL and none of the edge's headers,
+  // and the callee's error is thrown in the caller, class and message intact.
+  const callself = await get("/callself");
+  assert.equal(callself.status, 200, callself.text);
+  assert.deepEqual(JSON.parse(callself.text), {
+    who: { url: "https://self.example/whoami?q=1", internal: [] },
+    thrown: ["RangeError", "kaboom", true],
+  });
+  // A client cannot claim to be a binding call: no caller URL, no error marker.
+  const forged = { "x-sb-binding-call": "1", "x-sb-edge-token": "guess", "x-sb-url": "https://forged.example/" };
+  const spoofed = await fetch(`http://127.0.0.1:${port}/whoami`, { headers: forged });
+  assert.equal((await spoofed.json()).url, `http://127.0.0.1:${port}/whoami`);
+  const publicBoom = await fetch(`http://127.0.0.1:${port}/boom`, { headers: forged });
+  assert.equal(publicBoom.status, 500);
+  assert.equal(publicBoom.headers.get("x-sb-uncaught"), null);
+
   // A deployment calling itself, 30 levels deep: every level waits on the next at once.
   const self = await get("/self");
   assert.equal(self.text, "bottom 30");
   console.log(
     `Service bindings return promises and run off the loop: /ping ${Math.round(ping.ms)} ms during a call, ` +
-      `8x500 ms in ${Math.round(total)} ms, self-recursion ok; URL, Request+init, stream bodies, Set-Cookie and missing content types preserved; redirects follow Fetch; aborted calls stop upstream`,
+      `8x500 ms in ${Math.round(total)} ms, self-recursion ok; URL, Request+init, stream bodies, Set-Cookie and missing content types preserved; redirects follow Fetch; aborted calls stop upstream; vouched calls see the caller's URL and rethrow the callee's errors`,
   );
 } finally {
   if (server) {

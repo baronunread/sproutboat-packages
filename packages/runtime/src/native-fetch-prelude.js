@@ -5196,12 +5196,38 @@ globalThis.__sbInstallBindings = function (target, bindings) {
         let body = __sbUnwrapBody(parts.body);
         if (body instanceof ReadableStream) body = await __sbCollectBody(body);
         const msg = { binding, url: parts.url, method: parts.method, headers: parts.headers, ...__sbRequestBody(body) };
-        return __sbFetchFollowing("service.fetch", msg, "sproutboat service " + binding, parts.redirect, parts.signal);
+        const response = await __sbFetchFollowing("service.fetch", msg, "sproutboat service " + binding, parts.redirect, parts.signal);
+        // The callee threw: as in workerd, its error is thrown here.
+        const uncaught = response.headers.get("x-sb-uncaught");
+        if (uncaught != null) throw __sbRemoteError(uncaught);
+        return response;
       },
     };
   }
 
 };
+
+// The error a service-binding callee threw, from its x-sb-uncaught marker: the same
+// standard class where there is one, else an Error with the original name.
+function __sbRemoteError(marker) {
+  let name = "Error";
+  let message = "";
+  try {
+    const parsed = JSON.parse(decodeURIComponent(marker));
+    name = String(parsed.name || "Error");
+    message = String(parsed.message == null ? "" : parsed.message);
+  } catch {
+    /* a marker we cannot read still means the callee threw */
+  }
+  const error =
+    name === "TypeError" ? new TypeError(message)
+    : name === "RangeError" ? new RangeError(message)
+    : name === "SyntaxError" ? new SyntaxError(message)
+    : name === "ReferenceError" ? new ReferenceError(message)
+    : new Error(message);
+  if (error.name !== name) error.name = name;
+  return error;
+}
 
 // fetch(input, init) as Fetch reads it: a Request's method, headers, body, redirect mode
 // and signal apply unless init overrides them; a URL object stands for its href.
@@ -5808,7 +5834,7 @@ function __sbStreamResponse(response) {
   return response;
 }
 
-async function __sbFetchWithDrain(res, tasks) {
+async function __sbFetchWithDrain(res, tasks, bindingCall) {
   let r;
   try {
     r = res && __sbIsFn(res.then) ? await res : res;
@@ -5818,7 +5844,7 @@ async function __sbFetchWithDrain(res, tasks) {
     }
   } catch (error) {
     // #179 — a rejected handler promise must not take the process down with it.
-    r = __sbErrorResponse(error);
+    r = __sbErrorResponse(error, bindingCall);
   }
   // The response goes out now and ctx.waitUntil work keeps running after it, as in
   // workerd; it was awaited first, so a 1.5 s background task delayed the response by
@@ -5831,12 +5857,40 @@ async function __sbFetchWithDrain(res, tasks) {
 // propagate past __sbEntry and crash the whole server. Logged first, the way a
 // Worker logs "Uncaught Error: ...": a swallowed exception left a 500 with
 // nothing on stderr, which hid #168 entirely.
-function __sbErrorResponse(error) {
+function __sbErrorResponse(error, bindingCall) {
   __sbLogUncaught("fetch", error);
   // Untyped, as workerd sends it: the text/plain default is for handlers' bodies.
   const response = new Response("Internal Server Error", { status: 500 });
   response.headers.delete("content-type");
+  // A service-binding caller rethrows the error, as in workerd. Only on a call the
+  // edge vouched for: the marker carries the message, and the edge strips it from
+  // anything that goes to a client.
+  if (bindingCall) {
+    const name = (error && error.name) || "Error";
+    const message = error && error.message != null ? String(error.message) : String(error);
+    response.headers.set("x-sb-uncaught", encodeURIComponent(JSON.stringify({ name: String(name), message: message.slice(0, 1000) })));
+  }
   return response;
+}
+
+// A service-binding call the platform's edge vouched for: it carries the token the edge
+// gave this sprout (SB_EDGE_TOKEN), so no client can claim one. Such a call sees the URL
+// its caller passed (x-sb-url), not the deployment's hostname, and no remote address,
+// as in workerd. The edge's headers are removed from every request before the handler
+// sees it. Returns whether the edge vouched for this one.
+function __sbBindingCallIngress(request) {
+  const headers = request.headers;
+  const want = __sbEnv("SB_EDGE_TOKEN");
+  const vouched = !!want && headers.get("x-sb-binding-call") === "1" && __sbEqCt(headers.get("x-sb-edge-token") || "", want);
+  if (vouched) {
+    const url = headers.get("x-sb-url");
+    if (url && URL.canParse(url)) request.url = url;
+    headers.delete("x-sb-remote-addr");
+  }
+  for (const name of ["x-sb-binding-call", "x-sb-url", "x-sb-edge-token"]) {
+    if (headers.get(name) != null) headers.delete(name);
+  }
+  return vouched;
 }
 
 function __sbLogUncaught(where, error) {
@@ -5894,6 +5948,7 @@ globalThis.__sbEntry = function (handlers, request) {
   __sbDecodeIngress(request);
   const trigger = request.headers.get("x-sb-trigger");
   if (!trigger) {
+    const bindingCall = __sbBindingCallIngress(request);
     // #163/#128 — expose the request metadata the edge already has, the
     // Workers way, before the handler runs. httpProtocol/tlsVersion/tlsCipher
     // are only set when a trusted front proxy forwarded them; colo, ASN and
@@ -5932,11 +5987,11 @@ globalThis.__sbEntry = function (handlers, request) {
     } catch (error) {
       // #179 — a synchronous throw anywhere in the handler must not take the
       // whole process (and every other in-flight request) down with it.
-      return __sbErrorResponse(error);
+      return __sbErrorResponse(error, bindingCall);
     }
     // Same promise-identity rule as above applies to `__sbFetchWithDrain`'s
     // own return, which is why it's tail-called rather than chained on here.
-    if (__sbTasks.length || (__res && __sbIsFn(__res.then)) || __sbHasStreamBody(__res)) return __sbFetchWithDrain(__res, __sbTasks);
+    if (__sbTasks.length || (__res && __sbIsFn(__res.then)) || __sbHasStreamBody(__res)) return __sbFetchWithDrain(__res, __sbTasks, bindingCall);
     return __sbTagCpu(__res, __t0);
   }
   if (!__sbTriggerAuthed(request)) return new Response("forbidden", { status: 403 });

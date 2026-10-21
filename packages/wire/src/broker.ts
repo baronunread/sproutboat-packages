@@ -77,6 +77,12 @@ export type BrokerOptions = {
    */
   edgeUrl?: string;
   /**
+   * The edge's secret for service-binding calls (`SB_EDGE_SECRET`). With it, a call
+   * carries the secret and the caller's URL, so the edge can vouch for the call to the
+   * callee: the callee then sees that URL, and a callee that throws throws in the caller.
+   */
+  edgeSecret?: string;
+  /**
    * #48 — binding name -> the target's hostname, resolved by the control plane
    * at activation. Not part of the artifact: the same binary deploys to boxes
    * with different domains, and a target can be redeployed without rebuilding
@@ -1213,6 +1219,10 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       }
     }
     headers.set("host", host);
+    if (opts.edgeSecret) {
+      headers.set("x-sb-edge-secret", opts.edgeSecret);
+      headers.set("x-sb-url", str(msg.url));
+    }
     const method = str(msg.method || "GET").toUpperCase();
     const target = new URL(path, opts.edgeUrl);
     const res = await doFetch(target, {
@@ -2306,6 +2316,7 @@ export function startBroker(argv: string[], d1Pool?: D1Pool) {
     sproutUrl: values["sprout-url"] ?? process.env.SB_SPROUT_URL,
     assetsDir: values["assets-dir"],
     edgeUrl: values["edge-url"],
+    edgeSecret: process.env.SB_EDGE_SECRET || undefined,
     services,
     dispatchEnabled: () => dispatchEnabled,
   });
