@@ -233,6 +233,9 @@ const rewrite = (cls) => {
   const name = cls.id.name;
   const at = { start: cls.start, end: cls.end };
   const id = () => ({ type: 'Identifier', name, ...at });
+  // Porffor's TDZ check (Alpha 19) flags a same-function read that starts before its
+  // declarator ends, so the returned name sits at the end of the class, as in source.
+  const after = { start: cls.end, end: cls.end };
   return {
     type: 'CallExpression', optional: false, arguments: [], ...at,
     callee: {
@@ -243,7 +246,7 @@ const rewrite = (cls) => {
           { type: 'VariableDeclaration', kind: 'const', ...at, declarations: [
             { type: 'VariableDeclarator', id: id(), init: { ...cls, id: null }, ...at },
           ] },
-          { type: 'ReturnStatement', argument: id(), ...at },
+          { type: 'ReturnStatement', argument: { ...id(), ...after }, ...after },
         ],
       },
     },
@@ -388,97 +391,6 @@ const REPLACE_ALL_EDITS = [
   ],
 ] as const;
 const REPLACE_ALL_MARKER = "sproutboat #237: pieces joined once";
-
-// Porffor alpha 9 treats +02:00 as two milliseconds and adds offset hours
-// instead of subtracting them. Count fields even when they contain zero, and
-// apply the signed offset after parsing the local wall-clock fields.
-const DATE_PARSER_MARKER = "sproutboat: ISO timezone offset";
-const DATE_PARSER_ANCHOR = `  let n: number = 0;
-  let nInd: number = 0;
-
-  const len: i32 = string.length;
-  const endPtr: i32 = Porffor.IR.ptr(string) + len;
-  let ptr: i32 = Porffor.IR.ptr(string);
-
-  while (ptr <= endPtr) { // <= to include extra null byte to set last n
-    const chr: i32 = Porffor.IR.loadU8(ptr++, 4);
-    if (Porffor.fastAnd(chr >= 48, chr <= 57)) { // 0-9
-      n *= 10;
-      n += chr - 48;
-      continue;
-    }
-
-    if (chr == 45) { // -
-      if (Porffor.fastOr(ptr == Porffor.IR.ptr(string), nInd == 7)) n = -n;
-    }
-
-    if (n > 0) {
-      if (nInd == 0) y = n;
-        else if (nInd == 1) m = n - 1;
-        else if (nInd == 2) dt = n;
-        else if (nInd == 3) h = n;
-        else if (nInd == 4) min = n;
-        else if (nInd == 5) s = n;
-        else if (nInd == 6) milli = n;
-        else if (nInd == 7) tzHour = n;
-        else if (nInd == 8) tzMin = n;
-
-      n = 0;
-      nInd++;
-    }
-  }
-
-  h += tzHour;
-  min += tzMin;`;
-const DATE_PARSER_INJECT = `  // sproutboat: ISO timezone offset
-  let n: number = 0;
-  let nInd: number = 0;
-  let digits: i32 = 0;
-  let offsetSign: i32 = 0;
-
-  const len: i32 = string.length;
-  const endPtr: i32 = Porffor.IR.ptr(string) + len;
-  let ptr: i32 = Porffor.IR.ptr(string);
-
-  // Loop once past the last character to flush the final number, but read a
-  // 0 there, not the byte after the string: if that byte happened to be '+' or
-  // '-' it flipped the offset's sign.
-  while (ptr <= endPtr) {
-    const chr: i32 = ptr < endPtr ? Porffor.IR.loadU8(ptr, 4) : 0;
-    ptr++;
-    if (Porffor.fastAnd(chr >= 48, chr <= 57)) {
-      n = n * 10 + chr - 48;
-      digits++;
-      continue;
-    }
-
-    if (digits > 0) {
-      if (nInd == 0) y = n;
-        else if (nInd == 1) m = n - 1;
-        else if (nInd == 2) dt = n;
-        else if (nInd == 3) h = n;
-        else if (nInd == 4) min = n;
-        else if (nInd == 5) s = n;
-        else if (nInd == 6) {
-          while (digits < 3) { n *= 10; digits++; }
-          while (digits > 3) { n = Math.trunc(n / 10); digits--; }
-          milli = n;
-        }
-        else if (nInd == 7) tzHour = n;
-        else if (nInd == 8) tzMin = n;
-      n = 0;
-      nInd++;
-      digits = 0;
-    }
-
-    if (Porffor.fastOr(chr == 43, chr == 45) && nInd >= 6) {
-      offsetSign = chr == 43 ? 1 : -1;
-      nInd = 7;
-    }
-  }
-
-  h -= offsetSign * tzHour;
-  min -= offsetSign * tzMin;`;
 
 /**
  * #56 — make the inbound request-body limit configurable.
@@ -1407,30 +1319,6 @@ async function patchCompilerArgs(root: string): Promise<void> {
   if (changed) await writeFile(file, src);
 }
 
-export async function patchDateParser(root: string): Promise<void> {
-  const file = resolve(root, "compiler/builtins/date.ts");
-  const src = await readFile(file, "utf8");
-  if (src.includes(DATE_PARSER_MARKER)) return;
-  const start = src.indexOf("export const __ecma262_ParseDTSF");
-  const end = src.indexOf(
-    "// RFC 7231 or Date.prototype.toString() parser",
-    start,
-  );
-  if (start < 0 || end < 0)
-    throw new Error(`could not find Porffor's ISO date parser in ${file}`);
-  const parser = src.slice(start, end);
-  if (!parser.includes(DATE_PARSER_ANCHOR))
-    throw new Error(
-      `could not patch Porffor's ISO date parser: anchor not found in ${file}`,
-    );
-  await writeFile(
-    file,
-    src.slice(0, start) +
-      parser.replace(DATE_PARSER_ANCHOR, DATE_PARSER_INJECT) +
-      src.slice(end),
-  );
-}
-
 /** #168: keep a promise resolving to null out of the `then` probe. */
 export async function patchPromiseResolveNull(root: string): Promise<void> {
   const file = resolve(root, "compiler/builtins/promise.ts");
@@ -1499,30 +1387,6 @@ export async function patchLocalFunctionTypes(root: string): Promise<void> {
     "const func = resolveNamedFunction(scope, name);",
   );
   await writeFile(file, src);
-}
-
-/** Keep base64 option tags accurate and truncate the complete-chunk count. */
-export async function patchUint8ArrayBase64(root: string): Promise<void> {
-  const file = resolve(root, "compiler/builtins/uint8array_base64.ts");
-  let src = await readFile(file, "utf8");
-  const marker = "sproutboat: base64 option tags and complete chunks";
-  if (src.includes(marker)) return;
-  const edits = [
-    ["let alphabet: string =", "let alphabet: any ="],
-    ["let lastChunkHandling: string =", "let lastChunkHandling: any ="],
-    [
-      "const fullChunks: i32 = (len / 3) * 3;",
-      "const fullChunks: i32 = ((len / 3) | 0) * 3;",
-    ],
-  ] as const;
-  for (const [anchor, replacement] of edits) {
-    if (!src.includes(anchor))
-      throw new Error(
-        `could not patch Porffor base64: anchor not found in ${file}`,
-      );
-    src = src.replaceAll(anchor, replacement);
-  }
-  await writeFile(file, `// ${marker}\n${src}`);
 }
 
 export async function precompileBuiltins(root: string): Promise<void> {
@@ -1752,66 +1616,6 @@ export async function patchHeadersArrayInit(root: string): Promise<void> {
   );
 }
 
-// baronunread/sproutboat#286: Map.groupBy is missing (Object.groupBy exists). Same
-// shape as __Object_groupBy, keyed by SameValueZero through the Map itself.
-const MAP_GROUPBY_MARKER = "sproutboat #286: Map.groupBy";
-const MAP_GROUPBY_SOURCE =
-  "\n// sproutboat #286: Map.groupBy\n" +
-  "export const __Map_groupBy = (items: any, callbackFn: any): Map => {\n" +
-  "  const out: Map = __Porffor_hashtableNew(true);\n" +
-  "  Porffor.IR.gcBarrier(out, Porffor.TYPES.map);\n" +
-  "  let i: i32 = 0;\n" +
-  "  for (const x of items) {\n" +
-  "    const k: any = callbackFn(x, i++);\n" +
-  "    if (!Porffor.callThis(__Map_prototype_has, out, k)) Porffor.callThis(__Map_prototype_set, out, k, Porffor.array.new(4));\n" +
-  "    Porffor.array.fastPush(Porffor.callThis(__Map_prototype_get, out, k), x);\n" +
-  "  }\n" +
-  "  return out;\n" +
-  "};\n";
-
-/** #286: add Map.groupBy. Before the precompile, which compiles it with the other builtins. */
-export async function patchMapGroupBy(root: string): Promise<void> {
-  const file = resolve(root, "compiler/builtins/map.ts");
-  const src = await readFile(file, "utf8");
-  if (src.includes(MAP_GROUPBY_MARKER)) return;
-  if (!src.includes("export const Map = function (iterable: any): Map {"))
-    throw new Error(`could not patch Porffor's Map.groupBy: anchor not found in ${file}`);
-  if (src.includes("export const __Map_groupBy"))
-    throw new Error(`Porffor now defines Map.groupBy itself: drop patchMapGroupBy (${file})`);
-  await writeFile(file, src.trimEnd() + "\n" + MAP_GROUPBY_SOURCE);
-}
-
-// baronunread/sproutboat#286: a private field (#x) is stored as an ordinary property
-// named "__#x", installed like a public field, so Object.keys, for-in and
-// JSON.stringify listed it. Install private fields the way methods are installed:
-// writable and configurable but not enumerable. Object.getOwnPropertyNames still
-// sees the internal name.
-const PRIVATE_FIELD_MARKER = "sproutboat #286: private fields";
-const PRIVATE_FIELD_EDITS: [string, string][] = [
-  [
-    "        builtinCall(func, '__Porffor_object_class_value', [\n",
-    "        // sproutboat #286: private fields are not enumerable\n" +
-      "        builtinCall(func, x.key?.type === 'PrivateIdentifier' ? '__Porffor_object_class_method' : '__Porffor_object_class_value', [\n",
-  ],
-  [
-    "      if (kind === 'get' || kind === 'set') initKind = kind;\n",
-    "      if (kind === 'get' || kind === 'set') initKind = kind;\n" +
-      "      if (initKind === 'value' && x.key?.type === 'PrivateIdentifier') initKind = 'method'; // sproutboat #286: private fields\n",
-  ],
-];
-
-export async function patchPrivateFieldsHidden(root: string): Promise<void> {
-  const file = resolve(root, "compiler/codegen.js");
-  let src = await readFile(file, "utf8");
-  if (src.includes(PRIVATE_FIELD_MARKER)) return;
-  for (const [anchor, inject] of PRIVATE_FIELD_EDITS) {
-    if (src.split(anchor).length !== 2)
-      throw new Error(`could not patch Porffor's private fields: anchor not found in ${file}`);
-    src = src.replace(anchor, inject);
-  }
-  await writeFile(file, src);
-}
-
 // baronunread/sproutboat#287 (sproutd B9/B13): native-fetch mode runs frequent full
 // collections, and each returned its free pages to the OS (porf_gc_discard_free_runs),
 // so the next large allocation faulted them back in: allocation-heavy handlers ran up
@@ -1918,128 +1722,6 @@ export async function patchRepeatDoubling(root: string): Promise<void> {
   if (src.split(REPEAT_LOOP).length !== 3)
     throw new Error(`could not patch Porffor's String.prototype.repeat: anchor not found twice in ${file}`);
   await writeFile(file, src.replaceAll(REPEAT_LOOP, REPEAT_DOUBLING));
-}
-
-// JSON.stringify of a cyclic object recursed until the native stack overflowed: the
-// process died (SIGBUS/SIGSEGV) instead of throwing, so one request could take a
-// worker down (found by the W2 conformance suite). The replacer path already checks
-// cycles; the plain serializer now keeps its own ancestor stack and throws the same
-// TypeError. Arrays and objects push on entry and pop on exit; JSON.stringify clears
-// the stack first, so a throw mid-serialization leaves nothing behind.
-const JSON_CYCLE_MARKER = "sproutboat: JSON cycle check";
-const JSON_CYCLE_EDITS: [string, string, number][] = [
-  [
-    "let __Porffor_json_bufLimit: i32 = 0;\n",
-    "let __Porffor_json_bufLimit: i32 = 0;\n" +
-      "// sproutboat: JSON cycle check\n" +
-      "let __Porffor_json_ancestors: any = 0;\n" +
-      "export const __Porffor_json_enter = (value: any): void => {\n" +
-      "  if (__Porffor_json_ancestors === 0) __Porffor_json_ancestors = Porffor.array.new(8);\n" +
-      "  const stack: any[] = __Porffor_json_ancestors;\n" +
-      "  if (stack.includes(value)) {\n" +
-      "    stack.length = 0;\n" +
-      "    throw new TypeError('Converting circular structure to JSON');\n" +
-      "  }\n" +
-      "  Porffor.array.fastPush(stack, value);\n" +
-      "};\n" +
-      "export const __Porffor_json_leave = (): void => {\n" +
-      "  const stack: any[] = __Porffor_json_ancestors;\n" +
-      "  stack.length = stack.length - 1;\n" +
-      "};\n",
-    1,
-  ],
-  ["    depth += 1;\n", "    depth += 1;\n    __Porffor_json_enter(value);\n", 2],
-  ["    depth -= 1;\n", "    __Porffor_json_leave();\n    depth -= 1;\n", 2],
-  [
-    "  let out: i32 = __Porffor_json_serialize(buffer, value, 0, space);\n",
-    "  if (__Porffor_json_ancestors !== 0) (__Porffor_json_ancestors as any[]).length = 0;\n" +
-      "  let out: i32 = __Porffor_json_serialize(buffer, value, 0, space);\n",
-    1,
-  ],
-];
-
-/** JSON.stringify throws on cycles instead of overflowing the stack. Before the precompile. */
-export async function patchJsonCycles(root: string): Promise<void> {
-  const file = resolve(root, "compiler/builtins/json.ts");
-  let src = await readFile(file, "utf8");
-  if (src.includes(JSON_CYCLE_MARKER)) return;
-  for (const [anchor, inject, count] of JSON_CYCLE_EDITS) {
-    if (src.split(anchor).length !== count + 1)
-      throw new Error(`could not patch Porffor's JSON cycle check: anchor not found ${count}x in ${file}`);
-    src = src.replaceAll(anchor, inject);
-  }
-  await writeFile(file, src);
-}
-
-// JSON.parse ignored its reviver (W2 conformance: json/reviver). The parser keeps its body
-// under a new name, and __JSON_parse walks the result as the spec's InternalizeJSONProperty
-// does: children first, a reviver answer of undefined deletes the property.
-const JSON_REVIVER_MARKER = "sproutboat: JSON.parse reviver";
-// Porffor declares (_: bytestring); patchUnicode widens it to any later, on the renamed parser.
-const JSON_PARSE_ANCHOR = /export const __JSON_parse = \(_: (bytestring|any)\) => \{\n/;
-const JSON_REVIVER_SOURCE = `
-// ${JSON_REVIVER_MARKER}
-export const __Porffor_json_revive = (holder: any, key: any, reviver: any): any => {
-  const value: any = holder[key];
-  if (Porffor.type(value) == Porffor.TYPES.array) {
-    const len: i32 = value.length;
-    for (let i: i32 = 0; i < len; i++) {
-      const next: any = __Porffor_json_revive(value, ecma262.ToString(i), reviver);
-      if (next === undefined) delete value[i];
-      else value[i] = next;
-    }
-  } else if (Porffor.type(value) == Porffor.TYPES.object) {
-    for (const k: any in value) {
-      const next: any = __Porffor_json_revive(value, k, reviver);
-      if (next === undefined) delete value[k];
-      else value[k] = next;
-    }
-  }
-  return reviver.call(holder, key, value);
-};
-
-export const __JSON_parse = (text: any, reviver: any) => {
-  const value: any = __Porffor_json_parseText(text);
-  if (Porffor.type(reviver) != Porffor.TYPES.function) return value;
-  const root: object = {};
-  root[''] = value;
-  return __Porffor_json_revive(root, '', reviver);
-};
-`;
-
-/** JSON.parse applies its reviver, as InternalizeJSONProperty does. */
-export async function patchJsonReviver(root: string): Promise<void> {
-  const file = resolve(root, "compiler/builtins/json.ts");
-  const src = await readFile(file, "utf8");
-  if (src.includes(JSON_REVIVER_MARKER)) return;
-  if ((src.match(new RegExp(JSON_PARSE_ANCHOR, "g")) ?? []).length !== 1)
-    throw new Error(`could not patch Porffor's JSON.parse reviver: anchor not found in ${file}`);
-  await writeFile(
-    file,
-    src.replace(JSON_PARSE_ANCHOR, (_line, type) => `export const __Porffor_json_parseText = (_: ${type}) => {\n`).trimEnd() + "\n" + JSON_REVIVER_SOURCE,
-  );
-}
-
-// Object.prototype.toString gave "[object Object]" for typed arrays: their lazily
-// built prototypes have no toStringTag, and the fallback list of builtin tags left
-// them out (W2 conformance; V8 gives "[object Uint8Array]").
-const TA_TAG_MARKER = "sproutboat: typed array toStringTag";
-const TA_TAG_ANCHOR = "  return '[object ' + builtinTag + ']';\n};\n";
-const TA_TAG_INJECT =
-  "  // sproutboat: typed array toStringTag\n" +
-  "  if (Porffor.fastAnd(tag === undefined, t >= Porffor.TYPES.uint8clampedarray, t <= Porffor.TYPES.float64array)) {\n" +
-  "    if (t == Porffor.TYPES.uint8clampedarray) builtinTag = 'Uint8ClampedArray';\n    else if (t == Porffor.TYPES.uint8array) builtinTag = 'Uint8Array';\n    else if (t == Porffor.TYPES.int8array) builtinTag = 'Int8Array';\n    else if (t == Porffor.TYPES.uint16array) builtinTag = 'Uint16Array';\n    else if (t == Porffor.TYPES.int16array) builtinTag = 'Int16Array';\n    else if (t == Porffor.TYPES.uint32array) builtinTag = 'Uint32Array';\n    else if (t == Porffor.TYPES.int32array) builtinTag = 'Int32Array';\n    else if (t == Porffor.TYPES.biguint64array) builtinTag = 'BigUint64Array';\n    else if (t == Porffor.TYPES.bigint64array) builtinTag = 'BigInt64Array';\n    else if (t == Porffor.TYPES.float32array) builtinTag = 'Float32Array';\n    else if (t == Porffor.TYPES.float64array) builtinTag = 'Float64Array';\n" +
-  "  }\n" +
-  TA_TAG_ANCHOR;
-
-/** Typed arrays get their own toString tag. Before the precompile. */
-export async function patchTypedArrayTag(root: string): Promise<void> {
-  const file = resolve(root, "compiler/builtins/object.ts");
-  const src = await readFile(file, "utf8");
-  if (src.includes(TA_TAG_MARKER)) return;
-  if (src.split(TA_TAG_ANCHOR).length !== 2)
-    throw new Error(`could not patch Porffor's typed array toStringTag: anchor not found in ${file}`);
-  await writeFile(file, src.replace(TA_TAG_ANCHOR, TA_TAG_INJECT));
 }
 
 // console.log coloured numbers, booleans and objects with ANSI escapes even when
@@ -2317,11 +1999,9 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchQuietCollection(root);
   await patchAsyncWaker(root);
   await patchDeferredDiscard(root);
-  await patchDateParser(root);
   await patchPromiseResolveNull(root);
   await patchReplaceAll(root);
   await patchLocalFunctionTypes(root);
-  await patchUint8ArrayBase64(root);
   await patchResponseDefaults(root);
   await patchHeadersArrayInit(root);
   await patchHeadersClass(root);
@@ -2330,18 +2010,13 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchResponseBytes(root);
   await patchURLClass(root);
   await patchTextDecoder(root);
-  await patchMapGroupBy(root);
-  await patchPrivateFieldsHidden(root);
   await patchRepeatDoubling(root);
-  await patchJsonCycles(root);
-  await patchJsonReviver(root);
-  await patchTypedArrayTag(root);
   await patchConsoleColors(root);
   await patchCaseMapping(root);
   await patchZeroDelayTimers(root);
   await patchSplitGlobals(root);
-  // Last of the builtin edits: its precompile picks up the date, promise and
-  // replaceAll patches above too.
+  // Last of the builtin edits: its precompile picks up the promise, replaceAll,
+  // local function and repeat patches above too.
   await precompileBuiltins(root);
   await patchUnicode(root);
   done.add(root);

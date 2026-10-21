@@ -52,7 +52,10 @@ test("native Unicode JSON and UTF-8 encoding preserve code points and buffer bou
       }
       const lone = JSON.parse(JSON.stringify({ value: String.fromCharCode(0xd800) }));
       const quotedKey = JSON.parse(JSON.stringify({ ['quote"key']: "🚤" }));
-      return Response.json({ encoded, into, nested, escaped, growth, negatives, lone, quotedKey });
+      // The reviver sees each primitive's source text, sliced from UTF-16 input.
+      const sources = [];
+      JSON.parse('{"東京":{"id":"🚤","n":1.25},"l":[-3e2,"é"]}', (k, v, ctx) => { sources.push([k, ctx.source ?? null]); return v; });
+      return Response.json({ encoded, into, nested, escaped, growth, negatives, lone, quotedKey, sources });
     } };`;
     const [prelude, transport] = await Promise.all([
       readFile(preludePath, "utf8"),
@@ -103,6 +106,7 @@ test("native Unicode JSON and UTF-8 encoding preserve code points and buffer bou
     expect(actual.lone).toEqual({ value: "\ud800" });
     expect(actual.quotedKey).toEqual({ 'quote"key': "🚤" });
     expect(actual.negatives).toEqual([true, true, true, true]);
+    expect(actual.sources).toEqual([["id", '"🚤"'], ["n", "1.25"], ["東京", null], ["0", "-3e2"], ["1", '"é"'], ["l", null], ["", null]]);
   } finally {
     if (child) {
       child.kill(9);

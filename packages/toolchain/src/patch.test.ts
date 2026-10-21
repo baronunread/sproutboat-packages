@@ -7,11 +7,7 @@ import {
   patchHeadersArrayInit,
   patchLocalFunctionTypes,
   patchDeferredDiscard,
-  patchMapGroupBy,
-  patchPrivateFieldsHidden,
   patchRepeatDoubling,
-  patchJsonCycles,
-  patchTypedArrayTag,
   patchConsoleColors,
   patchCaseMapping,
   patchZeroDelayTimers,
@@ -25,7 +21,6 @@ import {
   patchTextDecoder,
   patchResponseDefaults,
   patchURLClass,
-  patchUint8ArrayBase64,
   patchRenderJs,
   patchUwebsockets,
 } from "./patch";
@@ -365,27 +360,6 @@ test("local function type patch registers lexical bindings and is idempotent", a
   }
 });
 
-test("base64 patch preserves option tags and truncates full chunks, idempotently", async () => {
-  const root = await mkdtemp(join(tmpdir(), "sb-base64-patch-"));
-  try {
-    await mkdir(join(root, "compiler/builtins"), { recursive: true });
-    const file = join(root, "compiler/builtins/uint8array_base64.ts");
-    await writeFile(
-      file,
-      "let alphabet: string = 'base64';\nlet lastChunkHandling: string = 'loose';\nconst fullChunks: i32 = (len / 3) * 3;",
-    );
-    await patchUint8ArrayBase64(root);
-    const patched = await readFile(file, "utf8");
-    expect(patched).toContain("let alphabet: any =");
-    expect(patched).toContain("let lastChunkHandling: any =");
-    expect(patched).toContain("((len / 3) | 0) * 3");
-    await patchUint8ArrayBase64(root);
-    expect(await readFile(file, "utf8")).toBe(patched);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
 test("Response defaults patch types string bodies only, idempotently", async () => {
   const root = await mkdtemp(join(tmpdir(), "sb-response-defaults-"));
   try {
@@ -457,47 +431,6 @@ test("URL patch replaces Porffor's URL class, idempotently", async () => {
 });
 
 
-test("Map.groupBy patch appends the builtin once and refuses an upstream one", async () => {
-  const root = await mkdtemp(join(tmpdir(), "sb-map-groupby-"));
-  try {
-    await mkdir(join(root, "compiler/builtins"), { recursive: true });
-    const file = join(root, "compiler/builtins/map.ts");
-    await writeFile(file, "export const Map = function (iterable: any): Map {\n};\n");
-    await patchMapGroupBy(root);
-    const patched = await readFile(file, "utf8");
-    expect(patched).toContain("export const __Map_groupBy = (items: any, callbackFn: any): Map => {");
-    await patchMapGroupBy(root);
-    expect(await readFile(file, "utf8")).toBe(patched);
-    await writeFile(file, "export const Map = function (iterable: any): Map {\n};\nexport const __Map_groupBy = 1;\n");
-    await expect(patchMapGroupBy(root)).rejects.toThrow("drop patchMapGroupBy");
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test("private field patch installs instance and static private fields as methods, idempotently", async () => {
-  const root = await mkdtemp(join(tmpdir(), "sb-private-fields-"));
-  try {
-    await mkdir(join(root, "compiler"));
-    const file = join(root, "compiler/codegen.js");
-    await writeFile(
-      file,
-      "        builtinCall(func, '__Porffor_object_class_value', [\n" +
-        "      if (kind === 'get' || kind === 'set') initKind = kind;\n",
-    );
-    await patchPrivateFieldsHidden(root);
-    const patched = await readFile(file, "utf8");
-    expect(patched).toContain("x.key?.type === 'PrivateIdentifier' ? '__Porffor_object_class_method' : '__Porffor_object_class_value'");
-    expect(patched).toContain("if (initKind === 'value' && x.key?.type === 'PrivateIdentifier') initKind = 'method';");
-    await patchPrivateFieldsHidden(root);
-    expect(await readFile(file, "utf8")).toBe(patched);
-    await writeFile(file, "export const x = 1;\n");
-    await expect(patchPrivateFieldsHidden(root)).rejects.toThrow("anchor not found");
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
 test("deferred discard patch moves page discard to the idle collection, idempotently", async () => {
   const root = await mkdtemp(join(tmpdir(), "sb-deferred-discard-"));
   try {
@@ -567,48 +500,6 @@ test("ensurePorfforPatched trusts a cache entry this toolchain version and patch
     } finally {
       await rm(stale, { recursive: true, force: true });
     }
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test("JSON cycle patch adds an ancestor stack around arrays and objects, idempotently", async () => {
-  const root = await mkdtemp(join(tmpdir(), "sb-json-cycles-"));
-  try {
-    await mkdir(join(root, "compiler/builtins"), { recursive: true });
-    const file = join(root, "compiler/builtins/json.ts");
-    await writeFile(
-      file,
-      "let __Porffor_json_bufLimit: i32 = 0;\n    depth += 1;\n    depth -= 1;\n    depth += 1;\n    depth -= 1;\n" +
-        "  let out: i32 = __Porffor_json_serialize(buffer, value, 0, space);\n",
-    );
-    await patchJsonCycles(root);
-    const patched = await readFile(file, "utf8");
-    expect(patched.split("__Porffor_json_enter(value);").length).toBe(3);
-    expect(patched.split("__Porffor_json_leave();").length).toBe(3);
-    expect(patched).toContain("throw new TypeError('Converting circular structure to JSON');");
-    await patchJsonCycles(root);
-    expect(await readFile(file, "utf8")).toBe(patched);
-    await writeFile(file, "let __Porffor_json_bufLimit: i32 = 0;\n");
-    await expect(patchJsonCycles(root)).rejects.toThrow("anchor not found");
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test("typed array tag patch names every typed array before toString returns, idempotently", async () => {
-  const root = await mkdtemp(join(tmpdir(), "sb-ta-tag-"));
-  try {
-    await mkdir(join(root, "compiler/builtins"), { recursive: true });
-    const file = join(root, "compiler/builtins/object.ts");
-    await writeFile(file, "  return '[object ' + builtinTag + ']';\n};\n");
-    await patchTypedArrayTag(root);
-    const patched = await readFile(file, "utf8");
-    for (const name of ["Uint8Array", "Uint8ClampedArray", "BigInt64Array", "Float64Array"]) expect(patched).toContain(`builtinTag = '${name}';`);
-    await patchTypedArrayTag(root);
-    expect(await readFile(file, "utf8")).toBe(patched);
-    await writeFile(file, "export const x = 1;\n");
-    await expect(patchTypedArrayTag(root)).rejects.toThrow("anchor not found");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

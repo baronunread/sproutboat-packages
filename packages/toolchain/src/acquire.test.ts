@@ -63,7 +63,7 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "const path = require('node:path');\n" +
       "fs.writeFileSync(path.join(__dirname, 'builtins_precompiled.js'), fs.readFileSync(path.join(__dirname, 'builtins/typedarray.js')));\n",
     "compiler/builtins_precompiled.js": "fixture:precompiled\n",
-    "compiler/builtins/date.ts": "export const __ecma262_ParseDTSF = (string: string) => {\n  let n: number = 0;\n  let nInd: number = 0;\n\n  const len: i32 = string.length;\n  const endPtr: i32 = Porffor.IR.ptr(string) + len;\n  let ptr: i32 = Porffor.IR.ptr(string);\n\n  while (ptr <= endPtr) { // <= to include extra null byte to set last n\n    const chr: i32 = Porffor.IR.loadU8(ptr++, 4);\n    if (Porffor.fastAnd(chr >= 48, chr <= 57)) { // 0-9\n      n *= 10;\n      n += chr - 48;\n      continue;\n    }\n\n    if (chr == 45) { // -\n      if (Porffor.fastOr(ptr == Porffor.IR.ptr(string), nInd == 7)) n = -n;\n    }\n\n    if (n > 0) {\n      if (nInd == 0) y = n;\n        else if (nInd == 1) m = n - 1;\n        else if (nInd == 2) dt = n;\n        else if (nInd == 3) h = n;\n        else if (nInd == 4) min = n;\n        else if (nInd == 5) s = n;\n        else if (nInd == 6) milli = n;\n        else if (nInd == 7) tzHour = n;\n        else if (nInd == 8) tzMin = n;\n\n      n = 0;\n      nInd++;\n    }\n  }\n\n  h += tzHour;\n  min += tzMin;\n};\n// RFC 7231 or Date.prototype.toString() parser\n",
+    "compiler/builtins/date.ts": "export const __ecma262_ParseDTSF = (string: string) => {\n};\n",
     "compiler/builtins/typedarray.js":
       "${typedArrayFuncs.reduce((acc, x) => acc + x.replace('// @porf-typed-array\\n', '').replaceAll('Array', name).replaceAll('any[]', name) + '\\n\\n', '')}`;\n" +
       "  offset = Math.trunc(offset);\n  if (Porffor.fastOr(offset < 0, offset > len)) throw new RangeError('Offset out of bounds');\n" +
@@ -150,10 +150,7 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "}\n" +
       "int main(void) {\n  porf_native_fetch_runtime_init();\n  porf_native_fetch_static_init();\n\n  return 0;\n}\n",
     "compiler/builtins/json.ts":
-      "let __Porffor_json_bufLimit: i32 = 0;\n    depth += 1;\n    depth -= 1;\n    depth += 1;\n    depth -= 1;\n  let out: i32 = __Porffor_json_serialize(buffer, value, 0, space);\n" +
       "// sb_json_utf16_v1\n" +
-      // patchJsonReviver's anchor.
-      "export const __JSON_parse = (_: bytestring) => {\n};\n" +
       "export const __Porffor_json_serialize = (_buffer: i32, value: any): i32 => {\n" +
       "    for (const x of (value as any[])) {\n    }\n" +
       "      const val: any = value[key];\n" +
@@ -168,14 +165,9 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "}\nfunction setTimeout() {}\nclass TextDecoder {\n}\n" +
       "class URL {\n  constructor(input) {\n    this.href = '';\n  }\n}\n\nclass Request {\n}\n" +
       "class Response {\n  constructor(body = null, init = undefined) {\n    this.body = body;\n    this.status = Number(init?.status ?? 200);\n    this.headers = new Headers(init?.headers);\n  }\n}\n",
-    "compiler/builtins/uint8array_base64.ts": "let alphabet: string = 'base64';\nlet lastChunkHandling: string = 'loose';\nconst fullChunks: i32 = (len / 3) * 3;\n",
-    "compiler/builtins/object.ts": "  return '[object ' + builtinTag + ']';\n};\n",
     "compiler/builtins/console.ts": "export const __Porffor_consolePrint = (arg: any): void => {\n  __Porffor_print(arg);\n};\n",
-    "compiler/builtins/map.ts": "export const Map = function (iterable: any): Map {\n};\n",
     "compiler/codegen.js":
       "if (!hoistRead && directCallOnlyFunctionBinding(scope, kind, name, pattern, func)) {\n        return valUndefined();\n}\nconst func = resolveNamedFunction(scope, name) ?? funcByName(name);\n" +
-      "        builtinCall(func, '__Porffor_object_class_value', [\n" +
-      "      if (kind === 'get' || kind === 'set') initKind = kind;\n" +
       "      stmt(scope, Store(ctype, addr, 4, ctype === 'f64' || ctype === 'f32' ? f : toUint32(scope, f)));\n" +
       "  const taGet = (ctype, size, signed = true) => () => {\n" +
       "    const loaded = Load(ctype, taAddr(size), 4);\n" +
@@ -298,16 +290,13 @@ test("the default call (no url/expectedSha256 override) never touches the networ
   expect(await readFile(join(dir, "compiler/uwebsockets.js"), "utf8")).toContain("sproutboat B19: streamed responses");
   // console colours only on a terminal.
   expect(await readFile(join(dir, "compiler/builtins/console.ts"), "utf8")).toContain("__Porffor_consoleColors");
-  // JSON.stringify throws on cycles; typed arrays have their own toString tag.
-  expect(await readFile(join(dir, "compiler/builtins/json.ts"), "utf8")).toContain("sproutboat: JSON cycle check");
-  expect(await readFile(join(dir, "compiler/builtins/object.ts"), "utf8")).toContain("sproutboat: typed array toStringTag");
+  // JSON cycles, the JSON.parse reviver, typed-array toString tags, ISO date offsets,
+  // base64 options, Map.groupBy and non-enumerable private fields (#286) are upstream's
+  // own since alpha-19; json-cycles, groupby-private, date and base64 native tests cover them.
   // B16: String.prototype.repeat doubles its copies.
   expect(await readFile(join(dir, "compiler/builtins/string.ts"), "utf8")).toContain("sproutboat B16: doubling repeat");
   // #287: full collections under load keep their free pages; the idle collection returns them.
   expect(await readFile(join(dir, "compiler/render.js"), "utf8")).toContain("if (porf_gc_discard_now) porf_gc_discard_free_runs(); else porf_gc_discard_pending = 1;");
-  // #286: Map.groupBy, and private fields installed as non-enumerable.
-  expect(await readFile(join(dir, "compiler/builtins/map.ts"), "utf8")).toContain("export const __Map_groupBy");
-  expect(await readFile(join(dir, "compiler/codegen.js"), "utf8")).toContain("sproutboat #286: private fields");
   // #256: named class expressions inside functions are rewritten at parse time.
   expect(await readFile(join(dir, "compiler/parse.js"), "utf8")).toContain("sbClassSelf(ast); // sproutboat #256");
   expect(await readFile(join(dir, "compiler/sb-class-self.js"), "utf8")).toContain("sproutboat #256");

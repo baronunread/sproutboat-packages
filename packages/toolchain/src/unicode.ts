@@ -42,19 +42,16 @@ export const __Porffor_json_appendChar = (out: string, char: i32): void => {
 };
 ` +
     source.slice(end);
+  // Every parser helper and JSON.parse's own `const text` (Alpha 19 types the argument any).
   source = replace(source, "text: bytestring", "text: any");
-  source = replace(source, "(_: bytestring)", "(_: any)");
   source = replace(
     source,
     "const out: bytestring = Porffor.malloc(6 + (strEnd - pos));",
     "const out: string = Porffor.malloc(4 + (strEnd - pos) * 2);",
   );
   source = replace(source, "Porffor.bytestring.appendChar(out,", "__Porffor_json_appendChar(out,");
-  source = replace(
-    source,
-    "Porffor.callThis(__ByteString_prototype_slice, text, start, pos)",
-    "text.slice(start, pos)",
-  );
+  // Number literals and, since Alpha 19, the reviver's source text records.
+  source = replace(source, "Porffor.callThis(__ByteString_prototype_slice, text, start, ", "text.slice(start, ");
   source = replace(
     source,
     "let buffer: bytestring = Porffor.malloc(6 + cap);",
@@ -96,14 +93,6 @@ export const __Porffor_json_appendChar = (out: string, char: i32): void => {
         continue;
       }
       buffer = __Porffor_bytestring_bufferChar(buffer, c);`,
-  );
-  // JSON.parse must reject trailing non-whitespace, not just parse a prefix.
-  source = replace(
-    source,
-    "return __Porffor_json_parseValue(_, posPtr, _.length);",
-    `const result: any = __Porffor_json_parseValue(_, posPtr, _.length);
-  if (__Porffor_json_skipWhitespace(_, Porffor.IR.loadI32(posPtr, 0), _.length) != _.length) throw new SyntaxError('Unexpected trailing JSON input');
-  return result;`,
   );
   return source;
 }
