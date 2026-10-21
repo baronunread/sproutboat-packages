@@ -3594,18 +3594,53 @@ if (globalThis.crypto.getRandomValues == null) {
       Promise.resolve().then(() => callback());
     };
   }
-  const nativeAtob = globalThis.atob, nativeBtoa = globalThis.btoa;
+  // Base64 in JavaScript rather than Porffor's atob/btoa: those read a string's storage,
+  // so a string held as UTF-16 (one from JSON.parse or TextDecoder, say) decoded to the
+  // wrong bytes, and btoa encoded its UTF-16 units.
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   globalThis.atob = function (data) {
     let text = String(data).replace(/[\t\n\f\r ]/g, "");
     if (text.length % 4 === 0) text = text.replace(/==?$/, "");
     if (text.length % 4 === 1 || !/^[A-Za-z0-9+/]*$/.test(text)) throw invalidCharacter("atob: the string is not valid base64");
-    while (text.length % 4 !== 0) text += "=";
-    return nativeAtob(text);
+    const parts = [];
+    let chunk = "";
+    let bits = 0;
+    let count = 0;
+    for (let i = 0; i < text.length; i++) {
+      bits = (bits << 6) | alphabet.indexOf(text[i]);
+      count += 6;
+      if (count >= 8) {
+        count -= 8;
+        chunk += String.fromCharCode((bits >> count) & 0xff);
+        if (chunk.length === 512) {
+          parts.push(chunk);
+          chunk = "";
+        }
+      }
+    }
+    parts.push(chunk);
+    return parts.join("");
   };
   globalThis.btoa = function (data) {
     const text = String(data);
-    for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) > 0xff) throw invalidCharacter("btoa: the string has characters outside Latin-1");
-    return nativeBtoa(text);
+    const parts = [];
+    let chunk = "";
+    for (let i = 0; i < text.length; i += 3) {
+      const a = text.charCodeAt(i);
+      const b = i + 1 < text.length ? text.charCodeAt(i + 1) : 0;
+      const c = i + 2 < text.length ? text.charCodeAt(i + 2) : 0;
+      if (a > 0xff || b > 0xff || c > 0xff) throw invalidCharacter("btoa: the string has characters outside Latin-1");
+      const n = (a << 16) | (b << 8) | c;
+      chunk += alphabet[(n >> 18) & 63] + alphabet[(n >> 12) & 63];
+      chunk += i + 1 < text.length ? alphabet[(n >> 6) & 63] : "=";
+      chunk += i + 2 < text.length ? alphabet[n & 63] : "=";
+      if (chunk.length >= 512) {
+        parts.push(chunk);
+        chunk = "";
+      }
+    }
+    parts.push(chunk);
+    return parts.join("");
   };
 }
 
