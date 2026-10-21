@@ -1,5 +1,55 @@
 # @sproutboat/wire
 
+## 0.14.0
+
+### Minor Changes
+
+- f2d2b72: Service-binding calls behave as in workerd in two more ways, on a platform edge that vouches for them:
+  
+  - **The callee sees the caller's URL.** `request.url` is the URL the caller passed (`https://peer/path`), where it used to be the callee deployment's own hostname.
+  - **A callee that throws makes the caller throw.** The caller's `fetch()` rejects with the callee's error, keeping its class for standard errors and its message, where it used to get a plain 500 response.
+  
+  How the platform vouches for a call:
+  
+  1. The broker sends each service call with the edge's secret (`SB_EDGE_SECRET`, which the edge gives only to brokers) and the caller's URL.
+  2. The edge forwards the call to the callee with that sprout's own token (`SB_EDGE_TOKEN`).
+  3. The callee trusts a call only when the token matches.
+  
+  A client can forge none of this. The edge removes its headers from every other request, and the error marker never reaches a client.
+  
+  A vouched call also no longer shows the broker's loopback address as `x-sb-remote-addr`. The edge's internal headers are removed before any handler sees a request.
+  
+  In `@sproutboat/wire`, the broker reads `SB_EDGE_SECRET` and takes an `edgeSecret` option.
+- b287117: `fetch()` and service bindings honour an abort signal, set as `init.signal` or a `Request`'s `signal`:
+  
+  - A signal that is already aborted rejects the call at once.
+  - Aborting it later, by hand or through `AbortSignal.timeout()`, rejects the pending call with the signal's reason.
+  
+  In a deployed sprout the abort also stops the work. The sprout closes the call's broker connection, the broker aborts its upstream request when a sprout's connection closes, and the platform's edge stops the callee's request in turn. Before, an abandoned call ran to the end anyway.
+  
+  In sproutd the request still runs to the end, and its late reply is dropped.
+  
+  In `@sproutboat/wire`, `Broker.handleFrame` takes an optional `AbortSignal`, which the broker server aborts when the connection closes.
+- 3798994: Responses to `fetch()` and service-binding calls stream. In a deployed sprout with compatibility date `2026-10-21` or later, the call resolves as soon as the status and headers arrive. `response.body` is then a `ReadableStream` that receives each chunk as the upstream sends it.
+  
+  Before, the whole body had to arrive first. A response streamed over several seconds, such as server-sent events or a long download, reached the caller only at the end.
+  
+  The 32 MiB `SB_FETCH_MAX_BYTES` cap still applies to the total. Cancelling the body, or aborting the call's signal, stops the upstream request.
+  
+  In `@sproutboat/wire`:
+  - the broker streams a `fetch` or `service.fetch` that asks for it (`stream: true`), sending the head and each chunk as `FRAME_V1_MORE` frames through the new `emit` argument of `handleFrame`;
+  - the final frame ends the response;
+  - a request that doesn't ask is answered whole, as before.
+
+### Patch Changes
+
+- Updated dependencies [85aa74d]
+- Updated dependencies [f2d2b72]
+- Updated dependencies [b287117]
+- Updated dependencies [9773e45]
+- Updated dependencies [3798994]
+  - @sproutboat/runtime@0.20.0
+
 ## 0.13.2
 
 ### Patch Changes
