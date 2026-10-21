@@ -1,4 +1,4 @@
-import { neutraliseExports } from "./wrap";
+import { inlineWorkersImports, neutraliseExports } from "./wrap";
 
 export type SourceValidation = { ok: true } | { ok: false; errors: string[] };
 
@@ -28,7 +28,10 @@ const alwaysForbidden: Array<[RegExp, string]> = [
 
 ];
 
-export function validateHttpSyncSource(source: string): SourceValidation {
+export function validateHttpSyncSource(module: string): SourceValidation {
+  // `cloudflare:workers` is the one import allowed past bundling: the compiler turns it
+  // into globals the same way (see inlineWorkersImports).
+  const source = inlineWorkersImports(module);
   const errors: string[] = [];
   // The default export must be an object literal with a `fetch` method. A module
   // may also declare Durable Object classes / helpers before it, so this is not
@@ -36,8 +39,9 @@ export function validateHttpSyncSource(source: string): SourceValidation {
   // A hand-written file exports inline; a bundled one re-exports at the end.
   // `neutraliseExports` is the same reader the compiler uses, so `check` cannot
   // accept a module the build would then reject.
-  if (neutraliseExports(source) === null || !/\bfetch\s*\(/.test(source)) {
-    errors.push("handler must default-export an object with fetch(request)");
+  // A WorkerEntrypoint may serve only RPC, with no fetch() at all.
+  if (neutraliseExports(source) === null || (!/\bfetch\s*\(/.test(source) && !/\bextends\s+WorkerEntrypoint\b/.test(source))) {
+    errors.push("handler must default-export an object with fetch(request), or a WorkerEntrypoint class");
   }
   for (const [pattern, message] of alwaysForbidden) if (pattern.test(source)) errors.push(message);
   return errors.length ? { ok: false, errors } : { ok: true };
