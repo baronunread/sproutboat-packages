@@ -87,7 +87,7 @@ static int sb_db_count = 0;
 // here preserves standalone builds without an installed SQLite development SDK.
 #ifndef SQLITE3_H
 #ifndef _SQLITE3_H_
-typedef int64_t sqlite3_int64;
+typedef long long sqlite3_int64;
 typedef struct sqlite3_file sqlite3_file;
 typedef struct sqlite3_io_methods sqlite3_io_methods;
 typedef struct sqlite3_vfs sqlite3_vfs;
@@ -203,6 +203,16 @@ static int sb_ltx_vreserved(sqlite3_file *f, int *n) {
 }
 static int sb_ltx_vcontrol(sqlite3_file *f, int n, void *p) {
   sqlite3_file *r = sb_ltx_real(f);
+  if (((sb_ltx_file *)f)->wal) {
+    // SIZE_HINT can preallocate inside the parent VFS, bypassing xWrite and
+    // xTruncate. Ignore hints beyond the ceiling and disable chunk rounding.
+    if (n == 5 && (*(sqlite3_int64 *)p < 0 || (uint64_t)*(sqlite3_int64 *)p > sb_ltx_max_bytes))
+      return 0;
+    if (n == 6) {
+      int zero = 0;
+      return r->pMethods->xFileControl(r, n, &zero);
+    }
+  }
   return r->pMethods->xFileControl(r, n, p);
 }
 static int sb_ltx_vsector(sqlite3_file *f) {
@@ -363,9 +373,12 @@ static int sb_ltx_sync_dir(const char *path) {
 }
 static int sb_ltx_flush(FILE *f) { return fflush(f) || fsync(fileno(f)) ? -1 : 0; }
 #ifdef SB_LTX_TESTING
+static int sb_ltx_test_armed, sb_ltx_test_commits;
 static void sb_ltx_phase(const char *phase) {
   const char *p = getenv("SB_LTX_TEST_STOP");
-  if (p && strcmp(p, phase) == 0)
+  if (sb_ltx_test_armed && p && strcmp(p, phase) == 0 &&
+      sb_ltx_test_commits ==
+          atoi(getenv("SB_LTX_TEST_COMMIT") ? getenv("SB_LTX_TEST_COMMIT") : "1"))
     raise(SIGSTOP);
 }
 #else
@@ -752,6 +765,10 @@ done:
 static int sb_ltx_hook(void *ctx, sqlite3 *db, const char *name, int frames) {
   (void)db;
   sb_ltx_state *s = ctx;
+#ifdef SB_LTX_TESTING
+  sb_ltx_test_commits++;
+#endif
+  sb_ltx_phase("wal-committed");
   if (s->failed || strcmp(name, "main") || sb_ltx_capture(s, (uint32_t)frames)) {
     s->failed = 1;
     fprintf(stderr, "LTX capture failed for %s, restart required\n", s->path);
@@ -791,11 +808,199 @@ static int sb_ltx_after(int idx) {
   }
   return 0;
 }
+// Verify our literal-block file before trusting a position. Reads stay bounded
+// even for a large base; CRC covers the logical uncompressed LTX contents.
+static int sb_ltx_verify_last(sb_ltx_state *s) {
+  char tmp[SB_LTX_PATH], final[SB_LTX_PATH], dir[SB_LTX_PATH];
+  if (sb_ltx_names(s, s->txid, tmp, final, dir))
+    return 0;
+  int fd = open(final, O_RDONLY);
+  struct stat st;
+  unsigned char h[100], fh[10], tail[24];
+  unsigned char *page = malloc(65536);
+  int valid = 0;
+  if (fd < 0 || !page || fstat(fd, &st) || st.st_size < 131 || sb_ltx_read(fd, h, 100, 0) ||
+      sb_ltx_read(fd, tail, 24, (uint64_t)st.st_size - 24))
+    goto done;
+  uint64_t min = 0, max = 0, post = 0, file_crc = 0, index_size = 0;
+  for (int i = 0; i < 8; i++) {
+    min = (min << 8) | h[16 + i];
+    max = (max << 8) | h[24 + i];
+    post = (post << 8) | tail[8 + i];
+    file_crc = (file_crc << 8) | tail[16 + i];
+    index_size = (index_size << 8) | tail[i];
+  }
+  if (memcmp(h, "LTX1", 4) || sb_ltx_be32(h + 4) || sb_ltx_be32(h + 8) != s->page_size ||
+      sb_ltx_be32(h + 12) != s->commit || min != s->txid || max != s->txid || post != s->checksum)
+    goto done;
+  uint64_t offset = 100, hash = sb_ltx_crc(UINT64_MAX, h, 100);
+  uint32_t prev = 0;
+  for (;;) {
+    if (sb_ltx_read(fd, fh, 6, offset))
+      goto done;
+    hash = sb_ltx_crc(hash, fh, 6);
+    offset += 6;
+    uint32_t pgno = sb_ltx_be32(fh);
+    if (!pgno) {
+      if (fh[4] || fh[5])
+        goto done;
+      break;
+    }
+    if (pgno <= prev || pgno > s->commit || fh[4] || fh[5] != 1)
+      goto done;
+    prev = pgno;
+    if (sb_ltx_read(fd, fh, 4, offset))
+      goto done;
+    hash = sb_ltx_crc(hash, fh, 4);
+    offset += 4;
+    uint32_t size = sb_ltx_be32(fh), literal = 15;
+    uint64_t end = offset + size;
+    unsigned char c;
+    if (size > s->page_size + s->page_size / 255 + 16 || sb_ltx_read(fd, &c, 1, offset++) ||
+        c != 0xf0)
+      goto done;
+    do {
+      if (sb_ltx_read(fd, &c, 1, offset++))
+        goto done;
+      literal += c;
+      if (literal > s->page_size)
+        goto done;
+    } while (c == 255);
+    if (literal != s->page_size || offset + s->page_size != end ||
+        sb_ltx_read(fd, page, s->page_size, offset))
+      goto done;
+    hash = sb_ltx_crc(hash, page, s->page_size);
+    offset = end;
+  }
+  if (index_size > (uint64_t)st.st_size || offset + index_size + 24 != (uint64_t)st.st_size)
+    goto done;
+  // Index bytes, its size field and post-apply checksum are all hashed.
+  while (offset < (uint64_t)st.st_size - 8) {
+    size_t n = (uint64_t)st.st_size - 8 - offset;
+    if (n > 65536)
+      n = 65536;
+    if (sb_ltx_read(fd, page, n, offset))
+      goto done;
+    hash = sb_ltx_crc(hash, page, n);
+    offset += n;
+  }
+  valid = (SB_LTX_FLAG | ~hash) == file_crc;
+done:
+  if (fd >= 0)
+    close(fd);
+  free(page);
+  return valid;
+}
+static int sb_ltx_load_position(sb_ltx_state *s) {
+  char path[SB_LTX_PATH], text[768];
+  if (snprintf(path, sizeof(path), "%s/position", s->root) >= sizeof(path))
+    return 0;
+  FILE *f = fopen(path, "rb");
+  if (!f)
+    return 0;
+  size_t n = fread(text, 1, sizeof(text) - 1, f);
+  int bad = ferror(f) || !feof(f);
+  fclose(f);
+  if (bad)
+    return 0;
+  text[n] = 0;
+  sb_ltx_state candidate = *s;
+  unsigned long long txid, offset, checksum, digest;
+  int used = 0, tail = 0;
+  if (sscanf(text, "LTXPOS1\n%63s\n%llu %u %u %llu %16llx %u %u %u %u\n%n", candidate.epoch, &txid,
+             &candidate.salt1, &candidate.salt2, &offset, &checksum, &candidate.wal_c1,
+             &candidate.wal_c2, &candidate.page_size, &candidate.commit, &used) != 10)
+    return 0;
+  if (!used || sscanf(text + used, "%16llx\n%n", &digest, &tail) != 1 ||
+      (size_t)(used + tail) != n || digest != ~sb_ltx_crc(UINT64_MAX, text, (size_t)used))
+    return 0;
+  if (strncmp(candidate.epoch, "epoch-", 6) || strlen(candidate.epoch) != 12 ||
+      strspn(candidate.epoch, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-") !=
+          12 ||
+      !txid || txid == UINT64_MAX || !(checksum & SB_LTX_FLAG) || !candidate.commit)
+    return 0;
+  uint32_t ps = candidate.page_size;
+  if (ps < 512 || ps > 65536 || (ps & (ps - 1)) || offset < 32 || offset > sb_ltx_max_bytes ||
+      (offset - 32) % (ps + 24))
+    return 0;
+  candidate.txid = txid;
+  candidate.offset = offset;
+  candidate.checksum = checksum;
+  if (!sb_ltx_verify_last(&candidate))
+    return 0;
+  // A published orphan ahead of the record is never overwritten. A new base
+  // captures the recovered source and preserves the old generation for restore.
+  char tmp[SB_LTX_PATH], final[SB_LTX_PATH], dir[SB_LTX_PATH];
+  if (sb_ltx_names(&candidate, txid + 1, tmp, final, dir) || access(final, F_OK) == 0)
+    return 0;
+  *s = candidate;
+  return 1;
+}
+static int sb_ltx_resume(sb_ltx_state *s) {
+  if (!sb_ltx_load_position(s))
+    return 0;
+  char path[SB_LTX_PATH];
+  if (snprintf(path, sizeof(path), "%s-wal", s->path) >= sizeof(path))
+    return 0;
+  int fd = open(path, O_RDONLY);
+  unsigned char h[32], fh[24];
+  unsigned char *page = malloc(s->page_size);
+  struct stat st;
+  int valid = 0;
+  uint32_t last = 0;
+  if (fd < 0 || !page || fstat(fd, &st) || st.st_size < (off_t)s->offset ||
+      st.st_size > (off_t)sb_ltx_max_bytes || sb_ltx_read(fd, h, 32, 0))
+    goto done;
+  uint32_t magic = sb_ltx_be32(h), a = 0, b = 0;
+  if ((magic != 0x377f0682 && magic != 0x377f0683) || sb_ltx_be32(h + 4) != 3007000 ||
+      sb_ltx_be32(h + 8) != s->page_size || sb_ltx_be32(h + 16) != s->salt1 ||
+      sb_ltx_be32(h + 20) != s->salt2)
+    goto done;
+  sb_ltx_wal_checksum(h, 24, magic & 1, &a, &b);
+  if (a != sb_ltx_be32(h + 24) || b != sb_ltx_be32(h + 28))
+    goto done;
+  uint32_t prior = (uint32_t)((s->offset - 32) / (s->page_size + 24));
+  uint32_t count = (uint32_t)(((uint64_t)st.st_size - 32) / (s->page_size + 24));
+  for (uint32_t i = 1; i <= count; i++) {
+    uint64_t off = 32 + (uint64_t)(i - 1) * (s->page_size + 24);
+    if (sb_ltx_read(fd, fh, 24, off) || sb_ltx_read(fd, page, s->page_size, off + 24) ||
+        !sb_ltx_be32(fh) || sb_ltx_be32(fh + 8) != s->salt1 || sb_ltx_be32(fh + 12) != s->salt2)
+      break;
+    sb_ltx_wal_checksum(fh, 8, magic & 1, &a, &b);
+    sb_ltx_wal_checksum(page, s->page_size, magic & 1, &a, &b);
+    if (a != sb_ltx_be32(fh + 16) || b != sb_ltx_be32(fh + 20))
+      break;
+    if (sb_ltx_be32(fh + 4))
+      last = i;
+    if (i == prior)
+      valid = a == s->wal_c1 && b == s->wal_c2 && sb_ltx_be32(fh + 4) == s->commit;
+  }
+done:
+  if (fd >= 0)
+    close(fd);
+  free(page);
+  if (!valid || last < (s->offset - 32) / (s->page_size + 24))
+    return 0;
+  if (last > (s->offset - 32) / (s->page_size + 24)) {
+    char tmp[SB_LTX_PATH], final[SB_LTX_PATH], dir[SB_LTX_PATH];
+    if (sb_ltx_names(s, s->txid + 1, tmp, final, dir))
+      return -1;
+    if (unlink(tmp) && errno != ENOENT)
+      return -1;
+    if (sb_ltx_capture(s, last))
+      return -1;
+  }
+  if (sb_ltx_checkpoint(s))
+    return -1;
+  return 1;
+}
+
 static int sb_ltx_start(int idx, sqlite3 *db, const char *path, int lock) {
   sb_ltx_state *s = &sb_ltx_states[idx];
   memset(s, 0, sizeof(*s));
   s->db = db;
   s->lock = lock;
+  s->read_fd = -1;
   if (snprintf(s->path, sizeof(s->path), "%s", path) >= sizeof(s->path) ||
       snprintf(s->root, sizeof(s->root), "%s.ltx", path) >= sizeof(s->root))
     return -1;
@@ -815,6 +1020,14 @@ static int sb_ltx_start(int idx, sqlite3 *db, const char *path, int lock) {
                    "locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; COMMIT;",
                    0, 0, 0))
     return -1;
+  sqlite3_stmt *mode = 0;
+  if (sqlite3_prepare_v2(db, "PRAGMA journal_mode", -1, &mode, 0) || !mode)
+    return -1;
+  int is_wal =
+      sqlite3_step(mode) == 100 && !strcmp((const char *)sqlite3_column_text(mode, 0), "wal");
+  sqlite3_finalize(mode);
+  if (!is_wal)
+    return -1;
   struct stat st;
   if (stat(path, &st))
     return -1;
@@ -826,8 +1039,8 @@ static int sb_ltx_start(int idx, sqlite3 *db, const char *path, int lock) {
   s->read_fd = open(path, O_RDONLY);
   if (s->read_fd < 0)
     return -1;
-  // Restart validation is added in the next step; initially always make a base.
-  if (sb_ltx_snapshot(s))
+  int resumed = sb_ltx_resume(s);
+  if (resumed < 0 || (resumed == 0 && sb_ltx_snapshot(s)))
     return -1;
   sqlite3_wal_hook(db, sb_ltx_hook, s);
   sqlite3_set_authorizer(db, sb_ltx_authorize, s);
@@ -875,7 +1088,7 @@ static int sb_db_for(const char* path) {
   sqlite3* db = 0;
   sb_mkdirs(path);
   int replicated = sb_ltx_opted(path), lock = -1;
-  if (replicated < 0) return -1;
+  if (replicated < 0 || (replicated && strlen(path) >= sizeof(sb_db_names[0]))) return -1;
   if (replicated) {
     char lockpath[SB_LTX_PATH];
     if (snprintf(lockpath, sizeof(lockpath), "%s.ltx.lock", path) >= sizeof(lockpath) || sb_ltx_register()) return -1;
@@ -903,7 +1116,12 @@ static int sb_db_for(const char* path) {
   if (replicated && sb_ltx_start(sb_db_count, db, path, lock)) {
     sb_ltx_states[sb_db_count].failed = 1;
     fprintf(stderr, "LTX initialization failed for %s\n", path);
-    sqlite3_close(db); close(lock); return -1;
+    sqlite3_close(db);
+    if (sb_ltx_states[sb_db_count].read_fd >= 0) close(sb_ltx_states[sb_db_count].read_fd);
+    sb_ltx_states[sb_db_count].read_fd = -1;
+    sb_dbs[sb_db_count] = 0;
+    sb_db_count++;
+    close(lock); return -1;
   }
   return sb_db_count++;
 }

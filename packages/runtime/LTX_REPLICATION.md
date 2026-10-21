@@ -76,11 +76,30 @@ applications must use idempotent transaction identifiers for retries.
 
 Capture is tested against the exact inline C through `bun run test:native-ltx`,
 including independent BigInt CRC and index verification, a 102-file chain,
-byte-exact restore, integrity checking and oversized transaction rollback.
+byte-exact restore, integrity checking, oversized transaction rollback, database truncation, explicit rollback and late position-write failure latching.
 The workspace prototype additionally tests the compiled Porffor executable,
 including external writer exclusion and invariant PRAGMA rejection.
-Restart validation and randomized crash qualification are the next step. Do not
-interpret this draft as a completed restart-safe backup service.
+Restart validation now checks the position CRC, completed LTX checksum, WAL
+header/salts, commit frame and cumulative frame checksum. A matching prefix
+resumes in the same generation; any later complete commits are captured before
+serving. Incomplete/torn trailing WAL frames are excluded. An orphan finished
+file ahead of position forces a new generation, preserving the old files.
+Missing, truncated, reset or mismatched WAL takes a fresh page-exact base.
+A checkpointed/empty WAL therefore deliberately causes a new generation on the
+next start. This is conservative and may duplicate a full base on restart.
+
+The regression SIGKILLs at eight durability boundaries, verifies matching-prefix
+resume and fallback cases, and recovers a committed tail beyond the durable
+cursor. The full Porffor executable passed 200 seeded random SIGKILL iterations on macOS
+arm64: 1,310 acknowledged writes retained, 26 same-generation resumes and 174
+fresh-base recoveries. Every finished chain passed file/database CRC verification,
+integrity_check, deterministic source comparison at the last durable TXID, and
+comparison after restart. The test also recovered commits whose HTTP response
+was interrupted. Evidence and the runnable harness are in the linked prototype
+workspace; the self-contained durability-boundary regression runs in this repo's
+native CI. These are process-crash tests, not power-cut or storage-failure tests.
+Linux CI exercises the same C implementation; a randomized full executable Linux
+campaign and a power-loss campaign are not yet qualified.
 
 No uploader is included. Finished local files are retained without a retention
 policy; disk usage of the backup chain is not bounded by the WAL ceiling.
