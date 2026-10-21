@@ -10,7 +10,7 @@ test("idle reclamation preserves unconditional request GC and is idempotent on t
   try {
     execFileSync("tar", [
       "-xzf",
-      resolve(import.meta.dir, "../vendor/porffor-deda494.tar.gz"),
+      resolve(import.meta.dir, "../vendor/porffor-0c135ce.tar.gz"),
       "--strip-components=1",
       "-C",
       root,

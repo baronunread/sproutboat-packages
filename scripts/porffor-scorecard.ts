@@ -53,7 +53,6 @@ const markers = [...patchSource.matchAll(/const ([A-Z0-9_]+_MARKER)\s*=/g)].map(
 const targets = {
   "compiler/render.js": ["PORT", "CONSOLE", "BYTESTRING", "READ_RAW"],
   "compiler/index.js": ["LINK", "CFLAGS", "FP_CONTRACT", "HTTP10_IMPORT", "HTTP10_CALL"],
-  "compiler/builtins/date.ts": ["DATE_PARSER"],
   "compiler/builtins/promise.ts": ["PROMISE_NULL"],
   "compiler/builtins/string.ts": ["REPLACE_ALL"],
   "compiler/codegen.js": ["TA_GET", "TA_SET_BOUNDS"],
