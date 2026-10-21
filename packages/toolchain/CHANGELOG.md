@@ -1,5 +1,15 @@
 # @sproutboat/toolchain
 
+## 0.12.0
+
+### Minor Changes
+
+- feba29b: Upgrade the verified vendored Porffor pin to Alpha 19 (`0c135ce`). Alpha 19 brings `Map.groupBy`, private names that stay out of `Object.keys`, `for-in` and `JSON.stringify`, `JSON.stringify` throwing on cycles, a spec `JSON.parse` reviver (with source text), spec ISO date parsing, spec base64 and hex on `Uint8Array`, typed-array `toString` tags, the `Error.prototype.stack` accessor, spec `instanceof`, `+` and template literals converting objects with ToPrimitive, sloppy functions boxing a primitive `this`, unresolvable names read from the global object, `with`, and many String, Date, Function and Object spec fixes. These move compiled handlers closer to V8 (Workers), so they are not gated on a compatibility date, as with earlier Porffor upgrades.
+  
+  Seven downstream workarounds are dropped because upstream now does the same thing, each proven by its native test without the patch: the ISO date offset parser, the base64 option tags, `Map.groupBy` and non-enumerable private fields (sproutboat#286), the `JSON.stringify` cycle check, the `JSON.parse` reviver, and the typed-array `toString` tag. The Unicode JSON patch is re-anchored on the new `JSON.parse`: upstream now rejects trailing input itself, and the reviver's source-text records keep UTF-16 text. The #256 class self-name rewrite is kept (Alpha 19 still has the bug) and now places its synthesized read after the class, so Alpha 19's new TDZ check does not reject it. #287 (GC page discard), B16 (`repeat`), #237 (`replaceAll`), #168 (promise resolving to `null`) and the local function types patch are still needed.
+  
+  One patch is new: Alpha 19 added a `new Function` source specialization that walked the whole program twice per top-level function, so compiling the runtime prelude took 3.7 s instead of 0.6 s before any C was generated. The patch checks the function body first; the generated code is byte-identical.
+
 ## 0.11.0
 
 ### Minor Changes

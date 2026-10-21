@@ -1,13 +1,13 @@
 {
   "name": "@sproutboat/toolchain",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "license": "MIT",
-  "type": "module",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/baronunread/sproutboat-packages.git",
     "directory": "packages/toolchain"
   },
+  "type": "module",
   "main": "./src/index.ts",
   "types": "./src/index.ts",
   "exports": {
