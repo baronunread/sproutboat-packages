@@ -11,7 +11,9 @@ import { EMPTY_BINDINGS, preludePath, TRANSPORT_MARKER, transportPath, wrapNativ
 // serving while a call is in flight: other requests answer at once, concurrent calls
 // overlap, and a deployment that calls itself through a binding does not deadlock.
 // Requests read like Fetch's: a URL object, a Request plus init, a stream body; every
-// Set-Cookie of the reply survives. A stand-in edge plays the platform's.
+// Set-Cookie of the reply survives, and a reply without a content type keeps none.
+// From compatibility date 2026-10-22, redirects are followed as Fetch does. A stand-in
+// edge plays the platform's.
 const handler = `
 export default {
   async fetch(request, env) {
@@ -25,7 +27,22 @@ export default {
       const stream = new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode("streamed ")); c.enqueue(new TextEncoder().encode("body")); c.close(); } });
       const viaStream = await (await env.PEER.fetch("https://peer/echo", { method: "POST", body: stream, duplex: "half" })).json();
       const cookies = (await env.PEER.fetch("https://peer/cookies")).headers.getSetCookie();
-      return Response.json({ isPromise, viaUrl, viaRequest, viaStream, cookies });
+      const bare = (await env.PEER.fetch("https://peer/bare")).headers.get("content-type");
+      return Response.json({ isPromise, viaUrl, viaRequest, viaStream, cookies, bare });
+    }
+    if (url.pathname === "/redirects") {
+      const followed = await (await env.PEER.fetch("https://peer/redirect?status=302&to=/echo?hop=1")).json();
+      const manual = await env.PEER.fetch("https://peer/redirect?status=302&to=/echo", { redirect: "manual" });
+      const post = (status, body) => env.PEER.fetch("https://peer/redirect?status=" + status + "&to=/typed", { method: "POST", body, headers: { "content-type": "text/plain" } });
+      const seeOther = await (await post(303, "dropped")).json();
+      const temporary = await (await post(307, "kept")).json();
+      let refused = "";
+      try {
+        await env.PEER.fetch("https://peer/redirect?status=302&to=/echo", { redirect: "error" });
+      } catch (e) {
+        refused = e.name;
+      }
+      return Response.json({ followed, manual: [manual.status, manual.headers.get("location")], seeOther, temporary, refused });
     }
     if (url.pathname === "/slow") return new Response(await (await env.PEER.fetch("https://peer/slow" + url.search)).text());
     if (url.pathname === "/self") {
@@ -64,6 +81,14 @@ const edge = Bun.serve({
         body: await request.text(),
       });
     }
+    if (url.pathname === "/typed") {
+      return Response.json({ method: request.method, type: request.headers.get("content-type"), body: await request.text() });
+    }
+    if (url.pathname === "/redirect") {
+      const status = Number(url.searchParams.get("status"));
+      return new Response(null, { status, headers: { location: url.searchParams.get("to") ?? "/" } });
+    }
+    if (url.pathname === "/bare") return new Response(null, { headers: { "x-bare": "1" } });
     if (url.pathname === "/slow") {
       await Bun.sleep(Number(url.searchParams.get("ms") || 500));
       return new Response("slow done");
@@ -109,7 +134,7 @@ try {
   assert(core.includes(TRANSPORT_MARKER), "runtime prelude is missing its transport marker");
   const generated = join(workdir, "services.generated.js");
   const binary = join(workdir, "services-native");
-  await writeFile(generated, wrapNativeFetchHandler(handler, core.replace(TRANSPORT_MARKER, transport), {}, bindings, undefined, "2026-10-21"));
+  await writeFile(generated, wrapNativeFetchHandler(handler, core.replace(TRANSPORT_MARKER, transport), {}, bindings, undefined, "2026-10-22"));
 
   const compile = Bun.spawn([node, resolve(porffor, "runtime/index.js"), "native", generated, "-o", binary, "-s", "-O0"], {
     cwd: workdir,
@@ -154,6 +179,19 @@ try {
     viaRequest: { method: "PATCH", path: "/echo", from: "request", body: "req body" },
     viaStream: { method: "POST", path: "/echo", from: null, body: "streamed body" },
     cookies: ["a=1; Path=/", "b=2; Path=/"],
+    bare: null,
+  });
+
+  // Redirects (compatibility date 2026-10-22): followed through the binding by default,
+  // returned under "manual", refused under "error"; a 303 turns a POST into a bodiless GET.
+  const redirects = await get("/redirects");
+  assert.equal(redirects.status, 200, redirects.text);
+  assert.deepEqual(JSON.parse(redirects.text), {
+    followed: { method: "GET", path: "/echo?hop=1", from: null, body: "" },
+    manual: [302, "/echo"],
+    seeOther: { method: "GET", type: null, body: "" },
+    temporary: { method: "POST", type: "text/plain", body: "kept" },
+    refused: "TypeError",
   });
 
   // A call in flight does not hold up other requests.
@@ -176,7 +214,7 @@ try {
   assert.equal(self.text, "bottom 30");
   console.log(
     `Service bindings return promises and run off the loop: /ping ${Math.round(ping.ms)} ms during a call, ` +
-      `8x500 ms in ${Math.round(total)} ms, self-recursion ok; URL, Request+init, stream bodies and Set-Cookie preserved`,
+      `8x500 ms in ${Math.round(total)} ms, self-recursion ok; URL, Request+init, stream bodies, Set-Cookie and missing content types preserved; redirects follow Fetch`,
   );
 } finally {
   if (server) {
