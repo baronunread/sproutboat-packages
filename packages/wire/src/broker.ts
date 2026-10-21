@@ -185,9 +185,10 @@ export type Broker = {
    * v1 starts with a 0x01 marker and carries `[u32 LE json length][json][bytes]`,
    * so an object body never has to be escaped into the JSON. A token's first
    * character is never 0x01, which is what makes the two tellable apart without
-   * negotiation.
+   * negotiation. `signal` aborts when the sprout's connection closes: a `fetch` or
+   * `service.fetch` in flight then stops its upstream request too.
    */
-  handleFrame(payload: Buffer): Promise<Buffer>;
+  handleFrame(payload: Buffer, signal?: AbortSignal): Promise<Buffer>;
   /** Serve one reserved direct R2 upload or download request. */
   transfer(request: Request): Promise<Response>;
   close(): void;
@@ -1148,7 +1149,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     return res;
   }
 
-  async function proxyFetch(msg: Frame): Promise<Upstream> {
+  async function proxyFetch(msg: Frame, signal?: AbortSignal): Promise<Upstream> {
     let url: URL;
     try {
       url = new URL(str(msg.url));
@@ -1169,6 +1170,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       headers,
       body: method === "GET" || method === "HEAD" ? undefined : upstreamBody(msg),
       redirect: "manual",
+      signal,
     };
     const res = egressUrl
       ? await viaEgressService(url, init)
@@ -1186,7 +1188,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
    * minus the trip through the network (and therefore minus TLS and the
    * default-deny egress rules, which is why this is not `fetch`).
    */
-  async function serviceFetch(msg: Frame): Promise<Upstream> {
+  async function serviceFetch(msg: Frame, signal?: AbortSignal): Promise<Upstream> {
     const binding = str(msg.binding);
     const declared = bindings.services.find((entry) => entry.binding === binding);
     if (!declared) throw new Error(`service not bound: ${binding}`);
@@ -1218,6 +1220,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       headers,
       body: method === "GET" || method === "HEAD" ? undefined : upstreamBody(msg),
       redirect: "manual",
+      signal,
     });
     const outHeaders: Array<[string, string]> = [];
     res.headers.forEach((v, k) => outHeaders.push([k, v]));
@@ -1658,7 +1661,11 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
    * #63 — the ops that carry bytes rather than escaping them into the frame.
    * Everything else goes through `dispatch` untouched.
    */
-  async function dispatchBinary(msg: Frame, binary: Uint8Array): Promise<{ reply: Frame; bytes?: Uint8Array }> {
+  async function dispatchBinary(
+    msg: Frame,
+    binary: Uint8Array,
+    signal?: AbortSignal,
+  ): Promise<{ reply: Frame; bytes?: Uint8Array }> {
     if (msg.op === "r2.put") {
       // The body arrived as bytes; write it straight to its own file rather
       // than into SQLite (#56) — no escape, no parse, no re-encode, and no
@@ -1708,8 +1715,8 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     }
 
     // #232 — a v1 fetch gets the upstream body as raw bytes, not decoded text.
-    if (msg.op === "fetch") return proxyFetch(msg);
-    if (msg.op === "service.fetch") return serviceFetch(msg);
+    if (msg.op === "fetch") return proxyFetch(msg, signal);
+    if (msg.op === "service.fetch") return serviceFetch(msg, signal);
 
     if (msg.op === "assets.get") {
       if (!bindings.assets) throw new Error("assets not bound");
@@ -1741,7 +1748,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   }
 
   /** One wire frame in, one out. See `handleFrame` on the Broker type. */
-  async function handleFrame(payload: Buffer): Promise<Buffer> {
+  async function handleFrame(payload: Buffer, signal?: AbortSignal): Promise<Buffer> {
     if (payload.length === 0 || payload[0] !== FRAME_V1) {
       return encodeFrame(await handlePayload(payload.toString("utf8")));
     }
@@ -1757,7 +1764,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         const seen = replayed.get(replayKey);
         if (seen) return frameOf(encodeV1(seen));
       }
-      const { reply, bytes } = await dispatchBinary(msg, binary);
+      const { reply, bytes } = await dispatchBinary(msg, binary, signal);
       if (replayKey && REPLAYABLE.has(str(msg.op))) rememberReplay(replayKey, reply);
       return frameOf(encodeV1(reply, bytes));
     } catch (e) {
@@ -2124,6 +2131,8 @@ export function listen(broker: Broker, hostname: string, port: number): BrokerSe
     output: Buffer | null;
     offset: number;
     written: (() => void) | null;
+    /** Aborted when the connection closes, so upstream requests it started stop. */
+    abort: AbortController;
   };
   const flush = (socket: Bun.Socket<SocketState>): void => {
     const state = socket.data;
@@ -2152,12 +2161,22 @@ export function listen(broker: Broker, hostname: string, port: number): BrokerSe
     port,
     socket: {
       open(socket) {
-        socket.data = { chunks: [], size: 0, processing: false, closed: false, output: null, offset: 0, written: null };
+        socket.data = {
+          chunks: [],
+          size: 0,
+          processing: false,
+          closed: false,
+          output: null,
+          offset: 0,
+          written: null,
+          abort: new AbortController(),
+        };
       },
       drain: flush,
       close(socket) {
         const state = socket.data;
         state.closed = true;
+        state.abort.abort();
         state.chunks = [];
         state.size = 0;
         state.output = null;
@@ -2193,7 +2212,7 @@ export function listen(broker: Broker, hostname: string, port: number): BrokerSe
           state.size = rest.length;
           // Bun does not buffer unwritten bytes. Serialize replies and retain
           // the unsent suffix until drain, including binary R2 responses.
-          await send(socket, await broker.handleFrame(payload));
+          await send(socket, await broker.handleFrame(payload, state.abort.signal));
         } } finally { state.processing = false; }
       },
     },
