@@ -3594,18 +3594,53 @@ if (globalThis.crypto.getRandomValues == null) {
       Promise.resolve().then(() => callback());
     };
   }
-  const nativeAtob = globalThis.atob, nativeBtoa = globalThis.btoa;
+  // Base64 in JavaScript rather than Porffor's atob/btoa: those read a string's storage,
+  // so a string held as UTF-16 (one from JSON.parse or TextDecoder, say) decoded to the
+  // wrong bytes, and btoa encoded its UTF-16 units.
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   globalThis.atob = function (data) {
     let text = String(data).replace(/[\t\n\f\r ]/g, "");
     if (text.length % 4 === 0) text = text.replace(/==?$/, "");
     if (text.length % 4 === 1 || !/^[A-Za-z0-9+/]*$/.test(text)) throw invalidCharacter("atob: the string is not valid base64");
-    while (text.length % 4 !== 0) text += "=";
-    return nativeAtob(text);
+    const parts = [];
+    let chunk = "";
+    let bits = 0;
+    let count = 0;
+    for (let i = 0; i < text.length; i++) {
+      bits = (bits << 6) | alphabet.indexOf(text[i]);
+      count += 6;
+      if (count >= 8) {
+        count -= 8;
+        chunk += String.fromCharCode((bits >> count) & 0xff);
+        if (chunk.length === 512) {
+          parts.push(chunk);
+          chunk = "";
+        }
+      }
+    }
+    parts.push(chunk);
+    return parts.join("");
   };
   globalThis.btoa = function (data) {
     const text = String(data);
-    for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) > 0xff) throw invalidCharacter("btoa: the string has characters outside Latin-1");
-    return nativeBtoa(text);
+    const parts = [];
+    let chunk = "";
+    for (let i = 0; i < text.length; i += 3) {
+      const a = text.charCodeAt(i);
+      const b = i + 1 < text.length ? text.charCodeAt(i + 1) : 0;
+      const c = i + 2 < text.length ? text.charCodeAt(i + 2) : 0;
+      if (a > 0xff || b > 0xff || c > 0xff) throw invalidCharacter("btoa: the string has characters outside Latin-1");
+      const n = (a << 16) | (b << 8) | c;
+      chunk += alphabet[(n >> 18) & 63] + alphabet[(n >> 12) & 63];
+      chunk += i + 1 < text.length ? alphabet[(n >> 6) & 63] : "=";
+      chunk += i + 2 < text.length ? alphabet[n & 63] : "=";
+      if (chunk.length >= 512) {
+        parts.push(chunk);
+        chunk = "";
+      }
+    }
+    parts.push(chunk);
+    return parts.join("");
   };
 }
 
@@ -5188,7 +5223,7 @@ globalThis.__sbInstallBindings = function (target, bindings) {
   // which is also what lets a deployment call itself without deadlocking.
   for (let i = 0; i < (bindings.services || []).length; i++) {
     const binding = bindings.services[i].binding;
-    target[binding] = {
+    const fetcher = {
       async fetch(input, init) {
         const parts = __sbFetchParts(input, init);
         if (parts.signal) parts.signal.throwIfAborted();
@@ -5203,6 +5238,15 @@ globalThis.__sbInstallBindings = function (target, bindings) {
         return response;
       },
     };
+    // Any other name is an RPC method of the callee's WorkerEntrypoint (see __sbRpcCall).
+    // "then" stays undefined, so awaiting the binding itself is not a call.
+    target[binding] = new Proxy(fetcher, {
+      get(t, prop) {
+        if (prop in t) return t[prop];
+        if (!__sbIsStr(prop) || prop === "then") return undefined;
+        return (...args) => __sbRpcCall(binding, prop, args);
+      },
+    });
   }
 
 };
@@ -5227,6 +5271,157 @@ function __sbRemoteError(marker) {
     : new Error(message);
   if (error.name !== name) error.name = name;
   return error;
+}
+
+// Workers RPC (cloudflare:workers). A service binding's methods other than fetch() call
+// the callee's WorkerEntrypoint: env.SVC.add(1, 2) runs `add(1, 2)` on an instance of
+// the callee's default export and resolves to what it returns. The call travels as a
+// service-binding request the platform's edge vouched for (x-sb-rpc names the method),
+// so no client can invoke a method. Arguments and results are copied as structured
+// clone does (__sbRpcEncode); functions and RPC stubs are not supported yet. An error
+// the method throws rejects the call with the same class and message, as fetch does.
+if (globalThis.WorkerEntrypoint == null) {
+  class WorkerEntrypoint {
+    constructor(ctx, env) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  }
+  class DurableObject {
+    constructor(ctx, env) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  }
+  class RpcTarget {}
+  globalThis.WorkerEntrypoint = WorkerEntrypoint;
+  globalThis.DurableObject = DurableObject;
+  globalThis.RpcTarget = RpcTarget;
+}
+
+// A value -> JSON that keeps what structured clone keeps: undefined, NaN, ±Infinity
+// and -0, Dates, RegExps, binary data, Maps, Sets and Errors are tagged ("$"); a plain
+// object that has its own "$" key is wrapped so it is not read as a tag.
+function __sbRpcEncode(value) {
+  if (value === undefined) return { $: "u" };
+  if (value === null || __sbIsStr(value) || value === true || value === false) return value;
+  // Number.isNaN is true only for NaN itself; strings and booleans returned above.
+  if (Number.isNaN(value)) return { $: "n", v: "NaN" };
+  if (value === Number(value)) {
+    if (value === Infinity) return { $: "n", v: "Infinity" };
+    if (value === -Infinity) return { $: "n", v: "-Infinity" };
+    if (value === 0 && 1 / value < 0) return { $: "n", v: "-0" };
+    return value;
+  }
+  if (__sbIsFn(value)) {
+    throw new TypeError("Could not serialize a function for an RPC call: passing functions is not supported yet.");
+  }
+  if (Array.isArray(value)) return value.map(__sbRpcEncode);
+  if (value instanceof Date) return { $: "d", v: value.getTime() };
+  if (value instanceof RegExp) return { $: "r", s: value.source, f: value.flags };
+  if (value instanceof ArrayBuffer) return { $: "ab", v: btoa(__sbToBytes(new Uint8Array(value))) };
+  if (ArrayBuffer.isView(value)) {
+    const bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    return { $: "ta", t: value.constructor.name, v: btoa(__sbToBytes(bytes)) };
+  }
+  if (value instanceof Map) {
+    const entries = [];
+    value.forEach((v, k) => entries.push([__sbRpcEncode(k), __sbRpcEncode(v)]));
+    return { $: "m", v: entries };
+  }
+  if (value instanceof Set) {
+    const items = [];
+    value.forEach((v) => items.push(__sbRpcEncode(v)));
+    return { $: "s", v: items };
+  }
+  if (value instanceof Error) return { $: "e", n: value.name, m: String(value.message) };
+  const out = {};
+  for (const key of Object.keys(value)) out[key] = __sbRpcEncode(value[key]);
+  return Object.prototype.hasOwnProperty.call(value, "$") ? { $: "o", v: out } : out;
+}
+
+function __sbRpcDecode(value) {
+  if (value === null || !(value instanceof Object)) return value;
+  if (Array.isArray(value)) return value.map(__sbRpcDecode);
+  const tag = value.$;
+  if (tag === undefined) {
+    const out = {};
+    for (const key of Object.keys(value)) out[key] = __sbRpcDecode(value[key]);
+    return out;
+  }
+  if (tag === "u") return undefined;
+  if (tag === "n") return value.v === "-0" ? -0 : Number(value.v);
+  if (tag === "d") return new Date(value.v);
+  if (tag === "r") return new RegExp(value.s, value.f);
+  if (tag === "ab") return __sbBufFrom(atob(value.v));
+  if (tag === "ta") {
+    const buffer = __sbBufFrom(atob(value.v));
+    const View = globalThis[value.t];
+    if (View === globalThis.DataView) return new DataView(buffer);
+    return View && View.BYTES_PER_ELEMENT ? new View(buffer) : new Uint8Array(buffer);
+  }
+  if (tag === "m") return new Map(value.v.map((pair) => [__sbRpcDecode(pair[0]), __sbRpcDecode(pair[1])]));
+  if (tag === "s") return new Set(value.v.map(__sbRpcDecode));
+  if (tag === "e") return __sbRemoteError(encodeURIComponent(JSON.stringify({ name: value.n, message: value.m })));
+  if (tag === "o") return __sbRpcDecode(value.v);
+  return value;
+}
+
+// Caller: one RPC call through service binding `binding`.
+async function __sbRpcCall(binding, method, args) {
+  const label = "sproutboat service " + binding;
+  const body = JSON.stringify(args.map(__sbRpcEncode));
+  const msg = {
+    binding,
+    url: "https://rpc.sproutboat.internal/" + method,
+    method: "POST",
+    headers: [
+      ["x-sb-rpc", method],
+      ["content-type", "application/json"],
+    ],
+    body,
+  };
+  const response = await __sbUpstream("service.fetch", msg, label, null);
+  const uncaught = response.headers.get("x-sb-uncaught");
+  if (uncaught != null) throw __sbRemoteError(uncaught);
+  if (response.headers.get("x-sb-rpc-result") !== "1") {
+    throw new TypeError(
+      label + ": the target answered " + response.status + " instead of an RPC result. RPC needs a platform edge " +
+        "that vouches for service-binding calls and a target whose default export extends WorkerEntrypoint.",
+    );
+  }
+  return __sbRpcDecode(JSON.parse(await response.text()));
+}
+
+// Whether the default export handles `name` (fetch, scheduled, queue): a method of the
+// object, or of the class's instances.
+function __sbHandles(handlers, name) {
+  return __sbIsFn(handlers) ? !!handlers.prototype && __sbIsFn(handlers.prototype[name]) : __sbIsFn(handlers[name]);
+}
+
+// Callee: the receiver of one request. A default export that is a class (a
+// WorkerEntrypoint) is instantiated per request with its ctx and env, as in workerd.
+function __sbReceiver(handlers, ctx) {
+  return __sbIsFn(handlers) ? new handlers(ctx, globalThis.env) : handlers;
+}
+
+// Callee: runs RPC method `method` of `receiver` with the arguments in the request body.
+// Only methods the receiver's class defines can be called, not ones every object has.
+async function __sbRpcDispatch(handlers, receiver, method, request) {
+  if (!__sbIsFn(handlers)) {
+    throw new TypeError(
+      "The receiving Worker does not allow its default export to be invoked over RPC, because it does not extend WorkerEntrypoint.",
+    );
+  }
+  const fn = receiver[method];
+  if (!__sbIsFn(fn) || method === "constructor" || method in Object.prototype) {
+    throw new TypeError('The RPC receiver does not implement the method "' + method + '".');
+  }
+  const args = JSON.parse(await request.text()).map(__sbRpcDecode);
+  const result = await fn.apply(receiver, args);
+  return new Response(JSON.stringify(__sbRpcEncode(result)), {
+    headers: { "content-type": "application/json", "x-sb-rpc-result": "1" },
+  });
 }
 
 // fetch(input, init) as Fetch reads it: a Request's method, headers, body, redirect mode
@@ -6066,9 +6261,14 @@ globalThis.__sbEntry = function (handlers, request) {
     };
     let __res;
     try {
-      __res = globalThis.__sbCompat >= "2026-09-28"
-        ? handlers.fetch(request, globalThis.env, ctx)
-        : handlers.fetch(request, ctx);
+      const receiver = __sbReceiver(handlers, ctx);
+      // An RPC call (a vouched binding call naming a method) runs that method instead.
+      const rpc = bindingCall ? request.headers.get("x-sb-rpc") : null;
+      __res = rpc != null
+        ? __sbRpcDispatch(handlers, receiver, rpc, request)
+        : globalThis.__sbCompat >= "2026-09-28"
+          ? receiver.fetch(request, globalThis.env, ctx)
+          : receiver.fetch(request, ctx);
     } catch (error) {
       // #179 — a synchronous throw anywhere in the handler must not take the
       // whole process (and every other in-flight request) down with it.
@@ -6082,7 +6282,7 @@ globalThis.__sbEntry = function (handlers, request) {
   if (!__sbTriggerAuthed(request)) return new Response("forbidden", { status: 403 });
 
   if (trigger === "scheduled") {
-    if (!__sbIsFn(handlers.scheduled)) return new Response("no scheduled handler", { status: 404 });
+    if (!__sbHandles(handlers, "scheduled")) return new Response("no scheduled handler", { status: 404 });
     const body = __sbReadJson(request);
     // #171 — ctx.waitUntil, same shape as fetch's. Was also fire-and-forget
     // before this: an async `scheduled()`'s own promise was dropped the
@@ -6096,9 +6296,10 @@ globalThis.__sbEntry = function (handlers, request) {
     let __sres;
     try {
       const event = { cron: body.cron || "", scheduledTime: body.scheduledTime || Date.now(), noRetry() {} };
+      const receiver = __sbReceiver(handlers, ctx);
       __sres = globalThis.__sbCompat >= "2026-09-28"
-        ? handlers.scheduled(event, globalThis.env, ctx)
-        : handlers.scheduled(event, ctx);
+        ? receiver.scheduled(event, globalThis.env, ctx)
+        : receiver.scheduled(event, ctx);
     } catch (error) {
       // #179 — same rule as fetch: don't let a throw here crash the process.
       __sbLogUncaught("scheduled", error);
@@ -6109,7 +6310,7 @@ globalThis.__sbEntry = function (handlers, request) {
   }
 
   if (trigger === "queue") {
-    if (!__sbIsFn(handlers.queue)) return new Response("no queue handler", { status: 404 });
+    if (!__sbHandles(handlers, "queue")) return new Response("no queue handler", { status: 404 });
     // #171 — same ctx.waitUntil shape. `__sbRunQueueBatch` was also
     // fire-and-forget for an async `queue()`: it computed the default
     // ack/retry and answered the broker before the handler's own awaits ran,
@@ -6124,7 +6325,7 @@ globalThis.__sbEntry = function (handlers, request) {
     // Always a promise now (`__sbRunQueueBatch` is async, to await the
     // handler above), so always tail-call the drain wrapper — same
     // promise-identity reasoning as `__sbFetchWithDrain`.
-    return __sbQueueWithDrain(__sbRunQueueBatch(handlers, __sbReadJson(request), ctx), __sbTasks);
+    return __sbQueueWithDrain(__sbRunQueueBatch(__sbReceiver(handlers, ctx), __sbReadJson(request), ctx), __sbTasks);
   }
 
   if (trigger === "alarm") {

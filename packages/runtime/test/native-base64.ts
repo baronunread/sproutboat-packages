@@ -18,7 +18,13 @@ const handler = `export default {fetch() {
     const decoded=Array.from(Uint8Array.fromBase64(url,{alphabet:"base64url"}));
     rows.push({padded,url,decoded});
   }
-  return Response.json(rows);
+  // atob/btoa on strings that are not literals (from JSON.parse, from TextDecoder): they
+  // used to read the string's UTF-16 storage and return the wrong bytes.
+  const parsed=JSON.parse('{"latin":"h\\u00e9llo w\\u00f6rld","b64":"AQL/"}');
+  const decodedText=new TextDecoder().decode(new TextEncoder().encode("AQL/"));
+  const codes=(s)=>Array.from(s,(c)=>c.charCodeAt(0));
+  const strings={btoa:btoa(parsed.latin),atob:codes(atob(parsed.b64)),fromDecoder:codes(atob(decodedText))};
+  return Response.json({rows,strings});
 }};`;
 
 function freePort(): number {
@@ -78,7 +84,10 @@ try {
   }
   assert(response, "compiled streams handler did not start");
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), expected);
+  assert.deepEqual(await response.json(), {
+    rows: expected,
+    strings: { btoa: btoa("h\u00e9llo w\u00f6rld"), atob: [1, 2, 255], fromDecoder: [1, 2, 255] },
+  });
   console.log("Native base64 and base64url round-trip zero to nine bytes with correct padding");
 } finally {
   if (server) {

@@ -113,7 +113,33 @@ function hasBindings(b: Bindings): boolean {
  * and re-exports at the end (`export { src_default as default, Counter }`) —
  * #89 made the second shape the normal case. Returns null when neither matches.
  */
+/**
+ * `cloudflare:workers` is not a module here: WorkerEntrypoint, DurableObject, RpcTarget
+ * and env are globals the prelude defines. Each import of it becomes a destructuring
+ * of globalThis, `as` renames included, so the handler's names still resolve. The CLI
+ * leaves the specifier external for this.
+ */
+export function inlineWorkersImports(source: string): string {
+  return source.replace(
+    /^import\s*\{([^}]*)\}\s*from\s*["']cloudflare:workers["'];?[ \t]*$/gm,
+    (_match, names: string) => {
+      const pairs = names
+        .split(",")
+        .map((part) => part.trim())
+        .filter(Boolean)
+        .map((part) => part.replace(/^(\S+)\s+as\s+(\S+)$/, "$1: $2"));
+      return `const { ${pairs.join(", ")} } = globalThis;`;
+    },
+  );
+}
+
 export function neutraliseExports(source: string): string | null {
+  // `export default class Name extends WorkerEntrypoint {`: the class is the handler.
+  if (/^\s*export\s+default\s+class\b/m.test(source)) {
+    return source
+      .replace(/^(\s*)export\s+default\s+class\b/m, "$1const __sbHandlers = class")
+      .replace(/^export\s+(async\s+function|function|class|const|let|var)\b/gm, "$1");
+  }
   if (/\bexport\s+default\s*\{/.test(source)) {
     return source
       .replace(/^(\s*)export\s+default\s*/m, "$1const __sbHandlers = ")
@@ -182,9 +208,10 @@ export function wrapNativeFetchHandler(
    */
   versionMetadata?: { binding: string; id: string; tag: string; timestamp: string },
 ): string {
-  const neutralised = neutraliseExports(source);
-  if (neutralised === null || !/\bfetch\s*\(/.test(source)) {
-    throw new Error("handler must default-export an object with a fetch(request) method");
+  const neutralised = neutraliseExports(inlineWorkersImports(source));
+  // A WorkerEntrypoint may serve only RPC, with no fetch() at all.
+  if (neutralised === null || (!/\bfetch\s*\(/.test(source) && !/\bextends\s+WorkerEntrypoint\b/.test(source))) {
+    throw new Error("handler must default-export an object with a fetch(request) method, or a WorkerEntrypoint class");
   }
 
   const env = `const env = ${JSON.stringify(vars)};\nglobalThis.env = env;\n`;
