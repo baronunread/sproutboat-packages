@@ -48,9 +48,10 @@ jobs:
       - run: bun run typecheck
       - run: bun run lint
       - run: bun run test
-      # Every test:native-* script, not a subset: run 4 at a time they take about
-      # as long as the seven this step used to run one by one. This is also what
-      # lets ci.yml skip the "Version Packages" PR this job opens.
+      # Every test:native-* script, not a subset: 4 at a time, all 19 take about
+      # 2.5 minutes on a hosted runner, against about 2 for the seven this step
+      # used to run one by one. Running all of them is also what lets ci.yml skip
+      # the "Version Packages" PR this job opens.
       - run: bun run test:native
       - name: Version or publish
         uses: changesets/action@v1
