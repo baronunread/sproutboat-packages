@@ -5267,6 +5267,88 @@ function __sbUpstreamResponse(r) {
   return response;
 }
 
+// A streamed upstream response (from compatibility date 2026-10-21, where body is a
+// stream anyway): the call resolves as soon as the head arrives, and the body is a
+// ReadableStream fed chunk by chunk as the broker passes them on. Each frame fires the
+// same callback, so it is an interval that the last frame clears. A reply that comes
+// whole (a broker from before streaming, or sproutd's embedded transport) is handled
+// as before. Cancelling the body, or the signal, drops the exchange, which stops the
+// upstream request.
+function __sbUpstreamStreamed(op, msg, label, signal) {
+  return new Promise((resolve, reject) => {
+    let controller = null;
+    let onAbort = null;
+    let done = false;
+    const finish = () => {
+      done = true;
+      clearInterval(id);
+      if (onAbort) signal.removeEventListener("abort", onAbort);
+    };
+    const id = setInterval(() => {
+      if (done) return;
+      const raw = __sbHttpAsyncResult(id);
+      if (controller === null) {
+        let reply;
+        try {
+          reply = JSON.parse(raw);
+        } catch (e) {
+          reply = { ok: false, error: String((e && e.message) || e) };
+        }
+        if (reply.ok === false || !reply.stream) {
+          finish();
+          try {
+            resolve(__sbUpstreamResponse(__sbFetchReply(raw)));
+          } catch (e) {
+            reject(new Error(label + ": " + ((e && e.message) || e)));
+          }
+          return;
+        }
+        const headers = new Headers();
+        for (let j = 0; j < (reply.headers || []).length; j++) headers.append(reply.headers[j][0], reply.headers[j][1]);
+        const body = new ReadableStream({
+          start(c) {
+            controller = c;
+          },
+          cancel() {
+            if (done) return;
+            finish();
+            __sbCancelAsync(id);
+          },
+        });
+        resolve(new Response(body, { status: reply.status || 502, headers }));
+        return;
+      }
+      const frame = JSON.parse(raw);
+      const bytes = __sbTakeBin();
+      if (frame.chunk) {
+        if (bytes.length) controller.enqueue(new Uint8Array(__sbBufFrom(bytes)));
+        return;
+      }
+      finish();
+      if (frame.ok === false) controller.error(new Error(label + ": " + (frame.error || "failed")));
+      else controller.close();
+    }, 2147483647);
+    if (signal) {
+      onAbort = () => {
+        if (done) return;
+        finish();
+        __sbCancelAsync(id);
+        if (controller === null) reject(signal.reason);
+        else controller.error(signal.reason);
+      };
+      signal.addEventListener("abort", onAbort);
+    }
+    try {
+      msg.asyncId = id;
+      msg.stream = true;
+      globalThis.__sbFetchUpstream(op, msg);
+    } catch (e) {
+      finish();
+      reject(e);
+    }
+  });
+}
+
 // Fetch's redirect handling, from compatibility date 2026-10-22 (before it, a 3xx came
 // back as it was, whatever the mode). "follow" sends the request again to the new
 // location, up to 20 times; each hop goes back through the broker, so outbound hops
@@ -5283,6 +5365,8 @@ function __sbFollowHop(op, msg, label, mode, signal, hops) {
     if (!(globalThis.__sbCompat >= "2026-10-22") || mode === "manual" || !redirect || location == null) return res;
     if (mode === "error") throw new TypeError(label + ": redirect not allowed (redirect: \"error\")");
     if (hops >= 20) throw new TypeError(label + ": too many redirects");
+    const dropped = __sbRawBody(res);
+    if (dropped instanceof ReadableStream) dropped.cancel();
     const from = new URL(msg.url);
     const to = new URL(location, from);
     const next = { ...msg, url: to.href };
@@ -5311,6 +5395,7 @@ function __sbFollowHop(op, msg, label, mode, signal, hops) {
 function __sbUpstream(op, msg, label, signal) {
   if (signal) signal.throwIfAborted();
   if (!__sbHttpAsyncEnabled()) return __sbUpstreamResponse(globalThis.__sbFetchUpstream(op, msg));
+  if (globalThis.__sbCompat >= "2026-10-21") return __sbUpstreamStreamed(op, msg, label, signal);
   return new Promise((resolve, reject) => {
     let onAbort = null;
     const settled = () => {
