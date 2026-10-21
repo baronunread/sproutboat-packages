@@ -1925,6 +1925,36 @@ export async function patchSplitGlobals(root: string): Promise<void> {
   await writeFile(file, src);
 }
 
+// The conservative scanner must recognize the encoded f64 form used by BigInt builtins.
+const BIGINT_GC_ANCHOR = "static void porf_gc_cons_candidate(u32 c);\n";
+const BIGINT_GC_HELPER = `static void porf_gc_cons_f64(f64 d) {
+  // Heap BigInts encode their offset above 2^51, including in f64 builtin arguments.
+  if (d >= 2251799813685248.0 && d < 2251804108652544.0) d -= 2251799813685248.0;
+  if (d > 0.0 && d < 4294967296.0) {
+    const u32 ptr = (u32)d;
+    if ((f64)ptr == d) porf_gc_cons_candidate(ptr);
+  }
+}
+`;
+const BIGINT_GC_SCAN = `    if (d > 0.0 && d < 4294967296.0) {
+      const i64 iv = (i64)d;
+      if ((f64)iv == d) porf_gc_cons_candidate((u32)(u64)iv);
+    }`;
+
+export async function patchBigIntRoots(root: string): Promise<void> {
+  const file = resolve(root, "compiler/render.js");
+  const src = await readFile(file, "utf8");
+  if (src.includes(BIGINT_GC_HELPER) && src.split("    porf_gc_cons_f64(d);").length === 3) return;
+  if (src.split(BIGINT_GC_ANCHOR).length !== 2 || src.split(BIGINT_GC_SCAN).length !== 3)
+    throw new Error(`could not patch Porffor's BigInt GC roots: anchor not found in ${file}`);
+  await writeFile(
+    file,
+    src
+      .replace(BIGINT_GC_ANCHOR, BIGINT_GC_ANCHOR + BIGINT_GC_HELPER)
+      .replaceAll(BIGINT_GC_SCAN, "    porf_gc_cons_f64(d);"),
+  );
+}
+
 const FETCH_CLASSES_MARKER = "sproutboat: Fetch-spec Request and Response";
 /** Replaces Porffor's Request and Response (fetch-classes.ts); covers patchResponseDefaults. */
 export async function patchFetchClasses(root: string): Promise<void> {
@@ -2023,6 +2053,7 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchClassSelfName(root);
   await patchUwebsockets(root);
   await patchRenderJs(root);
+  await patchBigIntRoots(root);
   await patchStreamingResponses(root);
   await patchQuietCollection(root);
   await patchAsyncWaker(root);
