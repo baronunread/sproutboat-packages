@@ -168,6 +168,7 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
     "compiler/builtins/console.ts": "export const __Porffor_consolePrint = (arg: any): void => {\n  __Porffor_print(arg);\n};\n",
     "compiler/codegen.js":
       "if (!hoistRead && directCallOnlyFunctionBinding(scope, kind, name, pattern, func)) {\n        return valUndefined();\n}\nconst func = resolveNamedFunction(scope, name) ?? funcByName(name);\n" +
+      "    // only names that are nothing but this declaration and its direct calls\n    if (find(program, n => n.name === x.id.name).length !== 1) continue;\n" +
       "      stmt(scope, Store(ctype, addr, 4, ctype === 'f64' || ctype === 'f32' ? f : toUint32(scope, f)));\n" +
       "  const taGet = (ctype, size, signed = true) => () => {\n" +
       "    const loaded = Load(ctype, taAddr(size), 4);\n" +
@@ -293,6 +294,8 @@ test("the default call (no url/expectedSha256 override) never touches the networ
   // JSON cycles, the JSON.parse reviver, typed-array toString tags, ISO date offsets,
   // base64 options, Map.groupBy and non-enumerable private fields (#286) are upstream's
   // own since alpha-19; json-cycles, groupby-private, date and base64 native tests cover them.
+  // Alpha 19 new Function specialization checks a function body before walking the program.
+  expect(await readFile(join(dir, "compiler/codegen.js"), "utf8")).toContain("sproutboat: body check before the whole-program walks");
   // B16: String.prototype.repeat doubles its copies.
   expect(await readFile(join(dir, "compiler/builtins/string.ts"), "utf8")).toContain("sproutboat B16: doubling repeat");
   // #287: full collections under load keep their free pages; the idle collection returns them.

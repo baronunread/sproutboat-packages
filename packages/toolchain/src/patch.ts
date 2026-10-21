@@ -1389,6 +1389,34 @@ export async function patchLocalFunctionTypes(root: string): Promise<void> {
   await writeFile(file, src);
 }
 
+/**
+ * Alpha 19's specializeFunctionSources (codegen.js) walks the whole program twice for
+ * every top-level function declaration before it checks whether that function's body
+ * calls `Function` at all, so a program with many top-level functions compiled
+ * quadratically: IR generation for the runtime prelude went from 0.6 s on Alpha 18 to
+ * 3.7 s (sproutd admission: 1.1 s to 4.2 s per app). Check the body first; every check
+ * is a pure walk, so the generated code is unchanged.
+ */
+const FUNCTION_SOURCES_MARKER = "sproutboat: body check before the whole-program walks";
+const FUNCTION_SOURCES_ANCHOR =
+  "    // only names that are nothing but this declaration and its direct calls\n    if (find(program, n => n.name === x.id.name)";
+export async function patchFunctionSourcesScan(root: string): Promise<void> {
+  const file = resolve(root, "compiler/codegen.js");
+  const src = await readFile(file, "utf8");
+  if (src.includes(FUNCTION_SOURCES_MARKER)) return;
+  if (src.split(FUNCTION_SOURCES_ANCHOR).length !== 2)
+    throw new Error(`could not patch Porffor's new Function source specialization: anchor not found in ${file}`);
+  await writeFile(
+    file,
+    src.replace(
+      FUNCTION_SOURCES_ANCHOR,
+      `    // ${FUNCTION_SOURCES_MARKER}\n` +
+        "    if (find(x.body, n => (n.type === 'CallExpression' || n.type === 'NewExpression') && n.callee.name === 'Function').length === 0) continue;\n" +
+        FUNCTION_SOURCES_ANCHOR,
+    ),
+  );
+}
+
 export async function precompileBuiltins(root: string): Promise<void> {
   const table = resolve(root, "compiler/builtins_precompiled.js");
   // Porffor only writes the table when import.meta.url matches argv[1].
@@ -2002,6 +2030,7 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchPromiseResolveNull(root);
   await patchReplaceAll(root);
   await patchLocalFunctionTypes(root);
+  await patchFunctionSourcesScan(root);
   await patchResponseDefaults(root);
   await patchHeadersArrayInit(root);
   await patchHeadersClass(root);

@@ -56,6 +56,14 @@ Re-anchored:
   which carried the class's start offset. The returned name is now positioned after
   the class, as it would be in source.
 
+New:
+
+- `patchFunctionSourcesScan`: Alpha 19's `specializeFunctionSources` (b2b9bf6) walks the
+  whole program twice for every top-level function declaration before checking whether
+  its body calls `Function`. On the runtime prelude IR generation took 3.7 s instead of
+  0.6 s (sproutd admission went from 1.1 to 4.2 s per app). The patch checks the body
+  first; the generated C is byte-identical (compared on a sproutd admission compile).
+
 Retained, still needed on Alpha 19:
 
 - Local function types: `alpha18-native` throws a TypeError without it.

@@ -6,6 +6,7 @@ import { EMPTY_BINDINGS, wrapNativeFetchHandler } from "../../runtime/src/wrap";
 import {
   patchHeadersArrayInit,
   patchLocalFunctionTypes,
+  patchFunctionSourcesScan,
   patchDeferredDiscard,
   patchRepeatDoubling,
   patchConsoleColors,
@@ -355,6 +356,26 @@ test("local function type patch registers lexical bindings and is idempotent", a
     expect(patched).not.toContain("?? funcByName(name)");
     await patchLocalFunctionTypes(root);
     expect(await readFile(file, "utf8")).toBe(patched);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("function source patch checks the body before walking the program, idempotently", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sb-function-sources-"));
+  try {
+    await mkdir(join(root, "compiler"));
+    const file = join(root, "compiler/codegen.js");
+    const anchor =
+      "    // only names that are nothing but this declaration and its direct calls\n    if (find(program, n => n.name === x.id.name).length !== 1) continue;\n";
+    await writeFile(file, anchor);
+    await patchFunctionSourcesScan(root);
+    const patched = await readFile(file, "utf8");
+    expect(patched.indexOf("n.callee.name === 'Function').length === 0) continue;")).toBeLessThan(patched.indexOf("find(program,"));
+    await patchFunctionSourcesScan(root);
+    expect(await readFile(file, "utf8")).toBe(patched);
+    await writeFile(file, "const unrelated = 1;\n");
+    await expect(patchFunctionSourcesScan(root)).rejects.toThrow("anchor not found");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
