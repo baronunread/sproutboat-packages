@@ -1,5 +1,11 @@
 # @sproutboat/toolchain
 
+## 0.12.1
+
+### Patch Changes
+
+- 1ff15e6: Keep heap-backed BigInts alive during conservative garbage collection. The native scanner now recognizes the encoded floating-point pointer used by BigInt arithmetic, preventing crashes and incorrect checksums in workloads such as CRC64 and LTX encoding.
+
 ## 0.12.0
 
 ### Minor Changes
