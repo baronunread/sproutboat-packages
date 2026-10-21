@@ -239,6 +239,7 @@ const broker = createBroker({
 });
 const brokerServer = listen(broker, "127.0.0.1", 0);
 let server: ReturnType<typeof Bun.spawn> | undefined;
+let legacy: ReturnType<typeof Bun.spawn> | undefined;
 const get = async (path: string) => {
   const t0 = performance.now();
   const res = await fetch(`http://127.0.0.1:${port}${path}`, { signal: AbortSignal.timeout(20_000) });
@@ -356,7 +357,7 @@ try {
   assert.equal(publicBoom.status, 500);
   assert.equal(publicBoom.headers.get("x-sb-uncaught"), null);
 
-  // Streamed responses (compatibility date 2026-10-21 on): the call resolves on the
+  // Streamed responses (compatibility date 2026-10-22 on): the call resolves on the
   // head, the first chunk arrives before the rest, and a 12 MiB body arrives intact.
   const streamed = await get("/streamed");
   assert.equal(streamed.status, 200, streamed.text);
@@ -380,14 +381,50 @@ try {
   // A deployment calling itself, 30 levels deep: every level waits on the next at once.
   const self = await get("/self");
   assert.equal(self.text, "bottom 30");
+  // Before compatibility date 2026-10-22 a binding call answers at once, as it always
+  // did: a handler that uses the Response without awaiting it keeps working.
+  const legacyHandler = `
+export default {
+  fetch(request, env) {
+    const res = env.PEER.fetch("https://peer/echo?legacy=1");
+    return new Response(String(res instanceof Response) + ":" + res.status + ":" + res.json().path);
+  },
+};
+`;
+  const legacyPort = freePort();
+  const legacySource = join(workdir, "legacy.generated.js");
+  const legacyBinary = join(workdir, "legacy-native");
+  await writeFile(legacySource, wrapNativeFetchHandler(legacyHandler, core.replace(TRANSPORT_MARKER, transport), {}, bindings, undefined, "2026-10-21"));
+  const legacyCompile = Bun.spawnSync([node, resolve(porffor, "runtime/index.js"), "native", legacySource, "-o", legacyBinary, "-s", "-O0"], { cwd: workdir });
+  assert.equal(legacyCompile.exitCode, 0, `legacy compile failed:\n${legacyCompile.stderr}`);
+  legacy = Bun.spawn([legacyBinary], {
+    cwd: workdir,
+    env: { ...process.env, PORT: String(legacyPort), SB_BROKER_PORT: String(brokerServer.port), SB_BROKER_TOKEN: "native-services" },
+    stdout: "ignore",
+    stderr: "inherit",
+  });
+  let legacyText = "";
+  for (let attempt = 0; attempt < 50 && !legacyText; attempt++) {
+    try {
+      legacyText = await (await fetch(`http://127.0.0.1:${legacyPort}/`, { signal: AbortSignal.timeout(20_000) })).text();
+    } catch {
+      await Bun.sleep(100);
+    }
+  }
+  assert.equal(legacyText, "true:200:/echo?legacy=1", "before 2026-10-22 a binding call answers synchronously");
+
   console.log(
     `Service bindings return promises and run off the loop: /ping ${Math.round(ping.ms)} ms during a call, ` +
-      `8x500 ms in ${Math.round(total)} ms, self-recursion ok; URL, Request+init, stream bodies, Set-Cookie and missing content types preserved; redirects follow Fetch; aborted calls stop upstream; vouched calls see the caller's URL and rethrow the callee's errors; responses stream; RPC calls WorkerEntrypoint methods`,
+      `8x500 ms in ${Math.round(total)} ms, self-recursion ok; URL, Request+init, stream bodies, Set-Cookie and missing content types preserved; redirects follow Fetch; aborted calls stop upstream; before 2026-10-22 calls answer at once; vouched calls see the caller's URL and rethrow the callee's errors; responses stream; RPC calls WorkerEntrypoint methods`,
   );
 } finally {
   if (server) {
     server.kill(9);
     await server.exited;
+  }
+  if (legacy) {
+    legacy.kill(9);
+    await legacy.exited;
   }
   brokerServer.stop();
   broker.close();
