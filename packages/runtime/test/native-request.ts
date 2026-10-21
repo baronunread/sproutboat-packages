@@ -19,8 +19,9 @@ const CASES = [
   `new Request("http://a.test/x", { method: "post" }).method`,
 ];
 const handler = `export default {async fetch(request) {
-  // The incoming request: its body is a ReadableStream, and text() still reads it.
-  if (request.method === "POST") { const viaStream = await new Response(request.body).text(); return new Response((request.body instanceof ReadableStream) + ":" + viaStream); }
+  // Before compatibility date 2026-10-21 (this build has the baseline date) the incoming body is
+  // the raw value, as apps written against earlier releases read it; text() decodes it.
+  if (request.method === "POST") return new Response((request.body instanceof ReadableStream) + ":" + (typeof request.body) + ":" + (await request.text()));
   const cases = [
 ${CASES.map((c) => `    () => (${c}),`).join("\n")}
   ];
@@ -94,8 +95,8 @@ try {
   const diffs = CASES.flatMap((c, i) => (got[i] === want[i] ? [] : [`${c}\n    want ${JSON.stringify(want[i])}\n    got  ${JSON.stringify(got[i])}`]));
   assert.deepEqual(diffs, [], `Request copies differ from Bun in ${diffs.length} of ${CASES.length} cases:\n${diffs.join("\n")}`);
   const posted = await (await fetch(`http://127.0.0.1:${port}/`, { method: "POST", body: "posted é" })).text();
-  assert.equal(posted, "true:posted é", "the incoming request body is a stream and text() reads it");
-  console.log(`Native Request copies match Bun in all ${CASES.length} cases; the incoming body is a stream`);
+  assert.equal(posted, "false:string:posted é", "before 2026-10-21 the incoming body stays the raw value");
+  console.log(`Native Request copies match Bun in all ${CASES.length} cases; an app before 2026-10-21 keeps its raw body`);
 } finally {
   if (server) {
     server.kill(9);

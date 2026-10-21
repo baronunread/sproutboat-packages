@@ -92,7 +92,7 @@ try {
   const prelude = core.replace(TRANSPORT_MARKER, broker);
   const generated = join(workdir, "bodies.generated.js");
   const binary = join(workdir, "bodies-native");
-  await writeFile(generated, wrapNativeFetchHandler(handler, prelude, undefined, undefined, undefined, "2026-10-01"));
+  await writeFile(generated, wrapNativeFetchHandler(handler, prelude, undefined, undefined, undefined, "2026-10-21"));
   await rm(binary, { force: true });
 
   const compile = Bun.spawn([node, resolve(porffor, "runtime/index.js"), "native", generated, "-o", binary, "-s", "-O0"], {
