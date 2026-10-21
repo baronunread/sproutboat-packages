@@ -192,9 +192,12 @@ export type Broker = {
    * so an object body never has to be escaped into the JSON. A token's first
    * character is never 0x01, which is what makes the two tellable apart without
    * negotiation. `signal` aborts when the sprout's connection closes: a `fetch` or
-   * `service.fetch` in flight then stops its upstream request too.
+   * `service.fetch` in flight then stops its upstream request too. With `emit`, a
+   * `fetch` or `service.fetch` that asks to stream (`stream: true`) sends its head and
+   * each body chunk through it as they arrive (FRAME_V1_MORE frames); the returned
+   * frame ends the response.
    */
-  handleFrame(payload: Buffer, signal?: AbortSignal): Promise<Buffer>;
+  handleFrame(payload: Buffer, signal?: AbortSignal, emit?: FrameEmitter): Promise<Buffer>;
   /** Serve one reserved direct R2 upload or download request. */
   transfer(request: Request): Promise<Response>;
   close(): void;
@@ -202,6 +205,10 @@ export type Broker = {
 
 /** First byte of a v1 payload. */
 export const FRAME_V1 = 1;
+/** A v1 frame with more to follow for the same request: a streamed response's head and chunks. */
+export const FRAME_V1_MORE = 2;
+/** Sends one frame for the request being handled, ahead of its final one. */
+export type FrameEmitter = (frame: Buffer) => Promise<void>;
 
 /** Wrap a payload in the [u32 LE length] header every frame carries. */
 export function frameOf(payload: Buffer): Buffer {
@@ -212,11 +219,11 @@ export function frameOf(payload: Buffer): Buffer {
 }
 
 /** Build a v1 payload: marker, json length, json, then the bytes. */
-export function encodeV1(json: Frame, binary?: Uint8Array): Buffer {
+export function encodeV1(json: Frame, binary?: Uint8Array, more = false): Buffer {
   const body = Buffer.from(JSON.stringify(json), "utf8");
   const bin = binary ?? new Uint8Array(0);
   const out = Buffer.allocUnsafe(1 + 4 + body.length + bin.length);
-  out.writeUInt8(FRAME_V1, 0);
+  out.writeUInt8(more ? FRAME_V1_MORE : FRAME_V1, 0);
   out.writeUInt32LE(body.length, 1);
   body.copy(out, 5);
   if (bin.length) Buffer.from(bin.buffer, bin.byteOffset, bin.length).copy(out, 5 + body.length);
@@ -1102,8 +1109,9 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
    * end the process. 32 MiB by default, and the same variable the embedded
    * transport reads so both backends agree.
    */
+  const fetchMaxBytes = () => Number(process.env.SB_FETCH_MAX_BYTES) || 32 * 1024 * 1024;
   async function readCapped(response: Response, host: string): Promise<Buffer> {
-    const cap = Number(process.env.SB_FETCH_MAX_BYTES) || 32 * 1024 * 1024;
+    const cap = fetchMaxBytes();
     const declared = Number(response.headers.get("content-length") || 0);
     if (declared > cap) throw new Error(`response exceeds SB_FETCH_MAX_BYTES from ${host}`);
     const reader = response.body?.getReader();
@@ -1155,7 +1163,32 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     return res;
   }
 
-  async function proxyFetch(msg: Frame, signal?: AbortSignal): Promise<Upstream> {
+  /**
+   * An upstream response, streamed: its head now, then each body chunk as it arrives,
+   * under the same cap as a whole body. `emit` resolves once the sprout's socket has
+   * taken the frame, so a slow reader slows the upstream read too.
+   */
+  async function streamUpstream(res: Response, host: string, emit: FrameEmitter): Promise<Upstream> {
+    const headers: Array<[string, string]> = [];
+    res.headers.forEach((v, k) => headers.push([k, v]));
+    await emit(frameOf(encodeV1({ ok: true, status: res.status, headers, stream: true }, undefined, true)));
+    const reader = res.body?.getReader();
+    if (!reader) return { reply: { ok: true, end: true }, bytes: Buffer.alloc(0) };
+    const cap = fetchMaxBytes();
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) return { reply: { ok: true, end: true }, bytes: Buffer.alloc(0) };
+      total += value.byteLength;
+      if (total > cap) {
+        await reader.cancel();
+        throw new Error(`response exceeds SB_FETCH_MAX_BYTES from ${host}`);
+      }
+      await emit(frameOf(encodeV1({ ok: true, chunk: true }, value, true)));
+    }
+  }
+
+  async function proxyFetch(msg: Frame, signal?: AbortSignal, emit?: FrameEmitter): Promise<Upstream> {
     let url: URL;
     try {
       url = new URL(str(msg.url));
@@ -1183,6 +1216,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       : await vettedFetch(url, init, { resolve: resolveHost, allow: egressAllow, fetchImpl: doFetch });
     const outHeaders: Array<[string, string]> = [];
     res.headers.forEach((v, k) => outHeaders.push([k, v]));
+    if (msg.stream === true && emit) return streamUpstream(res, url.host, emit);
     return { reply: { ok: true, status: res.status, headers: outHeaders }, bytes: await readCapped(res, url.host) };
   }
 
@@ -1194,7 +1228,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
    * minus the trip through the network (and therefore minus TLS and the
    * default-deny egress rules, which is why this is not `fetch`).
    */
-  async function serviceFetch(msg: Frame, signal?: AbortSignal): Promise<Upstream> {
+  async function serviceFetch(msg: Frame, signal?: AbortSignal, emit?: FrameEmitter): Promise<Upstream> {
     const binding = str(msg.binding);
     const declared = bindings.services.find((entry) => entry.binding === binding);
     if (!declared) throw new Error(`service not bound: ${binding}`);
@@ -1234,6 +1268,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     });
     const outHeaders: Array<[string, string]> = [];
     res.headers.forEach((v, k) => outHeaders.push([k, v]));
+    if (msg.stream === true && emit) return streamUpstream(res, host, emit);
     return { reply: { ok: true, status: res.status, headers: outHeaders }, bytes: await readCapped(res, host) };
   }
 
@@ -1675,6 +1710,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     msg: Frame,
     binary: Uint8Array,
     signal?: AbortSignal,
+    emit?: FrameEmitter,
   ): Promise<{ reply: Frame; bytes?: Uint8Array }> {
     if (msg.op === "r2.put") {
       // The body arrived as bytes; write it straight to its own file rather
@@ -1725,8 +1761,8 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     }
 
     // #232 — a v1 fetch gets the upstream body as raw bytes, not decoded text.
-    if (msg.op === "fetch") return proxyFetch(msg, signal);
-    if (msg.op === "service.fetch") return serviceFetch(msg, signal);
+    if (msg.op === "fetch") return proxyFetch(msg, signal, emit);
+    if (msg.op === "service.fetch") return serviceFetch(msg, signal, emit);
 
     if (msg.op === "assets.get") {
       if (!bindings.assets) throw new Error("assets not bound");
@@ -1758,7 +1794,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   }
 
   /** One wire frame in, one out. See `handleFrame` on the Broker type. */
-  async function handleFrame(payload: Buffer, signal?: AbortSignal): Promise<Buffer> {
+  async function handleFrame(payload: Buffer, signal?: AbortSignal, emit?: FrameEmitter): Promise<Buffer> {
     if (payload.length === 0 || payload[0] !== FRAME_V1) {
       return encodeFrame(await handlePayload(payload.toString("utf8")));
     }
@@ -1774,7 +1810,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         const seen = replayed.get(replayKey);
         if (seen) return frameOf(encodeV1(seen));
       }
-      const { reply, bytes } = await dispatchBinary(msg, binary, signal);
+      const { reply, bytes } = await dispatchBinary(msg, binary, signal, emit);
       if (replayKey && REPLAYABLE.has(str(msg.op))) rememberReplay(replayKey, reply);
       return frameOf(encodeV1(reply, bytes));
     } catch (e) {
@@ -2222,7 +2258,7 @@ export function listen(broker: Broker, hostname: string, port: number): BrokerSe
           state.size = rest.length;
           // Bun does not buffer unwritten bytes. Serialize replies and retain
           // the unsent suffix until drain, including binary R2 responses.
-          await send(socket, await broker.handleFrame(payload, state.abort.signal));
+          await send(socket, await broker.handleFrame(payload, state.abort.signal, (frame) => send(socket, frame)));
         } } finally { state.processing = false; }
       },
     },

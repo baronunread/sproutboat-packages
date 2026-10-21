@@ -242,12 +242,13 @@ static char* sb_v1_request(const char* json, size_t json_len, const char* body, 
 
 // Splits a v1 reply, which it takes ownership of, into its JSON (returned,
 // NUL-terminated, malloc'd) and its bytes (*bin, malloc'd, or 0 when there are
-// none). A broker that answered v0 to a v1 request predates this: its reply is
-// returned whole, so the error it wrote is what the handler sees. 0 on OOM.
+// none). Marker 1 is a final frame, 2 one of a streamed response's earlier ones. A
+// broker that answered v0 to a v1 request predates this: its reply is returned
+// whole, so the error it wrote is what the handler sees. 0 on OOM.
 static char* sb_v1_split(char* resp, size_t resp_len, size_t* json_len, char** bin, size_t* bin_len) {
   *bin = 0;
   *bin_len = 0;
-  if (resp_len >= 5 && (unsigned char)resp[0] == 1) {
+  if (resp_len >= 5 && ((unsigned char)resp[0] == 1 || (unsigned char)resp[0] == 2)) {
     unsigned int rjl = 0;
     memcpy(&rjl, resp + 1, 4);
     if (5 + (size_t)rjl <= resp_len) {
@@ -316,9 +317,11 @@ static int sb_broker_roundtrip_v1(const char* json, size_t json_len, const char*
 // broker connections with poll(), one per exchange in flight, and keeps a few
 // idle ones for reuse. A finished exchange is queued and the waker called; the
 // host then runs sb_async_drain() on its loop, which fires the JS callback
-// registered under the request's timer id. The thread touches only malloc'd jobs,
-// never the JS heap. The same contract as the embedded transport's B18, which
-// signals a pipe.
+// registered under the request's timer id. A streamed response is delivered frame
+// by frame (its head, then each chunk), each firing the callback, which the JS side
+// registers as an interval for that. The thread touches only malloc'd jobs, never
+// the JS heap. The same contract as the embedded transport's B18, which signals a
+// pipe.
 void porf_native_fetch_fire_timer(u32 id);
 void porf_native_fetch_timer_clear(u32 id);
 typedef struct sb_async_job {
@@ -330,14 +333,25 @@ typedef struct sb_async_job {
   unsigned char hdr[4]; size_t hdr_got;
   char* in; size_t in_len, in_got;
   int fd, reused, attempt, connecting;
+  // Asked for a streamed response; and has delivered part of one, so never retried.
+  int stream, delivered;
   long long retry_at;  // ms; 0 = not waiting to retry
   char* json; size_t json_len;
   char* bin; size_t bin_len;
 } sb_async_job;
+// One frame's worth of reply for the loop: a whole response, or part of a streamed one.
+typedef struct sb_async_delivery {
+  struct sb_async_delivery* next;
+  u32 id;
+  int final;
+  char* json; size_t json_len;
+  char* bin; size_t bin_len;
+} sb_async_delivery;
 // Idle connections kept for the next exchanges.
 #define SB_IO_IDLE 8
 static pthread_mutex_t sb_async_lock = PTHREAD_MUTEX_INITIALIZER;
-static sb_async_job *sb_async_queue = 0, *sb_async_done = 0, *sb_async_current = 0;
+static sb_async_job* sb_async_queue = 0;
+static sb_async_delivery *sb_async_ready = 0, *sb_async_current = 0;
 static int sb_io_started = 0, sb_io_wake[2] = { -1, -1 };
 // Ids of exchanges whose caller gave up (an aborted signal), for the I/O thread.
 static u32* sb_async_cancels = 0;
@@ -362,15 +376,35 @@ static void sb_async_error(sb_async_job* j, int rc) {
   j->json_len = (size_t)n;
 }
 
-// Hands a finished job (json set) back to the loop.
-static void sb_async_finish(sb_async_job* j) {
-  free(j->out); j->out = 0;
-  free(j->in); j->in = 0;
+// Queues a reply frame for the loop, which takes ownership of json and bin.
+static void sb_async_deliver(u32 id, int final, char* json, size_t json_len, char* bin, size_t bin_len) {
+  sb_async_delivery* d = (sb_async_delivery*)calloc(1, sizeof(sb_async_delivery));
+  if (!d) abort();
+  d->id = id; d->final = final;
+  d->json = json; d->json_len = json_len;
+  d->bin = bin; d->bin_len = bin_len;
   pthread_mutex_lock(&sb_async_lock);
-  j->next = sb_async_done;
-  sb_async_done = j;
+  d->next = sb_async_ready;
+  sb_async_ready = d;
   pthread_mutex_unlock(&sb_async_lock);
   sb_async_waker();
+}
+
+// Hands a finished job (json set) back to the loop, and frees it.
+static void sb_async_finish(sb_async_job* j) {
+  sb_async_deliver(j->id, 1, j->json, j->json_len, j->bin, j->bin_len);
+  free(j->out);
+  free(j->in);
+  free(j);
+}
+
+// A reply frame's payload -> its ASCII JSON and bytes (see sb_json_ascii). 0 on OOM.
+static char* sb_io_reply_json(char* payload, size_t len, size_t* json_len, char** bin, size_t* bin_len) {
+  char* json = sb_v1_split(payload, len, json_len, bin, bin_len);
+  size_t al = 0;
+  char* ascii = json ? sb_json_ascii(json, *json_len, &al) : 0;
+  if (ascii) { free(json); json = ascii; *json_len = al; }
+  return json;
 }
 
 static void sb_io_nonblock(int fd) { fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK); fcntl(fd, F_SETFD, FD_CLOEXEC); }
@@ -406,7 +440,7 @@ static void sb_io_begin(sb_async_job* j, int* idle, int* idle_n) {
 static int sb_io_failed(sb_async_job* j, int rc) {
   if (j->fd >= 0) { close(j->fd); j->fd = -1; }
   int unsent = j->out_off < j->out_len;
-  if ((unsent || j->reused) && ++j->attempt < 4) {
+  if (!j->delivered && (unsent || j->reused) && ++j->attempt < 4) {
     static const long ms[4] = { 0, 5, 25, 100 };
     j->retry_at = sb_now_ms() + ms[j->attempt];
     return 0;
@@ -429,34 +463,46 @@ static int sb_io_step(sb_async_job* j, int* idle, int* idle_n) {
     if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
     return sb_io_failed(j, -3);
   }
-  while (j->hdr_got < 4) {
-    long n = read(j->fd, j->hdr + j->hdr_got, 4 - j->hdr_got);
-    if (n > 0) { j->hdr_got += (size_t)n; continue; }
-    if (n < 0 && errno == EINTR) continue;
-    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
-    return sb_io_failed(j, -4);
+  for (;;) {
+    while (j->hdr_got < 4) {
+      long n = read(j->fd, j->hdr + j->hdr_got, 4 - j->hdr_got);
+      if (n > 0) { j->hdr_got += (size_t)n; continue; }
+      if (n < 0 && errno == EINTR) continue;
+      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+      return sb_io_failed(j, -4);
+    }
+    if (!j->in) {
+      j->in_len = (size_t)j->hdr[0] | ((size_t)j->hdr[1] << 8) | ((size_t)j->hdr[2] << 16) | ((size_t)j->hdr[3] << 24);
+      j->in = (char*)malloc(j->in_len ? j->in_len : 1);
+      if (!j->in) abort();
+    }
+    while (j->in_got < j->in_len) {
+      long n = read(j->fd, j->in + j->in_got, j->in_len - j->in_got);
+      if (n > 0) { j->in_got += (size_t)n; continue; }
+      if (n < 0 && errno == EINTR) continue;
+      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+      return sb_io_failed(j, -6);
+    }
+    char* payload = j->in;
+    size_t payload_len = j->in_len;
+    j->in = 0; j->in_len = 0; j->in_got = 0; j->hdr_got = 0;
+    int more = j->stream && payload_len >= 1 && (unsigned char)payload[0] == 2;
+    if (more) {
+      // Part of a streamed response: to the loop now, then on to the next frame.
+      size_t json_len = 0, bin_len = 0;
+      char* bin = 0;
+      char* json = sb_io_reply_json(payload, payload_len, &json_len, &bin, &bin_len);
+      if (!json) abort();
+      j->delivered = 1;
+      sb_async_deliver(j->id, 0, json, json_len, bin, bin_len);
+      continue;
+    }
+    if (*idle_n < SB_IO_IDLE) idle[(*idle_n)++] = j->fd; else close(j->fd);
+    j->fd = -1;
+    j->json = sb_io_reply_json(payload, payload_len, &j->json_len, &j->bin, &j->bin_len);
+    if (!j->json) sb_async_error(j, -4);
+    return 1;
   }
-  if (!j->in) {
-    j->in_len = (size_t)j->hdr[0] | ((size_t)j->hdr[1] << 8) | ((size_t)j->hdr[2] << 16) | ((size_t)j->hdr[3] << 24);
-    j->in = (char*)malloc(j->in_len ? j->in_len : 1);
-    if (!j->in) abort();
-  }
-  while (j->in_got < j->in_len) {
-    long n = read(j->fd, j->in + j->in_got, j->in_len - j->in_got);
-    if (n > 0) { j->in_got += (size_t)n; continue; }
-    if (n < 0 && errno == EINTR) continue;
-    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
-    return sb_io_failed(j, -6);
-  }
-  if (*idle_n < SB_IO_IDLE) idle[(*idle_n)++] = j->fd; else close(j->fd);
-  j->fd = -1;
-  char* resp = j->in; j->in = 0;
-  j->json = sb_v1_split(resp, j->in_len, &j->json_len, &j->bin, &j->bin_len);
-  size_t al = 0;
-  char* ascii = j->json ? sb_json_ascii(j->json, j->json_len, &al) : 0;
-  if (ascii) { free(j->json); j->json = ascii; j->json_len = al; }
-  if (!j->json) sb_async_error(j, -4);
-  return 1;
 }
 
 static void* sb_io_thread(void* unused) {
@@ -549,10 +595,11 @@ static void* sb_io_thread(void* unused) {
 
 // The inline C of __sbCallAsync calls this by prototype: Porffor may emit a
 // function's body before this block.
-void sb_async_submit_v1(u32 id, const char* json, size_t json_len, const char* body, size_t body_len) {
+void sb_async_submit_v1(u32 id, int stream, const char* json, size_t json_len, const char* body, size_t body_len) {
   sb_async_job* j = (sb_async_job*)calloc(1, sizeof(sb_async_job));
   if (!j) abort();
   j->id = id;
+  j->stream = stream;
   j->fd = -1;
   size_t req_len = 0;
   char* req = sb_v1_request(json, json_len, body, body_len, &req_len);
@@ -631,33 +678,34 @@ const char* sb_async_reply_json(u32 id, size_t* len) {
   return sb_async_current->json;
 }
 
-// Host, on its loop: fires each finished exchange's callback, oldest first. Its
-// bytes go where __sbTakeBin reads them.
+// Host, on its loop: fires the callback for each reply frame, oldest first. Its
+// bytes go where __sbTakeBin reads them. A final frame also drops the placeholder
+// timer; an earlier frame of a streamed response leaves it for the next one.
 void sb_async_drain(void) {
   pthread_mutex_lock(&sb_async_lock);
-  sb_async_job* done = sb_async_done;
-  sb_async_done = 0;
+  sb_async_delivery* ready = sb_async_ready;
+  sb_async_ready = 0;
   pthread_mutex_unlock(&sb_async_lock);
-  sb_async_job* oldest = 0;
-  while (done) {
-    sb_async_job* next = done->next;
-    done->next = oldest;
-    oldest = done;
-    done = next;
+  sb_async_delivery* oldest = 0;
+  while (ready) {
+    sb_async_delivery* next = ready->next;
+    ready->next = oldest;
+    oldest = ready;
+    ready = next;
   }
   while (oldest) {
-    sb_async_job* j = oldest;
-    oldest = j->next;
-    porf_native_fetch_timer_clear(j->id);  // the placeholder timer
+    sb_async_delivery* d = oldest;
+    oldest = d->next;
+    if (d->final) porf_native_fetch_timer_clear(d->id);
     if (sb_bin_reply) free(sb_bin_reply);
-    sb_bin_reply = j->bin;
-    sb_bin_reply_len = j->bin_len;
-    j->bin = 0;
-    sb_async_current = j;  // read by __sbHttpAsyncResult in the callback
-    porf_native_fetch_fire_timer(j->id);
+    sb_bin_reply = d->bin;
+    sb_bin_reply_len = d->bin_len;
+    d->bin = 0;
+    sb_async_current = d;  // read by __sbHttpAsyncResult in the callback
+    porf_native_fetch_fire_timer(d->id);
     sb_async_current = 0;
-    free(j->json);
-    free(j);
+    free(d->json);
+    free(d);
   }
 }
 `;
@@ -798,9 +846,10 @@ globalThis.__sbR2MultipartPut = function (bucket, key, uploadId, partNumber, bod
 globalThis.__sbFetchUpstream = function (op, msg) {
   const req = { v: 1, id: ++__sbReqId, token: __sbEnv("SB_BROKER_TOKEN"), op };
   for (const k in msg) req[k] = msg[k];
-  // Queued (async host); the reply reaches the callback registered under asyncId.
+  // Queued (async host); the reply reaches the callback registered under asyncId, in
+  // several frames when msg.stream asks for a streamed response.
   if (msg.asyncId > 0) {
-    __sbCallAsync(JSON.stringify(req), "", msg.asyncId);
+    __sbCallAsync(JSON.stringify(req), "", msg.asyncId, msg.stream === true ? "1" : "0");
     return { ok: true, pending: true };
   }
   const reply = JSON.parse(__sbCallBin(JSON.stringify(req), ""));
@@ -810,19 +859,26 @@ globalThis.__sbFetchUpstream = function (op, msg) {
   return reply;
 };
 
-// Queues one v1 exchange for the async threads, under timer id `asyncId`.
+// Queues one v1 exchange for the I/O thread, under timer id `asyncId`. `stream` is "1"
+// when the reply may come as several frames, each firing the callback; a string, like
+// the embedded transport's flags, so the C below reads it the same way whatever type
+// Porffor infers.
 // oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
-function __sbCallAsync(reqJson, body, asyncId) {
+function __sbCallAsync(reqJson, body, asyncId, stream) {
   // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
   Porffor.c`
-    void sb_async_submit_v1(u32, const char*, size_t, const char*, size_t);
+    void sb_async_submit_v1(u32, int, const char*, size_t, const char*, size_t);
     const char* __j; size_t __jl; char* __jo = 0;
     porf_native_fetch_read_value(reqJson, &__j, &__jl, &__jo);
     const char* __b; size_t __bl; char* __bo = 0;
     if (porf_native_fetch_read_raw_bytes(body, &__b, &__bl) != 0) {
       porf_native_fetch_read_value(body, &__b, &__bl, &__bo);
     }
-    if (asyncId.type == 1 && asyncId.val > 0) sb_async_submit_v1((u32)asyncId.val, __j, __jl, __b, __bl);
+    const char* __s; size_t __sl; char* __so = 0;
+    porf_native_fetch_read_value(stream, &__s, &__sl, &__so);
+    const int __stream = __sl > 0 && __s[0] == '1';
+    if (__so) free(__so);
+    if (asyncId.type == 1 && asyncId.val > 0) sb_async_submit_v1((u32)asyncId.val, __stream, __j, __jl, __b, __bl);
     if (__jo) free(__jo);
     if (__bo) free(__bo);
   `;

@@ -67,6 +67,25 @@ export default {
       if (depth >= 30) return new Response("bottom " + depth);
       return new Response(await (await env.SELF.fetch("https://self/self?depth=" + (depth + 1))).text());
     }
+    if (url.pathname === "/streamed") {
+      // Four chunks 300 ms apart upstream: a streamed body gets the first one early.
+      const t0 = Date.now();
+      const res = await env.PEER.fetch("https://peer/drip");
+      const reader = res.body.getReader();
+      let firstMs = -1;
+      let text = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (firstMs < 0) firstMs = Date.now() - t0;
+        text += new TextDecoder().decode(value);
+      }
+      const whole = await (await env.PEER.fetch("https://peer/drip")).text();
+      const big = new Uint8Array(await (await env.PEER.fetch("https://peer/big")).arrayBuffer());
+      let bigOk = big.length === 12 * 1048576;
+      for (let i = 0; bigOk && i < big.length; i += 4093) bigOk = big[i] === (i & 255);
+      return Response.json({ firstEarly: firstMs >= 0 && firstMs < 250, text, whole, bigOk });
+    }
     if (url.pathname === "/whoami") {
       return Response.json({ url: request.url, internal: [...request.headers.keys()].filter((k) => k.startsWith("x-sb-")) });
     }
@@ -133,6 +152,25 @@ const edge = Bun.serve({
     if (url.pathname === "/redirect") {
       const status = Number(url.searchParams.get("status"));
       return new Response(null, { status, headers: { location: url.searchParams.get("to") ?? "/" } });
+    }
+    if (url.pathname === "/drip") {
+      const encoder = new TextEncoder();
+      return new Response(
+        new ReadableStream({
+          async start(controller) {
+            for (let i = 0; i < 4; i++) {
+              if (i) await Bun.sleep(300);
+              controller.enqueue(encoder.encode(i + " "));
+            }
+            controller.close();
+          },
+        }),
+      );
+    }
+    if (url.pathname === "/big") {
+      const bytes = new Uint8Array(12 * 1048576);
+      for (let i = 0; i < bytes.length; i++) bytes[i] = i & 255;
+      return new Response(bytes);
     }
     if (url.pathname === "/bare") return new Response(null, { headers: { "x-bare": "1" } });
     if (url.pathname === "/slow") {
@@ -283,12 +321,18 @@ try {
   assert.equal(publicBoom.status, 500);
   assert.equal(publicBoom.headers.get("x-sb-uncaught"), null);
 
+  // Streamed responses (compatibility date 2026-10-21 on): the call resolves on the
+  // head, the first chunk arrives before the rest, and a 12 MiB body arrives intact.
+  const streamed = await get("/streamed");
+  assert.equal(streamed.status, 200, streamed.text);
+  assert.deepEqual(JSON.parse(streamed.text), { firstEarly: true, text: "0 1 2 3 ", whole: "0 1 2 3 ", bigOk: true });
+
   // A deployment calling itself, 30 levels deep: every level waits on the next at once.
   const self = await get("/self");
   assert.equal(self.text, "bottom 30");
   console.log(
     `Service bindings return promises and run off the loop: /ping ${Math.round(ping.ms)} ms during a call, ` +
-      `8x500 ms in ${Math.round(total)} ms, self-recursion ok; URL, Request+init, stream bodies, Set-Cookie and missing content types preserved; redirects follow Fetch; aborted calls stop upstream; vouched calls see the caller's URL and rethrow the callee's errors`,
+      `8x500 ms in ${Math.round(total)} ms, self-recursion ok; URL, Request+init, stream bodies, Set-Cookie and missing content types preserved; redirects follow Fetch; aborted calls stop upstream; vouched calls see the caller's URL and rethrow the callee's errors; responses stream`,
   );
 } finally {
   if (server) {
