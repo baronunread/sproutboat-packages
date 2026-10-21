@@ -5195,15 +5195,15 @@ globalThis.__sbInstallBindings = function (target, bindings) {
         let body = __sbUnwrapBody(parts.body);
         if (body instanceof ReadableStream) body = await __sbCollectBody(body);
         const msg = { binding, url: parts.url, method: parts.method, headers: parts.headers, ...__sbRequestBody(body) };
-        return __sbUpstream("service.fetch", msg, "sproutboat service " + binding);
+        return __sbFetchFollowing("service.fetch", msg, "sproutboat service " + binding, parts.redirect);
       },
     };
   }
 
 };
 
-// fetch(input, init) as Fetch reads it: a Request's method, headers and body apply
-// unless init overrides them; a URL object stands for its href.
+// fetch(input, init) as Fetch reads it: a Request's method, headers, body and redirect
+// mode apply unless init overrides them; a URL object stands for its href.
 function __sbFetchParts(input, init) {
   const req = input != null && !__sbIsStr(input) && input.url != null ? input : null;
   const url = req ? String(req.url) : input != null && input.href != null ? String(input.href) : String(input);
@@ -5216,19 +5216,62 @@ function __sbFetchParts(input, init) {
   }
   const body = opts.body !== undefined && !(opts instanceof Request) ? opts.body : req && __sbRawBody(req) !== "" ? __sbRawBody(req) : null;
   const method = opts.method || (req && req.method) || "GET";
-  return { url, method, headers, body };
+  const redirect = opts.redirect || (req && req.redirect) || "follow";
+  return { url, method, headers, body, redirect };
 }
 
 // An upstream reply (fetch or service.fetch) -> a Response. Headers are appended,
-// so each Set-Cookie survives.
+// so each Set-Cookie survives, and a reply without a content type keeps none: the
+// body reaches Response as a string, which would otherwise default to text/plain.
 function __sbUpstreamResponse(r) {
   const respHeaders = new Headers();
-  for (let j = 0; j < (r.headers || []).length; j++) respHeaders.append(r.headers[j][0], r.headers[j][1]);
+  let typed = false;
+  for (let j = 0; j < (r.headers || []).length; j++) {
+    respHeaders.append(r.headers[j][0], r.headers[j][1]);
+    if (String(r.headers[j][0]).toLowerCase() === "content-type") typed = true;
+  }
   // #176: bytes from another server or deployment, not a string this handler
   // built -- must not be re-encoded if the handler proxies it straight
   // through (see the assets binding for the same reasoning).
   if (r.body != null) respHeaders.set("x-sb-raw-body", "1");
-  return __sbRawBodyResponse(r.body, { status: r.status || 502, headers: respHeaders });
+  const response = __sbRawBodyResponse(r.body, { status: r.status || 502, headers: respHeaders });
+  if (!typed) response.headers.delete("content-type");
+  return response;
+}
+
+// Fetch's redirect handling, from compatibility date 2026-10-22 (before it, a 3xx came
+// back as it was, whatever the mode). "follow" sends the request again to the new
+// location, up to 20 times; each hop goes back through the broker, so outbound hops
+// are vetted like the first. A 303, or a 301/302 to a POST, becomes a bodiless GET;
+// a hop to another origin drops Authorization. A service binding follows through
+// the same binding, as in workerd. "error" rejects; "manual" returns the 3xx.
+function __sbFetchFollowing(op, msg, label, mode) {
+  return __sbFollowHop(op, msg, label, mode, 0);
+}
+function __sbFollowHop(op, msg, label, mode, hops) {
+  const step = (res) => {
+    const location = res.headers.get("location");
+    const redirect = res.status === 301 || res.status === 302 || res.status === 303 || res.status === 307 || res.status === 308;
+    if (!(globalThis.__sbCompat >= "2026-10-22") || mode === "manual" || !redirect || location == null) return res;
+    if (mode === "error") throw new TypeError(label + ": redirect not allowed (redirect: \"error\")");
+    if (hops >= 20) throw new TypeError(label + ": too many redirects");
+    const from = new URL(msg.url);
+    const to = new URL(location, from);
+    const next = { ...msg, url: to.href };
+    delete next.asyncId;
+    const toGet = res.status === 303 ? msg.method !== "GET" && msg.method !== "HEAD" : res.status !== 307 && res.status !== 308 && msg.method === "POST";
+    const drop = (name) =>
+      (toGet && /^content-(type|length|encoding|language|location)$/.test(name)) || (to.origin !== from.origin && name === "authorization");
+    next.headers = msg.headers.filter((pair) => !drop(String(pair[0]).toLowerCase()));
+    if (toGet) {
+      next.method = "GET";
+      next.body = null;
+      delete next.bodyBinary;
+    }
+    return __sbFollowHop(op, next, label, mode, hops + 1);
+  };
+  const out = __sbUpstream(op, msg, label);
+  return out instanceof Promise ? out.then(step) : step(out);
 }
 
 // Sends `msg` as `op` and answers with the Response: at once on a synchronous
@@ -5263,7 +5306,7 @@ globalThis.__sbInstallFetch = function () {
   globalThis.fetch = function (input, init) {
     const parts = __sbFetchParts(input, init);
     const msg = { url: parts.url, method: parts.method, headers: parts.headers, ...__sbRequestBody(parts.body) };
-    return __sbUpstream("fetch", msg, "sproutboat fetch");
+    return __sbFetchFollowing("fetch", msg, "sproutboat fetch", parts.redirect);
   };
 };
 
