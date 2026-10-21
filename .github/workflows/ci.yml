@@ -57,11 +57,14 @@ jobs:
           node-version: 24
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc libsqlite3-dev
       - run: bun install --frozen-lockfile
-      # The patched Porffor toolchain. Its cache directory is named after the
-      # patch fingerprint, so a stale entry is never used, only rebuilt next to.
+      # The patched Porffor toolchain, and the uWebSockets checkout and uSockets.a
+      # its native compiles build on first use. The toolchain's directory is
+      # named after the patch fingerprint, so a stale entry is never used.
       - uses: actions/cache@v6
         with:
-          path: ~/.cache/sproutboat/porffor-*
+          path: |
+            ~/.cache/sproutboat/porffor-*
+            ~/.cache/porffor/deps
           key: porffor-${{ runner.os }}-${{ hashFiles('packages/toolchain/package.json', 'packages/toolchain/src/*.ts', 'packages/toolchain/vendor/**') }}
       # Every test:native-* script, 4 at a time (scripts/test-native.ts).
       - run: bun run test:native
@@ -111,7 +114,9 @@ jobs:
           done
       - uses: actions/cache@v6
         with:
-          path: ~/.cache/sproutboat/porffor-*
+          path: |
+            ~/.cache/sproutboat/porffor-*
+            ~/.cache/porffor/deps
           key: porffor-${{ runner.os }}-${{ hashFiles('packages/toolchain/package.json', 'packages/toolchain/src/*.ts', 'packages/toolchain/vendor/**') }}
       - run: bun run kitchen-sink
         working-directory: sproutboat-cli

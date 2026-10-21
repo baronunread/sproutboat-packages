@@ -18,6 +18,12 @@
  * SPROUTBOAT_PORFFOR_DIR yourself to use a different toolchain, or
  * NATIVE_TEST_FRESH_PORFFOR=1 to let every script prepare its own.
  *
+ * The first native compile on a machine also fetches uWebSockets, patches it and
+ * builds uSockets.a in ~/.cache/porffor/deps, shared by every compile. Four
+ * compilers doing that at once trip over each other (CI failed with uSockets
+ * sources missing mid-build), so the quickest script runs alone first and the
+ * rest start once it has finished. After that the compilers only read it.
+ *
  * The scripts bind their ports with a port-0 probe (`freePort()`) or `port: 0`,
  * never a fixed number, so running them side by side does not make them collide.
  */
@@ -51,7 +57,7 @@ function testFileSize(command: string): number {
   }
 }
 
-/** The scripts to run, largest test file first so the slowest one doesn't finish alone at the end. */
+/** The scripts to run, largest test file first so the slowest one doesn't finish alone at the end. The last is the quickest. */
 function nativeScripts(filters: string[]): string[] {
   const manifest: { scripts?: Record<string, string> } = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"));
   const commands = new Map(Object.entries(manifest.scripts ?? {}).filter(([name]) => name.startsWith(PREFIX)));
@@ -111,8 +117,10 @@ async function run(name: string): Promise<Outcome> {
   return outcome;
 }
 
+// The quickest script warms the shared uWebSockets cache on its own (see above).
 const queue = [...scripts];
-const outcomes: Outcome[] = [];
+const warmup = queue.pop();
+const outcomes: Outcome[] = warmup === undefined ? [] : [await run(warmup)];
 await Promise.all(
   Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
     for (let next = queue.shift(); next !== undefined; next = queue.shift()) outcomes.push(await run(next));
