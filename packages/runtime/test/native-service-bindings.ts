@@ -15,7 +15,9 @@ import { EMPTY_BINDINGS, preludePath, TRANSPORT_MARKER, transportPath, wrapNativ
 // From compatibility date 2026-10-22, redirects are followed as Fetch does. A stand-in
 // edge plays the platform's.
 const handler = `
-export default {
+import { WorkerEntrypoint } from "cloudflare:workers";
+
+export default class Service extends WorkerEntrypoint {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === "/ping") return new Response("pong");
@@ -86,6 +88,22 @@ export default {
       for (let i = 0; bigOk && i < big.length; i += 4093) bigOk = big[i] === (i & 255);
       return Response.json({ firstEarly: firstMs >= 0 && firstMs < 250, text, whole, bigOk });
     }
+    if (url.pathname === "/rpc") {
+      // RPC to this deployment's own WorkerEntrypoint, through the vouched SELF binding.
+      const sum = await env.SELF.add(2, 3);
+      const trip = await env.SELF.roundTrip({ d: new Date(5), b: new Uint8Array([7, 255]), m: new Map([["k", -0]]), u: undefined, n: NaN });
+      const kept = {
+        d: trip.d instanceof Date && trip.d.getTime() === 5,
+        b: trip.b instanceof Uint8Array && trip.b.length === 2 && trip.b[1] === 255,
+        m: trip.m instanceof Map && Object.is(trip.m.get("k"), -0),
+        u: "u" in trip && trip.u === undefined,
+        n: Number.isNaN(trip.n),
+      };
+      const thrown = await env.SELF.fail("nope").then(() => null, (e) => [e.name, e.message, e instanceof RangeError]);
+      const unknown = await env.SELF.noSuchMethod().then(() => null, (e) => [e.name, e.message]);
+      const context = await env.SELF.whoAmI();
+      return Response.json({ sum, kept, thrown, unknown, context });
+    }
     if (url.pathname === "/whoami") {
       return Response.json({ url: request.url, internal: [...request.headers.keys()].filter((k) => k.startsWith("x-sb-")) });
     }
@@ -101,8 +119,24 @@ export default {
       return Response.json({ who, thrown });
     }
     return new Response("no route", { status: 404 });
-  },
-};
+  }
+
+  add(a, b) {
+    return a + b;
+  }
+
+  roundTrip(value) {
+    return value;
+  }
+
+  fail(message) {
+    throw new RangeError(message);
+  }
+
+  whoAmI() {
+    return { env: this.env !== undefined && this.env.SELF !== undefined, waitUntil: this.ctx.waitUntil instanceof Function };
+  }
+}
 `;
 
 function freePort(): number {
@@ -136,7 +170,8 @@ const edge = Bun.serve({
         const callerUrl = request.headers.get("x-sb-url");
         if (callerUrl) headers.set("x-sb-url", callerUrl);
       }
-      return fetch(`http://127.0.0.1:${port}${url.pathname}${url.search}`, { method: request.method, headers });
+      const body = request.method === "GET" || request.method === "HEAD" ? undefined : await request.arrayBuffer();
+      return fetch(`http://127.0.0.1:${port}${url.pathname}${url.search}`, { method: request.method, headers, body });
     }
     if (url.pathname === "/echo") {
       return Response.json({
@@ -327,12 +362,27 @@ try {
   assert.equal(streamed.status, 200, streamed.text);
   assert.deepEqual(JSON.parse(streamed.text), { firstEarly: true, text: "0 1 2 3 ", whole: "0 1 2 3 ", bigOk: true });
 
+  // RPC: methods of the WorkerEntrypoint, called on the binding, with values copied as
+  // structured clone does and errors thrown as in workerd.
+  const rpc = await get("/rpc");
+  assert.equal(rpc.status, 200, rpc.text);
+  assert.deepEqual(JSON.parse(rpc.text), {
+    sum: 5,
+    kept: { d: true, b: true, m: true, u: true, n: true },
+    thrown: ["RangeError", "nope", true],
+    unknown: ["TypeError", 'The RPC receiver does not implement the method "noSuchMethod".'],
+    context: { env: true, waitUntil: true },
+  });
+  // A client cannot call a method: without the edge's vouching, x-sb-rpc is just a header.
+  const forgedRpc = await fetch(`http://127.0.0.1:${port}/ping`, { method: "POST", headers: { "x-sb-rpc": "fail" }, body: "[\"x\"]" });
+  assert.equal(await forgedRpc.text(), "pong");
+
   // A deployment calling itself, 30 levels deep: every level waits on the next at once.
   const self = await get("/self");
   assert.equal(self.text, "bottom 30");
   console.log(
     `Service bindings return promises and run off the loop: /ping ${Math.round(ping.ms)} ms during a call, ` +
-      `8x500 ms in ${Math.round(total)} ms, self-recursion ok; URL, Request+init, stream bodies, Set-Cookie and missing content types preserved; redirects follow Fetch; aborted calls stop upstream; vouched calls see the caller's URL and rethrow the callee's errors; responses stream`,
+      `8x500 ms in ${Math.round(total)} ms, self-recursion ok; URL, Request+init, stream bodies, Set-Cookie and missing content types preserved; redirects follow Fetch; aborted calls stop upstream; vouched calls see the caller's URL and rethrow the callee's errors; responses stream; RPC calls WorkerEntrypoint methods`,
   );
 } finally {
   if (server) {
