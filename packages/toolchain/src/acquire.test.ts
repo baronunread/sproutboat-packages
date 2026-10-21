@@ -147,7 +147,8 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "  }\n" +
       "\n" +
       "  if (body_owned) free(body_owned);\n" +
-      "}\n",
+      "}\n" +
+      "int main(void) {\n  porf_native_fetch_runtime_init();\n  porf_native_fetch_static_init();\n\n  return 0;\n}\n",
     "compiler/builtins/json.ts":
       "let __Porffor_json_bufLimit: i32 = 0;\n    depth += 1;\n    depth -= 1;\n    depth += 1;\n    depth -= 1;\n  let out: i32 = __Porffor_json_serialize(buffer, value, 0, space);\n" +
       "// sb_json_utf16_v1\n" +

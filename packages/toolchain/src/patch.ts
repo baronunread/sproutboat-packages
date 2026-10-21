@@ -1841,6 +1841,39 @@ const DEFERRED_DISCARD_EDITS: [string, string][] = [
   ],
 ];
 
+const ASYNC_WAKER_MARKER = "// sproutboat: async broker exchanges";
+const ASYNC_WAKER_MAIN =
+  "int main(void) {\n  porf_native_fetch_runtime_init();\n  porf_native_fetch_static_init();\n";
+
+/**
+ * The broker transport runs fetch() and service-binding calls on its own threads
+ * once the host gives it a way back onto the loop, so a sprout keeps serving while
+ * a call is in flight. uWS's `defer()` is that way: it is the loop's one thread-safe
+ * entry (it locks, queues and wakes the loop). Builds without the broker transport
+ * link the weak no-op defaults and stay synchronous.
+ */
+export async function patchAsyncWaker(root: string): Promise<void> {
+  const shimFile = resolve(root, "compiler/uwebsockets.js");
+  const shim = await readFile(shimFile, "utf8");
+  if (shim.includes(ASYNC_WAKER_MARKER)) return;
+  if (!shim.includes(ASYNC_WAKER_MAIN))
+    throw new Error(`could not patch Porffor's native server for async calls: main() anchor not found in ${shimFile}`);
+  const waker = `${ASYNC_WAKER_MARKER}
+extern "C" __attribute__((weak)) void sb_async_set_waker(void (*wake)(void)) { (void)wake; }
+extern "C" __attribute__((weak)) void sb_async_drain(void) {}
+static uWS::Loop* sb_async_loop = nullptr;
+static void sb_async_wake(void) {
+  sb_async_loop->defer([] {
+    __porffor_js_enter();
+    sb_async_drain();
+    __porffor_js_exit();
+  });
+}
+`;
+  const install = "  sb_async_loop = uWS::Loop::get();\n  sb_async_set_waker(sb_async_wake);\n";
+  await writeFile(shimFile, shim.replace(ASYNC_WAKER_MAIN, waker + ASYNC_WAKER_MAIN + install));
+}
+
 /** #287: deferred discard and idle return. After patchQuietCollection, which adds the quiet collector. */
 export async function patchDeferredDiscard(root: string): Promise<void> {
   const file = resolve(root, "compiler/render.js");
@@ -2282,6 +2315,7 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchRenderJs(root);
   await patchStreamingResponses(root);
   await patchQuietCollection(root);
+  await patchAsyncWaker(root);
   await patchDeferredDiscard(root);
   await patchDateParser(root);
   await patchPromiseResolveNull(root);

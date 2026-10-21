@@ -38,7 +38,8 @@
     "test:native-waituntil": "bun packages/runtime/test/native-waituntil.ts",
     "test:native-web-apis": "bun packages/runtime/test/native-web-apis.ts",
     "test:native-bodies": "bun packages/runtime/test/native-bodies.ts",
-    "test:native-streaming": "bun packages/runtime/test/native-streaming.ts"
+    "test:native-streaming": "bun packages/runtime/test/native-streaming.ts",
+    "test:native-service-bindings": "bun packages/runtime/test/native-service-bindings.ts"
   },
   "devDependencies": {
     "@changesets/cli": "^3.0.2",

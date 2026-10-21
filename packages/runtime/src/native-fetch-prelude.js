@@ -5183,37 +5183,77 @@ globalThis.__sbInstallBindings = function (target, bindings) {
 
   // #48 — worker-to-worker. Same wire shape as outbound fetch, but the broker
   // resolves the target itself and forwards it internally, so this is not
-  // egress and is not subject to the private-address block.
+  // egress and is not subject to the private-address block. Always a promise, as
+  // in Workers; on an async host the caller keeps serving while the call runs,
+  // which is also what lets a deployment call itself without deadlocking.
   for (let i = 0; i < (bindings.services || []).length; i++) {
     const binding = bindings.services[i].binding;
     target[binding] = {
-      fetch(input, init) {
-        const url = __sbIsStr(input) ? input : String((input && input.url) || "https://service/");
-        const opts = init || (!__sbIsStr(input) && input) || {};
-        const headers = [];
-        if (opts.headers) {
-          if (__sbIsFn(opts.headers.forEach)) opts.headers.forEach((v, k) => headers.push([k, v]));
-          else for (const k in opts.headers) headers.push([k, opts.headers[k]]);
-        }
-        const r = globalThis.__sbFetchUpstream("service.fetch", {
-          binding,
-          url,
-          method: opts.method || "GET",
-          headers,
-          ...__sbRequestBody(opts instanceof Request ? __sbRawBody(opts) : opts.body),
-        });
-        const respHeaders = new Headers();
-        for (let j = 0; j < (r.headers || []).length; j++) respHeaders.set(r.headers[j][0], r.headers[j][1]);
-        // #176: wire bytes from another deployment, not a string this handler
-        // built -- must not be re-encoded if the handler proxies it straight
-        // through (see the assets binding for the same reasoning).
-        if (r.body != null) respHeaders.set("x-sb-raw-body", "1");
-        return __sbRawBodyResponse(r.body, { status: r.status || 502, headers: respHeaders });
+      async fetch(input, init) {
+        const parts = __sbFetchParts(input, init);
+        // A stream body is read to the end first: the wire carries a whole body.
+        let body = __sbUnwrapBody(parts.body);
+        if (body instanceof ReadableStream) body = await __sbCollectBody(body);
+        const msg = { binding, url: parts.url, method: parts.method, headers: parts.headers, ...__sbRequestBody(body) };
+        return __sbUpstream("service.fetch", msg, "sproutboat service " + binding);
       },
     };
   }
 
 };
+
+// fetch(input, init) as Fetch reads it: a Request's method, headers and body apply
+// unless init overrides them; a URL object stands for its href.
+function __sbFetchParts(input, init) {
+  const req = input != null && !__sbIsStr(input) && input.url != null ? input : null;
+  const url = req ? String(req.url) : input != null && input.href != null ? String(input.href) : String(input);
+  const opts = init || {};
+  const source = opts.headers != null ? opts.headers : req ? req.headers : null;
+  const headers = [];
+  if (source) {
+    if (__sbIsFn(source.forEach)) source.forEach((v, k) => headers.push([k, v]));
+    else for (const k in source) headers.push([k, source[k]]);
+  }
+  const body = opts.body !== undefined && !(opts instanceof Request) ? opts.body : req && __sbRawBody(req) !== "" ? __sbRawBody(req) : null;
+  const method = opts.method || (req && req.method) || "GET";
+  return { url, method, headers, body };
+}
+
+// An upstream reply (fetch or service.fetch) -> a Response. Headers are appended,
+// so each Set-Cookie survives.
+function __sbUpstreamResponse(r) {
+  const respHeaders = new Headers();
+  for (let j = 0; j < (r.headers || []).length; j++) respHeaders.append(r.headers[j][0], r.headers[j][1]);
+  // #176: bytes from another server or deployment, not a string this handler
+  // built -- must not be re-encoded if the handler proxies it straight
+  // through (see the assets binding for the same reasoning).
+  if (r.body != null) respHeaders.set("x-sb-raw-body", "1");
+  return __sbRawBodyResponse(r.body, { status: r.status || 502, headers: respHeaders });
+}
+
+// Sends `msg` as `op` and answers with the Response: at once on a synchronous
+// transport, or (B18) as a promise when the host runs requests off its event loop.
+// The reply fires a timer that never fires on its own; the timer table keeps the
+// callback alive until then.
+function __sbUpstream(op, msg, label) {
+  if (!__sbHttpAsyncEnabled()) return __sbUpstreamResponse(globalThis.__sbFetchUpstream(op, msg));
+  return new Promise((resolve, reject) => {
+    const id = setTimeout(() => {
+      try {
+        resolve(__sbUpstreamResponse(__sbFetchReply(__sbHttpAsyncResult(id))));
+      } catch (e) {
+        reject(new Error(label + ": " + ((e && e.message) || e)));
+      }
+    }, 2147483647);
+    try {
+      msg.asyncId = id;
+      globalThis.__sbFetchUpstream(op, msg);
+    } catch (e) {
+      clearTimeout(id);
+      reject(e);
+    }
+  });
+}
 
 // fetch() reaches any public address; the transport refuses private and
 // reserved ones at connect (baronunread/sproutboat#174). No config, like a
@@ -5221,48 +5261,9 @@ globalThis.__sbInstallBindings = function (target, bindings) {
 // prelude must not replace fetch just by being evaluated.
 globalThis.__sbInstallFetch = function () {
   globalThis.fetch = function (input, init) {
-    // A Request's method, headers and body apply unless init overrides them; a URL
-    // object stands for its href.
-    const req = input != null && !__sbIsStr(input) && input.url != null ? input : null;
-    const url = req ? String(req.url) : input != null && input.href != null ? String(input.href) : String(input);
-    const opts = init || {};
-    const source = opts.headers != null ? opts.headers : req ? req.headers : null;
-    const headers = [];
-    if (source) {
-      if (__sbIsFn(source.forEach)) source.forEach((v, k) => headers.push([k, v]));
-      else for (const k in source) headers.push([k, source[k]]);
-    }
-    const body = opts.body !== undefined && !(opts instanceof Request) ? opts.body : req && __sbRawBody(req) !== "" ? __sbRawBody(req) : null;
-    const method = opts.method || (req && req.method) || "GET";
-    const msg = { url, method, headers, ...__sbRequestBody(body) };
-    const respond = (r) => {
-      const respHeaders = new Headers();
-      for (let j = 0; j < (r.headers || []).length; j++) respHeaders.set(r.headers[j][0], r.headers[j][1]);
-      // #176: bytes from an outbound HTTP response, not a string this handler
-      // built -- must not be re-encoded if the handler proxies it straight
-      // through (see the assets binding for the same reasoning).
-      if (r.body != null) respHeaders.set("x-sb-raw-body", "1");
-      return __sbRawBodyResponse(r.body, { status: r.status || 502, headers: respHeaders });
-    };
-    if (!__sbHttpAsyncEnabled()) return respond(globalThis.__sbFetchUpstream("fetch", msg));
-    // B18: the host runs the request off the event loop. Its reply fires a timer
-    // that never fires on its own; the timer table keeps the callback alive.
-    return new Promise((resolve, reject) => {
-      const id = setTimeout(() => {
-        try {
-          resolve(respond(__sbFetchReply(__sbHttpAsyncResult(id))));
-        } catch (e) {
-          reject(new Error("sproutboat fetch: " + ((e && e.message) || e)));
-        }
-      }, 2147483647);
-      try {
-        msg.asyncId = id;
-        globalThis.__sbFetchUpstream("fetch", msg);
-      } catch (e) {
-        clearTimeout(id);
-        reject(e);
-      }
-    });
+    const parts = __sbFetchParts(input, init);
+    const msg = { url: parts.url, method: parts.method, headers: parts.headers, ...__sbRequestBody(parts.body) };
+    return __sbUpstream("fetch", msg, "sproutboat fetch");
   };
 };
 

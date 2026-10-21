@@ -36,3 +36,4 @@ jobs:
       - run: bun run test:native-web-apis
       - run: bun run test:native-bodies
       - run: bun run test:native-streaming
+      - run: bun run test:native-service-bindings
