@@ -18,6 +18,11 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
   const files = {
     "runtime/index.js": "fixture:runtime/index.js\n",
     "compiler/render.js": "// sb_native_utf8_scalar_v1\n" +
+      "static void porf_gc_cons_candidate(u32 c);\n" +
+      // Both conservative scanners consume raw f64 values.
+      ("    if (d > 0.0 && d < 4294967296.0) {\n" +
+        "      const i64 iv = (i64)d;\n" +
+        "      if ((f64)iv == d) porf_gc_cons_candidate((u32)(u64)iv);\n    }\n").repeat(2) +
       "static i32 porf_gc_mark_queue_cap = 0;\n    porf_gc_discard_free_runs();\n" +
       "  porf_native_fetch_timer_start(id, (i32)delay_ms, timer->repeat ? (i32)delay_ms : 0);\n" +
       "void porf_native_fetch_collect_normal_from(void* stack_top) {\n" +
