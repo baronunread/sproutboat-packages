@@ -5191,19 +5191,20 @@ globalThis.__sbInstallBindings = function (target, bindings) {
     target[binding] = {
       async fetch(input, init) {
         const parts = __sbFetchParts(input, init);
+        if (parts.signal) parts.signal.throwIfAborted();
         // A stream body is read to the end first: the wire carries a whole body.
         let body = __sbUnwrapBody(parts.body);
         if (body instanceof ReadableStream) body = await __sbCollectBody(body);
         const msg = { binding, url: parts.url, method: parts.method, headers: parts.headers, ...__sbRequestBody(body) };
-        return __sbFetchFollowing("service.fetch", msg, "sproutboat service " + binding, parts.redirect);
+        return __sbFetchFollowing("service.fetch", msg, "sproutboat service " + binding, parts.redirect, parts.signal);
       },
     };
   }
 
 };
 
-// fetch(input, init) as Fetch reads it: a Request's method, headers, body and redirect
-// mode apply unless init overrides them; a URL object stands for its href.
+// fetch(input, init) as Fetch reads it: a Request's method, headers, body, redirect mode
+// and signal apply unless init overrides them; a URL object stands for its href.
 function __sbFetchParts(input, init) {
   const req = input != null && !__sbIsStr(input) && input.url != null ? input : null;
   const url = req ? String(req.url) : input != null && input.href != null ? String(input.href) : String(input);
@@ -5217,7 +5218,8 @@ function __sbFetchParts(input, init) {
   const body = opts.body !== undefined && !(opts instanceof Request) ? opts.body : req && __sbRawBody(req) !== "" ? __sbRawBody(req) : null;
   const method = opts.method || (req && req.method) || "GET";
   const redirect = opts.redirect || (req && req.redirect) || "follow";
-  return { url, method, headers, body, redirect };
+  const signal = opts.signal || (req && req.signal) || null;
+  return { url, method, headers, body, redirect, signal };
 }
 
 // An upstream reply (fetch or service.fetch) -> a Response. Headers are appended,
@@ -5245,10 +5247,10 @@ function __sbUpstreamResponse(r) {
 // are vetted like the first. A 303, or a 301/302 to a POST, becomes a bodiless GET;
 // a hop to another origin drops Authorization. A service binding follows through
 // the same binding, as in workerd. "error" rejects; "manual" returns the 3xx.
-function __sbFetchFollowing(op, msg, label, mode) {
-  return __sbFollowHop(op, msg, label, mode, 0);
+function __sbFetchFollowing(op, msg, label, mode, signal) {
+  return __sbFollowHop(op, msg, label, mode, signal, 0);
 }
-function __sbFollowHop(op, msg, label, mode, hops) {
+function __sbFollowHop(op, msg, label, mode, signal, hops) {
   const step = (res) => {
     const location = res.headers.get("location");
     const redirect = res.status === 301 || res.status === 302 || res.status === 303 || res.status === 307 || res.status === 308;
@@ -5268,30 +5270,48 @@ function __sbFollowHop(op, msg, label, mode, hops) {
       next.body = null;
       delete next.bodyBinary;
     }
-    return __sbFollowHop(op, next, label, mode, hops + 1);
+    return __sbFollowHop(op, next, label, mode, signal, hops + 1);
   };
-  const out = __sbUpstream(op, msg, label);
+  const out = __sbUpstream(op, msg, label, signal);
   return out instanceof Promise ? out.then(step) : step(out);
 }
 
 // Sends `msg` as `op` and answers with the Response: at once on a synchronous
 // transport, or (B18) as a promise when the host runs requests off its event loop.
 // The reply fires a timer that never fires on its own; the timer table keeps the
-// callback alive until then.
-function __sbUpstream(op, msg, label) {
+// callback alive until then. An aborted `signal` rejects with its reason and cancels
+// the exchange, which closes its broker connection: the broker stops the upstream
+// request, and the edge in turn stops the callee's.
+function __sbUpstream(op, msg, label, signal) {
+  if (signal) signal.throwIfAborted();
   if (!__sbHttpAsyncEnabled()) return __sbUpstreamResponse(globalThis.__sbFetchUpstream(op, msg));
   return new Promise((resolve, reject) => {
+    let onAbort = null;
+    const settled = () => {
+      if (onAbort) signal.removeEventListener("abort", onAbort);
+    };
     const id = setTimeout(() => {
+      settled();
       try {
         resolve(__sbUpstreamResponse(__sbFetchReply(__sbHttpAsyncResult(id))));
       } catch (e) {
         reject(new Error(label + ": " + ((e && e.message) || e)));
       }
     }, 2147483647);
+    if (signal) {
+      onAbort = () => {
+        settled();
+        clearTimeout(id);
+        __sbCancelAsync(id);
+        reject(signal.reason);
+      };
+      signal.addEventListener("abort", onAbort);
+    }
     try {
       msg.asyncId = id;
       globalThis.__sbFetchUpstream(op, msg);
     } catch (e) {
+      settled();
       clearTimeout(id);
       reject(e);
     }
@@ -5306,7 +5326,7 @@ globalThis.__sbInstallFetch = function () {
   globalThis.fetch = function (input, init) {
     const parts = __sbFetchParts(input, init);
     const msg = { url: parts.url, method: parts.method, headers: parts.headers, ...__sbRequestBody(parts.body) };
-    return __sbFetchFollowing("fetch", msg, "sproutboat fetch", parts.redirect);
+    return __sbFetchFollowing("fetch", msg, "sproutboat fetch", parts.redirect, parts.signal);
   };
 };
 

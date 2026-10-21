@@ -45,6 +45,23 @@ export default {
       return Response.json({ followed, manual: [manual.status, manual.headers.get("location")], seeOther, temporary, refused });
     }
     if (url.pathname === "/slow") return new Response(await (await env.PEER.fetch("https://peer/slow" + url.search)).text());
+    if (url.pathname === "/abort") {
+      const outcome = async (signal) => {
+        const t0 = Date.now();
+        try {
+          await env.PEER.fetch("https://peer/slow?ms=3000", { signal });
+          return "answered";
+        } catch (e) {
+          return e.name + " " + (Date.now() - t0 < 1000 ? "fast" : "slow");
+        }
+      };
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), 100);
+      const aborted = await outcome(controller.signal);
+      const timedOut = await outcome(AbortSignal.timeout(100));
+      const already = await outcome(AbortSignal.abort());
+      return Response.json({ aborted, timedOut, already });
+    }
     if (url.pathname === "/self") {
       const depth = Number(url.searchParams.get("depth") || 0);
       if (depth >= 30) return new Response("bottom " + depth);
@@ -63,6 +80,9 @@ function freePort(): number {
 }
 
 const port = freePort();
+// Upstream requests whose client went away before the answer: a cancelled call must
+// stop here, not only be ignored by the caller.
+let slowAbandoned = 0;
 // The platform's edge, reduced to what the broker forwards to it: routing by Host.
 const edge = Bun.serve({
   hostname: "127.0.0.1",
@@ -90,6 +110,7 @@ const edge = Bun.serve({
     }
     if (url.pathname === "/bare") return new Response(null, { headers: { "x-bare": "1" } });
     if (url.pathname === "/slow") {
+      request.signal.addEventListener("abort", () => slowAbandoned++);
       await Bun.sleep(Number(url.searchParams.get("ms") || 500));
       return new Response("slow done");
     }
@@ -209,12 +230,21 @@ try {
   assert(all.every((r) => r.text === "slow done"), JSON.stringify(all));
   assert(total < 1500, `8 concurrent 500 ms calls took ${Math.round(total)} ms`);
 
+  // Cancellation: an aborted signal rejects at once, and the abort reaches the upstream
+  // request (the broker drops it when the sprout closes the exchange's connection).
+  const abandonedBefore = slowAbandoned;
+  const aborts = await get("/abort");
+  assert.equal(aborts.status, 200, aborts.text);
+  assert.deepEqual(JSON.parse(aborts.text), { aborted: "AbortError fast", timedOut: "TimeoutError fast", already: "AbortError fast" });
+  await Bun.sleep(300);
+  assert.equal(slowAbandoned - abandonedBefore, 2, "both in-flight calls were stopped upstream");
+
   // A deployment calling itself, 30 levels deep: every level waits on the next at once.
   const self = await get("/self");
   assert.equal(self.text, "bottom 30");
   console.log(
     `Service bindings return promises and run off the loop: /ping ${Math.round(ping.ms)} ms during a call, ` +
-      `8x500 ms in ${Math.round(total)} ms, self-recursion ok; URL, Request+init, stream bodies, Set-Cookie and missing content types preserved; redirects follow Fetch`,
+      `8x500 ms in ${Math.round(total)} ms, self-recursion ok; URL, Request+init, stream bodies, Set-Cookie and missing content types preserved; redirects follow Fetch; aborted calls stop upstream`,
   );
 } finally {
   if (server) {

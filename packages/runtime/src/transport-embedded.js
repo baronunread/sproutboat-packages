@@ -2082,6 +2082,10 @@ function __sbHttpAsyncResult(asyncId) {
   return res;
 }
 
+// An async request's caller gave up. The host's request runs to the end; with its
+// placeholder timer cleared, the reply is dropped when it arrives.
+function __sbCancelAsync() {}
+
 // Whether the host runs async requests (sb_async_enable was called).
 function __sbHttpAsyncEnabled() {
   let res = false;

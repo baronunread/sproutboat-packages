@@ -339,6 +339,9 @@ typedef struct sb_async_job {
 static pthread_mutex_t sb_async_lock = PTHREAD_MUTEX_INITIALIZER;
 static sb_async_job *sb_async_queue = 0, *sb_async_done = 0, *sb_async_current = 0;
 static int sb_io_started = 0, sb_io_wake[2] = { -1, -1 };
+// Ids of exchanges whose caller gave up (an aborted signal), for the I/O thread.
+static u32* sb_async_cancels = 0;
+static size_t sb_async_cancels_n = 0, sb_async_cancels_cap = 0;
 static void (*sb_async_waker)(void) = 0;
 
 void sb_async_set_waker(void (*wake)(void)) { sb_async_waker = wake; }
@@ -476,6 +479,24 @@ static void* sb_io_thread(void* unused) {
       j->next = active;
       active = j;
     }
+    // Exchanges given up on: their connections close, which tells the broker to stop.
+    pthread_mutex_lock(&sb_async_lock);
+    u32* cancels = sb_async_cancels;
+    size_t cancels_n = sb_async_cancels_n;
+    sb_async_cancels = 0;
+    sb_async_cancels_n = sb_async_cancels_cap = 0;
+    pthread_mutex_unlock(&sb_async_lock);
+    for (size_t c = 0; c < cancels_n; c++) {
+      for (sb_async_job** link = &active; *link; link = &(*link)->next) {
+        sb_async_job* j = *link;
+        if (j->id != cancels[c]) continue;
+        *link = j->next;
+        if (j->fd >= 0) close(j->fd);
+        free(j->out); free(j->in); free(j->json); free(j->bin); free(j);
+        break;
+      }
+    }
+    free(cancels);
     // Retries that are due restart; a job with no socket fails, or waits to retry.
     long long now = sb_now_ms();
     for (sb_async_job** link = &active; *link;) {
@@ -580,6 +601,26 @@ void sb_async_submit_v1(u32 id, const char* json, size_t json_len, const char* b
       return;
     }
   }
+  char one = 1;
+  while (write(sb_io_wake[1], &one, 1) < 0 && errno == EINTR) {}
+}
+
+// The caller gave up on exchange id: the I/O thread drops it and closes its
+// connection. One that already finished is dropped by the drain instead, since its
+// placeholder timer is gone.
+void sb_async_cancel(u32 id) {
+  pthread_mutex_lock(&sb_async_lock);
+  int started = sb_io_started;
+  if (started) {
+    if (sb_async_cancels_n == sb_async_cancels_cap) {
+      sb_async_cancels_cap = sb_async_cancels_cap ? sb_async_cancels_cap * 2 : 8;
+      sb_async_cancels = (u32*)realloc(sb_async_cancels, sb_async_cancels_cap * sizeof(u32));
+      if (!sb_async_cancels) abort();
+    }
+    sb_async_cancels[sb_async_cancels_n++] = id;
+  }
+  pthread_mutex_unlock(&sb_async_lock);
+  if (!started) return;
   char one = 1;
   while (write(sb_io_wake[1], &one, 1) < 0 && errno == EINTR) {}
 }
@@ -784,6 +825,17 @@ function __sbCallAsync(reqJson, body, asyncId) {
     if (asyncId.type == 1 && asyncId.val > 0) sb_async_submit_v1((u32)asyncId.val, __j, __jl, __b, __bl);
     if (__jo) free(__jo);
     if (__bo) free(__bo);
+  `;
+}
+
+// The caller gave up on the exchange under timer id `asyncId`: its connection
+// closes, which the broker reads as "stop" and passes on.
+// oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
+function __sbCancelAsync(asyncId) {
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    void sb_async_cancel(u32);
+    if (asyncId.type == 1 && asyncId.val > 0) sb_async_cancel((u32)asyncId.val);
   `;
 }
 
