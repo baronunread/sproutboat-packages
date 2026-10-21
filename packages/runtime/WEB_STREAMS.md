@@ -20,8 +20,10 @@ runtime links no zlib. Compression writes one fixed-Huffman block per chunk as i
 (close to zlib on text: 252 bytes against 221 for 22.5 KB); decompression inflates all
 block types once the input ends and checks the CRC-32 or Adler-32. Response and Request
 bodies that are ReadableStreams are read by text(), json(), arrayBuffer() and blob(), and
-their chunks must be bytes, as in workerd. `body` is a ReadableStream for every body type,
-as in Fetch: a stream body itself, otherwise a stream made once over the bytes.
+their chunks must be bytes, as in workerd. From compatibility date 2026-10-21, `body` is a
+ReadableStream for every body type, as in Fetch: a stream body itself, otherwise a stream made
+once over the bytes. Before that date it is the value as given, as apps written for earlier
+releases read it (`JSON.parse(request.body)`).
 BYOB buffer detachment requires transfer support from the underlying engine;
 the polyfill cannot supply that engine primitive. Full Web Platform Tests
 conformance has not been established for Porffor.

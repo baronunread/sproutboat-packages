@@ -72,8 +72,11 @@ export const REQUEST_CLASS_SOURCE = String.raw`class Request {
   // body is a ReadableStream, as in Fetch: a stream body itself, else a stream made once over
   // the bytes. The value as given stays in _bodyInit, which the native writer, streaming and
   // the prelude read; assigning body (the native ingress does) sets it.
+  // From compatibility date 2026-10-21. Before it, body is the value as given, as it always
+  // was here (apps read request.body as a string); a deployed handler keeps its behaviour.
   static _bodyAsStream(message) {
     const init = message._bodyInit;
+    if (!(globalThis.__sbCompat >= '2026-10-21')) return init;
     if (init == null) return null;
     if (Request._isStream(init)) return init;
     if (message._bodyStream == null) {

@@ -23,7 +23,7 @@ export default {
     if (request.method === "POST") {
       env.UPLOADS.put("upload", request.body);
       await env.KV.put("upload", request.body);
-      return Response.json({ r2: env.UPLOADS.get("upload").text(), kv: await env.KV.get("upload") });
+      return Response.json({ r2: env.UPLOADS.get("upload").text(), kv: await env.KV.get("upload"), stream: await new Response(request.body).text() });
     }
     await env.KV.put("k", ${JSON.stringify(text)});
     const kv = await env.KV.get("k");
@@ -65,7 +65,7 @@ try {
   assert(core.includes(TRANSPORT_MARKER), "runtime prelude is missing its transport marker");
   const generated = join(workdir, "utf8.generated.js");
   const binary = join(workdir, "utf8-native");
-  await writeFile(generated, wrapNativeFetchHandler(handler, core.replace(TRANSPORT_MARKER, transport), {}, bindings));
+  await writeFile(generated, wrapNativeFetchHandler(handler, core.replace(TRANSPORT_MARKER, transport), {}, bindings, undefined, "2026-10-21"));
 
   const compile = Bun.spawn([node, resolve(porffor, "runtime/index.js"), "native", generated, "-o", binary, "-s", "-O0"], {
     cwd: workdir,
@@ -121,7 +121,7 @@ try {
   assert.match(body.error, /tabellà/);
   assert.equal(body.url, "shadowed");
   const stored = await (await fetch(`http://127.0.0.1:${port}/`, { method: "POST", body: "uploaded é" })).json();
-  assert.deepEqual(stored, { r2: "uploaded é", kv: "uploaded é" }, "put(key, request.body) stores the request body");
+  assert.deepEqual(stored, { r2: "uploaded é", kv: "uploaded é", stream: "uploaded é" }, "put(key, request.body) stores the request body, and body reads as UTF-8");
   console.log("Non-ASCII KV, D1 and error text round-trip through the broker; a handler-level URL stays scoped; put(key, request.body) stores the body");
 } finally {
   if (server) {
