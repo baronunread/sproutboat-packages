@@ -16,6 +16,7 @@ import {
   patchCaseMapping,
   patchZeroDelayTimers,
   patchStreamingResponses,
+  patchAsyncWaker,
   patchSplitGlobals,
   patchBlobClass,
   patchFetchClasses,
@@ -766,6 +767,30 @@ test("streaming patch adds the stream registry and attaches marked responses, id
     await expect(patchStreamingResponses(root)).rejects.toThrow("anchor not found");
     await writeFile(render, "export const x = 1;\n");
     await expect(patchStreamingResponses(root)).rejects.toThrow("streaming fallbacks: anchor not found");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("async waker patch installs a loop waker in the native server, idempotently", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sb-async-waker-"));
+  try {
+    await mkdir(join(root, "compiler"));
+    const file = join(root, "compiler/uwebsockets.js");
+    await writeFile(
+      file,
+      "static void on_request() {}\nint main(void) {\n  porf_native_fetch_runtime_init();\n  porf_native_fetch_static_init();\n\n  uWS::App();\n}\n",
+    );
+    await patchAsyncWaker(root);
+    const patched = await readFile(file, "utf8");
+    expect(patched).toContain('extern "C" __attribute__((weak)) void sb_async_set_waker(void (*wake)(void))');
+    expect(patched).toContain("sb_async_loop->defer([] {");
+    expect(patched.indexOf("sb_async_set_waker(sb_async_wake);")).toBeGreaterThan(patched.indexOf("porf_native_fetch_static_init();"));
+    expect(patched.indexOf("sb_async_set_waker(sb_async_wake);")).toBeLessThan(patched.indexOf("uWS::App();"));
+    await patchAsyncWaker(root);
+    expect(await readFile(file, "utf8")).toBe(patched);
+    await writeFile(file, "export const x = 1;\n");
+    await expect(patchAsyncWaker(root)).rejects.toThrow("main() anchor not found");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

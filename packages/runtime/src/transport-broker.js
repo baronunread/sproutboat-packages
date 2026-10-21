@@ -11,14 +11,20 @@
 // If SB_BROKER_PORT is unset the shims below are never installed (compile.ts
 // only emits the __sbInstallBindings call when the project declares bindings),
 // so a plain sprout is byte-for-byte unchanged.
-// ponytail: text values only; still AF_INET loopback, not AF_UNIX. A failed
-// exchange reconnects and resends once — a broker crash between "request applied"
-// and "reply read" can double-apply a non-idempotent op (queue.send, INSERT);
-// the old fresh-connection-per-call path just failed the call there instead.
-// Binary values + AF_UNIX = v2.
+// ponytail: still AF_INET loopback, not AF_UNIX. A failed v0 exchange reconnects
+// and resends; the broker deduplicates its writes (queue.send, INSERT) by request
+// id. v1 exchanges (fetch, service.fetch, R2) resend only when the broker cannot
+// have acted: the request never fully left, or a reused connection had gone
+// stale. On a host with an event loop, fetch and service.fetch run off it, on
+// one I/O thread (sb_async_submit_v1).
 
 // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
 Porffor.c`
+#include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
+#include <time.h>
+
 // baronunread/sproutboat#176 — defined in render.js, alongside
 // porf_native_fetch_read_value (which every inline-C block below already
 // calls with no forward declaration of its own — that one gets one from
@@ -45,7 +51,8 @@ static int sb_io_all(int fd, unsigned char* buf, size_t len, int writing) {
 // connect() handshake or close() each time. -1 = not connected.
 static int sb_broker_fd = -1;
 
-static int sb_broker_connect(void) {
+// A new connection to the broker: its fd, or a negative code.
+static int sb_broker_open(void) {
   const char* port_s = getenv("SB_BROKER_PORT");
   if (!port_s) return -10;
   signal(SIGPIPE, SIG_IGN); // a dead broker must yield EPIPE, not kill the sprout
@@ -59,16 +66,23 @@ static int sb_broker_connect(void) {
   addr.sin_port = htons((unsigned short)atoi(port_s));
   addr.sin_addr.s_addr = htonl(0x7f000001u); // 127.0.0.1
   if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) { close(fd); return -2; }
+  return fd;
+}
+
+static int sb_broker_connect(void) {
+  int fd = sb_broker_open();
+  if (fd < 0) return fd;
   sb_broker_fd = fd;
   return 0;
 }
 
-// Send one framed request, read one framed reply, on the persistent fd.
-// Send one payload verbatim and read one reply. The caller owns the payload's
-// shape: a v0 exchange prepends the token line, a v1 one carries the token in
-// its JSON and must reach the broker byte for byte — prefixing it would leave
-// the marker in the wrong place and the frame would read as v0.
-static int sb_broker_exchange_raw(const char* body, size_t body_len, char** resp_out, size_t* resp_len_out) {
+// Send one payload verbatim on fd and read one reply. The caller owns the
+// payload's shape: a v0 exchange prepends the token line, a v1 one carries the
+// token in its JSON and must reach the broker byte for byte — prefixing it would
+// leave the marker in the wrong place and the frame would read as v0.
+// -3 and -5 mean the broker never had the whole request; -4 and -6 mean it did,
+// and may have acted on it.
+static int sb_broker_exchange_fd(int fd, const char* body, size_t body_len, char** resp_out, size_t* resp_len_out) {
   unsigned char* frame = (unsigned char*)malloc(4 + body_len);
   if (!frame) return -5;
   frame[0] = (unsigned char)(body_len & 0xff);
@@ -76,21 +90,26 @@ static int sb_broker_exchange_raw(const char* body, size_t body_len, char** resp
   frame[2] = (unsigned char)((body_len >> 16) & 0xff);
   frame[3] = (unsigned char)((body_len >> 24) & 0xff);
   if (body_len) memcpy(frame + 4, body, body_len);
-  int wr = sb_io_all(sb_broker_fd, frame, 4 + body_len, 1);
+  int wr = sb_io_all(fd, frame, 4 + body_len, 1);
   free(frame);
   if (wr != 0) return -3;
 
   unsigned char rhdr[4];
-  if (sb_io_all(sb_broker_fd, rhdr, 4, 0) != 0) return -4;
+  if (sb_io_all(fd, rhdr, 4, 0) != 0) return -4;
   size_t rlen = (size_t)rhdr[0] | ((size_t)rhdr[1] << 8) | ((size_t)rhdr[2] << 16) | ((size_t)rhdr[3] << 24);
 
   char* buf = (char*)malloc(rlen ? rlen : 1);
   if (!buf) return -5;
-  if (rlen && sb_io_all(sb_broker_fd, (unsigned char*)buf, rlen, 0) != 0) { free(buf); return -6; }
+  if (rlen && sb_io_all(fd, (unsigned char*)buf, rlen, 0) != 0) { free(buf); return -6; }
 
   *resp_out = buf;
   *resp_len_out = rlen;
   return 0;
+}
+
+// The same exchange on the persistent connection.
+static int sb_broker_exchange_raw(const char* body, size_t body_len, char** resp_out, size_t* resp_len_out) {
+  return sb_broker_exchange_fd(sb_broker_fd, body, body_len, resp_out, resp_len_out);
 }
 
 // #63 — the binary reply from the last v1 exchange, handed to JS on request.
@@ -207,60 +226,398 @@ static int sb_req_is_fetch(const char* req, size_t n) {
   return 0;
 }
 
-// A v1 exchange: marker, json length, json, then the body bytes. The reply is
-// split the same way, its JSON returned and its bytes stashed for __sbTakeBin.
-static int sb_broker_roundtrip_v1(const char* json, size_t json_len, const char* body, size_t body_len,
-                                  char** resp_out, size_t* resp_len_out) {
+// A v1 request: marker, json length, json, then the body bytes. malloc'd.
+static char* sb_v1_request(const char* json, size_t json_len, const char* body, size_t body_len, size_t* out_len) {
   size_t req_len = 1 + 4 + json_len + body_len;
   char* req = (char*)malloc(req_len);
-  if (!req) return -4;
+  if (!req) return 0;
   req[0] = 1;
   unsigned int jl = (unsigned int)json_len;
   memcpy(req + 1, &jl, 4);
   memcpy(req + 5, json, json_len);
   if (body_len) memcpy(req + 5 + json_len, body, body_len);
+  *out_len = req_len;
+  return req;
+}
 
-  char* resp = 0; size_t resp_len = 0;
-  int rc = -3;
-  for (int attempt = 0; attempt < 4; attempt++) {
-    sb_backoff(attempt);
-    if (sb_broker_fd < 0) {
-      int c = sb_broker_connect();
-      if (c != 0) { rc = c; continue; }
-    }
-    rc = sb_broker_exchange_raw(req, req_len, &resp, &resp_len);
-    if (rc == 0) break;
-    close(sb_broker_fd);
-    sb_broker_fd = -1;
-  }
-  free(req);
-  if (rc != 0) return rc;
-
-  if (sb_bin_reply) { free(sb_bin_reply); sb_bin_reply = 0; sb_bin_reply_len = 0; }
+// Splits a v1 reply, which it takes ownership of, into its JSON (returned,
+// NUL-terminated, malloc'd) and its bytes (*bin, malloc'd, or 0 when there are
+// none). A broker that answered v0 to a v1 request predates this: its reply is
+// returned whole, so the error it wrote is what the handler sees. 0 on OOM.
+static char* sb_v1_split(char* resp, size_t resp_len, size_t* json_len, char** bin, size_t* bin_len) {
+  *bin = 0;
+  *bin_len = 0;
   if (resp_len >= 5 && (unsigned char)resp[0] == 1) {
     unsigned int rjl = 0;
     memcpy(&rjl, resp + 1, 4);
     if (5 + (size_t)rjl <= resp_len) {
-      size_t bin_len = resp_len - 5 - rjl;
-      if (bin_len) {
-        sb_bin_reply = (char*)malloc(bin_len);
-        if (sb_bin_reply) { memcpy(sb_bin_reply, resp + 5 + rjl, bin_len); sb_bin_reply_len = bin_len; }
+      size_t n = resp_len - 5 - rjl;
+      if (n) {
+        *bin = (char*)malloc(n);
+        if (*bin) { memcpy(*bin, resp + 5 + rjl, n); *bin_len = n; }
       }
-      char* json_only = (char*)malloc(rjl + 1);
-      if (!json_only) { free(resp); return -4; }
-      memcpy(json_only, resp + 5, rjl);
-      json_only[rjl] = 0;
+      char* json = (char*)malloc(rjl + 1);
+      if (json) { memcpy(json, resp + 5, rjl); json[rjl] = 0; *json_len = rjl; }
       free(resp);
-      *resp_out = json_only;
-      *resp_len_out = rjl;
-      return 0;
+      return json;
     }
   }
-  // A broker that answered v0 to a v1 request predates this: pass its reply
-  // through so the error it wrote is what the handler sees.
-  *resp_out = resp;
-  *resp_len_out = resp_len;
+  *json_len = resp_len;
+  return resp;
+}
+
+// One v1 exchange on *fd (-1 = connect first), with up to four tries. A failure
+// before the broker had the whole request is always retried. One after it is
+// retried only on a connection that had served an earlier exchange, which may
+// simply have gone stale (a broker restart); on a fresh one the broker may have
+// acted on it, and fetch and service.fetch are not deduplicated by id.
+static int sb_v1_send(int* fd, const char* req, size_t req_len, char** resp, size_t* resp_len) {
+  int rc = -3;
+  for (int attempt = 0; attempt < 4; attempt++) {
+    sb_backoff(attempt);
+    int reused = *fd >= 0;
+    if (!reused) {
+      int c = sb_broker_open();
+      if (c < 0) { rc = c; continue; }
+      *fd = c;
+    }
+    rc = sb_broker_exchange_fd(*fd, req, req_len, resp, resp_len);
+    if (rc == 0) return 0;
+    close(*fd);
+    *fd = -1;
+    if (!reused && rc != -3 && rc != -5) return rc;
+  }
+  return rc;
+}
+
+// A v1 exchange on the persistent connection. The reply's JSON is returned and
+// its bytes stashed for __sbTakeBin.
+static int sb_broker_roundtrip_v1(const char* json, size_t json_len, const char* body, size_t body_len,
+                                  char** resp_out, size_t* resp_len_out) {
+  size_t req_len = 0;
+  char* req = sb_v1_request(json, json_len, body, body_len, &req_len);
+  if (!req) return -4;
+  char* resp = 0; size_t resp_len = 0;
+  int rc = sb_v1_send(&sb_broker_fd, req, req_len, &resp, &resp_len);
+  free(req);
+  if (rc != 0) return rc;
+  if (sb_bin_reply) { free(sb_bin_reply); sb_bin_reply = 0; sb_bin_reply_len = 0; }
+  char* json_only = sb_v1_split(resp, resp_len, resp_len_out, &sb_bin_reply, &sb_bin_reply_len);
+  if (!json_only) return -4;
+  *resp_out = json_only;
   return 0;
+}
+
+// Async exchanges, for a host with an event loop (the standalone server). The
+// host installs a waker with sb_async_set_waker(); fetch() and service bindings
+// then hand each exchange to one I/O thread and return at once, so the sprout
+// keeps serving while calls are in flight — including the calls back into itself
+// that recursion makes, however deep. The I/O thread multiplexes non-blocking
+// broker connections with poll(), one per exchange in flight, and keeps a few
+// idle ones for reuse. A finished exchange is queued and the waker called; the
+// host then runs sb_async_drain() on its loop, which fires the JS callback
+// registered under the request's timer id. The thread touches only malloc'd jobs,
+// never the JS heap. The same contract as the embedded transport's B18, which
+// signals a pipe.
+void porf_native_fetch_fire_timer(u32 id);
+void porf_native_fetch_timer_clear(u32 id);
+typedef struct sb_async_job {
+  struct sb_async_job* next;
+  u32 id;
+  // The framed request ([u32 LE length][v1 payload]) and how much of it is sent.
+  unsigned char* out; size_t out_len, out_off;
+  // The reply: its length prefix, then its payload.
+  unsigned char hdr[4]; size_t hdr_got;
+  char* in; size_t in_len, in_got;
+  int fd, reused, attempt, connecting;
+  long long retry_at;  // ms; 0 = not waiting to retry
+  char* json; size_t json_len;
+  char* bin; size_t bin_len;
+} sb_async_job;
+// Idle connections kept for the next exchanges.
+#define SB_IO_IDLE 8
+static pthread_mutex_t sb_async_lock = PTHREAD_MUTEX_INITIALIZER;
+static sb_async_job *sb_async_queue = 0, *sb_async_done = 0, *sb_async_current = 0;
+static int sb_io_started = 0, sb_io_wake[2] = { -1, -1 };
+static void (*sb_async_waker)(void) = 0;
+
+void sb_async_set_waker(void (*wake)(void)) { sb_async_waker = wake; }
+int sb_async_enabled(void) { return sb_async_waker != 0; }
+
+static long long sb_now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void sb_async_error(sb_async_job* j, int rc) {
+  char e[48];
+  int n = snprintf(e, sizeof(e), "{\"ok\":false,\"error\":\"broker rc %d\"}", rc);
+  j->json = (char*)malloc((size_t)n + 1);
+  if (!j->json) abort();
+  memcpy(j->json, e, (size_t)n + 1);
+  j->json_len = (size_t)n;
+}
+
+// Hands a finished job (json set) back to the loop.
+static void sb_async_finish(sb_async_job* j) {
+  free(j->out); j->out = 0;
+  free(j->in); j->in = 0;
+  pthread_mutex_lock(&sb_async_lock);
+  j->next = sb_async_done;
+  sb_async_done = j;
+  pthread_mutex_unlock(&sb_async_lock);
+  sb_async_waker();
+}
+
+static void sb_io_nonblock(int fd) { fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK); fcntl(fd, F_SETFD, FD_CLOEXEC); }
+
+// Starts (or restarts) a job: an idle connection if there is one, else a new one.
+static void sb_io_begin(sb_async_job* j, int* idle, int* idle_n) {
+  j->out_off = 0; j->hdr_got = 0; j->in_got = 0; j->in_len = 0;
+  free(j->in); j->in = 0;
+  j->retry_at = 0; j->connecting = 0;
+  if (*idle_n > 0) { j->fd = idle[--*idle_n]; j->reused = 1; return; }
+  j->reused = 0;
+  const char* port_s = getenv("SB_BROKER_PORT");
+  int fd = port_s ? socket(AF_INET, SOCK_STREAM, 0) : -1;
+  if (fd < 0) { j->fd = -1; return; }
+  int one = 1;
+  setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+  sb_io_nonblock(fd);
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons((unsigned short)atoi(port_s));
+  addr.sin_addr.s_addr = htonl(0x7f000001u);
+  if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+    if (errno != EINPROGRESS) { close(fd); j->fd = -1; return; }
+    j->connecting = 1;
+  }
+  j->fd = fd;
+}
+
+// A failed attempt. Retried (after a backoff) when the broker never had the whole
+// request, or the connection was a reused one that may have gone stale; failed
+// otherwise, since fetch and service.fetch are not deduplicated by id.
+static int sb_io_failed(sb_async_job* j, int rc) {
+  if (j->fd >= 0) { close(j->fd); j->fd = -1; }
+  int unsent = j->out_off < j->out_len;
+  if ((unsent || j->reused) && ++j->attempt < 4) {
+    static const long ms[4] = { 0, 5, 25, 100 };
+    j->retry_at = sb_now_ms() + ms[j->attempt];
+    return 0;
+  }
+  sb_async_error(j, rc);
+  return 1;
+}
+
+// Moves a job along as far as its socket allows. 1 = done (json set), 0 = not yet.
+static int sb_io_step(sb_async_job* j, int* idle, int* idle_n) {
+  if (j->connecting) {
+    int err = 0; socklen_t len = sizeof(err);
+    if (getsockopt(j->fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0 || err != 0) return sb_io_failed(j, -2);
+    j->connecting = 0;
+  }
+  while (j->out_off < j->out_len) {
+    long n = write(j->fd, j->out + j->out_off, j->out_len - j->out_off);
+    if (n > 0) { j->out_off += (size_t)n; continue; }
+    if (n < 0 && errno == EINTR) continue;
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+    return sb_io_failed(j, -3);
+  }
+  while (j->hdr_got < 4) {
+    long n = read(j->fd, j->hdr + j->hdr_got, 4 - j->hdr_got);
+    if (n > 0) { j->hdr_got += (size_t)n; continue; }
+    if (n < 0 && errno == EINTR) continue;
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+    return sb_io_failed(j, -4);
+  }
+  if (!j->in) {
+    j->in_len = (size_t)j->hdr[0] | ((size_t)j->hdr[1] << 8) | ((size_t)j->hdr[2] << 16) | ((size_t)j->hdr[3] << 24);
+    j->in = (char*)malloc(j->in_len ? j->in_len : 1);
+    if (!j->in) abort();
+  }
+  while (j->in_got < j->in_len) {
+    long n = read(j->fd, j->in + j->in_got, j->in_len - j->in_got);
+    if (n > 0) { j->in_got += (size_t)n; continue; }
+    if (n < 0 && errno == EINTR) continue;
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+    return sb_io_failed(j, -6);
+  }
+  if (*idle_n < SB_IO_IDLE) idle[(*idle_n)++] = j->fd; else close(j->fd);
+  j->fd = -1;
+  char* resp = j->in; j->in = 0;
+  j->json = sb_v1_split(resp, j->in_len, &j->json_len, &j->bin, &j->bin_len);
+  size_t al = 0;
+  char* ascii = j->json ? sb_json_ascii(j->json, j->json_len, &al) : 0;
+  if (ascii) { free(j->json); j->json = ascii; j->json_len = al; }
+  if (!j->json) sb_async_error(j, -4);
+  return 1;
+}
+
+static void* sb_io_thread(void* unused) {
+  (void)unused;
+  sb_async_job* active = 0;
+  int idle[SB_IO_IDLE], idle_n = 0;
+  struct pollfd* fds = 0;
+  sb_async_job** owners = 0;
+  size_t cap = 0;
+  for (;;) {
+    // New jobs.
+    pthread_mutex_lock(&sb_async_lock);
+    sb_async_job* fresh = sb_async_queue;
+    sb_async_queue = 0;
+    pthread_mutex_unlock(&sb_async_lock);
+    while (fresh) {
+      sb_async_job* j = fresh;
+      fresh = j->next;
+      sb_io_begin(j, idle, &idle_n);
+      j->next = active;
+      active = j;
+    }
+    // Retries that are due restart; a job with no socket fails, or waits to retry.
+    long long now = sb_now_ms();
+    for (sb_async_job** link = &active; *link;) {
+      sb_async_job* j = *link;
+      if (j->retry_at && j->retry_at <= now) sb_io_begin(j, idle, &idle_n);
+      if (!j->retry_at && j->fd < 0 && sb_io_failed(j, -2)) {
+        *link = j->next;
+        sb_async_finish(j);
+        continue;
+      }
+      link = &j->next;
+    }
+    long long soonest = 0;
+    size_t count = 0;
+    for (sb_async_job* j = active; j; j = j->next) {
+      if (!j->retry_at) count++;
+      else if (!soonest || j->retry_at < soonest) soonest = j->retry_at;
+    }
+    if (count + 1 > cap) {
+      cap = (count + 1) * 2;
+      fds = (struct pollfd*)realloc(fds, cap * sizeof(struct pollfd));
+      owners = (sb_async_job**)realloc(owners, cap * sizeof(sb_async_job*));
+      if (!fds || !owners) abort();
+    }
+    fds[0].fd = sb_io_wake[0]; fds[0].events = POLLIN; fds[0].revents = 0;
+    size_t n = 1;
+    for (sb_async_job* j = active; j; j = j->next) {
+      if (j->retry_at) continue;
+      fds[n].fd = j->fd;
+      fds[n].events = j->connecting || j->out_off < j->out_len ? POLLOUT : POLLIN;
+      fds[n].revents = 0;
+      owners[n++] = j;
+    }
+    int timeout = soonest ? (int)(soonest > now ? soonest - now : 0) : -1;
+    if (poll(fds, (nfds_t)n, timeout) < 0 && errno != EINTR) continue;
+    if (fds[0].revents) { char buf[64]; while (read(sb_io_wake[0], buf, sizeof(buf)) > 0) {} }
+    for (size_t i = 1; i < n; i++) {
+      if (!fds[i].revents) continue;
+      sb_async_job* j = owners[i];
+      if (!sb_io_step(j, idle, &idle_n)) continue;
+      // Done: unlink and hand back.
+      sb_async_job** link = &active;
+      while (*link != j) link = &(*link)->next;
+      *link = j->next;
+      sb_async_finish(j);
+    }
+  }
+  return 0;
+}
+
+// The inline C of __sbCallAsync calls this by prototype: Porffor may emit a
+// function's body before this block.
+void sb_async_submit_v1(u32 id, const char* json, size_t json_len, const char* body, size_t body_len) {
+  sb_async_job* j = (sb_async_job*)calloc(1, sizeof(sb_async_job));
+  if (!j) abort();
+  j->id = id;
+  j->fd = -1;
+  size_t req_len = 0;
+  char* req = sb_v1_request(json, json_len, body, body_len, &req_len);
+  if (!req) abort();
+  j->out = (unsigned char*)malloc(4 + req_len);
+  if (!j->out) abort();
+  for (int k = 0; k < 4; k++) j->out[k] = (unsigned char)((req_len >> (8 * k)) & 0xff);
+  memcpy(j->out + 4, req, req_len);
+  free(req);
+  j->out_len = 4 + req_len;
+  pthread_mutex_lock(&sb_async_lock);
+  int start = !sb_io_started;
+  if (start) {
+    signal(SIGPIPE, SIG_IGN);  // a dead broker must yield EPIPE, not kill the sprout
+    if (pipe(sb_io_wake) != 0) abort();
+    sb_io_nonblock(sb_io_wake[0]);
+    sb_io_nonblock(sb_io_wake[1]);
+    sb_io_started = 1;
+  }
+  j->next = sb_async_queue;
+  sb_async_queue = j;
+  pthread_mutex_unlock(&sb_async_lock);
+  if (start) {
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&attr, 256 * 1024);
+    pthread_t thread;
+    int failed = pthread_create(&thread, &attr, sb_io_thread, 0);
+    pthread_attr_destroy(&attr);
+    // No thread (a pids limit): every async call fails; the sync path still works.
+    if (failed) {
+      pthread_mutex_lock(&sb_async_lock);
+      sb_async_job* orphans = sb_async_queue;
+      sb_async_queue = 0;
+      sb_io_started = 0;
+      close(sb_io_wake[0]); close(sb_io_wake[1]);
+      sb_io_wake[0] = sb_io_wake[1] = -1;
+      pthread_mutex_unlock(&sb_async_lock);
+      while (orphans) {
+        sb_async_job* q = orphans;
+        orphans = q->next;
+        sb_async_error(q, -7);
+        sb_async_finish(q);
+      }
+      return;
+    }
+  }
+  char one = 1;
+  while (write(sb_io_wake[1], &one, 1) < 0 && errno == EINTR) {}
+}
+
+const char* sb_async_reply_json(u32 id, size_t* len) {
+  if (!sb_async_current || sb_async_current->id != id) return 0;
+  *len = sb_async_current->json_len;
+  return sb_async_current->json;
+}
+
+// Host, on its loop: fires each finished exchange's callback, oldest first. Its
+// bytes go where __sbTakeBin reads them.
+void sb_async_drain(void) {
+  pthread_mutex_lock(&sb_async_lock);
+  sb_async_job* done = sb_async_done;
+  sb_async_done = 0;
+  pthread_mutex_unlock(&sb_async_lock);
+  sb_async_job* oldest = 0;
+  while (done) {
+    sb_async_job* next = done->next;
+    done->next = oldest;
+    oldest = done;
+    done = next;
+  }
+  while (oldest) {
+    sb_async_job* j = oldest;
+    oldest = j->next;
+    porf_native_fetch_timer_clear(j->id);  // the placeholder timer
+    if (sb_bin_reply) free(sb_bin_reply);
+    sb_bin_reply = j->bin;
+    sb_bin_reply_len = j->bin_len;
+    j->bin = 0;
+    sb_async_current = j;  // read by __sbHttpAsyncResult in the callback
+    porf_native_fetch_fire_timer(j->id);
+    sb_async_current = 0;
+    free(j->json);
+    free(j);
+  }
 }
 `;
 
@@ -400,6 +757,11 @@ globalThis.__sbR2MultipartPut = function (bucket, key, uploadId, partNumber, bod
 globalThis.__sbFetchUpstream = function (op, msg) {
   const req = { v: 1, id: ++__sbReqId, token: __sbEnv("SB_BROKER_TOKEN"), op };
   for (const k in msg) req[k] = msg[k];
+  // Queued (async host); the reply reaches the callback registered under asyncId.
+  if (msg.asyncId > 0) {
+    __sbCallAsync(JSON.stringify(req), "", msg.asyncId);
+    return { ok: true, pending: true };
+  }
   const reply = JSON.parse(__sbCallBin(JSON.stringify(req), ""));
   if (reply.ok === false) throw new Error("sproutboat " + op + ": " + (reply.error || "failed"));
   const bytes = __sbTakeBin();
@@ -407,16 +769,56 @@ globalThis.__sbFetchUpstream = function (op, msg) {
   return reply;
 };
 
-// Async fetch (a host that drives requests off its event loop, like sproutd) exists
-// only in the embedded transport. Here fetch() is always synchronous.
+// Queues one v1 exchange for the async threads, under timer id `asyncId`.
+// oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
+function __sbCallAsync(reqJson, body, asyncId) {
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    void sb_async_submit_v1(u32, const char*, size_t, const char*, size_t);
+    const char* __j; size_t __jl; char* __jo = 0;
+    porf_native_fetch_read_value(reqJson, &__j, &__jl, &__jo);
+    const char* __b; size_t __bl; char* __bo = 0;
+    if (porf_native_fetch_read_raw_bytes(body, &__b, &__bl) != 0) {
+      porf_native_fetch_read_value(body, &__b, &__bl, &__bo);
+    }
+    if (asyncId.type == 1 && asyncId.val > 0) sb_async_submit_v1((u32)asyncId.val, __j, __jl, __b, __bl);
+    if (__jo) free(__jo);
+    if (__bo) free(__bo);
+  `;
+}
+
+// Whether the host runs exchanges off its loop (it installed a waker).
 function __sbHttpAsyncEnabled() {
-  return false;
+  let res = false;
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    int sb_async_enabled(void);
+    if (sb_async_enabled()) res = porf_box(1, 2);
+  `;
+  return res;
 }
-function __sbHttpAsyncResult() {
-  return "";
+
+// The reply JSON of the async exchange now firing its callback, or "".
+// oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
+function __sbHttpAsyncResult(asyncId) {
+  let res = "";
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    const char* sb_async_reply_json(u32, size_t*);
+    size_t __n = 0;
+    const char* __r = asyncId.type == 1 ? sb_async_reply_json((u32)asyncId.val, &__n) : 0;
+    if (__r) res = porf_box((f64)porf_native_fetch_alloc_bytestring(__r, __n), 195);
+  `;
+  return res;
 }
-function __sbFetchReply() {
-  throw new Error("async fetch needs the embedded transport");
+
+// An async exchange's reply JSON -> the fetch op's result, its bytes as the body.
+function __sbFetchReply(raw) {
+  const reply = JSON.parse(raw);
+  if (reply.ok === false) throw new Error(reply.error || "failed");
+  const bytes = __sbTakeBin();
+  reply.body = reply.body != null ? __sbToBytes(reply.body) : bytes;
+  return reply;
 }
 
 /** Static asset metadata stays JSON; the response body uses the v1 byte tail. */
