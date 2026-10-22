@@ -1963,13 +1963,17 @@ static char* sb_sql_script(const char* path, const char* sql) {
   if (idx < 0 && sb_db_capture_failed(path)) { sb_puts(&b, "{\"ok\":false,\"error\":\"" SB_LTX_FAILED "\",\"code\":10}"); return b.p; }
   if (idx < 0) { sb_puts(&b, "{\"ok\":false,\"error\":\"cannot open database\"}"); return b.p; }
   char* err = 0;
-  int script_rc = 0, capture_failed = 0;
+  int script_rc = 0, capture_failed = 0, failure_code = 0;
+  char failure[512] = { 0 };
   if (sb_ltx_states[idx].db) {
     const char *next = sql;
     while (*next && !script_rc) {
       sqlite3_stmt *st = 0; const char *tail = 0;
       script_rc = sqlite3_prepare_v2(sb_dbs[idx], next, -1, &st, &tail);
       if (!script_rc && st) { do { script_rc = sqlite3_step(st); } while (script_rc == SB_SQLITE_ROW); if (script_rc == SB_SQLITE_DONE) script_rc = 0; }
+      // Keep the statement's error before capture runs statements of its own (it would
+      // read "not an error" after them).
+      if (script_rc && !failure[0]) { snprintf(failure, sizeof(failure), "%s", sqlite3_errmsg(sb_dbs[idx])); failure_code = sqlite3_extended_errcode(sb_dbs[idx]); }
       if (st) sqlite3_finalize(st);
       if (sb_ltx_after(idx)) { script_rc = 10; capture_failed = 1; }
       if (!tail || tail <= next) break;
@@ -1977,10 +1981,12 @@ static char* sb_sql_script(const char* path, const char* sql) {
     }
   } else script_rc = sqlite3_exec(sb_dbs[idx], sql, 0, 0, &err);
   if (script_rc != 0) {
-    const char* m = capture_failed ? SB_LTX_FAILED : err ? err : sqlite3_errmsg(sb_dbs[idx]);
+    const char* m = capture_failed ? SB_LTX_FAILED : failure[0] ? failure : err ? err : sqlite3_errmsg(sb_dbs[idx]);
     sb_puts(&b, "{\"ok\":false,\"error\":");
     sb_putjson_text(&b, m, strlen(m));
-    sb_puts(&b, capture_failed ? ",\"code\":10}" : "}");
+    char code[32];
+    snprintf(code, sizeof(code), ",\"code\":%d}", capture_failed ? 10 : failure[0] ? failure_code : 0);
+    sb_puts(&b, code);
     return b.p;
   }
   sb_puts(&b, "{\"ok\":true}");
@@ -2071,14 +2077,55 @@ static char* sb_sql_run(const char* path, const char* sql, const char* params) {
   // Reset, don't finalize: the statement stays compiled in sb_stmt_cache. Reset
   // now (not just on next reuse) so a SELECT stops holding its read transaction.
   sqlite3_reset(st);
+  // The statement's own error, kept before LTX capture runs: capture executes statements
+  // of its own, after which SQLite reports "not an error".
+  char failure[512] = { 0 };
+  int failure_code = 0;
+  if (rc != SB_SQLITE_DONE && rc != SB_SQLITE_ROW) {
+    snprintf(failure, sizeof(failure), "%s", sqlite3_errmsg(db));
+    failure_code = sqlite3_extended_errcode(db);
+  }
   const int capture_failed = sb_ltx_after(idx) != 0;
   if (capture_failed) rc = 10;
   if (rc != SB_SQLITE_DONE && rc != SB_SQLITE_ROW) {
     free(b.p);
     if (capture_failed) return sb_sql_error(db, SB_LTX_FAILED, 10, 0);
-    return sb_sql_error(db, 0, -1, strict ? (int)sizeof(SB_D1_STRICT) - 1 : 0);
+    return sb_sql_error(db, failure, failure_code, 0);
   }
   return b.p;
+}
+
+// The storage quota (docs: an app's data directory is capped): bytes in regular files under
+// dir, symlinks not followed. Bounded by depth; an unreadable entry counts as 0.
+static long long sb_dir_bytes(const char* dir, int depth) {
+  DIR* d = opendir(dir);
+  if (!d || depth > 16) { if (d) closedir(d); return 0; }
+  long long total = 0;
+  struct dirent* e;
+  char path[4096];
+  while ((e = readdir(d))) {
+    if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+    if (snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) >= (int)sizeof(path)) continue;
+    struct stat st;
+    if (lstat(path, &st)) continue;
+    if (S_ISREG(st.st_mode)) total += (long long)st.st_size;
+    else if (S_ISDIR(st.st_mode)) total += sb_dir_bytes(path, depth + 1);
+  }
+  closedir(d);
+  return total;
+}
+
+// A database's page size without SQL: under LTX capture the authorizer refuses every
+// page_size pragma (the getter too), and capture records the size itself.
+static int sb_db_page_size(const char* path) {
+  int idx = sb_db_for(path);
+  if (idx < 0) return 0;
+  if (sb_ltx_states[idx].db) return (int)sb_ltx_states[idx].page_size;
+  sqlite3_stmt* st = 0;
+  int size = 0;
+  if (sqlite3_prepare_v2(sb_dbs[idx], "PRAGMA page_size", -1, &st, 0) == 0 && st && sqlite3_step(st) == SB_SQLITE_ROW) size = sqlite3_column_int(st, 0);
+  if (st) sqlite3_finalize(st);
+  return size;
 }
 
 // #164 — an online, consistent single-file snapshot of a database, via
@@ -3103,6 +3150,41 @@ function __sbSqlScriptRaw(path, sql) {
   return res;
 }
 
+// The bytes under a directory, as a decimal string (sb_dir_bytes).
+// oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
+function __sbDirBytesRaw(dir) {
+  let res = "";
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    const char* __d; size_t __dl; char* __do = 0;
+    porf_native_fetch_read_value(dir, &__d, &__dl, &__do);
+    char* __dir = (char*)malloc(__dl + 1); memcpy(__dir, __d, __dl); __dir[__dl] = 0;
+    if (__do) free(__do);
+    char __n[32]; int __k = snprintf(__n, sizeof(__n), "%lld", sb_dir_bytes(__dir, 0));
+    free(__dir);
+    res = porf_box((f64)porf_native_fetch_alloc_bytestring(__n, (size_t)__k), 195);
+  `;
+  return res;
+}
+
+// sb_db_page_size, for the quota: a path in, the page size out (0 if the database cannot open).
+// oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
+function __sbD1DbRaw(path, what) {
+  let res = "";
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    const char* __p; size_t __pl; char* __po = 0;
+    porf_native_fetch_read_value(path, &__p, &__pl, &__po);
+    char* __path = (char*)malloc(__pl + 1); memcpy(__path, __p, __pl); __path[__pl] = 0;
+    if (__po) free(__po);
+    int __r = sb_db_page_size(__path);
+    free(__path);
+    char __n[16]; int __k = snprintf(__n, sizeof(__n), "%d", __r);
+    res = porf_box((f64)porf_native_fetch_alloc_bytestring(__n, (size_t)__k), 195);
+  `;
+  return res;
+}
+
 // #164 — VACUUM INTO a fresh file. Two strings in, JSON out. Same pattern as
 // __sbSqlScriptRaw.
 // oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
@@ -3306,6 +3388,60 @@ function __sbDir() {
   }
   return __sbDataDir;
 }
+// The storage quota: an app's data directory holds at most SB_STORAGE_MAX_BYTES (sproutd
+// sets it per app; 10 GiB when unset, after D1's 10 GB per database). Past it, writes are
+// refused with an error that says so; reads and deletes still work, so an app can make
+// room. The size is measured at most once a second, and on a write's way in, so a write
+// can overshoot by what one second of writes adds. A D1 database is also capped at 10 GB.
+var __sbQuotaMax = -1;
+var __sbQuotaUsed = 0;
+var __sbQuotaAt = -1;
+function __sbQuotaLimit() {
+  if (__sbQuotaMax < 0) {
+    const v = Number(__sbEnv("SB_STORAGE_MAX_BYTES"));
+    __sbQuotaMax = v > 0 ? v : 10737418240;
+  }
+  return __sbQuotaMax;
+}
+function __sbQuotaFull() {
+  const now = Date.now();
+  if (__sbQuotaAt < 0 || now - __sbQuotaAt >= 1000) {
+    __sbQuotaUsed = Number(__sbDirBytesRaw(__sbDir())) || 0;
+    __sbQuotaAt = now;
+  }
+  return __sbQuotaUsed >= __sbQuotaLimit();
+}
+function __sbQuotaCheck(what) {
+  if (__sbQuotaFull())
+    throw new Error(
+      what + " failed: storage quota exceeded (this app stores " + __sbQuotaUsed + " bytes; the limit is " + __sbQuotaLimit() + ")",
+    );
+}
+var __sbQuotaOps = {
+  "kv.put": "KV put()",
+  "do.storage.put": "Durable Object storage put()",
+  "do.alarm.set": "Durable Object setAlarm()",
+  "queue.send": "Queue send()",
+  "queue.send_batch": "Queue sendBatch()",
+  "cache.put": "Cache put()",
+  "ae.write": "Analytics Engine writeDataPoint()",
+  "r2.put": "R2 put()",
+  "r2.multipart.create": "R2 createMultipartUpload()",
+  "r2.multipart.complete": "R2 completeMultipartUpload()",
+};
+// D1 over the quota: pin each database at its current size (SQLITE_FULL on growth, so
+// reads and deletes still run); under it, cap it at 10 GB or the quota, whichever is less.
+var __sbD1Capped = {};
+function __sbD1Quota(path) {
+  const full = __sbQuotaFull();
+  if (__sbD1Capped[path] === full) return;
+  __sbD1Capped[path] = full;
+  const size = Number(__sbD1DbRaw(path, "page_size")) || 4096;
+  const pages = full
+    ? Number(__sbSql(path, "PRAGMA page_count", []).rows[0][0])
+    : Math.floor(Math.min(__sbQuotaLimit(), 10000000000) / size);
+  __sbSql(path, "PRAGMA max_page_count = " + Math.max(1, pages), []);
+}
 function __sbStore() {
   return __sbDir() + "/store.sqlite";
 }
@@ -3436,6 +3572,7 @@ function __sbEmbeddedDispatch(msg) {
   __sbEnsureSchema();
   const store = __sbStore();
   const op = msg.op;
+  if (__sbQuotaOps[op]) __sbQuotaCheck(__sbQuotaOps[op]);
 
   if (op === "ping") return { ok: true, op: "pong", echo: msg.msg };
 
@@ -3586,6 +3723,7 @@ function __sbEmbeddedDispatch(msg) {
       // exec() takes a script; a single prepare would run only its first
       // statement and quietly drop the rest.
       __sbD1Open(path, msg.strict === true);
+      __sbD1Quota(path);
       if (msg.strict === true && Array.isArray(msg.lines)) {
         __sbD1ExecLines(path, msg.lines);
         return { ok: true };
@@ -3596,6 +3734,7 @@ function __sbEmbeddedDispatch(msg) {
     }
     const strict = msg.strict === true;
     __sbD1Open(path, strict);
+    __sbD1Quota(path);
     if (op === "d1.batch") return { ok: true, results: __sbD1Batch(path, msg.statements || [], strict) };
     const one = __sbD1Run(path, msg.sql, msg.params, strict);
     return { ok: true, results: one.results, columns: one.columns, rows: one.rows, meta: one.meta, success: true };
@@ -4166,6 +4305,7 @@ function __sbD1ExecLines(path, lines) {
  * itself does not know which backend it is on.
  */
 globalThis.__sbR2Put = function (bucket, key, body, httpMetadata, customMetadata) {
+  __sbQuotaCheck("R2 put()");
   __sbEnsureSchema();
   const reply = JSON.parse(
     __sbR2PutRaw(
@@ -4195,6 +4335,7 @@ globalThis.__sbR2Get = function (bucket, key) {
 };
 
 globalThis.__sbR2MultipartPut = function (bucket, key, uploadId, partNumber, body) {
+  __sbQuotaCheck("R2 uploadPart()");
   __sbEnsureSchema();
   const store = __sbStore();
   const upload = __sbSql(
