@@ -151,7 +151,9 @@ int main(void) {
   const toDriver = openSync(fifoIn, "w"),
     fromDriver = openSync(fifoOut, "r");
   let pending = "";
+  let driverClosed = false;
   const sqlRaw = (path: string, sql: string, params: string) => {
+    if (driverClosed) throw new Error("original D1 driver is closed");
     writeSync(toDriver, `${path}\t${sql}\t${params}\n`);
     const chunk = Buffer.alloc(65536);
     while (!pending.includes("\n")) {
@@ -227,14 +229,23 @@ int main(void) {
       return r;
     };
     // oxlint-disable-next-line no-function-constructor -- lifting a block out of the text-only transport
-    const lifted = new Function("__sbSqlRaw", "__sbSql", "__sbSqlScriptRaw", `${transport.slice(opsStart, opsEnd)}\nreturn { __sbD1Run, __sbD1Batch, __sbD1Open, __sbD1ExecLines };`)(
-      raw,
-      run,
-      (path: string, text: string) => raw(":script " + path, text, "[]"),
-    );
+    const lifted = new Function(
+      "__sbSqlRaw",
+      "__sbSql",
+      "__sbSqlScriptRaw",
+      `${transport.slice(opsStart, opsEnd)}\nreturn { __sbD1Run, __sbD1Batch, __sbD1Open, __sbD1ExecLines };`,
+    )(raw, run, (path: string, text: string) => raw(":script " + path, text, "[]"));
     const lift = (dir: string, limit: number) =>
       // oxlint-disable-next-line no-function-constructor -- lifting a block out of the text-only transport
-      new Function("__sbEnv", "__sbDir", "__sbDirBytesRaw", "__sbD1DbRaw", "__sbSql", "__sbSqlRaw", `${transport.slice(quotaStart, quotaEnd)}\nreturn { __sbQuotaCheck, __sbD1Quota, __sbQuotaFull };`)(
+      new Function(
+        "__sbEnv",
+        "__sbDir",
+        "__sbDirBytesRaw",
+        "__sbD1DbRaw",
+        "__sbSql",
+        "__sbSqlRaw",
+        `${transport.slice(quotaStart, quotaEnd)}\nreturn { __sbQuotaCheck, __sbD1Quota, __sbQuotaFull };`,
+      )(
         (name: string) => (name === "SB_STORAGE_MAX_BYTES" ? String(limit) : ""),
         () => dir,
         (d: string) => String(JSON.parse(raw(":bytes " + d, "", "")).n),
@@ -242,7 +253,13 @@ int main(void) {
         run,
         raw,
       );
-    return { sqlRaw: raw, ops: lifted, liftQuota: lift, exited: child.exited, close: () => (closeSync(to), closeSync(from)) };
+    return {
+      sqlRaw: raw,
+      ops: lifted,
+      liftQuota: lift,
+      exited: child.exited,
+      close: () => (closeSync(to), closeSync(from)),
+    };
   };
   // exec() from 2026-10-24: line by line, all or nothing, the failing line named.
   const ex = join(work, "data/d1/EXEC.sqlite");
@@ -332,8 +349,14 @@ int main(void) {
   // With capture on, an authorization failure says so (it read "not an error" once capture
   // had run), and the quota works: its page size comes from capture, not from the
   // page_size pragma the capture authorizer refuses.
-  assert.throws(() => ops.__sbD1Run(ltx, "PRAGMA page_size", [], true), (e: Error) => e.message === "D1_ERROR: not authorized: SQLITE_AUTH");
-  assert.throws(() => ops.__sbD1ExecLines(ltx, ["PRAGMA journal_mode = DELETE"]), (e: Error) => e.message === "D1_EXEC_ERROR: Error in line 1: PRAGMA journal_mode = DELETE: not authorized");
+  assert.throws(
+    () => ops.__sbD1Run(ltx, "PRAGMA page_size", [], true),
+    (e: Error) => e.message === "D1_ERROR: not authorized: SQLITE_AUTH",
+  );
+  assert.throws(
+    () => ops.__sbD1ExecLines(ltx, ["PRAGMA journal_mode = DELETE"]),
+    (e: Error) => e.message === "D1_EXEC_ERROR: Error in line 1: PRAGMA journal_mode = DELETE: not authorized",
+  );
   const data = join(work, "data");
   const roomy = liftQuota(data, dirBytes(data) + (1 << 20));
   roomy.__sbD1Quota(ltx);
@@ -345,12 +368,39 @@ int main(void) {
   const tight = liftQuota(data, 1);
   tight.__sbD1Quota(ltx);
   const spool = ltxFiles();
-  const QUOTA = "D1_ERROR: storage quota exceeded: writes are refused while this app's data, including its replication log, is over its quota: SQLITE_FULL";
-  for (const write of ["INSERT INTO e VALUES (11, 'x')", "UPDATE e SET v = 'y' WHERE id = 10", "DELETE FROM e WHERE id = 10"])
-    assert.throws(() => ops.__sbD1Run(ltx, write, [], true), (e: Error) => e.message === QUOTA, write);
-  assert.throws(() => ops.__sbD1ExecLines(ltx, ["UPDATE e SET v = 'z'"]), (e: Error) => e.message.startsWith("D1_EXEC_ERROR: Error in line 1: UPDATE e SET v = 'z': storage quota exceeded"));
-  assert.throws(() => ops.__sbD1Batch(ltx, [{ sql: "SELECT 1", params: [] }, { sql: "DELETE FROM e", params: [] }], true), (e: Error) => e.message === QUOTA);
-  assert.equal(ops.__sbD1Batch(ltx, [{ sql: "SELECT count(*) FROM e", params: [] }], true).length, 1, "a read-only batch runs");
+  const QUOTA =
+    "D1_ERROR: storage quota exceeded: writes are refused while this app's data, including its replication log, is over its quota: SQLITE_FULL";
+  for (const write of [
+    "INSERT INTO e VALUES (11, 'x')",
+    "UPDATE e SET v = 'y' WHERE id = 10",
+    "DELETE FROM e WHERE id = 10",
+  ])
+    assert.throws(
+      () => ops.__sbD1Run(ltx, write, [], true),
+      (e: Error) => e.message === QUOTA,
+      write,
+    );
+  assert.throws(
+    () => ops.__sbD1ExecLines(ltx, ["UPDATE e SET v = 'z'"]),
+    (e: Error) => e.message.startsWith("D1_EXEC_ERROR: Error in line 1: UPDATE e SET v = 'z': storage quota exceeded"),
+  );
+  assert.throws(
+    () =>
+      ops.__sbD1Batch(
+        ltx,
+        [
+          { sql: "SELECT 1", params: [] },
+          { sql: "DELETE FROM e", params: [] },
+        ],
+        true,
+      ),
+    (e: Error) => e.message === QUOTA,
+  );
+  assert.equal(
+    ops.__sbD1Batch(ltx, [{ sql: "SELECT count(*) FROM e", params: [] }], true).length,
+    1,
+    "a read-only batch runs",
+  );
   assert.equal(ops.__sbD1Run(ltx, "SELECT v FROM e WHERE id = 10", [], true).rows[0][0], "under the quota");
   assert.equal(ltxFiles(), spool, "no LTX file while over the quota");
   const again = liftQuota(data, dirBytes(data) + (1 << 20));
@@ -364,10 +414,14 @@ int main(void) {
     "__sbSql",
     "__sbSqlScriptRaw",
     `${transport.slice(opsStart, opsEnd)}\nreturn { __sbD1Run, __sbD1Batch };`,
-  )((path: string, text: string, params: string) => {
-    if (text === "RELEASE sb_d1_batch") sqlRaw(":break " + path, "", "");
-    return sqlRaw(path, text, params);
-  }, sql, scriptRaw);
+  )(
+    (path: string, text: string, params: string) => {
+      if (text === "RELEASE sb_d1_batch") sqlRaw(":break " + path, "", "");
+      return sqlRaw(path, text, params);
+    },
+    sql,
+    scriptRaw,
+  );
   const LTX_FAILED =
     "D1_ERROR: LTX capture failed: the transaction may be committed locally but is not durable in the replication log; writes are refused until restart: SQLITE_IOERR";
   assert.throws(
@@ -386,7 +440,9 @@ int main(void) {
   );
   assert.throws(
     () => ops.__sbD1ExecLines(ltx, ["INSERT INTO e VALUES (5, 'e')"]),
-    (e: Error) => e.message === "D1_ERROR: LTX capture failed: the transaction may be committed locally but is not durable in the replication log; writes are refused until restart: SQLITE_IOERR",
+    (e: Error) =>
+      e.message ===
+      "D1_ERROR: LTX capture failed: the transaction may be committed locally but is not durable in the replication log; writes are refused until restart: SQLITE_IOERR",
     "exec() after a capture failure",
   );
   const qdir = join(work, "quota");
@@ -399,13 +455,19 @@ int main(void) {
   // SQLITE_FULL; then the directory is over, a KV write is refused, and reads and deletes
   // keep working. VACUUM gives the space back and writes resume.
   let rows = 0;
-  assert.throws(() => {
-    for (; rows < 64; rows++) ops.__sbD1Run(qdb, "INSERT INTO q VALUES (zeroblob(65536))", [], true);
-  }, (e: Error) => e.message === "D1_ERROR: database or disk is full: SQLITE_FULL");
+  assert.throws(
+    () => {
+      for (; rows < 64; rows++) ops.__sbD1Run(qdb, "INSERT INTO q VALUES (zeroblob(65536))", [], true);
+    },
+    (e: Error) => e.message === "D1_ERROR: database or disk is full: SQLITE_FULL",
+  );
   assert(rows >= 2 && rows < 5, "filled to about 256 KiB: " + rows);
   quota.expire();
   assert.equal(quota.__sbQuotaFull(), true);
-  assert.throws(() => quota.__sbQuotaCheck("KV put()"), /^Error: KV put\(\) failed: storage quota exceeded \(this app stores \d+ bytes; the limit is 262144\)$/);
+  assert.throws(
+    () => quota.__sbQuotaCheck("KV put()"),
+    /^Error: KV put\(\) failed: storage quota exceeded \(this app stores \d+ bytes; the limit is 262144\)$/,
+  );
   quota.__sbD1Quota(qdb);
   assert.equal(ops.__sbD1Run(qdb, "SELECT count(*) FROM q", [], true).rows[0][0], rows, "reads still work");
   ops.__sbD1Run(qdb, "DELETE FROM q", [], true);
@@ -417,6 +479,7 @@ int main(void) {
   quota.__sbD1Quota(qdb);
   quota.__sbQuotaCheck("KV put()");
   ops.__sbD1Run(qdb, "INSERT INTO q VALUES (zeroblob(65536))", [], true);
+  driverClosed = true;
   closeSync(toDriver);
   closeSync(fromDriver);
   await driver.exited;
@@ -433,7 +496,11 @@ int main(void) {
   const positionBefore = readFileSync(ltx + ".ltx/position", "utf8");
   const count = second.ops.__sbD1Run(ltx, "SELECT count(*) FROM e", [], true).rows[0][0];
   for (const write of ["INSERT INTO e VALUES (20, 'x')", "UPDATE e SET v = v", "DELETE FROM e"])
-    assert.throws(() => second.ops.__sbD1Run(ltx, write, [], true), (e: Error) => e.message === QUOTA, "restart, over the quota: " + write);
+    assert.throws(
+      () => second.ops.__sbD1Run(ltx, write, [], true),
+      (e: Error) => e.message === QUOTA,
+      "restart, over the quota: " + write,
+    );
   assert.deepEqual(readdirSync(generation()).sort(), spoolBefore, "no LTX file after a clean resume over the quota");
   assert.equal(readFileSync(ltx + ".ltx/position", "utf8"), positionBefore, "the position is unchanged");
   second.close();
@@ -445,10 +512,15 @@ int main(void) {
     live.close();
     const restored = join(work, "restart-restored.sqlite");
     await restore(generation(), restored);
-    assert.deepEqual(await readFile(restored), await readFile(ltx), "the retained chain restores the database byte for byte");
+    assert.deepEqual(
+      await readFile(restored),
+      await readFile(ltx),
+      "the retained chain restores the database byte for byte",
+    );
   }
   const third = connect("failure");
-  third.liftQuota(data, dirBytes(data) + (1 << 20)).__sbD1Quota(ltx);
+  const thirdBytes = Number(JSON.parse(third.sqlRaw(":bytes " + data, "", "")).n);
+  third.liftQuota(data, thirdBytes + (1 << 20)).__sbD1Quota(ltx);
   const breaking3 = (path: string, text: string, params: string) => {
     if (text.startsWith("INSERT INTO e VALUES (30")) third.sqlRaw(":break " + path, "", "");
     return third.sqlRaw(path, text, params);
