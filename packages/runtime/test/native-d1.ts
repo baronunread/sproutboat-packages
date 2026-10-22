@@ -47,7 +47,8 @@ int main(void) {
     if (!strncmp(line, ":break ", 7)) { line[strcspn(line, "\\t")] = 0; char p[1024]; snprintf(p, sizeof(p), "%s.ltx/position.tmp", line + 7); mkdir(p, 0700); puts("{}"); fflush(stdout); continue; }
     char* sql = strchr(line, '\\t'); if (!sql) return 2; *sql++ = 0;
     char* params = strchr(sql, '\\t'); if (!params) return 2; *params++ = 0;
-    char* out = sb_sql_run(line, sql, params); puts(out); fflush(stdout); free(out);
+    // ":script PATH" runs SQL as a script (sb_sql_script, what exec() uses).
+    char* out = !strncmp(line, ":script ", 8) ? sb_sql_script(line + 8, sql) : sb_sql_run(line, sql, params); puts(out); fflush(stdout); free(out);
   }
   return 0;
 }
@@ -164,11 +165,21 @@ int main(void) {
     return r;
   };
   // oxlint-disable-next-line no-function-constructor -- lifting a block out of the text-only transport
+  const scriptRaw = (path: string, text: string) => sqlRaw(":script " + path, text, "[]");
   const ops = new Function(
     "__sbSqlRaw",
     "__sbSql",
-    `${transport.slice(opsStart, opsEnd)}\nreturn { __sbD1Run, __sbD1Batch, __sbD1Open };`,
-  )(sqlRaw, sql);
+    "__sbSqlScriptRaw",
+    `${transport.slice(opsStart, opsEnd)}\nreturn { __sbD1Run, __sbD1Batch, __sbD1Open, __sbD1ExecLines };`,
+  )(sqlRaw, sql, scriptRaw);
+  // exec() from 2026-10-24: line by line, all or nothing, the failing line named.
+  const ex = join(work, "data/d1/EXEC.sqlite");
+  ops.__sbD1ExecLines(ex, ["CREATE TABLE x (id INTEGER)", "INSERT INTO x VALUES (1); INSERT INTO x VALUES (2);"]);
+  assert.throws(
+    () => ops.__sbD1ExecLines(ex, ["INSERT INTO x VALUES (3);", "SELEC 2"]),
+    (e: Error) => e.message === 'D1_EXEC_ERROR: Error in line 2: SELEC 2: near "SELEC": syntax error',
+  );
+  assert.equal(ops.__sbD1Run(ex, "SELECT count(*) AS n FROM x", [], false).results[0].n, 2, "exec rolled back");
   const db2 = join(work, "data/d1/OPS.sqlite");
   ops.__sbD1Run(db2, "CREATE TABLE p (id INTEGER PRIMARY KEY)", [], false);
   ops.__sbD1Run(db2, "CREATE TABLE c (id INTEGER PRIMARY KEY, p INTEGER REFERENCES p(id))", [], false);
@@ -251,11 +262,12 @@ int main(void) {
   const breaking = new Function(
     "__sbSqlRaw",
     "__sbSql",
+    "__sbSqlScriptRaw",
     `${transport.slice(opsStart, opsEnd)}\nreturn { __sbD1Run, __sbD1Batch };`,
   )((path: string, text: string, params: string) => {
     if (text === "RELEASE sb_d1_batch") sqlRaw(":break " + path, "", "");
     return sqlRaw(path, text, params);
-  }, sql);
+  }, sql, scriptRaw);
   const LTX_FAILED =
     "D1_ERROR: LTX capture failed: the transaction may be committed locally but is not durable in the replication log; writes are refused until restart: SQLITE_IOERR";
   assert.throws(
@@ -271,6 +283,11 @@ int main(void) {
     () => ops.__sbD1Run(ltx, "SELECT 1", [], false),
     /^Error: sqlite: LTX capture failed/,
     "old dates see the same failure",
+  );
+  assert.throws(
+    () => ops.__sbD1ExecLines(ltx, ["INSERT INTO e VALUES (5, 'e')"]),
+    (e: Error) => e.message === "D1_ERROR: LTX capture failed: the transaction may be committed locally but is not durable in the replication log; writes are refused until restart: SQLITE_IOERR",
+    "exec() after a capture failure",
   );
   closeSync(toDriver);
   closeSync(fromDriver);

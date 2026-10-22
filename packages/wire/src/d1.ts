@@ -188,9 +188,24 @@ export function createD1Store(executionMs = 0, capability = "") {
         switch (msg.op) {
           case "d1.query":
             return { ok: true, ...exec1(db, str(msg.sql), params(msg.params)) };
-          case "d1.exec":
-            db.exec(str(msg.sql));
+          case "d1.exec": {
+            const lines = Array.isArray(msg.lines) ? msg.lines.map(str) : null;
+            if (!strict || !lines) {
+              db.exec(str(msg.sql));
+              return { ok: true };
+            }
+            // From 2026-10-24: line by line as workerd runs it, all or nothing.
+            db.transaction(() =>
+              lines.forEach((line, i) => {
+                try {
+                  db.exec(line);
+                } catch (error) {
+                  throw new Error(`D1_EXEC_ERROR: Error in line ${i + 1}: ${line}: ${error instanceof Error ? error.message : String(error)}`);
+                }
+              }),
+            )();
             return { ok: true };
+          }
           case "d1.batch": {
             const statements = Array.isArray(msg.statements) ? msg.statements.map((s) => jsonObject(s) ?? {}) : [];
             return {

@@ -4869,7 +4869,62 @@ function __sbD1Result(r, strict) {
   if (!strict) return { results: r.results || [], success: true, meta: r.meta || {} };
   return { results: __sbD1Objects(r.columns || [], __sbD1Rows(r)), success: true, meta: r.meta || {} };
 }
+function __sbD1Fail(message) {
+  return new Error(message);
+}
+// From 2026-10-24: workerd's surface. Every query method returns a Promise, meta has D1's
+// keys, raw() takes { columnNames }, first(name) checks the column, empty SQL and
+// transaction statements are refused, exec() runs line by line, and withSession() exists.
+var __sbD1NoTransactions =
+  "D1_ERROR: To execute a transaction, please use the state.storage.transaction() or state.storage.transactionSync() APIs instead of the SQL BEGIN TRANSACTION or SAVEPOINT statements. The JavaScript API is safer because it will automatically roll back on exceptions, and because it interacts correctly with Durable Objects' automatic atomic write coalescing.";
+function __sbD1Check(sql) {
+  const text = String(sql).trim();
+  if (!text) throw __sbD1Fail("D1_ERROR: No SQL statements detected.");
+  if (/^(BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b/i.test(text)) throw __sbD1Fail(__sbD1NoTransactions);
+}
+function __sbD1Meta(meta, started) {
+  const changes = Number(meta.changes) || 0;
+  return {
+    served_by: "sproutboat",
+    duration: Date.now() - started,
+    changes,
+    last_row_id: Number(meta.last_row_id) || 0,
+    changed_db: changes > 0,
+    size_after: 0,
+    rows_read: Number(meta.rows_read) || 0,
+    rows_written: changes,
+  };
+}
+// Columns and rows of a strict reply (an older broker answers with objects only).
+function __sbD1Table(r) {
+  if (r.columns) return { columns: r.columns, rows: __sbD1Rows(r) };
+  const objects = r.results || [];
+  const columns = objects.length ? Object.keys(objects[0]) : [];
+  const rows = [];
+  for (let i = 0; i < objects.length; i++) {
+    const row = [];
+    for (let c = 0; c < columns.length; c++) row.push(objects[i][columns[c]]);
+    rows.push(row);
+  }
+  return { columns, rows };
+}
+function __sbD1Promise(run) {
+  try {
+    return Promise.resolve(run());
+  } catch (err) {
+    return Promise.reject(err);
+  }
+}
 function __sbMakeD1(dbName) {
+  // The synchronous core: the answer to one statement as columns, rows and meta.
+  function query(sql, params, strict) {
+    if (strict) __sbD1Check(sql);
+    const started = Date.now();
+    const r = __sbD1Rpc("d1.query", { db: dbName, sql, params }, strict);
+    if (!strict) return { results: r.results || [], success: true, meta: r.meta || {} };
+    const table = __sbD1Table(r);
+    return { columns: table.columns, rows: table.rows, meta: __sbD1Meta(r.meta || {}, started) };
+  }
   function stmt(sql, params) {
     const s = {
       __sql: sql,
@@ -4881,47 +4936,109 @@ function __sbMakeD1(dbName) {
         return stmt(sql, list);
       },
       all() {
-        const strict = __sbD1Strict();
-        return __sbD1Result(__sbD1Rpc("d1.query", { db: dbName, sql, params }, strict), strict);
+        if (!__sbD1Strict()) return query(sql, params, false);
+        return __sbD1Promise(() => {
+          const t = query(sql, params, true);
+          return { success: true, meta: t.meta, results: __sbD1Objects(t.columns, t.rows) };
+        });
       },
       run() {
         return s.all();
       },
-      raw() {
-        const rows = s.all().results;
-        const out = [];
-        for (let i = 0; i < rows.length; i++) {
-          const cols = [];
-          for (const k in rows[i]) cols.push(rows[i][k]);
-          out.push(cols);
+      raw(options) {
+        if (!__sbD1Strict()) {
+          const rows = query(sql, params, false).results;
+          const out = [];
+          for (let i = 0; i < rows.length; i++) {
+            const cols = [];
+            for (const k in rows[i]) cols.push(rows[i][k]);
+            out.push(cols);
+          }
+          return out;
         }
-        return out;
+        return __sbD1Promise(() => {
+          const t = query(sql, params, true);
+          return options && options.columnNames ? [t.columns].concat(t.rows) : t.rows;
+        });
       },
       first(column) {
-        const rows = s.all().results;
-        if (rows.length === 0) return null;
-        return column == null ? rows[0] : rows[0][column];
+        if (!__sbD1Strict()) {
+          const rows = query(sql, params, false).results;
+          if (rows.length === 0) return null;
+          return column == null ? rows[0] : rows[0][column];
+        }
+        return __sbD1Promise(() => {
+          const t = query(sql, params, true);
+          if (column == null) return t.rows.length ? __sbD1Objects(t.columns, [t.rows[0]])[0] : null;
+          const at = t.columns.indexOf(String(column));
+          if (!t.rows.length) return null;
+          if (at < 0) throw __sbD1Fail("D1_COLUMN_NOTFOUND: Column not found (" + column + ")");
+          return t.rows[0][t.columns.lastIndexOf(String(column))];
+        });
       },
     };
     return s;
   }
-  return {
+  function batch(statements) {
+    const strict = __sbD1Strict();
+    const list = [];
+    for (let i = 0; i < (statements || []).length; i++) {
+      if (strict) __sbD1Check(statements[i].__sql);
+      list.push({ sql: statements[i].__sql, params: statements[i].__params });
+    }
+    if (strict && !list.length) throw __sbD1Fail("D1_ERROR: No SQL statements detected.");
+    const started = Date.now();
+    const r = __sbD1Rpc("d1.batch", { db: dbName, statements: list }, strict);
+    const out = [];
+    for (let i = 0; i < (r.results || []).length; i++) {
+      if (!strict) {
+        out.push(__sbD1Result(r.results[i], false));
+        continue;
+      }
+      const t = __sbD1Table(r.results[i]);
+      out.push({ success: true, meta: __sbD1Meta(r.results[i].meta || {}, started), results: __sbD1Objects(t.columns, t.rows) });
+    }
+    return out;
+  }
+  function exec(sql) {
+    if (!__sbD1Strict()) {
+      __sbRpc("d1.exec", { db: dbName, sql: String(sql) });
+      return { count: (String(sql).match(/;/g) || []).length, duration: 0 };
+    }
+    // workerd runs exec() line by line and counts the lines.
+    const started = Date.now();
+    const all = String(sql).trim().split("\n");
+    const lines = [];
+    for (let i = 0; i < all.length; i++) if (all[i].trim()) lines.push(all[i]);
+    if (!lines.length) throw __sbD1Fail("D1_ERROR: No SQL statements detected.");
+    __sbD1Rpc("d1.exec", { db: dbName, sql: lines.join("\n"), lines }, true);
+    return { count: lines.length, duration: Date.now() - started };
+  }
+  const db = {
     prepare(sql) {
       return stmt(String(sql), []);
     },
     batch(statements) {
-      const strict = __sbD1Strict();
-      const list = [];
-      for (let i = 0; i < (statements || []).length; i++)
-        list.push({ sql: statements[i].__sql, params: statements[i].__params });
-      const r = __sbD1Rpc("d1.batch", { db: dbName, statements: list }, strict);
-      const out = [];
-      for (let i = 0; i < (r.results || []).length; i++) out.push(__sbD1Result(r.results[i], strict));
-      return out;
+      if (!__sbD1Strict()) return batch(statements);
+      return __sbD1Promise(() => batch(statements));
     },
     exec(sql) {
-      __sbD1Rpc("d1.exec", { db: dbName, sql: String(sql) }, __sbD1Strict());
-      return { count: (String(sql).match(/;/g) || []).length, duration: 0 };
+      if (!__sbD1Strict()) return exec(sql);
+      return __sbD1Promise(() => exec(sql));
+    },
+    // workerd's D1 sessions (read replication). One database here, so a session is the
+    // database itself, and there is never a bookmark to return.
+    withSession() {
+      return {
+        prepare: db.prepare,
+        batch: db.batch,
+        getBookmark() {
+          return null;
+        },
+      };
+    },
+    dump() {
+      return Promise.reject(__sbD1Fail("D1_DUMP_ERROR: dump() is not supported; use backup()"));
     },
     // Sproutboat extension (not in CF Workers D1): an online, integrity-checked
     // snapshot of this database. Both transports implement it: standalone writes
@@ -4932,6 +5049,7 @@ function __sbMakeD1(dbName) {
       return { path: r.path, bytes: r.bytes };
     },
   };
+  return db;
 }
 
 // R2: a Cloudflare-shaped object. When `body` is present the sync accessors

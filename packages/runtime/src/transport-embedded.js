@@ -1945,6 +1945,14 @@ size_t sb_r2_transfer_download_read(sb_r2_transfer_ctx* ctx, size_t offset, char
 }
 void sb_r2_transfer_download_close(sb_r2_transfer_ctx* ctx) { if (ctx) { if (ctx->file) fclose(ctx->file); free(ctx); } }
 
+// LTX capture (#141) failed after SQLite committed: the write is in the database but not in
+// the replication log, and the database refuses writes until the process restarts. Said as
+// such (SQLITE_IOERR), never as SQLite's own message, which still reads "not an error".
+#define SB_LTX_FAILED "LTX capture failed: the transaction may be committed locally but is not durable in the replication log; writes are refused until restart"
+static int sb_db_capture_failed(const char* path) {
+  for (int i = 0; i < sb_db_count; i++) if (strcmp(sb_db_names[i], path) == 0) return sb_ltx_states[i].failed;
+  return 0;
+}
 // Run a script: one or more statements separated by semicolons. sqlite3_exec
 // handles the whole string, which prepare/step does not — it compiles the first
 // statement and silently ignores the rest, so a schema built from one exec call
@@ -1952,9 +1960,10 @@ void sb_r2_transfer_download_close(sb_r2_transfer_ctx* ctx) { if (ctx) { if (ctx
 static char* sb_sql_script(const char* path, const char* sql) {
   sb_buf b = { 0, 0, 0 };
   int idx = sb_db_for(path);
+  if (idx < 0 && sb_db_capture_failed(path)) { sb_puts(&b, "{\"ok\":false,\"error\":\"" SB_LTX_FAILED "\",\"code\":10}"); return b.p; }
   if (idx < 0) { sb_puts(&b, "{\"ok\":false,\"error\":\"cannot open database\"}"); return b.p; }
   char* err = 0;
-  int script_rc = 0;
+  int script_rc = 0, capture_failed = 0;
   if (sb_ltx_states[idx].db) {
     const char *next = sql;
     while (*next && !script_rc) {
@@ -1962,15 +1971,16 @@ static char* sb_sql_script(const char* path, const char* sql) {
       script_rc = sqlite3_prepare_v2(sb_dbs[idx], next, -1, &st, &tail);
       if (!script_rc && st) { do { script_rc = sqlite3_step(st); } while (script_rc == SB_SQLITE_ROW); if (script_rc == SB_SQLITE_DONE) script_rc = 0; }
       if (st) sqlite3_finalize(st);
-      if (sb_ltx_after(idx)) script_rc = 10;
+      if (sb_ltx_after(idx)) { script_rc = 10; capture_failed = 1; }
       if (!tail || tail <= next) break;
       next = tail;
     }
   } else script_rc = sqlite3_exec(sb_dbs[idx], sql, 0, 0, &err);
   if (script_rc != 0) {
+    const char* m = capture_failed ? SB_LTX_FAILED : err ? err : sqlite3_errmsg(sb_dbs[idx]);
     sb_puts(&b, "{\"ok\":false,\"error\":");
-    sb_putjson_text(&b, err ? err : sqlite3_errmsg(sb_dbs[idx]), err ? strlen(err) : strlen(sqlite3_errmsg(sb_dbs[idx])));
-    sb_puts(&b, "}");
+    sb_putjson_text(&b, m, strlen(m));
+    sb_puts(&b, capture_failed ? ",\"code\":10}" : "}");
     return b.p;
   }
   sb_puts(&b, "{\"ok\":true}");
@@ -1995,14 +2005,6 @@ static char* sb_sql_error(sqlite3* db, const char* message, int code, int skip) 
 // D1 calls from compatibility date 2026-10-24 put this comment first: the statement must
 // get exactly as many parameters as it has, like D1.
 #define SB_D1_STRICT "/*sb-d1-strict*/"
-// LTX capture (#141) failed after SQLite committed: the write is in the database but not in
-// the replication log, and the database refuses writes until the process restarts. Said as
-// such (SQLITE_IOERR), never as SQLite's own message, which still reads "not an error".
-#define SB_LTX_FAILED "LTX capture failed: the transaction may be committed locally but is not durable in the replication log; writes are refused until restart"
-static int sb_db_capture_failed(const char* path) {
-  for (int i = 0; i < sb_db_count; i++) if (strcmp(sb_db_names[i], path) == 0) return sb_ltx_states[i].failed;
-  return 0;
-}
 
 // Run one statement. Returns malloc'd JSON:
 //   {"ok":true,"cols":[...],"rows":[[...]],"changes":n,"rowid":n}
@@ -3584,6 +3586,10 @@ function __sbEmbeddedDispatch(msg) {
       // exec() takes a script; a single prepare would run only its first
       // statement and quietly drop the rest.
       __sbD1Open(path, msg.strict === true);
+      if (msg.strict === true && Array.isArray(msg.lines)) {
+        __sbD1ExecLines(path, msg.lines);
+        return { ok: true };
+      }
       const reply = JSON.parse(__sbSqlScriptRaw(path, String(msg.sql)));
       if (reply.ok === false) throw new Error("sqlite: " + reply.error);
       return { ok: true };
@@ -4137,6 +4143,18 @@ function __sbD1Release(path, savepoint, strict) {
   if (r.ok !== false) return;
   if (Number(r.code) !== 10) __sbD1Undo(path, savepoint);
   throw strict ? __sbD1Error(r) : new Error("sqlite: " + r.error);
+}
+// exec() from 2026-10-24: line by line as workerd runs it, all or nothing.
+function __sbD1ExecLines(path, lines) {
+  __sbD1Control(path, "SAVEPOINT sb_d1_exec", true);
+  for (let i = 0; i < lines.length; i++) {
+    const reply = JSON.parse(__sbSqlScriptRaw(path, String(lines[i])));
+    if (reply.ok === false) {
+      if (Number(reply.code) !== 10) __sbD1Undo(path, "sb_d1_exec");
+      throw new Error("D1_EXEC_ERROR: Error in line " + (i + 1) + ": " + lines[i] + ": " + reply.error);
+    }
+  }
+  __sbD1Release(path, "sb_d1_exec", true);
 }
 // END D1 OPS
 
