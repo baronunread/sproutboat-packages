@@ -1,5 +1,12 @@
 # @sproutboat/wire
 
+## 0.14.3
+
+### Patch Changes
+
+- Updated dependencies [df612fc]
+  - @sproutboat/runtime@0.23.0
+
 ## 0.14.2
 
 ### Patch Changes
