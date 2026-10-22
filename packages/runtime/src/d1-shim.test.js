@@ -1,5 +1,5 @@
 // The D1 shim (`env.DB`) over the broker's D1 store (the production platform's path),
-// at a compatibility date before and after 2026-10-23. The embedded transport's half is
+// at a compatibility date before and after 2026-10-24. The embedded transport's half is
 // test/native-d1.ts.
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
@@ -35,7 +35,7 @@ const caught = (fn) => {
   return "did not throw";
 };
 
-for (const date of ["2026-09-28", "2026-10-23"]) {
+for (const date of ["2026-09-28", "2026-10-24"]) {
   test(`${date}: bytes bind as a BLOB, and the parameters after them are kept`, () => {
     const DB = fresh(date);
     DB.exec("CREATE TABLE t (a TEXT, b BLOB, c TEXT)");
@@ -65,7 +65,7 @@ for (const date of ["2026-09-28", "2026-10-23"]) {
   });
 }
 
-test("before 2026-10-23: lenient parameters, no foreign keys, BLOBs as one char per byte", () => {
+test("before 2026-10-24: lenient parameters, no foreign keys, BLOBs as one char per byte", () => {
   const DB = fresh("2026-09-28");
   // (bun:sqlite has always refused a wrong parameter count here; the embedded transport has not.)
   expect(DB.prepare("SELECT ?1 AS a").bind(undefined).first()).toEqual({ a: null });
@@ -75,8 +75,8 @@ test("before 2026-10-23: lenient parameters, no foreign keys, BLOBs as one char 
   expect(caught(() => DB.prepare("SELEC 1").all())).toMatch(/^sproutboat d1\.query: /);
 });
 
-test("from 2026-10-23: D1's parameter rules", () => {
-  const DB = fresh("2026-10-23");
+test("from 2026-10-24: D1's parameter rules", () => {
+  const DB = fresh("2026-10-24");
   expect(caught(() => DB.prepare("SELECT ?1").bind(undefined))).toBe(
     "D1_TYPE_ERROR: Type 'undefined' not supported for value 'undefined'",
   );
@@ -98,8 +98,8 @@ test("from 2026-10-23: D1's parameter rules", () => {
   expect(DB.prepare("SELECT ?1 AS a, ?1 AS b, ?2 AS c").bind("x", true).first()).toEqual({ a: "x", b: "x", c: 1 });
 });
 
-test("from 2026-10-23: foreign keys, BLOBs as byte arrays, D1's error text", () => {
-  const DB = fresh("2026-10-23");
+test("from 2026-10-24: foreign keys, BLOBs as byte arrays, D1's error text", () => {
+  const DB = fresh("2026-10-24");
   DB.exec("CREATE TABLE p (id INTEGER PRIMARY KEY); CREATE TABLE c (p INTEGER REFERENCES p(id))");
   expect(caught(() => DB.prepare("INSERT INTO c VALUES (99)").run())).toBe(
     "D1_ERROR: FOREIGN KEY constraint failed: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_FOREIGNKEY)",

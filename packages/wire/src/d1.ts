@@ -80,7 +80,7 @@ export type D1Request = { owner: string; key: string; path: string; name: string
 export function createD1Store(executionMs = 0, capability = "") {
   if (executionMs && !/^[a-f0-9]{64}$/.test(capability)) throw new Error("invalid host budget capability");
   const connections = new Map<string, { db: Database; owners: Set<string> }>();
-  // Strict calls (the shim's compatibility date 2026-10-23): the parameter count must match
+  // Strict calls (the shim's compatibility date 2026-10-24): the parameter count must match
   // and rows come back as arrays with their column names.
   // A read changes nothing: changes() still holds the last write's count, total_changes() does not move.
   const total = (db: Database) => db.query<{ n: number }, []>("SELECT total_changes() AS n").get()?.n ?? 0;
@@ -181,7 +181,7 @@ export function createD1Store(executionMs = 0, capability = "") {
       };
       try {
         const strict = msg.strict === true;
-        // Foreign keys are enforced from compatibility date 2026-10-23, as in D1. The
+        // Foreign keys are enforced from compatibility date 2026-10-24, as in D1. The
         // pragma is per connection and a no-op inside a transaction, so set it per call.
         if (msg.op !== "d1.backup") db.exec(strict ? "PRAGMA foreign_keys = ON" : "PRAGMA foreign_keys = OFF");
         const exec1 = strict ? runStrict : run;

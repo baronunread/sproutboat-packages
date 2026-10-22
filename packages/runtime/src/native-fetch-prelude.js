@@ -4811,13 +4811,13 @@ function __sbRpc(op, extra) {
 // plus batch and exec). Every call is one broker roundtrip.
 //
 // Bytes (an ArrayBuffer or a typed array) bind as a BLOB at every compatibility date:
-// before, they were stored as NULL. From compatibility date 2026-10-23 D1 calls are
+// before, they were stored as NULL. From compatibility date 2026-10-24 D1 calls are
 // strict, as in workerd: a parameter must be null, a number, a string, a boolean or
 // bytes (D1_TYPE_ERROR otherwise), the count must match the statement, foreign keys
 // are enforced, errors read "D1_ERROR: ...", and a BLOB comes back as an array of
 // byte values. Earlier dates keep the old behaviour.
 function __sbD1Strict() {
-  return globalThis.__sbCompat >= "2026-10-23";
+  return globalThis.__sbCompat >= "2026-10-24";
 }
 function __sbD1Param(value, strict) {
   if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {

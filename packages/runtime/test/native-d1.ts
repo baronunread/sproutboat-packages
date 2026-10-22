@@ -93,7 +93,7 @@ int main(void) {
   ]);
   assert.deepEqual(kept.rows, [[null, 5, "x"]]);
 
-  // Strict D1 calls (compatibility date 2026-10-23) check the parameter count.
+  // Strict D1 calls (compatibility date 2026-10-24) check the parameter count.
   const [few, many, right, reuse] = run([
     [d1, "/*sb-d1-strict*/SELECT ?1, ?2", [1]],
     [d1, "/*sb-d1-strict*/SELECT ?1", [1, 2]],
@@ -203,7 +203,7 @@ int main(void) {
   const oldBlob = ops.__sbD1Run(db2, "SELECT ?1 AS b", [{ $blob: "00ff" }], false).results[0].b;
   assert.equal(oldBlob, "\u0000ÿ");
   assert.throws(() => ops.__sbD1Run(db2, "SELEC 1", [], false), /^Error: sqlite: near "SELEC": syntax error$/);
-  // Strict (2026-10-23): foreign keys on, rows with columns, D1's error text.
+  // Strict (2026-10-24): foreign keys on, rows with columns, D1's error text.
   ops.__sbD1Open(db2, true);
   assert.throws(
     () => ops.__sbD1Run(db2, "INSERT INTO c VALUES (2, 98)", [], true),

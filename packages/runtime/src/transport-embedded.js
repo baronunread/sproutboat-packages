@@ -1992,7 +1992,7 @@ static char* sb_sql_error(sqlite3* db, const char* message, int code, int skip) 
   return e.p;
 }
 
-// D1 calls from compatibility date 2026-10-23 put this comment first: the statement must
+// D1 calls from compatibility date 2026-10-24 put this comment first: the statement must
 // get exactly as many parameters as it has, like D1.
 #define SB_D1_STRICT "/*sb-d1-strict*/"
 // LTX capture (#141) failed after SQLite committed: the write is in the database but not in
@@ -4047,7 +4047,7 @@ function __sbEmbeddedDispatch(msg) {
 
 /** One D1 statement, shaped like the broker's d1Run. */
 // BEGIN D1 OPS (lifted by test/native-d1.ts)
-// D1 calls from compatibility date 2026-10-23 come with msg.strict (the shim sets it):
+// D1 calls from compatibility date 2026-10-24 come with msg.strict (the shim sets it):
 // exact parameter counts, foreign keys enforced, D1's error text, and rows as arrays with
 // their column names (the shim builds the objects, so duplicate names survive in raw()).
 // A BLOB comes from C as {"$blob":"HEX"}; strict calls get it so, older ones get the one
