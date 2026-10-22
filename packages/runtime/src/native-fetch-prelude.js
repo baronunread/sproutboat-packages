@@ -5238,6 +5238,261 @@ function __sbR2Multipart(bucket, key, uploadId) {
   };
 }
 
+// R2 from compatibility date 2026-10-26: workerd's surface. Every method returns a
+// Promise; an object's etag is the MD5 of its bytes (sha256 before; objects written
+// earlier keep theirs), with `checksums.md5`, `uploaded` as a Date and `range`; get()
+// takes `range` and `onlyIf`, put() takes `onlyIf`, a ReadableStream or a Blob and
+// httpMetadata as Headers; delete() takes a list of keys; list() pages with limit and
+// cursor, groups by delimiter and returns metadata only when `include` asks for it.
+// Earlier dates keep the synchronous shim below.
+function __sbR2Strict() {
+  return globalThis.__sbCompat >= "2026-10-26";
+}
+function __sbR2Key(key, verb) {
+  const name = String(key);
+  if (new TextEncoder().encode(name).length > 1024) throw new Error(verb + ": The specified object name is not valid. (10020)");
+  return name;
+}
+function __sbR2HexOf(bytes) {
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) {
+    const b = bytes.charCodeAt(i) & 0xff;
+    out += (b < 16 ? "0" : "") + b.toString(16);
+  }
+  return out;
+}
+// R2's httpMetadata, in workerd's key order, from an object or a Headers.
+function __sbR2Http(h) {
+  if (h == null) return {};
+  const src = h instanceof Headers
+    ? {
+        contentType: h.get("content-type"),
+        contentLanguage: h.get("content-language"),
+        contentDisposition: h.get("content-disposition"),
+        contentEncoding: h.get("content-encoding"),
+        cacheControl: h.get("cache-control"),
+        cacheExpiry: h.get("expires"),
+      }
+    : h;
+  const out = {};
+  const names = ["contentType", "contentLanguage", "contentDisposition", "contentEncoding", "cacheControl", "cacheExpiry"];
+  for (let i = 0; i < names.length; i++) if (src[names[i]] != null) out[names[i]] = src[names[i]];
+  return out;
+}
+function __sbR2EtagIn(list, etag) {
+  const items = Array.isArray(list) ? list : String(list).split(",");
+  for (let i = 0; i < items.length; i++) {
+    const e = String(items[i]).trim().replace(/^W\//, "").replace(/^"|"$/g, "");
+    if (e === "*" || e === etag) return true;
+  }
+  return false;
+}
+// Whether an object passes onlyIf (an object or a Headers with If-* headers).
+function __sbR2OnlyIf(cond, etag, uploaded) {
+  if (cond == null) return true;
+  const c = cond instanceof Headers
+    ? {
+        etagMatches: cond.get("if-match"),
+        etagDoesNotMatch: cond.get("if-none-match"),
+        uploadedBefore: cond.get("if-unmodified-since"),
+        uploadedAfter: cond.get("if-modified-since"),
+      }
+    : cond;
+  const at = new Date(uploaded).getTime();
+  if (c.etagMatches != null && !__sbR2EtagIn(c.etagMatches, etag)) return false;
+  if (c.etagDoesNotMatch != null && __sbR2EtagIn(c.etagDoesNotMatch, etag)) return false;
+  if (c.uploadedBefore != null && !(at < new Date(c.uploadedBefore).getTime())) return false;
+  if (c.uploadedAfter != null && !(at > new Date(c.uploadedAfter).getTime())) return false;
+  return true;
+}
+// {offset, length} of a range (an object or a Headers with Range) on an object of SIZE.
+function __sbR2Range(range, size) {
+  let offset = 0, length = size;
+  if (range instanceof Headers) {
+    const m = /^bytes=(\d*)-(\d*)$/.exec(String(range.get("range") || "").trim());
+    if (!m) return { offset, length };
+    if (m[1] === "") range = { suffix: Number(m[2]) };
+    else range = m[2] === "" ? { offset: Number(m[1]) } : { offset: Number(m[1]), length: Number(m[2]) - Number(m[1]) + 1 };
+  }
+  if (range.suffix != null) {
+    length = Math.min(Number(range.suffix), size);
+    offset = size - length;
+  } else {
+    offset = Math.min(Number(range.offset || 0), size);
+    length = range.length == null ? size - offset : Math.min(Number(range.length), size - offset);
+  }
+  return { offset, length };
+}
+// An R2Object (or an R2ObjectBody, given BYTES) as workerd returns it.
+function __sbR2StrictObject(meta, bytes, range, include) {
+  const etag = meta.md5 || meta.etag;
+  const md5 = meta.md5;
+  const obj = {
+    key: meta.key,
+    version: meta.etag,
+    size: meta.size,
+    etag,
+    httpEtag: '"' + etag + '"',
+    checksums: {
+      md5: md5 ? __sbBufFrom(__sbR2Bytes(md5)) : undefined,
+      toJSON() {
+        return { md5: md5 || undefined, sha1: undefined, sha256: undefined, sha384: undefined, sha512: undefined };
+      },
+    },
+    uploaded: new Date(meta.uploaded),
+    httpMetadata: include === false ? {} : __sbR2Http(meta.httpMetadata),
+    customMetadata: include === false ? {} : meta.customMetadata || {},
+    storageClass: "",
+    range,
+    writeHttpMetadata(headers) {
+      const h = obj.httpMetadata;
+      if (h.contentType != null) headers.set("content-type", h.contentType);
+      if (h.contentLanguage != null) headers.set("content-language", h.contentLanguage);
+      if (h.contentDisposition != null) headers.set("content-disposition", h.contentDisposition);
+      if (h.contentEncoding != null) headers.set("content-encoding", h.contentEncoding);
+      if (h.cacheControl != null) headers.set("cache-control", h.cacheControl);
+      if (h.cacheExpiry != null) headers.set("expires", new Date(h.cacheExpiry).toUTCString());
+    },
+  };
+  if (bytes == null) return obj;
+  let used = false;
+  const take = () => {
+    if (used) throw new TypeError("Body has already been used. It can only be used once. Use tee() first if you need to read it twice.");
+    used = true;
+    return bytes;
+  };
+  obj.body = new Response(__sbBufFrom(bytes)).body;
+  Object.defineProperty(obj, "bodyUsed", { get: () => used, enumerable: true });
+  obj.text = async () => __sbFromUtf8(take());
+  obj.json = async () => JSON.parse(__sbFromUtf8(take()));
+  obj.arrayBuffer = async () => __sbBufFrom(take());
+  obj.blob = async () => new Blob([__sbBufFrom(take())], { type: obj.httpMetadata.contentType || "" });
+  return obj;
+}
+// A hex string's bytes, one char per byte.
+function __sbR2Bytes(hex) {
+  let out = "";
+  for (let i = 0; i + 1 < hex.length; i += 2) out += String.fromCharCode(parseInt(hex.slice(i, i + 2), 16));
+  return out;
+}
+function __sbMakeR2(name) {
+  const attempt = (run) => {
+    try {
+      return Promise.resolve(run());
+    } catch (err) {
+      return Promise.reject(err);
+    }
+  };
+  const head = (key) => {
+    const r = __sbRpc("r2.head", { bucket: name, key });
+    return r.found ? r.object : null;
+  };
+  const upload = (key, uploadId) => {
+    const inner = __sbR2Multipart(name, key, uploadId);
+    return {
+      key,
+      uploadId,
+      uploadPart: (partNumber, value) => attempt(() => inner.uploadPart(partNumber, value)),
+      // ponytail: a multipart object's etag stays the transport's sha256; workerd's is
+      // MD5-of-part-MD5s-N. Add when an app compares multipart etags.
+      complete: (parts) => attempt(() => __sbR2StrictObject(__sbRpc("r2.multipart.complete", { bucket: name, key, uploadId, parts: parts || [] }).object, null)),
+      abort: () => attempt(() => inner.abort()),
+    };
+  };
+  return {
+    head(key) {
+      return attempt(() => {
+        const meta = head(__sbR2Key(key, "head"));
+        return meta ? __sbR2StrictObject(meta, null, { offset: 0, length: meta.size }) : null;
+      });
+    },
+    get(key, options) {
+      return attempt(() => {
+        const o = options || {};
+        const r = __sbR2Get(name, __sbR2Key(key, "get"));
+        if (!r.found) return null;
+        const meta = r.object;
+        if (!__sbR2OnlyIf(o.onlyIf, meta.md5 || meta.etag, meta.uploaded)) return __sbR2StrictObject(meta, null, { offset: 0, length: meta.size });
+        const bytes = r.body == null ? "" : r.body;
+        const range = o.range == null ? { offset: 0, length: meta.size } : __sbR2Range(o.range, meta.size);
+        return __sbR2StrictObject(meta, bytes.slice(range.offset, range.offset + range.length), range);
+      });
+    },
+    async put(key, value, options) {
+      const objectKey = __sbR2Key(key, "put");
+      const o = options || {};
+      value = __sbUnwrapBody(value);
+      if (value instanceof Blob) value = await value.arrayBuffer();
+      else if (value != null && __sbIsFn(value.getReader)) value = await new Response(value).arrayBuffer();
+      let bytes;
+      if (value == null) bytes = "";
+      else if (__sbIsStr(value)) bytes = __sbToBytes(value);
+      else if (value.byteLength !== undefined)
+        bytes = __sbToBytes(value.buffer !== undefined ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength) : new Uint8Array(value));
+      else
+        throw new TypeError("Failed to execute 'put' on 'R2Bucket': parameter 2 is not of type 'ReadableStream or ArrayBuffer or ArrayBufferView or string or Blob'.");
+      if (o.onlyIf != null) {
+        // ponytail: check, then write; one worker per app, so nothing writes in between.
+        const current = head(objectKey);
+        if (current && !__sbR2OnlyIf(o.onlyIf, current.md5 || current.etag, current.uploaded)) return null;
+        if (!current && o.onlyIf.etagMatches != null) return null;
+      }
+      const http = __sbR2Http(o.httpMetadata);
+      const custom = o.customMetadata || {};
+      const meta = __sbR2Put(name, objectKey, bytes, http, custom).object;
+      meta.md5 = __sbR2HexOf(__sbDigestRaw("5", bytes));
+      __sbRpc("r2.md5", { bucket: name, key: objectKey, etag: meta.etag, md5: meta.md5 });
+      meta.httpMetadata = http;
+      meta.customMetadata = custom;
+      return __sbR2StrictObject(meta, null, undefined);
+    },
+    delete(keys) {
+      return attempt(() => {
+        const list = Array.isArray(keys) ? keys : [keys];
+        for (let i = 0; i < list.length; i++) __sbRpc("r2.delete", { bucket: name, key: __sbR2Key(list[i], "delete") });
+      });
+    },
+    list(options) {
+      return attempt(() => {
+        const o = options || {};
+        const r = __sbRpc("r2.list", {
+          bucket: name,
+          page: true,
+          prefix: o.prefix == null ? "" : String(o.prefix),
+          cursor: o.cursor == null ? "" : String(o.cursor),
+          limit: o.limit == null ? 1000 : Number(o.limit),
+          delimiter: o.delimiter == null ? "" : String(o.delimiter),
+        });
+        const include = o.include || [];
+        const objects = [];
+        for (let j = 0; j < (r.objects || []).length; j++) {
+          const obj = __sbR2StrictObject(r.objects[j], null, undefined);
+          if (include.indexOf("httpMetadata") < 0) obj.httpMetadata = {};
+          if (include.indexOf("customMetadata") < 0) obj.customMetadata = {};
+          objects.push(obj);
+        }
+        return { objects, truncated: !!r.truncated, cursor: r.truncated ? r.cursor : undefined, delimitedPrefixes: r.delimitedPrefixes || [] };
+      });
+    },
+    createMultipartUpload(key, options) {
+      return attempt(() => {
+        const objectKey = __sbR2Key(key, "createMultipartUpload");
+        const o = options || {};
+        const r = __sbRpc("r2.multipart.create", {
+          bucket: name,
+          key: objectKey,
+          httpMetadata: __sbR2Http(o.httpMetadata),
+          customMetadata: o.customMetadata || {},
+        });
+        return upload(objectKey, r.uploadId);
+      });
+    },
+    resumeMultipartUpload(key, uploadId) {
+      return upload(String(key), String(uploadId));
+    },
+  };
+}
+
 // Asset rules use the same parsed manifest in both transports. Matching mirrors
 // @sproutboat/assets; parity tests cover the portable native implementation.
 function __sbAssetRedirect(rule, path) {
@@ -5364,7 +5619,7 @@ globalThis.__sbInstallBindings = function (target, bindings) {
 
   for (let i = 0; i < (bindings.r2 || []).length; i++) {
     const name = bindings.r2[i];
-    target[name] = {
+    target[name] = __sbR2Strict() ? __sbMakeR2(name) : {
       put(key, value, options) {
         value = __sbUnwrapBody(value);
         const o = options || {};

@@ -424,6 +424,28 @@ test("R2: put / get / head / list / delete on a bound bucket", async () => {
   await expect(b.dispatch({ op: "r2.put", bucket: "NOPE", key: "x", body: "y" })).rejects.toThrow("not bound");
 });
 
+test("R2: exact list prefix at every date; md5, paged list and delimiter for the shim from 2026-10-26", async () => {
+  const b = make({ bindings: { r2: ["ASSETS"] } });
+  for (const key of ["a_x", "ab", "AB", "d/1", "d/2", "e/1", "f"]) await b.dispatch({ op: "r2.put", bucket: "ASSETS", key, body: "v" });
+  // LIKE listed "ab" for "a_" and "AB" for "a".
+  expect(arr((await b.dispatch({ op: "r2.list", bucket: "ASSETS", prefix: "a_" })).objects).map((o) => obj(o).key)).toEqual(["a_x"]);
+  expect(arr((await b.dispatch({ op: "r2.list", bucket: "ASSETS", prefix: "a" })).objects).map((o) => obj(o).key)).toEqual(["a_x", "ab"]);
+  const put = await b.dispatch({ op: "r2.put", bucket: "ASSETS", key: "m", body: "hello" });
+  await b.dispatch({ op: "r2.md5", bucket: "ASSETS", key: "m", etag: obj(put.object).etag, md5: "5d41402abc4b2a76b9719d911017c592" });
+  expect(obj((await b.dispatch({ op: "r2.head", bucket: "ASSETS", key: "m" })).object).md5).toBe("5d41402abc4b2a76b9719d911017c592");
+  // A stale etag (the object was written again since) records nothing.
+  await b.dispatch({ op: "r2.md5", bucket: "ASSETS", key: "m", etag: "stale", md5: "x" });
+  expect(obj((await b.dispatch({ op: "r2.head", bucket: "ASSETS", key: "m" })).object).md5).toBe("5d41402abc4b2a76b9719d911017c592");
+  const page = (cursor: string) => b.dispatch({ op: "r2.list", bucket: "ASSETS", page: true, prefix: "", cursor, limit: 3, delimiter: "/" });
+  const first = await page("");
+  expect(arr(first.objects).map((o) => obj(o).key)).toEqual(["AB", "a_x", "ab"]);
+  expect(first).toMatchObject({ truncated: true, cursor: "ab", delimitedPrefixes: [] });
+  const second = await page("ab");
+  expect(arr(second.objects).map((o) => obj(o).key)).toEqual(["f"]);
+  expect(second).toMatchObject({ truncated: true, delimitedPrefixes: ["d/", "e/"] });
+  expect(await page(String(second.cursor))).toMatchObject({ objects: [{ key: "m" }], truncated: false, cursor: "" });
+});
+
 test("R2 direct transfer: streamed upload, metadata, one-use ticket and ranged download", async () => {
   const root = mkdtempSync(join(tmpdir(), "sb-r2-transfer-"));
   try {

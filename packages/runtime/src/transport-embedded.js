@@ -3590,6 +3590,10 @@ function __sbEnsureSchema() {
   let hasBlobId = false;
   for (let i = 0; i < r2Columns.length; i++) if (r2Columns[i][1] === "blob_id") hasBlobId = true;
   if (!hasBlobId) __sbSql(s, "ALTER TABLE r2 ADD COLUMN blob_id TEXT", []);
+  // The MD5 of an object's bytes, its etag from compatibility date 2026-10-26 (r2.md5).
+  let hasR2Md5 = false;
+  for (let i = 0; i < r2Columns.length; i++) if (r2Columns[i][1] === "md5") hasR2Md5 = true;
+  if (!hasR2Md5) __sbSql(s, "ALTER TABLE r2 ADD COLUMN md5 TEXT", []);
   __sbSql(
     s,
     "CREATE TABLE IF NOT EXISTS r2_upload (bucket TEXT NOT NULL, key TEXT NOT NULL, upload_id TEXT NOT NULL, " +
@@ -3659,6 +3663,51 @@ function __sbEnsureSchema() {
     s,
     "CREATE TABLE IF NOT EXISTS cache (name TEXT NOT NULL, cache_key TEXT NOT NULL, status INTEGER NOT NULL, headers_json TEXT NOT NULL, body TEXT NOT NULL, expires_at INTEGER, PRIMARY KEY (name, cache_key))",
   );
+}
+
+// One page of r2.list for the shim from 2026-10-26: at most LIMIT entries after CURSOR,
+// keys under PREFIX, those holding DELIMITER after it grouped into delimitedPrefixes (a
+// group counts as one entry). Same rules as the broker's r2ListPage.
+// ponytail: with a delimiter every key after the cursor is read; an index on the
+// delimited prefix if buckets grow past ~100k keys.
+function __sbR2ListPage(store, msg) {
+  const prefix = String(msg.prefix || "");
+  const delimiter = String(msg.delimiter || "");
+  const limit = Math.min(Math.max(Math.floor(Number(msg.limit)) || 1000, 1), 1000);
+  const r = __sbSql(
+    store,
+    "SELECT key, size, etag, uploaded, http_json, custom_json, md5 FROM r2 WHERE bucket = ?1 AND substr(key, 1, length(?2)) = ?2 " +
+      "AND key > ?3 ORDER BY key" + (delimiter ? "" : " LIMIT " + (limit + 1)),
+    [msg.bucket, prefix, String(msg.cursor || "")],
+  );
+  const objects = [];
+  const delimitedPrefixes = [];
+  let last = "";
+  let truncated = false;
+  for (let i = 0; i < r.rows.length; i++) {
+    const row = r.rows[i];
+    const at = delimiter ? row[0].indexOf(delimiter, prefix.length) : -1;
+    const group = at < 0 ? "" : row[0].slice(0, at + delimiter.length);
+    if (!group || delimitedPrefixes[delimitedPrefixes.length - 1] !== group) {
+      if (objects.length + delimitedPrefixes.length >= limit) {
+        truncated = true;
+        break;
+      }
+      if (group) delimitedPrefixes.push(group);
+      else
+        objects.push({
+          key: row[0],
+          size: Number(row[1]),
+          etag: row[2],
+          uploaded: row[3],
+          httpMetadata: JSON.parse(row[4] || "{}"),
+          customMetadata: JSON.parse(row[5] || "{}"),
+          md5: row[6],
+        });
+    }
+    last = row[0];
+  }
+  return { ok: true, objects, delimitedPrefixes, truncated, cursor: truncated ? last : "" };
 }
 
 function __sbHex(n) {
@@ -4072,7 +4121,7 @@ function __sbEmbeddedDispatch(msg) {
     const wantsBody = op === "r2.get";
     const r = __sbSql(
       store,
-      "SELECT size, etag, uploaded, http_json, custom_json, blob_id FROM r2 WHERE bucket = ? AND key = ?",
+      "SELECT size, etag, uploaded, http_json, custom_json, blob_id, md5 FROM r2 WHERE bucket = ? AND key = ?",
       [msg.bucket, msg.key],
     );
     if (!r.rows.length) return { ok: true, found: false };
@@ -4088,6 +4137,7 @@ function __sbEmbeddedDispatch(msg) {
         uploaded: row[2],
         httpMetadata: JSON.parse(row[3] || "{}"),
         customMetadata: JSON.parse(row[4] || "{}"),
+        md5: row[6],
       },
       blobId: row[5] || "",
       body: wantsBody
@@ -4110,10 +4160,23 @@ function __sbEmbeddedDispatch(msg) {
       );
     return { ok: true };
   }
+  if (op === "r2.md5") {
+    // Recorded after the put that wrote these bytes (etag): the shim from 2026-10-26 hashes them.
+    __sbSql(store, "UPDATE r2 SET md5 = ?1 WHERE bucket = ?2 AND key = ?3 AND etag = ?4", [
+      String(msg.md5),
+      msg.bucket,
+      msg.key,
+      String(msg.etag),
+    ]);
+    return { ok: true };
+  }
   if (op === "r2.list") {
+    // The prefix matches exactly at every date: LIKE ignored case and read "_" and "%" as
+    // wildcards. With `page` (the shim from 2026-10-26), a page after the cursor.
+    if (msg.page) return __sbR2ListPage(store, msg);
     const r = __sbSql(
       store,
-      "SELECT key, size, etag, uploaded FROM r2 WHERE bucket = ? AND key LIKE ? || '%' ORDER BY key",
+      "SELECT key, size, etag, uploaded FROM r2 WHERE bucket = ?1 AND substr(key, 1, length(?2)) = ?2 ORDER BY key",
       [msg.bucket, msg.prefix || ""],
     );
     const objects = [];
