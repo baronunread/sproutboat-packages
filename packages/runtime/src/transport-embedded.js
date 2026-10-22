@@ -2137,12 +2137,12 @@ static int sb_db_page_size(const char* path) {
   if (st) sqlite3_finalize(st);
   return size;
 }
-// Freeze (refuse writes to) or thaw a database for the quota. Returns 1 when the database
-// is under LTX capture, 0 when not, -1 when it cannot be opened.
+// Freeze (refuse writes to) or thaw a database for the quota; on < 0 only asks. Returns 1
+// when the database is under LTX capture, 0 when not, -1 when it cannot be opened.
 static int sb_db_quota_freeze(const char* path, int on) {
   int idx = sb_db_for(path);
   if (idx < 0) return -1;
-  sb_quota_frozen[idx] = on && sb_ltx_states[idx].db ? 1 : 0;
+  if (on >= 0) sb_quota_frozen[idx] = on && sb_ltx_states[idx].db ? 1 : 0;
   return sb_ltx_states[idx].db ? 1 : 0;
 }
 
@@ -3197,7 +3197,7 @@ function __sbD1DbRaw(path, what) {
     if (__po) free(__po);
     const char* __w; size_t __wl; char* __wo = 0;
     porf_native_fetch_read_value(what, &__w, &__wl, &__wo);
-    int __r = __wl && __w[0] == 'p' ? sb_db_page_size(__path) : sb_db_quota_freeze(__path, __wl && __w[0] == 'f');
+    int __r = __wl && __w[0] == 'p' ? sb_db_page_size(__path) : __wl && __w[0] == 'c' ? sb_db_quota_freeze(__path, -1) : sb_db_quota_freeze(__path, __wl && __w[0] == 'f');
     if (__wo) free(__wo);
     free(__path);
     char __n[16]; int __k = snprintf(__n, sizeof(__n), "%d", __r);
@@ -3455,11 +3455,31 @@ var __sbQuotaOps = {
 // A database under LTX capture is frozen instead: every write is refused, because even a
 // DELETE adds a file to the replication spool, which counts toward the quota.
 var __sbD1Capped = {};
+var __sbD1Captured = {};
+var __sbD1Checkpointed = {};
 function __sbD1Quota(path) {
-  const full = __sbQuotaFull();
+  // Whether capture owns this database, from the private helper (no SQL), before anything
+  // below depends on it. A database that cannot open (or whose capture failed) is left to
+  // the call itself, which reports why.
+  const status = Number(__sbD1DbRaw(path, "captured"));
+  if (status < 0) return;
+  __sbD1Captured[path] = status === 1;
+  let full = __sbQuotaFull();
+  // Over the quota, a database's -wal file can hold space the app has already freed (a
+  // DELETE, a VACUUM): checkpoint it into the database and truncate it, at most once a
+  // second, then measure again. Not under capture: LTX owns that database's checkpoints.
+  if (full && !__sbD1Captured[path] && Date.now() - (__sbD1Checkpointed[path] || 0) >= 1000) {
+    __sbD1Checkpointed[path] = Date.now();
+    JSON.parse(__sbSqlRaw(path, "PRAGMA wal_checkpoint(TRUNCATE)", "[]"));
+    __sbQuotaAt = -1;
+    full = __sbQuotaFull();
+  }
   if (__sbD1Capped[path] === full) return;
   __sbD1Capped[path] = full;
-  const captured = Number(__sbD1DbRaw(path, full ? "freeze" : "thaw")) === 1;
+  const frozen = Number(__sbD1DbRaw(path, full ? "freeze" : "thaw"));
+  if (frozen < 0) return;
+  const captured = frozen === 1;
+  __sbD1Captured[path] = captured;
   if (full && captured) return;
   const size = Number(__sbD1DbRaw(path, "page_size")) || 4096;
   const pages = full
