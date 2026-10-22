@@ -1,5 +1,36 @@
 # @sproutboat/runtime
 
+## 0.26.0
+
+### Minor Changes
+
+- 9b15539: KV matches workerd from compatibility date `2026-10-25`:
+  
+  - `get`, `getWithMetadata`, `put`, `delete` and `list` return Promises, and errors reject them.
+  - `get(key, type)` takes `"text"`, `"json"`, `"arrayBuffer"` and `"stream"`, and `get([keys])` returns a `Map`.
+  - `getWithMetadata(key, type)` returns `{ value, metadata, cacheStatus }`.
+  - `put(key, value, { expiration, expirationTtl, metadata })` takes strings, bytes and `ReadableStream`s, and stores the metadata.
+  - `list({ prefix, limit, cursor })` returns `{ keys: [{ name, expiration?, metadata? }], list_complete, cursor?, cacheStatus }` and pages at up to 1,000 keys.
+  - Keys, values, expirations, metadata and list limits fail with KV's own errors. For example: `Key name cannot be empty.`, `KV PUT failed: 414 UTF-8 encoded length of 513 exceeds key length limit of 512.`, `KV PUT failed: 400 Invalid expiration_ttl of 30. Expiration TTL must be at least 60.`, and `KV PUT failed: 413 Metadata length of 1110 exceeds limit of 1024.`
+  
+  Earlier dates keep the synchronous shim. Two changes apply at every date:
+  
+  - **A `list()` prefix now matches exactly.** It used SQL `LIKE`, so it ignored case and read `_` and `%` as wildcards. For example, the prefix `a_` also listed `ab`, and `a` also listed `AB`.
+  - **Both transports store KV metadata in a new column.** It's added to existing stores when they open.
+
+### Patch Changes
+
+- 1c36119: Create the LTX page-index scratch file inside the database's replication spool
+  instead of libc's global temporary directory, fixing capture initialization when
+  a worker's filesystem sandbox permits writes only beneath its own state directory.
+  The scratch file is private and immediately unlinked. If a kill lands before
+  unlink, the next capture-lock owner removes the stale regular index file before
+  recovery. After unlink, closing the writer or killing the process releases it.
+  Its anonymous transient disk use is not counted by the
+  directory-walk quota. Capture retains its existing explicit opt-in and compatibility
+  date of 2026-10-22; capture-off apps and earlier dates keep their existing behavior.
+- 3cad1f0: The storage quota counts a D1 database's WAL file, which can hold space the app has already freed. While the app is over its quota, the runtime now checkpoints and truncates each D1 database's WAL before measuring again, at most once a second. So `DELETE` then `VACUUM` is enough to get back under the quota, and the app no longer has to run a checkpoint itself. Databases under LTX capture are left alone: capture owns their checkpoints, and they stay frozen until the quota is raised or other data is deleted.
+
 ## 0.25.0
 
 ### Minor Changes
