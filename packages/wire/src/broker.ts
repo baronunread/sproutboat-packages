@@ -150,6 +150,7 @@ type R2Row = {
   http_json: string;
   custom_json: string;
   blob_id: string | null;
+  md5?: string | null;
 };
 type R2UploadRow = {
   key: string;
@@ -317,6 +318,8 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     );
     const r2Columns = conn.query<{ name: string }, []>("PRAGMA table_info(r2)").all();
     if (!r2Columns.some((column) => column.name === "blob_id")) conn.exec("ALTER TABLE r2 ADD COLUMN blob_id TEXT");
+    // The MD5 of an object's bytes, its etag from compatibility date 2026-10-26 (r2.md5).
+    if (!r2Columns.some((column) => column.name === "md5")) conn.exec("ALTER TABLE r2 ADD COLUMN md5 TEXT");
     conn.exec(
       "CREATE TABLE IF NOT EXISTS r2_upload (bucket TEXT NOT NULL, key TEXT NOT NULL, upload_id TEXT NOT NULL, " +
         "uploaded TEXT NOT NULL, http_json TEXT NOT NULL DEFAULT '{}', custom_json TEXT NOT NULL DEFAULT '{}', " +
@@ -1095,6 +1098,38 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     return r2Row(row);
   };
 
+  // One page of r2.list for the shim from 2026-10-26: at most LIMIT entries after CURSOR,
+  // keys under PREFIX, those holding DELIMITER after it grouped into delimitedPrefixes (a
+  // group counts as one entry). Same rules as the embedded transport's __sbR2ListPage.
+  // ponytail: with a delimiter every key after the cursor is read; an index on the
+  // delimited prefix if buckets grow past ~100k keys.
+  const r2ListPage = (store: Database, bucket: string, prefix: string, cursor: string, limit: number, delimiter: string) => {
+    const rows = store
+      .query<R2Row, [string, string, string]>(
+        "SELECT * FROM r2 WHERE bucket = ?1 AND substr(key, 1, length(?2)) = ?2 AND key > ?3 ORDER BY key" +
+          (delimiter ? "" : ` LIMIT ${limit + 1}`),
+      )
+      .all(bucket, prefix, cursor);
+    const objects: ReturnType<typeof r2Row>[] = [];
+    const delimitedPrefixes: string[] = [];
+    let last = "";
+    let truncated = false;
+    for (const row of rows) {
+      const at = delimiter ? row.key.indexOf(delimiter, prefix.length) : -1;
+      const group = at < 0 ? "" : row.key.slice(0, at + delimiter.length);
+      if (!group || delimitedPrefixes[delimitedPrefixes.length - 1] !== group) {
+        if (objects.length + delimitedPrefixes.length >= limit) {
+          truncated = true;
+          break;
+        }
+        if (group) delimitedPrefixes.push(group);
+        else objects.push(r2Row(row));
+      }
+      last = row.key;
+    }
+    return { ok: true, objects, delimitedPrefixes, truncated, cursor: truncated ? last : "" };
+  };
+
   const r2Row = (r: R2Row) => ({
     key: r.key,
     size: r.size,
@@ -1102,6 +1137,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     uploaded: r.uploaded,
     httpMetadata: parseJsonValue(r.http_json),
     customMetadata: parseJsonValue(r.custom_json),
+    md5: r.md5 ?? null,
   });
 
   /**
@@ -1543,14 +1579,22 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         if (row) r2DeleteBlob(store, bucket, key, row.blob_id);
         return { ok: true };
       }
+      case "r2.md5": {
+        // Recorded after the put that wrote these bytes (etag): the shim from 2026-10-26 hashes them.
+        const { store, part: bucket } = storeFor("r2", requireR2(msg.bucket));
+        store.query("UPDATE r2 SET md5 = ?1 WHERE bucket = ?2 AND key = ?3 AND etag = ?4").run(str(msg.md5), bucket, str(msg.key), str(msg.etag));
+        return { ok: true };
+      }
       case "r2.list": {
+        // The prefix matches exactly at every date: LIKE ignored case and read "_" and "%" as wildcards.
         const { store, part: bucket } = storeFor("r2", requireR2(msg.bucket));
         const prefix = str(msg.prefix);
         const cursor = str(msg.cursor);
-        const limit = Math.min(Math.max(Number(msg.limit) || 1000, 1), 1000);
+        const limit = Math.min(Math.max(Math.floor(Number(msg.limit)) || 1000, 1), 1000);
+        if (msg.page === true) return r2ListPage(store, bucket, prefix, cursor, limit, str(msg.delimiter));
         const rows = store
           .query<R2Row, [string, string, string, number]>(
-            "SELECT * FROM r2 WHERE bucket = ? AND key LIKE ? || '%' AND key > ? ORDER BY key LIMIT ?",
+            "SELECT * FROM r2 WHERE bucket = ?1 AND substr(key, 1, length(?2)) = ?2 AND key > ?3 ORDER BY key LIMIT ?4",
           )
           .all(bucket, prefix, cursor, limit + 1);
         const truncated = rows.length > limit;
@@ -1876,6 +1920,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     "r2.multipart.abort",
     "r2.transfer.create",
     "r2.delete",
+    "r2.md5",
     "do.storage.put",
     "do.storage.delete",
     "do.storage.delete_all",
