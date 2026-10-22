@@ -12,7 +12,9 @@ const end = src.indexOf("// sproutboat #181 — wrap a Response");
 if (start === -1 || end === -1 || end < start) throw new Error("__sbFromUtf8 block not found in prelude");
 
 // oxlint-disable-next-line no-function-constructor -- lifting a pure block out of the text-only prelude for test
-const load = new Function(`${src.slice(start, end)}\nreturn { __sbFromUtf8 };`);
+const load = new Function(
+  `// The C fast paths (Porffor.c) cannot run here: the stubs make the JS fallback run.\nfunction __sbFromUtf8Native() { return ""; }\nfunction __sbToBytesNative() { return ""; }\n${src.slice(start, end)}\nreturn { __sbFromUtf8 };`,
+);
 const { __sbFromUtf8 } = load();
 
 /** Build a bytestring (one char per raw byte) the way __sbToBytes/porf_native_fetch_alloc_bytestring would, from real UTF-8 bytes. */
@@ -78,7 +80,7 @@ if (rbrStart === -1 || rbrEnd === -1 || rbrEnd < rbrStart) {
 // oxlint-disable-next-line no-function-constructor -- lifting a pure block out of the text-only prelude for test
 const loadRbr = new Function(
   "Response",
-  `${src.slice(start, end)}\n${src.slice(rbrStart, rbrEnd)}\nreturn { __sbRawBodyResponse };`,
+  `// The C fast paths (Porffor.c) cannot run here: the stubs make the JS fallback run.\nfunction __sbFromUtf8Native() { return ""; }\nfunction __sbToBytesNative() { return ""; }\n${src.slice(start, end)}\n${src.slice(rbrStart, rbrEnd)}\nreturn { __sbRawBodyResponse };`,
 );
 // A minimal Response stand-in: only what __sbRawBodyResponse touches (the
 // constructor call and setting .text/.json on the instance), no Porffor

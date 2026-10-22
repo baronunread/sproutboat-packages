@@ -22,7 +22,7 @@ if (hexStart === -1 || hexEnd === -1 || hexEnd < hexStart) throw new Error("__sb
 
 // oxlint-disable-next-line no-function-constructor -- lifting pure blocks out of the text-only prelude for test
 const load = new Function(
-  `${src.slice(isStrStart, isStrEnd)}\n${src.slice(start, end)}\n${src.slice(hexStart, hexEnd)}\nreturn { __sbToBytes, __sbHexOrBytes };`,
+  `// The C fast paths (Porffor.c) cannot run here: the stubs make the JS fallback run.\nfunction __sbFromUtf8Native() { return ""; }\nfunction __sbToBytesNative() { return ""; }\n${src.slice(isStrStart, isStrEnd)}\n${src.slice(start, end)}\n${src.slice(hexStart, hexEnd)}\nreturn { __sbToBytes, __sbHexOrBytes };`,
 );
 const { __sbToBytes, __sbHexOrBytes } = load();
 
