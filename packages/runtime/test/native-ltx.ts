@@ -247,6 +247,55 @@ try {
     assert.deepEqual(await readdir(join(root, epoch)), finishedBefore, "idle restart must not rewrite a base");
     assert.equal((await readdir(root)).filter((n) => n.startsWith("epoch-")).length, 1);
   }
+  // A D1 batch() (__sbD1Batch) is a SAVEPOINT around its statements, each its own call,
+  // then RELEASE: one transaction, so one LTX file with the next TXID. A rolled-back batch
+  // (ROLLBACK TO, then RELEASE) commits the pages it touched back unchanged: at most one
+  // more LTX file, and the restored database has none of its rows.
+  {
+    const batchPath = join(work, "batch.sqlite");
+    await run(batchPath, "CREATE TABLE b(id INTEGER PRIMARY KEY,value TEXT);\n");
+    const batchRoot = batchPath + ".ltx";
+    const batchEpoch = (await readdir(batchRoot)).find((n) => n.startsWith("epoch-"));
+    assert(batchEpoch);
+    const ltxFiles = async () => (await readdir(join(batchRoot, batchEpoch))).filter((n) => n.endsWith(".ltx")).sort();
+    const before = await ltxFiles();
+    const lastTxid = BigInt("0x" + before[before.length - 1].split("-")[0]);
+    const replies = await run(
+      batchPath,
+      "SAVEPOINT sb_d1_batch;\nINSERT INTO b VALUES(1,'one');\nINSERT INTO b VALUES(2,'two');\nRELEASE sb_d1_batch;\n",
+    );
+    assert(
+      replies.every((n) => n.startsWith("0 ")),
+      replies.join("\n"),
+    );
+    const after = await ltxFiles();
+    const added = after.filter((n) => !before.includes(n));
+    assert.equal(added.length, 1, "a batch is one LTX file: " + added.join(", "));
+    const [minTxid, maxTxid] = added[0]
+      .replace(".ltx", "")
+      .split("-")
+      .map((h) => BigInt("0x" + h));
+    assert.equal(minTxid, lastTxid + 1n);
+    assert.equal(maxTxid, lastTxid + 1n);
+    const rolledBack = await run(
+      batchPath,
+      "SAVEPOINT sb_d1_batch;\nINSERT INTO b VALUES(3,'three');\nROLLBACK TO sb_d1_batch;\nRELEASE sb_d1_batch;\n",
+    );
+    assert(
+      rolledBack.every((n) => n.startsWith("0 ")),
+      rolledBack.join("\n"),
+    );
+    assert((await ltxFiles()).length <= after.length + 1, "a rolled-back batch writes at most one LTX file");
+    const batchRestore = join(work, "batch-restored.sqlite");
+    await restore(join(batchRoot, batchEpoch), batchRestore);
+    assert.deepEqual(await readFile(batchRestore), await readFile(batchPath));
+    const check = new Database(batchRestore);
+    assert.deepEqual(check.query("SELECT id, value FROM b ORDER BY id").all(), [
+      { id: 1, value: "one" },
+      { id: 2, value: "two" },
+    ]);
+    check.close();
+  }
   // Size alone is not enough: an offline committed change must invalidate a clean marker.
   const offline = new Database(path);
   offline.exec("UPDATE t SET value='changed-offline' WHERE id=1");
