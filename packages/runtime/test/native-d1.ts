@@ -185,6 +185,7 @@ int main(void) {
       "__sbDirBytesRaw",
       "__sbD1DbRaw",
       "__sbSql",
+      "__sbSqlRaw",
       `${transport.slice(quotaStart, quotaEnd)}\nreturn { __sbQuotaCheck, __sbD1Quota, __sbQuotaFull, expire() { __sbQuotaAt = -1; } };`,
     )(
       (name: string) => (name === "SB_STORAGE_MAX_BYTES" ? String(limit) : ""),
@@ -192,6 +193,7 @@ int main(void) {
       (d: string) => String(JSON.parse(sqlRaw(":bytes " + d, "", "")).n),
       (path: string, what: string) => String(JSON.parse(sqlRaw(":db " + path, what, "")).n),
       sql,
+      sqlRaw,
     );
   const dirBytes = (d: string) => Number(JSON.parse(sqlRaw(":bytes " + d, "", "")).n);
   // exec() from 2026-10-24: line by line, all or nothing, the failing line named.
@@ -360,7 +362,9 @@ int main(void) {
   assert.equal(ops.__sbD1Run(qdb, "SELECT count(*) FROM q", [], true).rows[0][0], rows, "reads still work");
   ops.__sbD1Run(qdb, "DELETE FROM q", [], true);
   ops.__sbD1Run(qdb, "VACUUM", [], true);
-  ops.__sbD1Run(qdb, "PRAGMA wal_checkpoint(TRUNCATE)", [], true);
+  // No checkpoint by the app: over the quota the runtime checkpoints and truncates the WAL
+  // (once a second) before measuring again, so DELETE and VACUUM alone make room.
+  await Bun.sleep(1000);
   quota.expire();
   quota.__sbD1Quota(qdb);
   quota.__sbQuotaCheck("KV put()");

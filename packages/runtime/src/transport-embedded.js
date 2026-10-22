@@ -3455,11 +3455,23 @@ var __sbQuotaOps = {
 // A database under LTX capture is frozen instead: every write is refused, because even a
 // DELETE adds a file to the replication spool, which counts toward the quota.
 var __sbD1Capped = {};
+var __sbD1Captured = {};
+var __sbD1Checkpointed = {};
 function __sbD1Quota(path) {
-  const full = __sbQuotaFull();
+  let full = __sbQuotaFull();
+  // Over the quota, a database's -wal file can hold space the app has already freed (a
+  // DELETE, a VACUUM): checkpoint it into the database and truncate it, at most once a
+  // second, then measure again. Not under capture: LTX owns that database's checkpoints.
+  if (full && __sbD1Captured[path] !== true && Date.now() - (__sbD1Checkpointed[path] || 0) >= 1000) {
+    __sbD1Checkpointed[path] = Date.now();
+    JSON.parse(__sbSqlRaw(path, "PRAGMA wal_checkpoint(TRUNCATE)", "[]"));
+    __sbQuotaAt = -1;
+    full = __sbQuotaFull();
+  }
   if (__sbD1Capped[path] === full) return;
   __sbD1Capped[path] = full;
   const captured = Number(__sbD1DbRaw(path, full ? "freeze" : "thaw")) === 1;
+  __sbD1Captured[path] = captured;
   if (full && captured) return;
   const size = Number(__sbD1DbRaw(path, "page_size")) || 4096;
   const pages = full
