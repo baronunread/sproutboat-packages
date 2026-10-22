@@ -47,6 +47,7 @@ int main(void) {
     if (!strncmp(line, ":break ", 7)) { line[strcspn(line, "\\t")] = 0; char p[1024]; snprintf(p, sizeof(p), "%s.ltx/position.tmp", line + 7); mkdir(p, 0700); puts("{}"); fflush(stdout); continue; }
     char* sql = strchr(line, '\\t'); if (!sql) return 2; *sql++ = 0;
     char* params = strchr(sql, '\\t'); if (!params) return 2; *params++ = 0;
+    if (!strncmp(line, ":db ", 4)) { int r = sb_db_page_size(line + 4); printf("{\\"n\\":%d}\\n", r); fflush(stdout); continue; }
     if (!strncmp(line, ":bytes ", 7)) { line[strcspn(line, "\\t")] = 0; printf("{\\"n\\":%lld}\\n", sb_dir_bytes(line + 7, 0)); fflush(stdout); continue; }
     // ":script PATH" runs SQL as a script (sb_sql_script, what exec() uses).
     char* out = !strncmp(line, ":script ", 8) ? sb_sql_script(line + 8, sql) : sb_sql_run(line, sql, params); puts(out); fflush(stdout); free(out);
@@ -173,6 +174,26 @@ int main(void) {
     "__sbSqlScriptRaw",
     `${transport.slice(opsStart, opsEnd)}\nreturn { __sbD1Run, __sbD1Batch, __sbD1Open, __sbD1ExecLines };`,
   )(sqlRaw, sql, scriptRaw);
+  // The storage quota, lifted from "The storage quota" to __sbStore, for DIR and LIMIT.
+  const quotaStart = transport.indexOf("// The storage quota: an app's data directory");
+  const quotaEnd = transport.indexOf("function __sbStore() {");
+  assert(quotaStart > 0 && quotaEnd > quotaStart, "quota block moved");
+  const liftQuota = (dir: string, limit: number) =>
+    new Function(
+      "__sbEnv",
+      "__sbDir",
+      "__sbDirBytesRaw",
+      "__sbD1DbRaw",
+      "__sbSql",
+      `${transport.slice(quotaStart, quotaEnd)}\nreturn { __sbQuotaCheck, __sbD1Quota, __sbQuotaFull, expire() { __sbQuotaAt = -1; } };`,
+    )(
+      (name: string) => (name === "SB_STORAGE_MAX_BYTES" ? String(limit) : ""),
+      () => dir,
+      (d: string) => String(JSON.parse(sqlRaw(":bytes " + d, "", "")).n),
+      (path: string, what: string) => String(JSON.parse(sqlRaw(":db " + path, what, "")).n),
+      sql,
+    );
+  const dirBytes = (d: string) => Number(JSON.parse(sqlRaw(":bytes " + d, "", "")).n);
   // exec() from 2026-10-24: line by line, all or nothing, the failing line named.
   const ex = join(work, "data/d1/EXEC.sqlite");
   ops.__sbD1ExecLines(ex, ["CREATE TABLE x (id INTEGER)", "INSERT INTO x VALUES (1); INSERT INTO x VALUES (2);"]);
@@ -258,6 +279,22 @@ int main(void) {
     true,
   );
   assert.equal(ltxFiles(), beforeBatch + 1, "a batch is one LTX commit");
+  // With capture on, an authorization failure says so (it read "not an error" once capture
+  // had run), and the quota works: its page size comes from capture, not from the
+  // page_size pragma the capture authorizer refuses.
+  assert.throws(() => ops.__sbD1Run(ltx, "PRAGMA page_size", [], true), (e: Error) => e.message === "D1_ERROR: not authorized: SQLITE_AUTH");
+  assert.throws(() => ops.__sbD1ExecLines(ltx, ["PRAGMA journal_mode = DELETE"]), (e: Error) => e.message === "D1_EXEC_ERROR: Error in line 1: PRAGMA journal_mode = DELETE: not authorized");
+  const data = join(work, "data");
+  const roomy = liftQuota(data, dirBytes(data) + (1 << 20));
+  roomy.__sbD1Quota(ltx);
+  ops.__sbD1Run(ltx, "INSERT INTO e VALUES (10, 'under the quota')", [], true);
+  assert.equal(ops.__sbD1Run(ltx, "SELECT v FROM e WHERE id = 10", [], true).rows[0][0], "under the quota");
+  // Over the quota, the database is pinned at its size: growth fails with the quota's
+  // SQLITE_FULL, not "not authorized".
+  const tight = liftQuota(data, 1);
+  tight.__sbD1Quota(ltx);
+  assert.throws(() => ops.__sbD1Run(ltx, "INSERT INTO e VALUES (11, zeroblob(65536))", [], true), (e: Error) => e.message === "D1_ERROR: database or disk is full: SQLITE_FULL");
+  liftQuota(data, dirBytes(data) + (1 << 20)).__sbD1Quota(ltx);
   // Break capture just before the batch's RELEASE.
   // oxlint-disable-next-line no-function-constructor -- lifting a block out of the text-only transport
   const breaking = new Function(
@@ -290,24 +327,9 @@ int main(void) {
     (e: Error) => e.message === "D1_ERROR: LTX capture failed: the transaction may be committed locally but is not durable in the replication log; writes are refused until restart: SQLITE_IOERR",
     "exec() after a capture failure",
   );
-  // The storage quota (lifted from "The storage quota" to __sbStore): a 256 KiB limit.
-  const quotaStart = transport.indexOf("// The storage quota: an app's data directory");
-  const quotaEnd = transport.indexOf("function __sbStore() {");
-  assert(quotaStart > 0 && quotaEnd > quotaStart, "quota block moved");
   const qdir = join(work, "quota");
   const qdb = join(qdir, "d1/Q.sqlite");
-  const quota = new Function(
-    "__sbEnv",
-    "__sbDir",
-    "__sbDirBytesRaw",
-    "__sbSql",
-    `${transport.slice(quotaStart, quotaEnd)}\nreturn { __sbQuotaCheck, __sbD1Quota, __sbQuotaFull, expire() { __sbQuotaAt = -1; } };`,
-  )(
-    (name: string) => (name === "SB_STORAGE_MAX_BYTES" ? "262144" : ""),
-    () => qdir,
-    (dir: string) => String(JSON.parse(sqlRaw(":bytes " + dir, "", "")).n),
-    sql,
-  );
+  const quota = liftQuota(qdir, 262144);
   ops.__sbD1Run(qdb, "CREATE TABLE q (b BLOB)", [], true);
   quota.__sbD1Quota(qdb);
   quota.__sbQuotaCheck("KV put()");

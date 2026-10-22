@@ -1963,13 +1963,17 @@ static char* sb_sql_script(const char* path, const char* sql) {
   if (idx < 0 && sb_db_capture_failed(path)) { sb_puts(&b, "{\"ok\":false,\"error\":\"" SB_LTX_FAILED "\",\"code\":10}"); return b.p; }
   if (idx < 0) { sb_puts(&b, "{\"ok\":false,\"error\":\"cannot open database\"}"); return b.p; }
   char* err = 0;
-  int script_rc = 0, capture_failed = 0;
+  int script_rc = 0, capture_failed = 0, failure_code = 0;
+  char failure[512] = { 0 };
   if (sb_ltx_states[idx].db) {
     const char *next = sql;
     while (*next && !script_rc) {
       sqlite3_stmt *st = 0; const char *tail = 0;
       script_rc = sqlite3_prepare_v2(sb_dbs[idx], next, -1, &st, &tail);
       if (!script_rc && st) { do { script_rc = sqlite3_step(st); } while (script_rc == SB_SQLITE_ROW); if (script_rc == SB_SQLITE_DONE) script_rc = 0; }
+      // Keep the statement's error before capture runs statements of its own (it would
+      // read "not an error" after them).
+      if (script_rc && !failure[0]) { snprintf(failure, sizeof(failure), "%s", sqlite3_errmsg(sb_dbs[idx])); failure_code = sqlite3_extended_errcode(sb_dbs[idx]); }
       if (st) sqlite3_finalize(st);
       if (sb_ltx_after(idx)) { script_rc = 10; capture_failed = 1; }
       if (!tail || tail <= next) break;
@@ -1977,10 +1981,12 @@ static char* sb_sql_script(const char* path, const char* sql) {
     }
   } else script_rc = sqlite3_exec(sb_dbs[idx], sql, 0, 0, &err);
   if (script_rc != 0) {
-    const char* m = capture_failed ? SB_LTX_FAILED : err ? err : sqlite3_errmsg(sb_dbs[idx]);
+    const char* m = capture_failed ? SB_LTX_FAILED : failure[0] ? failure : err ? err : sqlite3_errmsg(sb_dbs[idx]);
     sb_puts(&b, "{\"ok\":false,\"error\":");
     sb_putjson_text(&b, m, strlen(m));
-    sb_puts(&b, capture_failed ? ",\"code\":10}" : "}");
+    char code[32];
+    snprintf(code, sizeof(code), ",\"code\":%d}", capture_failed ? 10 : failure[0] ? failure_code : 0);
+    sb_puts(&b, code);
     return b.p;
   }
   sb_puts(&b, "{\"ok\":true}");
@@ -2071,12 +2077,20 @@ static char* sb_sql_run(const char* path, const char* sql, const char* params) {
   // Reset, don't finalize: the statement stays compiled in sb_stmt_cache. Reset
   // now (not just on next reuse) so a SELECT stops holding its read transaction.
   sqlite3_reset(st);
+  // The statement's own error, kept before LTX capture runs: capture executes statements
+  // of its own, after which SQLite reports "not an error".
+  char failure[512] = { 0 };
+  int failure_code = 0;
+  if (rc != SB_SQLITE_DONE && rc != SB_SQLITE_ROW) {
+    snprintf(failure, sizeof(failure), "%s", sqlite3_errmsg(db));
+    failure_code = sqlite3_extended_errcode(db);
+  }
   const int capture_failed = sb_ltx_after(idx) != 0;
   if (capture_failed) rc = 10;
   if (rc != SB_SQLITE_DONE && rc != SB_SQLITE_ROW) {
     free(b.p);
     if (capture_failed) return sb_sql_error(db, SB_LTX_FAILED, 10, 0);
-    return sb_sql_error(db, 0, -1, strict ? (int)sizeof(SB_D1_STRICT) - 1 : 0);
+    return sb_sql_error(db, failure, failure_code, 0);
   }
   return b.p;
 }
@@ -2099,6 +2113,19 @@ static long long sb_dir_bytes(const char* dir, int depth) {
   }
   closedir(d);
   return total;
+}
+
+// A database's page size without SQL: under LTX capture the authorizer refuses every
+// page_size pragma (the getter too), and capture records the size itself.
+static int sb_db_page_size(const char* path) {
+  int idx = sb_db_for(path);
+  if (idx < 0) return 0;
+  if (sb_ltx_states[idx].db) return (int)sb_ltx_states[idx].page_size;
+  sqlite3_stmt* st = 0;
+  int size = 0;
+  if (sqlite3_prepare_v2(sb_dbs[idx], "PRAGMA page_size", -1, &st, 0) == 0 && st && sqlite3_step(st) == SB_SQLITE_ROW) size = sqlite3_column_int(st, 0);
+  if (st) sqlite3_finalize(st);
+  return size;
 }
 
 // #164 — an online, consistent single-file snapshot of a database, via
@@ -3140,6 +3167,24 @@ function __sbDirBytesRaw(dir) {
   return res;
 }
 
+// sb_db_page_size, for the quota: a path in, the page size out (0 if the database cannot open).
+// oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
+function __sbD1DbRaw(path, what) {
+  let res = "";
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    const char* __p; size_t __pl; char* __po = 0;
+    porf_native_fetch_read_value(path, &__p, &__pl, &__po);
+    char* __path = (char*)malloc(__pl + 1); memcpy(__path, __p, __pl); __path[__pl] = 0;
+    if (__po) free(__po);
+    int __r = sb_db_page_size(__path);
+    free(__path);
+    char __n[16]; int __k = snprintf(__n, sizeof(__n), "%d", __r);
+    res = porf_box((f64)porf_native_fetch_alloc_bytestring(__n, (size_t)__k), 195);
+  `;
+  return res;
+}
+
 // #164 — VACUUM INTO a fresh file. Two strings in, JSON out. Same pattern as
 // __sbSqlScriptRaw.
 // oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
@@ -3391,7 +3436,7 @@ function __sbD1Quota(path) {
   const full = __sbQuotaFull();
   if (__sbD1Capped[path] === full) return;
   __sbD1Capped[path] = full;
-  const size = Number(__sbSql(path, "PRAGMA page_size", []).rows[0][0]) || 4096;
+  const size = Number(__sbD1DbRaw(path, "page_size")) || 4096;
   const pages = full
     ? Number(__sbSql(path, "PRAGMA page_count", []).rows[0][0])
     : Math.floor(Math.min(__sbQuotaLimit(), 10000000000) / size);
