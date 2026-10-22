@@ -2081,6 +2081,26 @@ static char* sb_sql_run(const char* path, const char* sql, const char* params) {
   return b.p;
 }
 
+// The storage quota (docs: an app's data directory is capped): bytes in regular files under
+// dir, symlinks not followed. Bounded by depth; an unreadable entry counts as 0.
+static long long sb_dir_bytes(const char* dir, int depth) {
+  DIR* d = opendir(dir);
+  if (!d || depth > 16) { if (d) closedir(d); return 0; }
+  long long total = 0;
+  struct dirent* e;
+  char path[4096];
+  while ((e = readdir(d))) {
+    if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+    if (snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) >= (int)sizeof(path)) continue;
+    struct stat st;
+    if (lstat(path, &st)) continue;
+    if (S_ISREG(st.st_mode)) total += (long long)st.st_size;
+    else if (S_ISDIR(st.st_mode)) total += sb_dir_bytes(path, depth + 1);
+  }
+  closedir(d);
+  return total;
+}
+
 // #164 — an online, consistent single-file snapshot of a database, via
 // VACUUM INTO. Runs against the live db with no downtime (SQLite holds a read
 // transaction for the copy) and writes a fresh, defragmented file with no WAL
@@ -3103,6 +3123,23 @@ function __sbSqlScriptRaw(path, sql) {
   return res;
 }
 
+// The bytes under a directory, as a decimal string (sb_dir_bytes).
+// oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
+function __sbDirBytesRaw(dir) {
+  let res = "";
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    const char* __d; size_t __dl; char* __do = 0;
+    porf_native_fetch_read_value(dir, &__d, &__dl, &__do);
+    char* __dir = (char*)malloc(__dl + 1); memcpy(__dir, __d, __dl); __dir[__dl] = 0;
+    if (__do) free(__do);
+    char __n[32]; int __k = snprintf(__n, sizeof(__n), "%lld", sb_dir_bytes(__dir, 0));
+    free(__dir);
+    res = porf_box((f64)porf_native_fetch_alloc_bytestring(__n, (size_t)__k), 195);
+  `;
+  return res;
+}
+
 // #164 — VACUUM INTO a fresh file. Two strings in, JSON out. Same pattern as
 // __sbSqlScriptRaw.
 // oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
@@ -3306,6 +3343,60 @@ function __sbDir() {
   }
   return __sbDataDir;
 }
+// The storage quota: an app's data directory holds at most SB_STORAGE_MAX_BYTES (sproutd
+// sets it per app; 10 GiB when unset, after D1's 10 GB per database). Past it, writes are
+// refused with an error that says so; reads and deletes still work, so an app can make
+// room. The size is measured at most once a second, and on a write's way in, so a write
+// can overshoot by what one second of writes adds. A D1 database is also capped at 10 GB.
+var __sbQuotaMax = -1;
+var __sbQuotaUsed = 0;
+var __sbQuotaAt = -1;
+function __sbQuotaLimit() {
+  if (__sbQuotaMax < 0) {
+    const v = Number(__sbEnv("SB_STORAGE_MAX_BYTES"));
+    __sbQuotaMax = v > 0 ? v : 10737418240;
+  }
+  return __sbQuotaMax;
+}
+function __sbQuotaFull() {
+  const now = Date.now();
+  if (__sbQuotaAt < 0 || now - __sbQuotaAt >= 1000) {
+    __sbQuotaUsed = Number(__sbDirBytesRaw(__sbDir())) || 0;
+    __sbQuotaAt = now;
+  }
+  return __sbQuotaUsed >= __sbQuotaLimit();
+}
+function __sbQuotaCheck(what) {
+  if (__sbQuotaFull())
+    throw new Error(
+      what + " failed: storage quota exceeded (this app stores " + __sbQuotaUsed + " bytes; the limit is " + __sbQuotaLimit() + ")",
+    );
+}
+var __sbQuotaOps = {
+  "kv.put": "KV put()",
+  "do.storage.put": "Durable Object storage put()",
+  "do.alarm.set": "Durable Object setAlarm()",
+  "queue.send": "Queue send()",
+  "queue.send_batch": "Queue sendBatch()",
+  "cache.put": "Cache put()",
+  "ae.write": "Analytics Engine writeDataPoint()",
+  "r2.put": "R2 put()",
+  "r2.multipart.create": "R2 createMultipartUpload()",
+  "r2.multipart.complete": "R2 completeMultipartUpload()",
+};
+// D1 over the quota: pin each database at its current size (SQLITE_FULL on growth, so
+// reads and deletes still run); under it, cap it at 10 GB or the quota, whichever is less.
+var __sbD1Capped = {};
+function __sbD1Quota(path) {
+  const full = __sbQuotaFull();
+  if (__sbD1Capped[path] === full) return;
+  __sbD1Capped[path] = full;
+  const size = Number(__sbSql(path, "PRAGMA page_size", []).rows[0][0]) || 4096;
+  const pages = full
+    ? Number(__sbSql(path, "PRAGMA page_count", []).rows[0][0])
+    : Math.floor(Math.min(__sbQuotaLimit(), 10000000000) / size);
+  __sbSql(path, "PRAGMA max_page_count = " + Math.max(1, pages), []);
+}
 function __sbStore() {
   return __sbDir() + "/store.sqlite";
 }
@@ -3436,6 +3527,7 @@ function __sbEmbeddedDispatch(msg) {
   __sbEnsureSchema();
   const store = __sbStore();
   const op = msg.op;
+  if (__sbQuotaOps[op]) __sbQuotaCheck(__sbQuotaOps[op]);
 
   if (op === "ping") return { ok: true, op: "pong", echo: msg.msg };
 
@@ -3586,6 +3678,7 @@ function __sbEmbeddedDispatch(msg) {
       // exec() takes a script; a single prepare would run only its first
       // statement and quietly drop the rest.
       __sbD1Open(path, msg.strict === true);
+      __sbD1Quota(path);
       if (msg.strict === true && Array.isArray(msg.lines)) {
         __sbD1ExecLines(path, msg.lines);
         return { ok: true };
@@ -3596,6 +3689,7 @@ function __sbEmbeddedDispatch(msg) {
     }
     const strict = msg.strict === true;
     __sbD1Open(path, strict);
+    __sbD1Quota(path);
     if (op === "d1.batch") return { ok: true, results: __sbD1Batch(path, msg.statements || [], strict) };
     const one = __sbD1Run(path, msg.sql, msg.params, strict);
     return { ok: true, results: one.results, columns: one.columns, rows: one.rows, meta: one.meta, success: true };
@@ -4166,6 +4260,7 @@ function __sbD1ExecLines(path, lines) {
  * itself does not know which backend it is on.
  */
 globalThis.__sbR2Put = function (bucket, key, body, httpMetadata, customMetadata) {
+  __sbQuotaCheck("R2 put()");
   __sbEnsureSchema();
   const reply = JSON.parse(
     __sbR2PutRaw(
@@ -4195,6 +4290,7 @@ globalThis.__sbR2Get = function (bucket, key) {
 };
 
 globalThis.__sbR2MultipartPut = function (bucket, key, uploadId, partNumber, body) {
+  __sbQuotaCheck("R2 uploadPart()");
   __sbEnsureSchema();
   const store = __sbStore();
   const upload = __sbSql(

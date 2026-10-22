@@ -47,6 +47,7 @@ int main(void) {
     if (!strncmp(line, ":break ", 7)) { line[strcspn(line, "\\t")] = 0; char p[1024]; snprintf(p, sizeof(p), "%s.ltx/position.tmp", line + 7); mkdir(p, 0700); puts("{}"); fflush(stdout); continue; }
     char* sql = strchr(line, '\\t'); if (!sql) return 2; *sql++ = 0;
     char* params = strchr(sql, '\\t'); if (!params) return 2; *params++ = 0;
+    if (!strncmp(line, ":bytes ", 7)) { line[strcspn(line, "\\t")] = 0; printf("{\\"n\\":%lld}\\n", sb_dir_bytes(line + 7, 0)); fflush(stdout); continue; }
     // ":script PATH" runs SQL as a script (sb_sql_script, what exec() uses).
     char* out = !strncmp(line, ":script ", 8) ? sb_sql_script(line + 8, sql) : sb_sql_run(line, sql, params); puts(out); fflush(stdout); free(out);
   }
@@ -289,6 +290,47 @@ int main(void) {
     (e: Error) => e.message === "D1_ERROR: LTX capture failed: the transaction may be committed locally but is not durable in the replication log; writes are refused until restart: SQLITE_IOERR",
     "exec() after a capture failure",
   );
+  // The storage quota (lifted from "The storage quota" to __sbStore): a 256 KiB limit.
+  const quotaStart = transport.indexOf("// The storage quota: an app's data directory");
+  const quotaEnd = transport.indexOf("function __sbStore() {");
+  assert(quotaStart > 0 && quotaEnd > quotaStart, "quota block moved");
+  const qdir = join(work, "quota");
+  const qdb = join(qdir, "d1/Q.sqlite");
+  const quota = new Function(
+    "__sbEnv",
+    "__sbDir",
+    "__sbDirBytesRaw",
+    "__sbSql",
+    `${transport.slice(quotaStart, quotaEnd)}\nreturn { __sbQuotaCheck, __sbD1Quota, __sbQuotaFull, expire() { __sbQuotaAt = -1; } };`,
+  )(
+    (name: string) => (name === "SB_STORAGE_MAX_BYTES" ? "262144" : ""),
+    () => qdir,
+    (dir: string) => String(JSON.parse(sqlRaw(":bytes " + dir, "", "")).n),
+    sql,
+  );
+  ops.__sbD1Run(qdb, "CREATE TABLE q (b BLOB)", [], true);
+  quota.__sbD1Quota(qdb);
+  quota.__sbQuotaCheck("KV put()");
+  // Fill to the limit: a database is capped at the quota, so growth past it fails with
+  // SQLITE_FULL; then the directory is over, a KV write is refused, and reads and deletes
+  // keep working. VACUUM gives the space back and writes resume.
+  let rows = 0;
+  assert.throws(() => {
+    for (; rows < 64; rows++) ops.__sbD1Run(qdb, "INSERT INTO q VALUES (zeroblob(65536))", [], true);
+  }, (e: Error) => e.message === "D1_ERROR: database or disk is full: SQLITE_FULL");
+  assert(rows >= 2 && rows < 5, "filled to about 256 KiB: " + rows);
+  quota.expire();
+  assert.equal(quota.__sbQuotaFull(), true);
+  assert.throws(() => quota.__sbQuotaCheck("KV put()"), /^Error: KV put\(\) failed: storage quota exceeded \(this app stores \d+ bytes; the limit is 262144\)$/);
+  quota.__sbD1Quota(qdb);
+  assert.equal(ops.__sbD1Run(qdb, "SELECT count(*) FROM q", [], true).rows[0][0], rows, "reads still work");
+  ops.__sbD1Run(qdb, "DELETE FROM q", [], true);
+  ops.__sbD1Run(qdb, "VACUUM", [], true);
+  ops.__sbD1Run(qdb, "PRAGMA wal_checkpoint(TRUNCATE)", [], true);
+  quota.expire();
+  quota.__sbD1Quota(qdb);
+  quota.__sbQuotaCheck("KV put()");
+  ops.__sbD1Run(qdb, "INSERT INTO q VALUES (zeroblob(65536))", [], true);
   closeSync(toDriver);
   closeSync(fromDriver);
   await driver.exited;
