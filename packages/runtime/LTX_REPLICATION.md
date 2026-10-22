@@ -53,7 +53,14 @@ for this opted-in binding. Use the base LTX file for replication.
 
 Files live under `<database-path>.ltx/epoch-XXXXXX/`. Completed names are
 `<minTXID as 16 hex digits>-<maxTXID as 16 hex digits>.ltx`.
-The encoder streams one page at a time and spools index records with `tmpfile()`.
+The encoder streams one page at a time. It creates its index scratch file with
+`mkstemp()` beneath `<database-path>.ltx/`, immediately unlinks the name, and uses
+the open descriptor until the writer closes. This needs no access to a global
+temporary directory, which a sandboxed worker may not have. The scratch file is
+private (0600) and process death releases it without leaving a named index file.
+Its transient disk usage grows with the index records and is not visible to the
+directory-walk storage quota after unlink. Allow disk headroom for that scratch
+space as well as the LTX output; the quota is not a hard filesystem limit.
 
 For every LTX file:
 
@@ -78,7 +85,10 @@ applications must use idempotent transaction identifiers for retries.
 ## Qualification status
 
 Capture is tested against the exact inline C through `bun run test:native-ltx`,
-including independent BigInt CRC and index verification, a 102-file chain,
+with global `tmpfile()` access deliberately denied in the driver so the capture
+path cannot depend on it. This portable regression does not itself qualify the
+Linux Landlock/seccomp sandbox; sproutd's capture-on lifecycle smoke must do that.
+The tests cover independent BigInt CRC and index verification, a 102-file chain,
 byte-exact restore, integrity checking, oversized transaction rollback, database truncation, explicit rollback and late position-write failure latching.
 The workspace prototype additionally tests the compiled Porffor executable,
 including external writer exclusion and invariant PRAGMA rejection.

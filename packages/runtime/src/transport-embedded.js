@@ -419,9 +419,25 @@ static int sb_ltx_begin(sb_ltx_writer *w, const char *path, sb_ltx_state *s, uin
   memset(w, 0, sizeof(*w));
   w->hash = UINT64_MAX;
   w->page_size = s->page_size;
+  // Global temporary directories are outside a sandboxed worker's writable tree.
+  // Unlink immediately: close (including process death) reclaims the scratch file.
+  char index_path[SB_LTX_PATH];
+  if (snprintf(index_path, sizeof(index_path), "%s/index-XXXXXX", s->root) >= sizeof(index_path))
+    return -1;
+  int index = mkstemp(index_path);
+  if (index < 0)
+    return -1;
+  if (unlink(index_path)) {
+    close(index);
+    return -1;
+  }
+  w->index = fdopen(index, "w+b");
+  if (!w->index) {
+    close(index);
+    return -1;
+  }
   w->out = fopen(path, "wbx");
-  w->index = tmpfile();
-  if (!w->out || !w->index)
+  if (!w->out)
     return -1;
   unsigned char h[100] = {0};
   memcpy(h, "LTX1", 4);

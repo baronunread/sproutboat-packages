@@ -24,6 +24,11 @@ const source = `
 #include <sys/stat.h>
 #include <time.h>
 #include <signal.h>
+#include <errno.h>
+// Reproduce denial of global temporary-file access on every test platform.
+// The sproutd sandbox qualification separately exercises real Linux Landlock.
+static FILE *forbidden_tmpfile(void) { errno=EACCES; return NULL; }
+#define tmpfile forbidden_tmpfile
 #define SB_MAX_DB 16
 ${transport.slice(start, end)}
 int main(int argc,char **argv) {
@@ -169,6 +174,7 @@ async function run(path: string, sql: string, extra: Record<string, string> = {}
   ]);
   assert.equal(code, 0, error);
   assert(out.startsWith("ready\n"), out);
+  assert(!(await readdir(path + ".ltx")).some((name) => name.startsWith("index-")), "index scratch file leaked");
   return out.split("\n").slice(1).filter(Boolean);
 }
 async function stoppedCommit(path: string, phase: string, count = 1) {
@@ -212,6 +218,7 @@ async function stoppedCommit(path: string, phase: string, count = 1) {
   }
   child.kill("SIGKILL");
   await child.exited;
+  assert(!(await readdir(path + ".ltx")).some((name) => name.startsWith("index-")), "killed writer left index scratch");
   assert(stopped, "did not reach crash boundary " + phase);
   return epoch;
 }
