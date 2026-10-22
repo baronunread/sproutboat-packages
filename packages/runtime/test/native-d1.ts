@@ -47,7 +47,7 @@ int main(void) {
     if (!strncmp(line, ":break ", 7)) { line[strcspn(line, "\\t")] = 0; char p[1024]; snprintf(p, sizeof(p), "%s.ltx/position.tmp", line + 7); mkdir(p, 0700); puts("{}"); fflush(stdout); continue; }
     char* sql = strchr(line, '\\t'); if (!sql) return 2; *sql++ = 0;
     char* params = strchr(sql, '\\t'); if (!params) return 2; *params++ = 0;
-    if (!strncmp(line, ":db ", 4)) { int r = sb_db_page_size(line + 4); printf("{\\"n\\":%d}\\n", r); fflush(stdout); continue; }
+    if (!strncmp(line, ":db ", 4)) { int r = sql[0] == 'p' ? sb_db_page_size(line + 4) : sb_db_quota_freeze(line + 4, sql[0] == 'f'); printf("{\\"n\\":%d}\\n", r); fflush(stdout); continue; }
     if (!strncmp(line, ":bytes ", 7)) { line[strcspn(line, "\\t")] = 0; printf("{\\"n\\":%lld}\\n", sb_dir_bytes(line + 7, 0)); fflush(stdout); continue; }
     // ":script PATH" runs SQL as a script (sb_sql_script, what exec() uses).
     char* out = !strncmp(line, ":script ", 8) ? sb_sql_script(line + 8, sql) : sb_sql_run(line, sql, params); puts(out); fflush(stdout); free(out);
@@ -289,12 +289,24 @@ int main(void) {
   roomy.__sbD1Quota(ltx);
   ops.__sbD1Run(ltx, "INSERT INTO e VALUES (10, 'under the quota')", [], true);
   assert.equal(ops.__sbD1Run(ltx, "SELECT v FROM e WHERE id = 10", [], true).rows[0][0], "under the quota");
-  // Over the quota, the database is pinned at its size: growth fails with the quota's
-  // SQLITE_FULL, not "not authorized".
+  // Over the quota with capture on, every write is refused, a same-size UPDATE and a DELETE
+  // too (each would add an LTX file to the spool), and the spool stops growing; reads and
+  // read-only batches still run. Under the quota again, writes resume.
   const tight = liftQuota(data, 1);
   tight.__sbD1Quota(ltx);
-  assert.throws(() => ops.__sbD1Run(ltx, "INSERT INTO e VALUES (11, zeroblob(65536))", [], true), (e: Error) => e.message === "D1_ERROR: database or disk is full: SQLITE_FULL");
-  liftQuota(data, dirBytes(data) + (1 << 20)).__sbD1Quota(ltx);
+  const spool = ltxFiles();
+  const QUOTA = "D1_ERROR: storage quota exceeded: writes are refused while this app's data, including its replication log, is over its quota: SQLITE_FULL";
+  for (const write of ["INSERT INTO e VALUES (11, 'x')", "UPDATE e SET v = 'y' WHERE id = 10", "DELETE FROM e WHERE id = 10"])
+    assert.throws(() => ops.__sbD1Run(ltx, write, [], true), (e: Error) => e.message === QUOTA, write);
+  assert.throws(() => ops.__sbD1ExecLines(ltx, ["UPDATE e SET v = 'z'"]), (e: Error) => e.message.startsWith("D1_EXEC_ERROR: Error in line 1: UPDATE e SET v = 'z': storage quota exceeded"));
+  assert.throws(() => ops.__sbD1Batch(ltx, [{ sql: "SELECT 1", params: [] }, { sql: "DELETE FROM e", params: [] }], true), (e: Error) => e.message === QUOTA);
+  assert.equal(ops.__sbD1Batch(ltx, [{ sql: "SELECT count(*) FROM e", params: [] }], true).length, 1, "a read-only batch runs");
+  assert.equal(ops.__sbD1Run(ltx, "SELECT v FROM e WHERE id = 10", [], true).rows[0][0], "under the quota");
+  assert.equal(ltxFiles(), spool, "no LTX file while over the quota");
+  const again = liftQuota(data, dirBytes(data) + (1 << 20));
+  again.__sbD1Quota(ltx);
+  ops.__sbD1Run(ltx, "UPDATE e SET v = 'thawed' WHERE id = 10", [], true);
+  assert.equal(ltxFiles(), spool + 1, "writes, and capture, resume under the quota");
   // Break capture just before the batch's RELEASE.
   // oxlint-disable-next-line no-function-constructor -- lifting a block out of the text-only transport
   const breaking = new Function(

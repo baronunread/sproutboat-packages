@@ -1949,6 +1949,11 @@ void sb_r2_transfer_download_close(sb_r2_transfer_ctx* ctx) { if (ctx) { if (ctx
 // the replication log, and the database refuses writes until the process restarts. Said as
 // such (SQLITE_IOERR), never as SQLite's own message, which still reads "not an error".
 #define SB_LTX_FAILED "LTX capture failed: the transaction may be committed locally but is not durable in the replication log; writes are refused until restart"
+// The storage quota, for a database under LTX capture: while the app is over its quota,
+// every write is refused (a same-size UPDATE or a DELETE still adds an LTX file to the
+// spool, which counts toward the quota). Reads and transaction control still run.
+#define SB_QUOTA_FULL "storage quota exceeded: writes are refused while this app's data, including its replication log, is over its quota"
+static unsigned char sb_quota_frozen[SB_MAX_DB];
 static int sb_db_capture_failed(const char* path) {
   for (int i = 0; i < sb_db_count; i++) if (strcmp(sb_db_names[i], path) == 0) return sb_ltx_states[i].failed;
   return 0;
@@ -1963,13 +1968,14 @@ static char* sb_sql_script(const char* path, const char* sql) {
   if (idx < 0 && sb_db_capture_failed(path)) { sb_puts(&b, "{\"ok\":false,\"error\":\"" SB_LTX_FAILED "\",\"code\":10}"); return b.p; }
   if (idx < 0) { sb_puts(&b, "{\"ok\":false,\"error\":\"cannot open database\"}"); return b.p; }
   char* err = 0;
-  int script_rc = 0, capture_failed = 0, failure_code = 0;
+  int script_rc = 0, capture_failed = 0, quota_full = 0, failure_code = 0;
   char failure[512] = { 0 };
   if (sb_ltx_states[idx].db) {
     const char *next = sql;
     while (*next && !script_rc) {
       sqlite3_stmt *st = 0; const char *tail = 0;
       script_rc = sqlite3_prepare_v2(sb_dbs[idx], next, -1, &st, &tail);
+      if (!script_rc && st && sb_quota_frozen[idx] && !sqlite3_stmt_readonly(st)) { sqlite3_finalize(st); quota_full = 1; script_rc = 13; break; }
       if (!script_rc && st) { do { script_rc = sqlite3_step(st); } while (script_rc == SB_SQLITE_ROW); if (script_rc == SB_SQLITE_DONE) script_rc = 0; }
       // Keep the statement's error before capture runs statements of its own (it would
       // read "not an error" after them).
@@ -1981,11 +1987,11 @@ static char* sb_sql_script(const char* path, const char* sql) {
     }
   } else script_rc = sqlite3_exec(sb_dbs[idx], sql, 0, 0, &err);
   if (script_rc != 0) {
-    const char* m = capture_failed ? SB_LTX_FAILED : failure[0] ? failure : err ? err : sqlite3_errmsg(sb_dbs[idx]);
+    const char* m = quota_full ? SB_QUOTA_FULL : capture_failed ? SB_LTX_FAILED : failure[0] ? failure : err ? err : sqlite3_errmsg(sb_dbs[idx]);
     sb_puts(&b, "{\"ok\":false,\"error\":");
     sb_putjson_text(&b, m, strlen(m));
     char code[32];
-    snprintf(code, sizeof(code), ",\"code\":%d}", capture_failed ? 10 : failure[0] ? failure_code : 0);
+    snprintf(code, sizeof(code), ",\"code\":%d}", quota_full ? 13 : capture_failed ? 10 : failure[0] ? failure_code : 0);
     sb_puts(&b, code);
     return b.p;
   }
@@ -2027,6 +2033,10 @@ static char* sb_sql_run(const char* path, const char* sql, const char* params) {
   sqlite3_stmt* st = sb_stmt_get(idx, db, sql);
   if (!st) return sb_sql_error(db, 0, -1, strict ? (int)sizeof(SB_D1_STRICT) - 1 : 0);
   int bound = params && *params ? sb_bind_params(st, params) : 0;
+  if (sb_quota_frozen[idx] && !sqlite3_stmt_readonly(st)) {
+    sqlite3_reset(st);
+    return sb_sql_error(db, SB_QUOTA_FULL, 13, 0);
+  }
   if (strict && bound != sqlite3_bind_parameter_count(st)) {
     sqlite3_reset(st);
     return sb_sql_error(db, "Wrong number of parameter bindings for SQL query.", 0, 0);
@@ -2126,6 +2136,14 @@ static int sb_db_page_size(const char* path) {
   if (sqlite3_prepare_v2(sb_dbs[idx], "PRAGMA page_size", -1, &st, 0) == 0 && st && sqlite3_step(st) == SB_SQLITE_ROW) size = sqlite3_column_int(st, 0);
   if (st) sqlite3_finalize(st);
   return size;
+}
+// Freeze (refuse writes to) or thaw a database for the quota. Returns 1 when the database
+// is under LTX capture, 0 when not, -1 when it cannot be opened.
+static int sb_db_quota_freeze(const char* path, int on) {
+  int idx = sb_db_for(path);
+  if (idx < 0) return -1;
+  sb_quota_frozen[idx] = on && sb_ltx_states[idx].db ? 1 : 0;
+  return sb_ltx_states[idx].db ? 1 : 0;
 }
 
 // #164 — an online, consistent single-file snapshot of a database, via
@@ -3167,7 +3185,7 @@ function __sbDirBytesRaw(dir) {
   return res;
 }
 
-// sb_db_page_size, for the quota: a path in, the page size out (0 if the database cannot open).
+// sb_db_page_size and sb_db_quota_freeze, for the quota (a path and a "0"/"1" in, a number out).
 // oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
 function __sbD1DbRaw(path, what) {
   let res = "";
@@ -3177,7 +3195,10 @@ function __sbD1DbRaw(path, what) {
     porf_native_fetch_read_value(path, &__p, &__pl, &__po);
     char* __path = (char*)malloc(__pl + 1); memcpy(__path, __p, __pl); __path[__pl] = 0;
     if (__po) free(__po);
-    int __r = sb_db_page_size(__path);
+    const char* __w; size_t __wl; char* __wo = 0;
+    porf_native_fetch_read_value(what, &__w, &__wl, &__wo);
+    int __r = __wl && __w[0] == 'p' ? sb_db_page_size(__path) : sb_db_quota_freeze(__path, __wl && __w[0] == 'f');
+    if (__wo) free(__wo);
     free(__path);
     char __n[16]; int __k = snprintf(__n, sizeof(__n), "%d", __r);
     res = porf_box((f64)porf_native_fetch_alloc_bytestring(__n, (size_t)__k), 195);
@@ -3431,11 +3452,15 @@ var __sbQuotaOps = {
 };
 // D1 over the quota: pin each database at its current size (SQLITE_FULL on growth, so
 // reads and deletes still run); under it, cap it at 10 GB or the quota, whichever is less.
+// A database under LTX capture is frozen instead: every write is refused, because even a
+// DELETE adds a file to the replication spool, which counts toward the quota.
 var __sbD1Capped = {};
 function __sbD1Quota(path) {
   const full = __sbQuotaFull();
   if (__sbD1Capped[path] === full) return;
   __sbD1Capped[path] = full;
+  const captured = Number(__sbD1DbRaw(path, full ? "freeze" : "thaw")) === 1;
+  if (full && captured) return;
   const size = Number(__sbD1DbRaw(path, "page_size")) || 4096;
   const pages = full
     ? Number(__sbSql(path, "PRAGMA page_count", []).rows[0][0])
