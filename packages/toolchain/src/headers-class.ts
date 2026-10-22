@@ -7,6 +7,10 @@
  * Storage stays Porffor's: `_entries` holds each appended name (lowercased) and value in
  * order, flat, because the native response writer reads it, and each Set-Cookie must reach
  * the wire as its own header. The Fetch spec's combined, sorted view is computed on read.
+ *
+ * `_immutable`, when the runtime sets it, makes append, set and delete throw as workerd's
+ * immutable guard does (an incoming request's headers, a fetched response's). The runtime
+ * sets it from compatibility date 2026-10-23; a copy (`new Headers(h)`) is always mutable.
  */
 export const HEADERS_CLASS_SOURCE = String.raw`class Headers {
   // sproutboat: Fetch-spec Headers
@@ -52,11 +56,17 @@ export const HEADERS_CLASS_SOURCE = String.raw`class Headers {
     Porffor.array.fastPush(this._entries, value);
   }
 
+  _writable() {
+    if (this._immutable === true) throw new TypeError("Can't modify immutable headers.");
+  }
+
   append(name, value) {
+    this._writable();
     this._push(Headers._name(name), Headers._value(value));
   }
 
   delete(name) {
+    this._writable();
     const normalized = Headers._name(name);
     const next = Porffor.array.new(this._entries.length);
     for (let i = 0; i < this._entries.length; i += 2) {
@@ -90,6 +100,7 @@ export const HEADERS_CLASS_SOURCE = String.raw`class Headers {
   }
 
   set(name, value) {
+    this._writable();
     const normalized = Headers._name(name), v = Headers._value(value);
     this.delete(normalized);
     this._push(normalized, v);
