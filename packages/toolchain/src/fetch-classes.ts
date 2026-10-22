@@ -61,9 +61,43 @@ export const REQUEST_CLASS_SOURCE = String.raw`class Request {
     return new TextEncoder().encode(text);
   }
 
+  // Fetch as workerd implements it, from compatibility date 2026-10-23: a Request made from
+  // another takes its body (the source becomes used, and a used one cannot be copied),
+  // GET and HEAD refuse any body, methods and redirect modes are workerd's, and errors
+  // carry workerd's messages. Before it, a copy shared the body, as it always did here.
+  static _strict() { return globalThis.__sbCompat >= '2026-10-23'; }
+  static _usedError() {
+    return new TypeError(Request._strict() ? 'Body has already been used. It can only be used once. Use tee() first if you need to read it twice.' : 'Body has already been used');
+  }
+  // workerd's methods (kj's list): known names in any case, uppercased; anything else throws.
+  static _method(method) {
+    const upper = method.toUpperCase();
+    const known = ' GET HEAD POST PUT DELETE PATCH PURGE OPTIONS TRACE COPY LOCK MKCOL MOVE PROPFIND PROPPATCH SEARCH UNLOCK ACL REPORT MKACTIVITY CHECKOUT MERGE MSEARCH NOTIFY SUBSCRIBE UNSUBSCRIBE QUERY ';
+    if (method.indexOf(' ') < 0 && known.indexOf(' ' + upper + ' ') >= 0) return upper;
+    throw new TypeError('Invalid HTTP method string: ' + method);
+  }
+  // Whether the body was used: read through this message, or (from 2026-10-23, as in
+  // workerd) through its stream by anyone, such as a Request given it as init.
+  static _used(message) {
+    if (message._bodyUsed === true) return true;
+    if (!Request._strict()) return false;
+    const stream = message._bodyStream != null ? message._bodyStream : message._bodyInit;
+    return Request._isStream(stream) && stream._disturbed === true;
+  }
+  // A body for two readers: a stream is teed, the first branch staying with the source.
+  // Values are read by copying, so both share them.
+  static _split(message) {
+    const init = message._bodyStream != null ? message._bodyStream : message._bodyInit;
+    if (!Request._isStream(init)) return init;
+    const pair = init.tee();
+    message._bodyInit = pair[0];
+    message._bodyStream = null;
+    return pair[1];
+  }
+
   // A body is read once: the first reader marks it used, a second throws, as in Fetch.
   static _consume(message) {
-    if (message._bodyUsed === true) throw new TypeError('Body has already been used');
+    if (Request._used(message)) throw Request._usedError();
     message._bodyUsed = true;
     // A stream the body getter handed out is what the reader reads: a locked one throws.
     return message._bodyStream != null ? message._bodyStream : message._bodyInit;
@@ -87,6 +121,12 @@ export const REQUEST_CLASS_SOURCE = String.raw`class Request {
       message._bodyStream._sbBody = message._bodyLatin1 === true ? bytes : init;
     }
     return message._bodyStream;
+  }
+
+  // Raw ingress bytes (a copy of an incoming request) decode as UTF-8, like any byte body.
+  static _messageText(message, body) {
+    if (message._bodyLatin1 === true && typeof body == 'string') return new TextDecoder().decode(Request._messageBytes(message, body));
+    return Request._bodyText(body);
   }
 
   static _bodyText(body) {
@@ -140,11 +180,15 @@ export const REQUEST_CLASS_SOURCE = String.raw`class Request {
   }
 
   constructor(input, init = undefined) {
+    const strict = Request._strict();
     let url = input;
     let method = 'GET';
     let headers = undefined;
     let body = null;
     let redirect = undefined;
+    let signal = null;
+    // The Request whose body this one takes, when init gives none.
+    let source = null;
 
     if (input instanceof Request) {
       url = input.url;
@@ -152,13 +196,19 @@ export const REQUEST_CLASS_SOURCE = String.raw`class Request {
       headers = input.headers;
       body = input._bodyStream != null ? input._bodyStream : input._bodyInit;
       redirect = input.redirect;
+      if (input._signal != null) signal = input._signal;
+      if (body != null) source = input;
     } else if (input != null && Porffor.type(input) == Porffor.TYPES.object && input.href != null) url = input.href;
 
     if (init != null) {
       if (init.method != null) method = init.method;
       if (init.headers != null) headers = init.headers;
-      if (init.body !== undefined) body = init.body;
+      if (init.body !== undefined) {
+        body = init.body;
+        source = null;
+      }
       if (init.redirect != null) redirect = init.redirect;
+      if (init.signal !== undefined) signal = init.signal;
     }
 
     const raw = (Porffor.type(url) | 0b10000000) == Porffor.TYPES.bytestring ? url : String(url);
@@ -169,34 +219,58 @@ export const REQUEST_CLASS_SOURCE = String.raw`class Request {
       throw new TypeError('Invalid URL: ' + raw);
     }
     this.url = href;
-    this.method = ((Porffor.type(method) | 0b10000000) == Porffor.TYPES.bytestring ? method : String(method)).toUpperCase();
-    if (init != null && init.body != null && init.body !== '' && (this.method == 'GET' || this.method == 'HEAD'))
+    const methodText = (Porffor.type(method) | 0b10000000) == Porffor.TYPES.bytestring ? method : String(method);
+    this.method = strict ? Request._method(methodText) : methodText.toUpperCase();
+    if (strict) {
+      if (redirect != null && redirect != 'follow' && redirect != 'manual')
+        throw new TypeError('Invalid redirect value, must be one of "follow" or "manual" ("error" won\'t be implemented since it does not make sense at the edge; use "manual" and check the response status code).');
+      if (body != null && (this.method == 'GET' || this.method == 'HEAD'))
+        throw new TypeError('Request with a GET or HEAD method cannot have a body.');
+      if (source != null && Request._used(source)) throw new TypeError('Cannot reconstruct a Request with a used body.');
+    } else if (init != null && init.body != null && init.body !== '' && (this.method == 'GET' || this.method == 'HEAD'))
       throw new TypeError('Request with GET/HEAD method cannot have body.');
     this.headers = new Headers(headers);
-    this._bodyInit = Request._extractBody(body, this.headers);
+    if (source != null) {
+      // The body as the source holds it, already extracted: no content type is added, and
+      // raw ingress bytes stay bytes. From 2026-10-23 the source gives it up.
+      this._bodyInit = body;
+      if (source._bodyLatin1 === true) this._bodyLatin1 = true;
+      if (strict) source._bodyUsed = true;
+    } else this._bodyInit = Request._extractBody(body, this.headers);
     if (redirect != null) this._redirect = String(redirect);
+    if (signal != null) this._signal = signal;
   }
 
   get redirect() { return this._redirect ?? 'follow'; }
+  // A signal that never aborts unless one was given, made when first asked for.
+  get signal() {
+    if (this._signal == null) this._signal = new globalThis.AbortController().signal;
+    return this._signal;
+  }
   get body() { return Request._bodyAsStream(this); }
   set body(value) { this._bodyInit = value; this._bodyStream = null; }
-  get bodyUsed() { return this._bodyUsed === true; }
+  get bodyUsed() { return Request._used(this); }
 
   arrayBuffer() { return Request._read(this, (bytes) => bytes.buffer); }
   blob() { return Request._read(this, (bytes) => new Blob([bytes])); }
+  // A copy with its own branch of the body. workerd says the used body's stream is locked.
   clone() {
-    if (this._bodyUsed === true) throw new TypeError('Body has already been used');
-    return new Request(this);
+    if (Request._used(this))
+      throw new TypeError(Request._strict() ? 'This ReadableStream is currently locked to a reader,' : 'Body has already been used');
+    const copy = new Request(this.url, { method: this.method, headers: this.headers, redirect: this._redirect, signal: this._signal });
+    copy._bodyInit = Request._split(this);
+    if (this._bodyLatin1 === true) copy._bodyLatin1 = true;
+    return copy;
   }
   json() {
     const body = Request._consume(this);
     if (Request._isStream(body)) return Request._streamBytes(body).then((bytes) => JSON.parse(new TextDecoder().decode(bytes)));
-    return JSON.parse(Request._bodyText(body));
+    return JSON.parse(Request._messageText(this, body));
   }
   text() {
     const body = Request._consume(this);
     if (Request._isStream(body)) return Request._streamBytes(body).then((bytes) => new TextDecoder().decode(bytes));
-    return Request._bodyText(body);
+    return Request._messageText(this, body);
   }
 }
 
@@ -227,14 +301,14 @@ export const RESPONSE_CLASS_SOURCE = String.raw`class Response {
   get ok() { return this.status >= 200 && this.status < 300; }
   get body() { return Request._bodyAsStream(this); }
   set body(value) { this._bodyInit = value; this._bodyStream = null; }
-  get bodyUsed() { return this._bodyUsed === true; }
+  get bodyUsed() { return Request._used(this); }
 
   arrayBuffer() { return Request._read(this, (bytes) => bytes.buffer); }
   blob() { return Request._read(this, (bytes) => new Blob([bytes])); }
   clone() {
-    if (this._bodyUsed === true) throw new TypeError('Body has already been used');
+    if (Request._used(this)) throw new TypeError('Body has already been used');
     const copy = new Response(null, { status: this.status == 0 ? 200 : this.status, statusText: this._statusText, headers: this.headers });
-    copy._bodyInit = this._bodyInit;
+    copy._bodyInit = Request._split(this);
     copy.status = this.status;
     if (this._type != null) copy._type = this._type;
     return copy;
@@ -242,12 +316,12 @@ export const RESPONSE_CLASS_SOURCE = String.raw`class Response {
   json() {
     const body = Request._consume(this);
     if (Request._isStream(body)) return Request._streamBytes(body).then((bytes) => JSON.parse(new TextDecoder().decode(bytes)));
-    return JSON.parse(Request._bodyText(body));
+    return JSON.parse(Request._messageText(this, body));
   }
   text() {
     const body = Request._consume(this);
     if (Request._isStream(body)) return Request._streamBytes(body).then((bytes) => new TextDecoder().decode(bytes));
-    return Request._bodyText(body);
+    return Request._messageText(this, body);
   }
 }
 `;

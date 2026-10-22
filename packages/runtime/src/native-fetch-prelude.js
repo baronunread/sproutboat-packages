@@ -3315,6 +3315,15 @@ for (const E of [Error, TypeError, RangeError, ReferenceError, SyntaxError, Eval
 // Object.fromEntries(headers) work. Porffor's Headers has entries() but no iterator.
 if (Headers.prototype[Symbol.iterator] == null) Headers.prototype[Symbol.iterator] = Headers.prototype.entries;
 
+// workerd's immutable headers, from compatibility date 2026-10-23: an incoming request's,
+// a fetched or service-binding response's, and Response.redirect()'s refuse append, set
+// and delete with a TypeError. A copy (new Headers(h), new Response(body, res)) is
+// mutable. The runtime's own writes after the handler lift the guard first.
+function __sbFreezeHeaders(message) {
+  if (globalThis.__sbCompat >= "2026-10-23") message.headers._immutable = true;
+  return message;
+}
+
 // Porffor alpha-10 has no static Response.redirect().
 if (Response.redirect == null) {
   Response.redirect = function (url, status = 302) {
@@ -3322,7 +3331,7 @@ if (Response.redirect == null) {
       throw new RangeError("invalid redirect status");
     }
     // Serialized like the URL parser does (a bare origin gains its "/"); invalid URLs throw.
-    return new Response(null, { status, headers: { location: new URL(String(url)).href } });
+    return __sbFreezeHeaders(new Response(null, { status, headers: { location: new URL(String(url)).href } }));
   };
 }
 
@@ -3739,7 +3748,9 @@ if (typeof globalThis.EventTarget !== "function") {
     __sbAbort(reason) {
       if (this.aborted) return;
       this.aborted = true;
-      this.reason = reason === undefined ? namedError("AbortError", "This operation was aborted") : reason;
+      // workerd's default reason reads "The operation was aborted" (from 2026-10-23 here).
+      const message = globalThis.__sbCompat >= "2026-10-23" ? "The operation was aborted" : "This operation was aborted";
+      this.reason = reason === undefined ? namedError("AbortError", message) : reason;
       const event = new Event("abort");
       if (typeof this.onabort === "function") this.onabort.call(this, event);
       this.dispatchEvent(event);
@@ -5229,7 +5240,7 @@ globalThis.__sbInstallBindings = function (target, bindings) {
       fetch(input, init) {
         if (globalThis.__sbCompat >= "2026-10-22") return __sbServiceFetch(binding, input, init);
         const parts = __sbFetchParts(input, init);
-        const msg = { binding, url: parts.url, method: parts.method, headers: parts.headers, ...__sbRequestBody(parts.body) };
+        const msg = { binding, url: parts.url, method: parts.method, headers: parts.headers, ...__sbPartsBody(parts) };
         return __sbUpstreamResponse(globalThis.__sbFetchUpstream("service.fetch", msg));
       },
     };
@@ -5251,9 +5262,9 @@ async function __sbServiceFetch(binding, input, init) {
   const parts = __sbFetchParts(input, init);
   if (parts.signal) parts.signal.throwIfAborted();
   // A stream body is read to the end first: the wire carries a whole body.
-  let body = __sbUnwrapBody(parts.body);
-  if (body instanceof ReadableStream) body = await __sbCollectBody(body);
-  const msg = { binding, url: parts.url, method: parts.method, headers: parts.headers, ...__sbRequestBody(body) };
+  const body = __sbUnwrapBody(parts.body);
+  const wire = body instanceof ReadableStream ? __sbRequestBody(await __sbCollectBody(body)) : __sbPartsBody({ ...parts, body });
+  const msg = { binding, url: parts.url, method: parts.method, headers: parts.headers, ...wire };
   const response = await __sbFetchFollowing("service.fetch", msg, "sproutboat service " + binding, parts.redirect, parts.signal);
   // The callee threw: as in workerd, its error is thrown here.
   const uncaught = response.headers.get("x-sb-uncaught");
@@ -5436,7 +5447,29 @@ async function __sbRpcDispatch(handlers, receiver, method, request) {
 
 // fetch(input, init) as Fetch reads it: a Request's method, headers, body, redirect mode
 // and signal apply unless init overrides them; a URL object stands for its href.
+// From compatibility date 2026-10-23 it is Fetch's own first step, `new Request(input,
+// init)`, as in workerd: the input Request's body is used up (a second fetch of it
+// throws), a Request given as init brings its body, GET and HEAD refuse a body, and the
+// method and redirect mode are checked. Before it, the parts are read off the input.
 function __sbFetchParts(input, init) {
+  if (globalThis.__sbCompat >= "2026-10-23") {
+    const request = new Request(input, init);
+    const headers = [];
+    request.headers.forEach((v, k) => headers.push([k, v]));
+    const body = request._bodyStream != null ? request._bodyStream : request._bodyInit;
+    // A stream the runtime made over a value is sent as that value, unread: it is used
+    // all the same, so a Request that gave it (as input or as init) reads as used.
+    if (body instanceof ReadableStream && body._sbBody !== undefined) body._disturbed = true;
+    return {
+      url: request.url,
+      method: request.method,
+      headers,
+      body: body === undefined ? null : body,
+      latin1: request._bodyLatin1 === true,
+      redirect: request.redirect,
+      signal: request._signal || null,
+    };
+  }
   const req = input != null && !__sbIsStr(input) && input.url != null ? input : null;
   const url = req ? String(req.url) : input != null && input.href != null ? String(input.href) : String(input);
   const opts = init || {};
@@ -5449,8 +5482,17 @@ function __sbFetchParts(input, init) {
   const body = opts.body !== undefined && !(opts instanceof Request) ? opts.body : req && __sbRawBody(req) !== "" ? __sbRawBody(req) : null;
   const method = opts.method || (req && req.method) || "GET";
   const redirect = opts.redirect || (req && req.redirect) || "follow";
-  const signal = opts.signal || (req && req.signal) || null;
-  return { url, method, headers, body, redirect, signal };
+  const signal = opts.signal || (req && req._signal) || null;
+  // An incoming request's body is its raw bytes, one character each: sent as bytes.
+  const latin1 = body != null && opts.body === undefined && req !== null && req._bodyLatin1 === true;
+  return { url, method, headers, body, latin1, redirect, signal };
+}
+
+// The wire fields of a fetch body (see __sbRequestBody). Raw ingress bytes go as bytes,
+// not as text encoded again.
+function __sbPartsBody(parts) {
+  if (parts.latin1 === true && __sbIsStr(parts.body)) return { body: parts.body, bodyBinary: true };
+  return __sbRequestBody(parts.body);
 }
 
 // An upstream reply (fetch or service.fetch) -> a Response. Headers are appended,
@@ -5469,7 +5511,7 @@ function __sbUpstreamResponse(r) {
   if (r.body != null) respHeaders.set("x-sb-raw-body", "1");
   const response = __sbRawBodyResponse(r.body, { status: r.status || 502, headers: respHeaders });
   if (!typed) response.headers.delete("content-type");
-  return response;
+  return __sbFreezeHeaders(response);
 }
 
 // A streamed upstream response (from compatibility date 2026-10-22, with the other
@@ -5520,7 +5562,7 @@ function __sbUpstreamStreamed(op, msg, label, signal) {
             __sbCancelAsync(id);
           },
         });
-        resolve(new Response(body, { status: reply.status || 502, headers }));
+        resolve(__sbFreezeHeaders(new Response(body, { status: reply.status || 502, headers })));
         return;
       }
       const frame = JSON.parse(raw);
@@ -5645,9 +5687,23 @@ function __sbUpstream(op, msg, label, signal, always) {
 // prelude must not replace fetch just by being evaluated.
 globalThis.__sbInstallFetch = function () {
   globalThis.fetch = function (input, init) {
-    const parts = __sbFetchParts(input, init);
-    const msg = { url: parts.url, method: parts.method, headers: parts.headers, ...__sbRequestBody(parts.body) };
-    return __sbFetchFollowing("fetch", msg, "sproutboat fetch", parts.redirect, parts.signal);
+    let parts;
+    try {
+      parts = __sbFetchParts(input, init);
+    } catch (error) {
+      // From 2026-10-23 an invalid request rejects, as in workerd; before it, it threw.
+      if (globalThis.__sbCompat >= "2026-10-23") return Promise.reject(error);
+      throw error;
+    }
+    const send = (body) => {
+      const msg = { url: parts.url, method: parts.method, headers: parts.headers, ...body };
+      return __sbFetchFollowing("fetch", msg, "sproutboat fetch", parts.redirect, parts.signal);
+    };
+    // A stream body is read to the end first, as for a service binding: the wire carries a
+    // whole body. It was sent as the text "[object ReadableStream]".
+    const stream = __sbUnwrapBody(parts.body);
+    if (stream instanceof ReadableStream) return __sbCollectBody(stream).then((bytes) => send(__sbRequestBody(bytes)));
+    return send(__sbPartsBody(parts));
   };
 };
 
@@ -5691,7 +5747,11 @@ function __sbMakeDONamespace(binding, className) {
       return {
         fetch(input, init) {
           let req;
-          if (__sbIsObj(input) && __sbIsStr(input.url) && !init) {
+          // From 2026-10-23 the object gets the Request Fetch makes of input and init, as in
+          // workerd: method, headers and body survive, and the input's body is used up.
+          if (globalThis.__sbCompat >= "2026-10-23") {
+            req = new Request(input, init);
+          } else if (__sbIsObj(input) && __sbIsStr(input.url) && !init) {
             req = input;
           } else {
             const url = __sbIsStr(input) ? input : String((input && input.url) || "https://do/");
@@ -6101,6 +6161,8 @@ function __sbStreamingSupported() {
 function __sbStreamResponse(response) {
   const stream = __sbRawBody(response);
   const id = __sbStreamOp("o", "0", "");
+  // A fetched response returned as it is has immutable headers; this mark is ours.
+  response.headers._immutable = false;
   response.headers.set("x-sb-stream", id);
   response.body = "";
   (async () => {
@@ -6227,6 +6289,12 @@ async function __sbQueueWithDrain(result, tasks) {
 function __sbDecodeIngress(request) {
   const raw = __sbRawBody(request);
   if (raw == null) return;
+  // A GET or HEAD has no body, as in workerd (from 2026-10-23): request.body is null, and
+  // new Request(request) copies none. Before it, the body is the empty string.
+  if (raw === "" && (request.method === "GET" || request.method === "HEAD") && globalThis.__sbCompat >= "2026-10-23") {
+    request.body = null;
+    return;
+  }
   // Raw bytes, one character each: arrayBuffer(), blob() and body read them as bytes.
   request._bodyLatin1 = true;
   let decoded = null;
@@ -6258,6 +6326,8 @@ globalThis.__sbEntry = function (handlers, request) {
     const __tlsCipher = __sbTrustedProxyHeader(request, "x-sb-tls-cipher");
     if (__tlsCipher) __cf.tlsCipher = __tlsCipher;
     request.cf = __cf;
+    // The edge's headers are gone: from 2026-10-23 the handler cannot change the rest.
+    __sbFreezeHeaders(request);
     // #28 — per-invocation CPU time. One fetch turn per process (serial), so the
     // process CPU delta across the handler is this invocation's CPU.
     // ponytail: serial-turn assumption; revisit if the profile ever allows

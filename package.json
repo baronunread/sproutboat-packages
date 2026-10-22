@@ -44,6 +44,7 @@
     "test:native-bodies": "bun packages/runtime/test/native-bodies.ts",
     "test:native-streaming": "bun packages/runtime/test/native-streaming.ts",
     "test:native-service-bindings": "bun packages/runtime/test/native-service-bindings.ts",
+    "test:native-fetch-request": "bun packages/runtime/test/native-fetch-request.ts",
     "test:native-ltx": "bun packages/runtime/test/native-ltx.ts"
   },
   "devDependencies": {
