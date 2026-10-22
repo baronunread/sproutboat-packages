@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { closeSync, openSync, readSync, writeSync } from "node:fs";
+import { closeSync, openSync, readFileSync, readdirSync, readSync, writeSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -31,16 +31,20 @@ static void br_sha256_out(const br_sha256_context* c, void* o) { (void)c; (void)
 #include <unistd.h>
 #include <fcntl.h>
 #include <time.h>
+#include <sys/stat.h>
 typedef struct { double val; int type; } jsval;
 typedef uint32_t u32;
 static uint32_t porf_native_fetch_alloc_bytestring(const char* d, size_t n) { (void)d; (void)n; return 0; }
 #include "block.c"
 const char* sb_standalone_app_name(void) { return "test"; }
-// One call per line: PATH \\t SQL \\t PARAMS_JSON; one reply line each.
+// One call per line: PATH \\t SQL \\t PARAMS_JSON; one reply line each. ":break PATH" makes
+// PATH's next LTX capture fail (native-ltx.ts's :break-position).
 int main(void) {
+  sb_ltx_compat = 1;  // __sbLtxConfigure at compatibility date 2026-10-22 or later
   char* line = 0; size_t cap = 0;
   while (getline(&line, &cap, stdin) > 0) {
     line[strcspn(line, "\\n")] = 0;
+    if (!strncmp(line, ":break ", 7)) { line[strcspn(line, "\\t")] = 0; char p[1024]; snprintf(p, sizeof(p), "%s.ltx/position.tmp", line + 7); mkdir(p, 0700); puts("{}"); fflush(stdout); continue; }
     char* sql = strchr(line, '\\t'); if (!sql) return 2; *sql++ = 0;
     char* params = strchr(sql, '\\t'); if (!params) return 2; *params++ = 0;
     char* out = sb_sql_run(line, sql, params); puts(out); fflush(stdout); free(out);
@@ -136,7 +140,9 @@ int main(void) {
   const fifoIn = join(work, "in"),
     fifoOut = join(work, "out");
   assert.equal(Bun.spawnSync(["mkfifo", fifoIn, fifoOut]).exitCode, 0);
-  const driver = Bun.spawn(["sh", "-c", `exec "${binary}" < "${fifoIn}" > "${fifoOut}"`]);
+  const driver = Bun.spawn(["sh", "-c", `exec "${binary}" < "${fifoIn}" > "${fifoOut}"`], {
+    env: { ...process.env, SB_LTX_ENABLE: "1", SB_LTX_DATABASE: "LTX" },
+  });
   const toDriver = openSync(fifoIn, "w"),
     fromDriver = openSync(fifoOut, "r");
   let pending = "";
@@ -220,6 +226,51 @@ int main(void) {
   assert.throws(
     () => ops.__sbD1Run(db2, "SELECT ?1", [], true),
     (e: Error) => e.message === "D1_ERROR: Wrong number of parameter bindings for SQL query.",
+  );
+  // LTX capture on (SB_LTX_ENABLE, database LTX): a batch is one commit, and a capture
+  // that fails at RELEASE (after SQLite committed) surfaces as itself: SQLITE_IOERR with a
+  // message that says so, never "no such savepoint" from the cleanup, and the database then
+  // refuses writes until restart.
+  const ltx = join(work, "data/d1/LTX.sqlite");
+  const generation = () => join(ltx + ".ltx", readFileSync(ltx + ".ltx/position", "utf8").split("\n")[1]);
+  const ltxFiles = () => readdirSync(generation()).filter((n) => n.endsWith(".ltx")).length;
+  ops.__sbD1Open(ltx, true);
+  ops.__sbD1Run(ltx, "CREATE TABLE e (id INTEGER PRIMARY KEY, v TEXT)", [], true);
+  const beforeBatch = ltxFiles();
+  ops.__sbD1Batch(
+    ltx,
+    [
+      { sql: "INSERT INTO e VALUES (1, 'a')", params: [] },
+      { sql: "INSERT INTO e VALUES (2, 'b')", params: [] },
+    ],
+    true,
+  );
+  assert.equal(ltxFiles(), beforeBatch + 1, "a batch is one LTX commit");
+  // Break capture just before the batch's RELEASE.
+  // oxlint-disable-next-line no-function-constructor -- lifting a block out of the text-only transport
+  const breaking = new Function(
+    "__sbSqlRaw",
+    "__sbSql",
+    `${transport.slice(opsStart, opsEnd)}\nreturn { __sbD1Run, __sbD1Batch };`,
+  )((path: string, text: string, params: string) => {
+    if (text === "RELEASE sb_d1_batch") sqlRaw(":break " + path, "", "");
+    return sqlRaw(path, text, params);
+  }, sql);
+  const LTX_FAILED =
+    "D1_ERROR: LTX capture failed: the transaction may be committed locally but is not durable in the replication log; writes are refused until restart: SQLITE_IOERR";
+  assert.throws(
+    () => breaking.__sbD1Batch(ltx, [{ sql: "INSERT INTO e VALUES (3, 'c')", params: [] }], true),
+    (e: Error) => e.message === LTX_FAILED,
+  );
+  assert.throws(
+    () => ops.__sbD1Run(ltx, "INSERT INTO e VALUES (4, 'd')", [], true),
+    (e: Error) => e.message === LTX_FAILED,
+    "writes refused after a capture failure",
+  );
+  assert.throws(
+    () => ops.__sbD1Run(ltx, "SELECT 1", [], false),
+    /^Error: sqlite: LTX capture failed/,
+    "old dates see the same failure",
   );
   closeSync(toDriver);
   closeSync(fromDriver);

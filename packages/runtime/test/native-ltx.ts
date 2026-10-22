@@ -285,7 +285,17 @@ try {
       rolledBack.every((n) => n.startsWith("0 ")),
       rolledBack.join("\n"),
     );
-    assert((await ltxFiles()).length <= after.length + 1, "a rolled-back batch writes at most one LTX file");
+    const afterRollback = await ltxFiles();
+    assert(afterRollback.length <= after.length + 1, "a rolled-back batch writes at most one LTX file");
+    // If it writes one, it holds page 1 only (SQLite bumps the header of the page it had
+    // dirtied: the file change counter and version-valid-for number, bytes 24-27 and 92-95,
+    // so the pre- and post-apply checksums differ); the rows are checked below.
+    for (const name of afterRollback.filter((n) => !after.includes(n))) {
+      const b = new Uint8Array(await readFile(join(batchRoot, batchEpoch, name)));
+      const v = new DataView(b.buffer, b.byteOffset, b.byteLength);
+      assert.equal(v.getUint32(100), 1, "first page of the rolled-back batch's LTX file");
+      assert.equal(v.getUint32(106 + 4 + v.getUint32(106)), 0, "the rolled-back batch's LTX file holds one page");
+    }
     const batchRestore = join(work, "batch-restored.sqlite");
     await restore(join(batchRoot, batchEpoch), batchRestore);
     assert.deepEqual(await readFile(batchRestore), await readFile(batchPath));
