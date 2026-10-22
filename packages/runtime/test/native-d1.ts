@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { Database } from "bun:sqlite";
+import { restore } from "./ltx-restore";
 import { closeSync, openSync, readFileSync, readdirSync, readSync, writeSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -47,7 +49,7 @@ int main(void) {
     if (!strncmp(line, ":break ", 7)) { line[strcspn(line, "\\t")] = 0; char p[1024]; snprintf(p, sizeof(p), "%s.ltx/position.tmp", line + 7); mkdir(p, 0700); puts("{}"); fflush(stdout); continue; }
     char* sql = strchr(line, '\\t'); if (!sql) return 2; *sql++ = 0;
     char* params = strchr(sql, '\\t'); if (!params) return 2; *params++ = 0;
-    if (!strncmp(line, ":db ", 4)) { int r = sql[0] == 'p' ? sb_db_page_size(line + 4) : sb_db_quota_freeze(line + 4, sql[0] == 'f'); printf("{\\"n\\":%d}\\n", r); fflush(stdout); continue; }
+    if (!strncmp(line, ":db ", 4)) { int r = sql[0] == 'p' ? sb_db_page_size(line + 4) : sb_db_quota_freeze(line + 4, sql[0] == 'c' ? -1 : sql[0] == 'f'); printf("{\\"n\\":%d}\\n", r); fflush(stdout); continue; }
     if (!strncmp(line, ":bytes ", 7)) { line[strcspn(line, "\\t")] = 0; printf("{\\"n\\":%lld}\\n", sb_dir_bytes(line + 7, 0)); fflush(stdout); continue; }
     // ":script PATH" runs SQL as a script (sb_sql_script, what exec() uses).
     char* out = !strncmp(line, ":script ", 8) ? sb_sql_script(line + 8, sql) : sb_sql_run(line, sql, params); puts(out); fflush(stdout); free(out);
@@ -196,6 +198,52 @@ int main(void) {
       sqlRaw,
     );
   const dirBytes = (d: string) => Number(JSON.parse(sqlRaw(":bytes " + d, "", "")).n);
+  // Another driver process (a restarted worker), with its own FIFOs and lifted blocks.
+  const connect = (tag: string) => {
+    const inPath = join(work, "in-" + tag),
+      outPath = join(work, "out-" + tag);
+    assert.equal(Bun.spawnSync(["mkfifo", inPath, outPath]).exitCode, 0);
+    const child = Bun.spawn(["sh", "-c", `exec "${binary}" < "${inPath}" > "${outPath}"`], {
+      env: { ...process.env, SB_LTX_ENABLE: "1", SB_LTX_DATABASE: "LTX" },
+    });
+    const to = openSync(inPath, "w"),
+      from = openSync(outPath, "r");
+    let buffered = "";
+    const raw = (path: string, text: string, params: string) => {
+      writeSync(to, `${path}\t${text}\t${params}\n`);
+      const chunk = Buffer.alloc(65536);
+      while (!buffered.includes("\n")) {
+        const n = readSync(from, chunk, 0, chunk.length, null);
+        if (n <= 0) throw new Error("driver exited");
+        buffered += chunk.toString("utf8", 0, n);
+      }
+      const line = buffered.slice(0, buffered.indexOf("\n"));
+      buffered = buffered.slice(line.length + 1);
+      return line;
+    };
+    const run = (path: string, text: string, params: unknown[]) => {
+      const r = JSON.parse(raw(path, text, JSON.stringify(params)));
+      if (r.ok === false) throw new Error("sqlite: " + r.error);
+      return r;
+    };
+    // oxlint-disable-next-line no-function-constructor -- lifting a block out of the text-only transport
+    const lifted = new Function("__sbSqlRaw", "__sbSql", "__sbSqlScriptRaw", `${transport.slice(opsStart, opsEnd)}\nreturn { __sbD1Run, __sbD1Batch, __sbD1Open, __sbD1ExecLines };`)(
+      raw,
+      run,
+      (path: string, text: string) => raw(":script " + path, text, "[]"),
+    );
+    const lift = (dir: string, limit: number) =>
+      // oxlint-disable-next-line no-function-constructor -- lifting a block out of the text-only transport
+      new Function("__sbEnv", "__sbDir", "__sbDirBytesRaw", "__sbD1DbRaw", "__sbSql", "__sbSqlRaw", `${transport.slice(quotaStart, quotaEnd)}\nreturn { __sbQuotaCheck, __sbD1Quota, __sbQuotaFull };`)(
+        (name: string) => (name === "SB_STORAGE_MAX_BYTES" ? String(limit) : ""),
+        () => dir,
+        (d: string) => String(JSON.parse(raw(":bytes " + d, "", "")).n),
+        (path: string, what: string) => String(JSON.parse(raw(":db " + path, what, "")).n),
+        run,
+        raw,
+      );
+    return { sqlRaw: raw, ops: lifted, liftQuota: lift, exited: child.exited, close: () => (closeSync(to), closeSync(from)) };
+  };
   // exec() from 2026-10-24: line by line, all or nothing, the failing line named.
   const ex = join(work, "data/d1/EXEC.sqlite");
   ops.__sbD1ExecLines(ex, ["CREATE TABLE x (id INTEGER)", "INSERT INTO x VALUES (1); INSERT INTO x VALUES (2);"]);
@@ -372,6 +420,49 @@ int main(void) {
   closeSync(toDriver);
   closeSync(fromDriver);
   await driver.exited;
+
+  // A restart that finds the app over its quota, capture on: the first D1 call of the new
+  // worker (process) already freezes. Reads work, writes are refused, the spool and its
+  // position stay exactly as they were, and the chain restores the database byte for byte.
+  // A capture failure still reads as one, over the quota too.
+  await rm(ltx + ".ltx/position.tmp", { recursive: true, force: true });
+  const second = connect("restart");
+  const quota2 = second.liftQuota(data, 1);
+  quota2.__sbD1Quota(ltx);
+  const spoolBefore = readdirSync(generation()).sort();
+  const positionBefore = readFileSync(ltx + ".ltx/position", "utf8");
+  const count = second.ops.__sbD1Run(ltx, "SELECT count(*) FROM e", [], true).rows[0][0];
+  for (const write of ["INSERT INTO e VALUES (20, 'x')", "UPDATE e SET v = v", "DELETE FROM e"])
+    assert.throws(() => second.ops.__sbD1Run(ltx, write, [], true), (e: Error) => e.message === QUOTA, "restart, over the quota: " + write);
+  assert.deepEqual(readdirSync(generation()).sort(), spoolBefore, "no LTX file after a clean resume over the quota");
+  assert.equal(readFileSync(ltx + ".ltx/position", "utf8"), positionBefore, "the position is unchanged");
+  second.close();
+  await second.exited;
+  {
+    const live = new Database(ltx);
+    live.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    assert.equal(live.query("SELECT count(*) AS n FROM e").get()?.n, count);
+    live.close();
+    const restored = join(work, "restart-restored.sqlite");
+    await restore(generation(), restored);
+    assert.deepEqual(await readFile(restored), await readFile(ltx), "the retained chain restores the database byte for byte");
+  }
+  const third = connect("failure");
+  third.liftQuota(data, dirBytes(data) + (1 << 20)).__sbD1Quota(ltx);
+  const breaking3 = (path: string, text: string, params: string) => {
+    if (text.startsWith("INSERT INTO e VALUES (30")) third.sqlRaw(":break " + path, "", "");
+    return third.sqlRaw(path, text, params);
+  };
+  const brokenWrite = JSON.parse(breaking3(ltx, "INSERT INTO e VALUES (30, 'x')", "[]"));
+  assert.equal(brokenWrite.code, 10, "a capture failure reports SQLITE_IOERR");
+  const failed3 = JSON.parse(third.sqlRaw(ltx, "INSERT INTO e VALUES (31, 'y')", "[]"));
+  assert.equal(failed3.code, 10, "after a capture failure, writes report it");
+  third.liftQuota(data, 1).__sbD1Quota(ltx);
+  const failedOver = JSON.parse(third.sqlRaw(ltx, "INSERT INTO e VALUES (32, 'z')", "[]"));
+  assert.equal(failedOver.code, 10, "over the quota too, the capture failure is what a write reports");
+  assert.match(failedOver.error, /^LTX capture failed/);
+  third.close();
+  await third.exited;
   console.log(
     "native d1: sb_sql_run and the D1 ops pass (blob binds, atomic batch, strict counts, foreign keys, error text)",
   );
