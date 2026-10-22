@@ -4824,12 +4824,13 @@ function __sbKvKey(key, verb) {
   return name;
 }
 function __sbKvType(typeOrOptions) {
-  const type = typeOrOptions == null ? "text" : __sbIsStr(typeOrOptions) ? typeOrOptions : typeOrOptions.type || "text";
+  return typeOrOptions == null ? "text" : __sbIsStr(typeOrOptions) ? typeOrOptions : typeOrOptions.type || "text";
+}
+// An unknown type fails only when there is a value to decode: a missing key is null
+// whatever the type, as in workerd.
+function __sbKvDecode(r, type) {
   if (type !== "text" && type !== "json" && type !== "arrayBuffer" && type !== "stream")
     throw new TypeError('Unknown response type. Possible types are "text", "arrayBuffer", "json", and "stream".');
-  return type;
-}
-function __sbKvDecode(r, type) {
   if (type === "arrayBuffer") return __sbBufFrom(r.binary ? r.value : __sbToBytes(r.value));
   if (type === "stream") return new Response(__sbBufFrom(r.binary ? r.value : __sbToBytes(r.value))).body;
   const text = r.binary ? __sbFromUtf8(r.value) : r.value;

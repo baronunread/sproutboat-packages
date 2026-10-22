@@ -98,6 +98,9 @@ test("from 2026-10-25: KV's errors for keys, values, expiration and metadata", a
     "Error: KV PUT failed: 400 Invalid expiration of 1000. Please specify integer greater than the current number of seconds since the UNIX epoch.",
   );
   expect(await failure(() => KV.put("a", "v", { metadata: { big: "x".repeat(1100) } }))).toBe("Error: KV PUT failed: 413 Metadata length of 1110 exceeds limit of 1024.");
+  expect(await KV.get("missing", "nope")).toBeNull();
+  await KV.put("there", "v");
+  expect(await failure(() => KV.get("there", "nope"))).toBe('TypeError: Unknown response type. Possible types are "text", "arrayBuffer", "json", and "stream".');
   expect(await failure(() => KV.list({ limit: 1001 }))).toBe("Error: KV GET failed: 400 Invalid key_count_limit of 1001. Please specify an integer less than 1000.");
   // A failing get rejects rather than throws.
   const rejected = KV.get("");
