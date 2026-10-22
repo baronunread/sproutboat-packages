@@ -1,19 +1,15 @@
 {
   "name": "@sproutboat/wire",
-  "version": "0.14.1",
+  "version": "0.14.2",
   "license": "MIT",
-  "type": "module",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/baronunread/sproutboat-packages.git",
     "directory": "packages/wire"
   },
+  "type": "module",
   "main": "./src/index.ts",
   "types": "./src/index.ts",
-  "dependencies": {
-    "@sproutboat/assets": "^0.3.0",
-    "@sproutboat/runtime": "^0.21.0"
-  },
   "exports": {
     ".": "./src/index.ts",
     "./broker": "./src/broker.ts",
@@ -24,5 +20,9 @@
   "scripts": {
     "test": "bun test ./",
     "build:sql-budget": "bun src/build-d1-budget.ts"
+  },
+  "dependencies": {
+    "@sproutboat/assets": "^0.3.0",
+    "@sproutboat/runtime": "^0.22.0"
   }
 }

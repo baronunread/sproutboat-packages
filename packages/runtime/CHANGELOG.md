@@ -1,5 +1,17 @@
 # @sproutboat/runtime
 
+## 0.22.0
+
+### Minor Changes
+
+- 3f95234: Add experimental bounded local LTX replication to the embedded SQLite transport.
+  Opt in with compatibility date 2026-10-22 and SB_LTX_ENABLE=1. A single writer
+  owns the database, commits are captured durably before checkpoint, and the WAL
+  has an enforced byte ceiling. Default behavior and the broker are unchanged.
+  Verified clean-checkpoint restarts reuse their generation without rewriting a base.
+  
+  Developed with AI assistance from OpenAI Codex (GPT-6.1).
+
 ## 0.21.1
 
 ### Patch Changes
