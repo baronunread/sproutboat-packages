@@ -1,5 +1,25 @@
 # @sproutboat/runtime
 
+## 0.25.0
+
+### Minor Changes
+
+- ef40955: The storage quota is a hard bound when LTX capture is on. A D1 database under capture can't be capped by pinning its page count: a same-size `UPDATE`, or a `DELETE`, still adds a file to the replication spool, and the spool counts toward the app's quota. So while the app is over its quota, every write to a captured database is refused with `D1_ERROR: storage quota exceeded: writes are refused while this app's data, including its replication log, is over its quota: SQLITE_FULL`. That covers `exec()` and `batch()` too.
+  
+  - Reads, read-only batches and transaction control still run.
+  - No LTX file is ever dropped to make room: the policy fails closed.
+  - Writes resume once the app is under its quota again, at the next rescan: for example after the operator raises the quota, or the app deletes R2 or KV data. The freeze holds across a restart.
+  
+  This freezes statements after the quota scan; it is not a hard filesystem cap. The write that crosses the quota is accepted.
+  
+  Databases without capture are unchanged: they are pinned at their size, so deletes still work.
+- 95f6bd7: A storage quota for standalone sprouts and sproutd. An app's data directory (KV, D1, R2, Durable Object storage, queues) holds at most `SB_STORAGE_MAX_BYTES` bytes; sproutd sets it per app, and it defaults to 10 GiB. Each D1 database is also capped at 10 GB, as in D1. Past the quota:
+  
+  - writes fail with an error that says so, such as `KV put() failed: storage quota exceeded (this app stores N bytes; the limit is M)`, or `D1_ERROR: database or disk is full: SQLITE_FULL` for D1;
+  - reads and deletes keep working, so an app can make room (for D1, `DELETE` and then `VACUUM`).
+  
+  This is a check after a scan, not a hard filesystem cap with zero overshoot. The size is measured at most once a second, by walking the directory, and a write is checked against the last measurement. The write that crosses the limit is accepted (an R2 object, say), and so is anything else written within that second. Writes after it are refused.
+
 ## 0.24.0
 
 ### Minor Changes
