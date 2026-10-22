@@ -77,6 +77,1040 @@ static sqlite3* sb_dbs[SB_MAX_DB];
 static char sb_db_names[SB_MAX_DB][256];
 static int sb_db_count = 0;
 
+// BEGIN LTX NATIVE: also compiled directly by the replication regression.
+#include <dirent.h>
+#include <errno.h>
+#include <limits.h>
+#include <sys/file.h>
+
+// Public SQLite VFS ABI, from sqlite3.h (public domain). Keeping declarations
+// here preserves standalone builds without an installed SQLite development SDK.
+#ifndef SQLITE3_H
+#ifndef _SQLITE3_H_
+typedef long long sqlite3_int64;
+typedef struct sqlite3_file sqlite3_file;
+typedef struct sqlite3_io_methods sqlite3_io_methods;
+typedef struct sqlite3_vfs sqlite3_vfs;
+struct sqlite3_file {
+  const sqlite3_io_methods *pMethods;
+};
+struct sqlite3_io_methods {
+  int iVersion;
+  int (*xClose)(sqlite3_file *);
+  int (*xRead)(sqlite3_file *, void *, int, sqlite3_int64);
+  int (*xWrite)(sqlite3_file *, const void *, int, sqlite3_int64);
+  int (*xTruncate)(sqlite3_file *, sqlite3_int64);
+  int (*xSync)(sqlite3_file *, int);
+  int (*xFileSize)(sqlite3_file *, sqlite3_int64 *);
+  int (*xLock)(sqlite3_file *, int);
+  int (*xUnlock)(sqlite3_file *, int);
+  int (*xCheckReservedLock)(sqlite3_file *, int *);
+  int (*xFileControl)(sqlite3_file *, int, void *);
+  int (*xSectorSize)(sqlite3_file *);
+  int (*xDeviceCharacteristics)(sqlite3_file *);
+  int (*xShmMap)(sqlite3_file *, int, int, int, void volatile **);
+  int (*xShmLock)(sqlite3_file *, int, int, int);
+  void (*xShmBarrier)(sqlite3_file *);
+  int (*xShmUnmap)(sqlite3_file *, int);
+  int (*xFetch)(sqlite3_file *, sqlite3_int64, int, void **);
+  int (*xUnfetch)(sqlite3_file *, sqlite3_int64, void *);
+};
+struct sqlite3_vfs {
+  int iVersion, szOsFile, mxPathname;
+  sqlite3_vfs *pNext;
+  const char *zName;
+  void *pAppData;
+  int (*xOpen)(sqlite3_vfs *, const char *, sqlite3_file *, int, int *);
+  int (*xDelete)(sqlite3_vfs *, const char *, int);
+  int (*xAccess)(sqlite3_vfs *, const char *, int, int *);
+  int (*xFullPathname)(sqlite3_vfs *, const char *, int, char *);
+  void *(*xDlOpen)(sqlite3_vfs *, const char *);
+  void (*xDlError)(sqlite3_vfs *, int, char *);
+  void (*(*xDlSym)(sqlite3_vfs *, void *, const char *))(void);
+  void (*xDlClose)(sqlite3_vfs *, void *);
+  int (*xRandomness)(sqlite3_vfs *, int, char *);
+  int (*xSleep)(sqlite3_vfs *, int);
+  int (*xCurrentTime)(sqlite3_vfs *, double *);
+  int (*xGetLastError)(sqlite3_vfs *, int, char *);
+  int (*xCurrentTimeInt64)(sqlite3_vfs *, sqlite3_int64 *);
+  int (*xSetSystemCall)(sqlite3_vfs *, const char *, void (*)(void));
+  void (*(*xGetSystemCall)(sqlite3_vfs *, const char *))(void);
+  const char *(*xNextSystemCall)(sqlite3_vfs *, const char *);
+};
+#endif
+#endif
+extern sqlite3_vfs *sqlite3_vfs_find(const char *);
+extern int sqlite3_vfs_register(sqlite3_vfs *, int);
+extern int sqlite3_open_v2(const char *, sqlite3 **, int, const char *);
+extern void *sqlite3_wal_hook(sqlite3 *, int (*)(void *, sqlite3 *, const char *, int), void *);
+extern int sqlite3_wal_checkpoint_v2(sqlite3 *, const char *, int, int *, int *);
+extern int sqlite3_set_authorizer(sqlite3 *,
+                                  int (*)(void *, int, const char *, const char *, const char *,
+                                          const char *),
+                                  void *);
+
+#define SB_LTX_FLAG UINT64_C(0x8000000000000000)
+#define SB_LTX_PATH 1024
+static int sb_ltx_compat = 0;
+static uint64_t sb_ltx_max_bytes = 16777216;
+static sqlite3_vfs sb_ltx_vfs, *sb_ltx_parent;
+typedef struct {
+  sqlite3_file base;
+  sqlite3_file *real;
+  int wal;
+} sb_ltx_file;
+static sqlite3_file *sb_ltx_real(sqlite3_file *f) { return ((sb_ltx_file *)f)->real; }
+static int sb_ltx_vclose(sqlite3_file *f) {
+  sqlite3_file *r = sb_ltx_real(f);
+  return r->pMethods->xClose(r);
+}
+static int sb_ltx_vread(sqlite3_file *f, void *b, int n, sqlite3_int64 o) {
+  sqlite3_file *r = sb_ltx_real(f);
+  return r->pMethods->xRead(r, b, n, o);
+}
+static int sb_ltx_vwrite(sqlite3_file *f, const void *b, int n, sqlite3_int64 o) {
+  if (((sb_ltx_file *)f)->wal && (o < 0 || n < 0 || (uint64_t)o > sb_ltx_max_bytes ||
+                                  (uint64_t)n > sb_ltx_max_bytes - (uint64_t)o))
+    return 13; // SQLITE_FULL, before writing.
+  sqlite3_file *r = sb_ltx_real(f);
+  return r->pMethods->xWrite(r, b, n, o);
+}
+static int sb_ltx_vtruncate(sqlite3_file *f, sqlite3_int64 n) {
+  sqlite3_file *r = sb_ltx_real(f);
+  if (((sb_ltx_file *)f)->wal && (uint64_t)n > sb_ltx_max_bytes)
+    return 13;
+  return r->pMethods->xTruncate(r, n);
+}
+static int sb_ltx_vsync(sqlite3_file *f, int n) {
+  sqlite3_file *r = sb_ltx_real(f);
+  return r->pMethods->xSync(r, n);
+}
+static int sb_ltx_vsize(sqlite3_file *f, sqlite3_int64 *n) {
+  sqlite3_file *r = sb_ltx_real(f);
+  return r->pMethods->xFileSize(r, n);
+}
+static int sb_ltx_vlock(sqlite3_file *f, int n) {
+  sqlite3_file *r = sb_ltx_real(f);
+  return r->pMethods->xLock(r, n);
+}
+static int sb_ltx_vunlock(sqlite3_file *f, int n) {
+  sqlite3_file *r = sb_ltx_real(f);
+  return r->pMethods->xUnlock(r, n);
+}
+static int sb_ltx_vreserved(sqlite3_file *f, int *n) {
+  sqlite3_file *r = sb_ltx_real(f);
+  return r->pMethods->xCheckReservedLock(r, n);
+}
+static int sb_ltx_vcontrol(sqlite3_file *f, int n, void *p) {
+  sqlite3_file *r = sb_ltx_real(f);
+  if (((sb_ltx_file *)f)->wal) {
+    // SIZE_HINT can preallocate inside the parent VFS, bypassing xWrite and
+    // xTruncate. Ignore hints beyond the ceiling and disable chunk rounding.
+    if (n == 5 && (*(sqlite3_int64 *)p < 0 || (uint64_t)*(sqlite3_int64 *)p > sb_ltx_max_bytes))
+      return 0;
+    if (n == 6) {
+      int zero = 0;
+      return r->pMethods->xFileControl(r, n, &zero);
+    }
+  }
+  return r->pMethods->xFileControl(r, n, p);
+}
+static int sb_ltx_vsector(sqlite3_file *f) {
+  sqlite3_file *r = sb_ltx_real(f);
+  return r->pMethods->xSectorSize(r);
+}
+static int sb_ltx_vdevice(sqlite3_file *f) {
+  sqlite3_file *r = sb_ltx_real(f);
+  return r->pMethods->xDeviceCharacteristics(r);
+}
+static int sb_ltx_vmap(sqlite3_file *f, int p, int n, int w, void volatile **o) {
+  sqlite3_file *r = sb_ltx_real(f);
+  return r->pMethods->xShmMap(r, p, n, w, o);
+}
+static int sb_ltx_vshmlock(sqlite3_file *f, int o, int n, int v) {
+  sqlite3_file *r = sb_ltx_real(f);
+  return r->pMethods->xShmLock(r, o, n, v);
+}
+static void sb_ltx_vbarrier(sqlite3_file *f) {
+  sqlite3_file *r = sb_ltx_real(f);
+  r->pMethods->xShmBarrier(r);
+}
+static int sb_ltx_vunmap(sqlite3_file *f, int n) {
+  sqlite3_file *r = sb_ltx_real(f);
+  return r->pMethods->xShmUnmap(r, n);
+}
+// No mmap: bounds and RSS apply to reads as well as writes.
+static int sb_ltx_vfetch(sqlite3_file *f, sqlite3_int64 o, int n, void **p) {
+  (void)f;
+  (void)o;
+  (void)n;
+  *p = 0;
+  return 0;
+}
+static int sb_ltx_vunfetch(sqlite3_file *f, sqlite3_int64 o, void *p) {
+  (void)f;
+  (void)o;
+  (void)p;
+  return 0;
+}
+static const sqlite3_io_methods sb_ltx_methods = {3,
+                                                  sb_ltx_vclose,
+                                                  sb_ltx_vread,
+                                                  sb_ltx_vwrite,
+                                                  sb_ltx_vtruncate,
+                                                  sb_ltx_vsync,
+                                                  sb_ltx_vsize,
+                                                  sb_ltx_vlock,
+                                                  sb_ltx_vunlock,
+                                                  sb_ltx_vreserved,
+                                                  sb_ltx_vcontrol,
+                                                  sb_ltx_vsector,
+                                                  sb_ltx_vdevice,
+                                                  sb_ltx_vmap,
+                                                  sb_ltx_vshmlock,
+                                                  sb_ltx_vbarrier,
+                                                  sb_ltx_vunmap,
+                                                  sb_ltx_vfetch,
+                                                  sb_ltx_vunfetch};
+static int sb_ltx_vopen(sqlite3_vfs *v, const char *name, sqlite3_file *f, int flags, int *out) {
+  (void)v;
+  sb_ltx_file *w = (sb_ltx_file *)f;
+  memset(w, 0, sizeof(*w));
+  w->real = (sqlite3_file *)((char *)f + sizeof(*w));
+  w->wal = (flags & 0x80000) != 0;
+  int rc = sb_ltx_parent->xOpen(sb_ltx_parent, name, w->real, flags, out);
+  if (!rc)
+    w->base.pMethods = &sb_ltx_methods;
+  return rc;
+}
+static int sb_ltx_register(void) {
+  if (sb_ltx_parent)
+    return 0;
+  const char *n = getenv("SB_LTX_MAX_WAL_BYTES");
+  if (n && *n) {
+    char *end = 0;
+    unsigned long long value = strtoull(n, &end, 10);
+    if (*end || value < 131072 || value > 1073741824)
+      return -1;
+    sb_ltx_max_bytes = value;
+  }
+  sb_ltx_parent = sqlite3_vfs_find(0);
+  if (!sb_ltx_parent)
+    return -1;
+  sb_ltx_vfs = *sb_ltx_parent;
+  sb_ltx_vfs.zName = "sb-ltx-bounded";
+  sb_ltx_vfs.pNext = 0;
+  sb_ltx_vfs.szOsFile += (int)sizeof(sb_ltx_file);
+  sb_ltx_vfs.xOpen = sb_ltx_vopen;
+  return sqlite3_vfs_register(&sb_ltx_vfs, 0);
+}
+
+typedef struct {
+  sqlite3 *db;
+  char path[SB_LTX_PATH], root[SB_LTX_PATH], epoch[64];
+  int lock, failed, read_fd, checkpointed;
+  uint32_t page_size, commit, salt1, salt2, wal_c1, wal_c2;
+  uint64_t txid, offset, checksum;
+} sb_ltx_state;
+static sb_ltx_state sb_ltx_states[SB_MAX_DB];
+static uint64_t sb_ltx_crc_table[256];
+static int sb_ltx_crc_ready;
+static uint32_t sb_ltx_be32(const unsigned char *p) {
+  return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+static void sb_ltx_put32(unsigned char *p, uint32_t v) {
+  for (int i = 3; i >= 0; i--) {
+    p[i] = (unsigned char)v;
+    v >>= 8;
+  }
+}
+static void sb_ltx_put64(unsigned char *p, uint64_t v) {
+  for (int i = 7; i >= 0; i--) {
+    p[i] = (unsigned char)v;
+    v >>= 8;
+  }
+}
+static uint64_t sb_ltx_crc(uint64_t crc, const void *buf, size_t n) {
+  if (!sb_ltx_crc_ready) {
+    for (int i = 0; i < 256; i++) {
+      uint64_t c = i;
+      for (int j = 0; j < 8; j++)
+        c = (c >> 1) ^ ((c & 1) ? UINT64_C(0xd800000000000000) : 0);
+      sb_ltx_crc_table[i] = c;
+    }
+    sb_ltx_crc_ready = 1;
+  }
+  const unsigned char *p = buf;
+  while (n--)
+    crc = sb_ltx_crc_table[(crc ^ *p++) & 255] ^ (crc >> 8);
+  return crc;
+}
+static uint64_t sb_ltx_page_crc(uint32_t pgno, const void *page, uint32_t size) {
+  unsigned char b[4];
+  sb_ltx_put32(b, pgno);
+  return SB_LTX_FLAG | ~sb_ltx_crc(sb_ltx_crc(UINT64_MAX, b, 4), page, size);
+}
+static int sb_ltx_read(int fd, void *buf, size_t n, uint64_t offset) {
+  size_t done = 0;
+  while (done < n) {
+    ssize_t r = pread(fd, (char *)buf + done, n - done, (off_t)(offset + done));
+    if (r < 0 && errno == EINTR)
+      continue;
+    if (r <= 0)
+      return -1;
+    done += (size_t)r;
+  }
+  return 0;
+}
+static int sb_ltx_sync_dir(const char *path) {
+  int fd = open(path, O_RDONLY | O_DIRECTORY);
+  if (fd < 0)
+    return -1;
+  int rc = fsync(fd);
+  if (close(fd) && !rc)
+    rc = -1;
+  return rc;
+}
+static int sb_ltx_flush(FILE *f) { return fflush(f) || fsync(fileno(f)) ? -1 : 0; }
+#ifdef SB_LTX_TESTING
+static int sb_ltx_test_armed, sb_ltx_test_commits;
+static void sb_ltx_phase(const char *phase) {
+  const char *p = getenv("SB_LTX_TEST_STOP");
+  if (sb_ltx_test_armed && p && strcmp(p, phase) == 0 &&
+      sb_ltx_test_commits ==
+          atoi(getenv("SB_LTX_TEST_COMMIT") ? getenv("SB_LTX_TEST_COMMIT") : "1"))
+    raise(SIGSTOP);
+}
+#else
+static void sb_ltx_phase(const char *phase) { (void)phase; }
+#endif
+
+typedef struct {
+  FILE *out, *index;
+  uint64_t hash, n, index_n;
+  uint32_t page_size;
+} sb_ltx_writer;
+static int sb_ltx_write(sb_ltx_writer *w, const void *buf, size_t n, int hash) {
+  if (fwrite(buf, 1, n, w->out) != n)
+    return -1;
+  if (hash)
+    w->hash = sb_ltx_crc(w->hash, buf, n);
+  w->n += n;
+  return 0;
+}
+static int sb_ltx_varint(FILE *f, uint64_t v, uint64_t *n) {
+  do {
+    unsigned char b = (unsigned char)(v & 127);
+    v >>= 7;
+    if (v)
+      b |= 128;
+    if (fwrite(&b, 1, 1, f) != 1)
+      return -1;
+    (*n)++;
+  } while (v);
+  return 0;
+}
+static int sb_ltx_begin(sb_ltx_writer *w, const char *path, sb_ltx_state *s, uint32_t commit,
+                        int snapshot, uint64_t wal_size) {
+  memset(w, 0, sizeof(*w));
+  w->hash = UINT64_MAX;
+  w->page_size = s->page_size;
+  w->out = fopen(path, "wbx");
+  w->index = tmpfile();
+  if (!w->out || !w->index)
+    return -1;
+  unsigned char h[100] = {0};
+  memcpy(h, "LTX1", 4);
+  sb_ltx_put32(h + 8, s->page_size);
+  sb_ltx_put32(h + 12, commit);
+  sb_ltx_put64(h + 16, snapshot ? 1 : s->txid + 1);
+  sb_ltx_put64(h + 24, snapshot ? 1 : s->txid + 1);
+  sb_ltx_put64(h + 32, (uint64_t)time(0) * 1000);
+  sb_ltx_put64(h + 40, snapshot ? 0 : s->checksum);
+  if (!snapshot) {
+    sb_ltx_put64(h + 48, s->offset ? s->offset : 32);
+    sb_ltx_put64(h + 56, wal_size);
+    sb_ltx_put32(h + 64, s->salt1);
+    sb_ltx_put32(h + 68, s->salt2);
+  }
+  return sb_ltx_write(w, h, sizeof(h), 1);
+}
+// Literal-only LZ4 blocks: bounded, interoperable, no compression library.
+// Compression can be added after crash qualification without changing the format.
+static int sb_ltx_page(sb_ltx_writer *w, uint32_t pgno, const unsigned char *page) {
+  uint64_t offset = w->n;
+  unsigned char hdr[10] = {0};
+  sb_ltx_put32(hdr, pgno);
+  hdr[5] = 1;
+  uint32_t extra = (w->page_size - 15) / 255 + 1, size = 1 + extra + w->page_size;
+  sb_ltx_put32(hdr + 6, size);
+  if (sb_ltx_write(w, hdr, 10, 1))
+    return -1;
+  unsigned char literal = 0xf0;
+  if (sb_ltx_write(w, &literal, 1, 0))
+    return -1;
+  uint32_t remaining = w->page_size - 15;
+  while (remaining >= 255) {
+    literal = 255;
+    if (sb_ltx_write(w, &literal, 1, 0))
+      return -1;
+    remaining -= 255;
+  }
+  literal = (unsigned char)remaining;
+  if (sb_ltx_write(w, &literal, 1, 0) || sb_ltx_write(w, page, w->page_size, 0))
+    return -1;
+  w->hash = sb_ltx_crc(w->hash, page, w->page_size);
+  return sb_ltx_varint(w->index, pgno, &w->index_n) ||
+                 sb_ltx_varint(w->index, offset, &w->index_n) ||
+                 sb_ltx_varint(w->index, w->n - offset, &w->index_n)
+             ? -1
+             : 0;
+}
+static int sb_ltx_finish(sb_ltx_writer *w, uint64_t checksum) {
+  unsigned char zero[6] = {0}, buf[65536];
+  if (sb_ltx_write(w, zero, 6, 1) || fflush(w->index))
+    return -1;
+  rewind(w->index);
+  size_t n;
+  while ((n = fread(buf, 1, sizeof(buf), w->index)))
+    if (sb_ltx_write(w, buf, n, 1))
+      return -1;
+  if (ferror(w->index) || sb_ltx_write(w, zero, 1, 1))
+    return -1;
+  sb_ltx_put64(buf, w->index_n + 1);
+  if (sb_ltx_write(w, buf, 8, 1))
+    return -1;
+  sb_ltx_put64(buf, checksum);
+  if (sb_ltx_write(w, buf, 8, 1))
+    return -1;
+  sb_ltx_put64(buf, SB_LTX_FLAG | ~w->hash);
+  if (sb_ltx_write(w, buf, 8, 0))
+    return -1;
+  sb_ltx_phase("ltx-written");
+  if (sb_ltx_flush(w->out))
+    return -1;
+  sb_ltx_phase("ltx-fsynced");
+  return 0;
+}
+static void sb_ltx_writer_close(sb_ltx_writer *w) {
+  if (w->out)
+    fclose(w->out);
+  if (w->index)
+    fclose(w->index);
+}
+static int sb_ltx_names(sb_ltx_state *s, uint64_t txid, char *tmp, char *final, char *dir) {
+  if (snprintf(dir, SB_LTX_PATH, "%s/%s", s->root, s->epoch) >= SB_LTX_PATH)
+    return -1;
+  if (snprintf(final, SB_LTX_PATH, "%s/%016llx-%016llx.ltx", dir, (unsigned long long)txid,
+               (unsigned long long)txid) >= SB_LTX_PATH)
+    return -1;
+  return snprintf(tmp, SB_LTX_PATH, "%s.tmp", final) >= SB_LTX_PATH ? -1 : 0;
+}
+static int sb_ltx_publish(const char *tmp, const char *final, const char *dir) {
+  // Never replace a finished file, including an orphan ahead of position.
+  if (link(tmp, final))
+    return -1; // Atomic no-replace publication on the same filesystem.
+  if (unlink(tmp) || sb_ltx_sync_dir(dir))
+    return -1;
+  sb_ltx_phase("ltx-published");
+  return 0;
+}
+static int sb_ltx_position(sb_ltx_state *s) {
+  char path[SB_LTX_PATH], tmp[SB_LTX_PATH], body[512];
+  if (snprintf(path, sizeof(path), "%s/position", s->root) >= sizeof(path) ||
+      snprintf(tmp, sizeof(tmp), "%s/position.tmp", s->root) >= sizeof(tmp))
+    return -1;
+  int n = snprintf(body, sizeof(body), "LTXPOS2\n%s\n%c %llu %u %u %llu %016llx %u %u %u %u\n",
+                   s->epoch, s->checkpointed ? 'C' : 'W', (unsigned long long)s->txid, s->salt1,
+                   s->salt2, (unsigned long long)s->offset, (unsigned long long)s->checksum,
+                   s->wal_c1, s->wal_c2, s->page_size, s->commit);
+  if (n < 0 || n >= (int)sizeof(body))
+    return -1;
+  FILE *f = fopen(tmp, "wb");
+  if (!f)
+    return -1;
+  int rc = fwrite(body, 1, n, f) != (size_t)n ||
+           fprintf(f, "%016llx\n", (unsigned long long)~sb_ltx_crc(UINT64_MAX, body, n)) < 0 ||
+           sb_ltx_flush(f);
+  if (fclose(f))
+    rc = -1;
+  if (rc)
+    return -1;
+  sb_ltx_phase(s->checkpointed ? "checkpoint-record-fsynced" : "position-fsynced");
+  if (rename(tmp, path) || sb_ltx_sync_dir(s->root))
+    return -1;
+  sb_ltx_phase(s->checkpointed ? "checkpoint-record-published" : "position-published");
+  return 0;
+}
+static int sb_ltx_checkpoint(sb_ltx_state *s, int persist) {
+  int a, b;
+  sb_ltx_phase("before-checkpoint");
+  int rc = sqlite3_wal_checkpoint_v2(s->db, "main", 3, &a, &b);
+  if (!rc) {
+    s->offset = 0;
+    s->salt1 = s->salt2 = s->wal_c1 = s->wal_c2 = 0;
+  }
+  sb_ltx_phase("after-checkpoint");
+  // The WAL record remains authoritative until checkpoint has completed. A
+  // crash before this second atomic record write retains conservative recovery.
+  if (!rc && persist && !s->checkpointed) {
+    s->checkpointed = 1;
+    rc = sb_ltx_position(s);
+  }
+  return rc;
+}
+static int sb_ltx_snapshot(sb_ltx_state *s) {
+  if (sb_ltx_checkpoint(s, 0))
+    return -1;
+  // EXCLUSIVE SQLite locking mode excludes other connections. BEGIN pins the
+  // checkpointed live pages while they are read; no VACUUM or page rewriting.
+  if (sqlite3_exec(s->db, "BEGIN", 0, 0, 0))
+    return -1;
+  int fd = s->read_fd;
+  unsigned char head[100];
+  struct stat st;
+  int rc = -1;
+  if (fd < 0 || fstat(fd, &st) || sb_ltx_read(fd, head, 100, 0) ||
+      memcmp(head, "SQLite format 3", 15))
+    goto done;
+  s->page_size = ((uint32_t)head[16] << 8) | head[17];
+  if (s->page_size == 1)
+    s->page_size = 65536;
+  if (s->page_size < 512 || s->page_size > 65536 || (s->page_size & (s->page_size - 1)) ||
+      st.st_size % s->page_size)
+    goto done;
+  s->commit = (uint32_t)(st.st_size / s->page_size);
+  s->txid = 1;
+  s->checksum = SB_LTX_FLAG;
+  char dir[SB_LTX_PATH], tmp[SB_LTX_PATH], final[SB_LTX_PATH];
+  if (snprintf(dir, sizeof(dir), "%s/epoch-XXXXXX", s->root) >= sizeof(dir) || !mkdtemp(dir))
+    goto done;
+  snprintf(s->epoch, sizeof(s->epoch), "%s", strrchr(dir, '/') + 1);
+  if (sb_ltx_sync_dir(s->root) || sb_ltx_names(s, 1, tmp, final, dir))
+    goto done;
+  unsigned char *page = malloc(s->page_size);
+  if (!page)
+    goto done;
+  sb_ltx_writer w;
+  rc = sb_ltx_begin(&w, tmp, s, s->commit, 1, 0);
+  for (uint32_t p = 1; !rc && p <= s->commit; p++) {
+    if (p == (0x40000000u / s->page_size) + 1)
+      continue;
+    if (sb_ltx_read(fd, page, s->page_size, (uint64_t)(p - 1) * s->page_size) ||
+        sb_ltx_page(&w, p, page)) {
+      rc = -1;
+      break;
+    }
+    s->checksum = SB_LTX_FLAG | (s->checksum ^ sb_ltx_page_crc(p, page, s->page_size));
+  }
+  free(page);
+  if (!rc)
+    rc = sb_ltx_finish(&w, s->checksum);
+  sb_ltx_writer_close(&w);
+  if (!rc)
+    rc = sb_ltx_publish(tmp, final, dir);
+  if (!rc) {
+    s->checkpointed = 1;
+    rc = sb_ltx_position(s);
+  }
+done:
+  if (sqlite3_exec(s->db, "COMMIT", 0, 0, 0))
+    rc = -1;
+  return rc;
+}
+
+typedef struct {
+  uint32_t pgno, frame;
+} sb_ltx_frame;
+static int sb_ltx_frame_cmp(const void *a, const void *b) {
+  const sb_ltx_frame *x = a, *y = b;
+  return x->pgno < y->pgno     ? -1
+         : x->pgno > y->pgno   ? 1
+         : x->frame < y->frame ? -1
+                               : x->frame > y->frame;
+}
+static void sb_ltx_wal_checksum(const unsigned char *p, size_t n, int big, uint32_t *a,
+                                uint32_t *b) {
+  for (size_t i = 0; i < n; i += 8) {
+    uint32_t x, y;
+    if (big) {
+      x = sb_ltx_be32(p + i);
+      y = sb_ltx_be32(p + i + 4);
+    } else {
+      x = (uint32_t)p[i] | (uint32_t)p[i + 1] << 8 | (uint32_t)p[i + 2] << 16 |
+          (uint32_t)p[i + 3] << 24;
+      y = (uint32_t)p[i + 4] | (uint32_t)p[i + 5] << 8 | (uint32_t)p[i + 6] << 16 |
+          (uint32_t)p[i + 7] << 24;
+    }
+    *a += x + *b;
+    *b += y + *a;
+  }
+}
+static int sb_ltx_capture(sb_ltx_state *s, uint32_t frames) {
+  char path[SB_LTX_PATH];
+  if (snprintf(path, sizeof(path), "%s-wal", s->path) >= sizeof(path))
+    return -1;
+  int wal = open(path, O_RDONLY), db = s->read_fd;
+  unsigned char head[32], fh[24];
+  unsigned char *page = 0;
+  sb_ltx_frame *map = 0;
+  int rc = -1;
+  if (wal < 0 || db < 0 || sb_ltx_read(wal, head, 32, 0))
+    goto done;
+  uint32_t magic = sb_ltx_be32(head), ps = sb_ltx_be32(head + 8), salt1 = sb_ltx_be32(head + 16),
+           salt2 = sb_ltx_be32(head + 20), a = 0, b = 0;
+  if ((magic != 0x377f0682 && magic != 0x377f0683) || sb_ltx_be32(head + 4) != 3007000 ||
+      ps != s->page_size || !frames || 32 + (uint64_t)frames * (ps + 24) > sb_ltx_max_bytes)
+    goto done;
+  sb_ltx_wal_checksum(head, 24, magic & 1, &a, &b);
+  if (a != sb_ltx_be32(head + 24) || b != sb_ltx_be32(head + 28))
+    goto done;
+  uint32_t prior = s->offset ? (uint32_t)((s->offset - 32) / (ps + 24)) : 0;
+  if (s->offset && (s->salt1 != salt1 || s->salt2 != salt2 || prior > frames))
+    goto done;
+  page = malloc(ps);
+  map = malloc((size_t)frames * sizeof(*map));
+  if (!page || !map)
+    goto done;
+  uint32_t commit = 0;
+  for (uint32_t f = 1; f <= frames; f++) {
+    uint64_t off = 32 + (uint64_t)(f - 1) * (ps + 24);
+    if (sb_ltx_read(wal, fh, 24, off) || sb_ltx_read(wal, page, ps, off + 24) ||
+        sb_ltx_be32(fh + 8) != salt1 || sb_ltx_be32(fh + 12) != salt2 || !sb_ltx_be32(fh))
+      goto done;
+    sb_ltx_wal_checksum(fh, 8, magic & 1, &a, &b);
+    sb_ltx_wal_checksum(page, ps, magic & 1, &a, &b);
+    if (a != sb_ltx_be32(fh + 16) || b != sb_ltx_be32(fh + 20))
+      goto done;
+    if (f == prior && (a != s->wal_c1 || b != s->wal_c2))
+      goto done;
+    map[f - 1] = (sb_ltx_frame){sb_ltx_be32(fh), f};
+    commit = sb_ltx_be32(fh + 4);
+  }
+  if (!commit)
+    goto done;
+  if (frames == prior) {
+    rc = 0;
+    goto done;
+  }
+  qsort(map, frames, sizeof(*map), sb_ltx_frame_cmp);
+  uint64_t checksum = s->checksum;
+  unsigned char *old = malloc(ps);
+  if (!old)
+    goto done;
+  // Remove truncated old pages, reading the last captured WAL version if present.
+  for (uint32_t p = commit + 1; p && p <= s->commit; p++) {
+    if (p == (0x40000000u / ps) + 1)
+      continue;
+    uint32_t prev = 0;
+    for (uint32_t i = 0; i < frames; i++)
+      if (map[i].pgno == p && map[i].frame <= prior)
+        prev = map[i].frame;
+    if (sb_ltx_read(prev ? wal : db, old, ps,
+                    prev ? 32 + (uint64_t)(prev - 1) * (ps + 24) + 24 : (uint64_t)(p - 1) * ps)) {
+      free(old);
+      goto done;
+    }
+    checksum = SB_LTX_FLAG | (checksum ^ sb_ltx_page_crc(p, old, ps));
+  }
+  char tmp[SB_LTX_PATH], final[SB_LTX_PATH], dir[SB_LTX_PATH];
+  if (sb_ltx_names(s, s->txid + 1, tmp, final, dir)) {
+    free(old);
+    goto done;
+  }
+  s->salt1 = salt1;
+  s->salt2 = salt2;
+  sb_ltx_writer w;
+  rc = sb_ltx_begin(&w, tmp, s, commit, 0, (uint64_t)(frames - prior) * (ps + 24));
+  for (uint32_t i = 0; !rc && i < frames;) {
+    uint32_t p = map[i].pgno, latest = 0, prev = 0;
+    do {
+      if (map[i].frame <= prior)
+        prev = map[i].frame;
+      else
+        latest = map[i].frame;
+      i++;
+    } while (i < frames && map[i].pgno == p);
+    if (!latest || p > commit || p == (0x40000000u / ps) + 1)
+      continue;
+    if (p <= s->commit) {
+      if (sb_ltx_read(prev ? wal : db, old, ps,
+                      prev ? 32 + (uint64_t)(prev - 1) * (ps + 24) + 24 : (uint64_t)(p - 1) * ps)) {
+        rc = -1;
+        break;
+      }
+      checksum = SB_LTX_FLAG | (checksum ^ sb_ltx_page_crc(p, old, ps));
+    }
+    if (sb_ltx_read(wal, page, ps, 32 + (uint64_t)(latest - 1) * (ps + 24) + 24) ||
+        sb_ltx_page(&w, p, page)) {
+      rc = -1;
+      break;
+    }
+    checksum = SB_LTX_FLAG | (checksum ^ sb_ltx_page_crc(p, page, ps));
+  }
+  free(old);
+  if (!rc)
+    rc = sb_ltx_finish(&w, checksum);
+  sb_ltx_writer_close(&w);
+  if (!rc)
+    rc = sb_ltx_publish(tmp, final, dir);
+  if (!rc) {
+    s->checkpointed = 0;
+    s->txid++;
+    s->commit = commit;
+    s->offset = 32 + (uint64_t)frames * (ps + 24);
+    s->checksum = checksum;
+    s->wal_c1 = a;
+    s->wal_c2 = b;
+    rc = sb_ltx_position(s);
+  }
+done:
+  if (wal >= 0)
+    close(wal);
+  free(page);
+  free(map);
+  return rc;
+}
+static int sb_ltx_hook(void *ctx, sqlite3 *db, const char *name, int frames) {
+  (void)db;
+  sb_ltx_state *s = ctx;
+#ifdef SB_LTX_TESTING
+  sb_ltx_test_commits++;
+#endif
+  sb_ltx_phase("wal-committed");
+  if (s->failed || strcmp(name, "main") || sb_ltx_capture(s, (uint32_t)frames)) {
+    s->failed = 1;
+    fprintf(stderr, "LTX capture failed for %s, restart required\n", s->path);
+    return 10;
+  }
+  // Checkpoint after the statement resets, so a subsequent transaction cannot
+  // reset the WAL salts before the in-memory cursor has been cleared.
+  return 0;
+}
+static int sb_ltx_authorize(void *ctx, int action, const char *a, const char *b, const char *c,
+                            const char *d) {
+  (void)ctx;
+  (void)b;
+  (void)c;
+  (void)d;
+  if (action == 24 || action == 25)
+    return 1; // ATTACH / DETACH would escape capture.
+  if (action == 19 && a &&
+      (!strcasecmp(a, "wal_checkpoint") || !strcasecmp(a, "wal_autocheckpoint") ||
+       !strcasecmp(a, "journal_mode") || !strcasecmp(a, "locking_mode") ||
+       !strcasecmp(a, "synchronous") || !strcasecmp(a, "page_size") || !strcasecmp(a, "mmap_size")))
+    return 1;
+  return 0;
+}
+static int sb_ltx_after(int idx) {
+  sb_ltx_state *s = &sb_ltx_states[idx];
+  if (!s->db)
+    return 0;
+  if (s->failed)
+    return -1;
+  // SQLITE_BUSY can occur with an explicit transaction holding a read lock.
+  // Keep the validated WAL and position; the VFS still imposes the hard ceiling.
+  int rc = sb_ltx_checkpoint(s, 1);
+  if (rc && rc != 5 && rc != 6) {
+    s->failed = 1;
+    return -1;
+  }
+  return 0;
+}
+// Verify our literal-block file before trusting a position. Reads stay bounded
+// even for a large base; CRC covers the logical uncompressed LTX contents.
+static int sb_ltx_verify_last(sb_ltx_state *s) {
+  char tmp[SB_LTX_PATH], final[SB_LTX_PATH], dir[SB_LTX_PATH];
+  if (sb_ltx_names(s, s->txid, tmp, final, dir))
+    return 0;
+  int fd = open(final, O_RDONLY);
+  struct stat st;
+  unsigned char h[100], fh[10], tail[24];
+  unsigned char *page = malloc(65536);
+  int valid = 0;
+  if (fd < 0 || !page || fstat(fd, &st) || st.st_size < 131 || sb_ltx_read(fd, h, 100, 0) ||
+      sb_ltx_read(fd, tail, 24, (uint64_t)st.st_size - 24))
+    goto done;
+  uint64_t min = 0, max = 0, post = 0, file_crc = 0, index_size = 0;
+  for (int i = 0; i < 8; i++) {
+    min = (min << 8) | h[16 + i];
+    max = (max << 8) | h[24 + i];
+    post = (post << 8) | tail[8 + i];
+    file_crc = (file_crc << 8) | tail[16 + i];
+    index_size = (index_size << 8) | tail[i];
+  }
+  if (memcmp(h, "LTX1", 4) || sb_ltx_be32(h + 4) || sb_ltx_be32(h + 8) != s->page_size ||
+      sb_ltx_be32(h + 12) != s->commit || min != s->txid || max != s->txid || post != s->checksum)
+    goto done;
+  uint64_t offset = 100, hash = sb_ltx_crc(UINT64_MAX, h, 100);
+  uint32_t prev = 0;
+  for (;;) {
+    if (sb_ltx_read(fd, fh, 6, offset))
+      goto done;
+    hash = sb_ltx_crc(hash, fh, 6);
+    offset += 6;
+    uint32_t pgno = sb_ltx_be32(fh);
+    if (!pgno) {
+      if (fh[4] || fh[5])
+        goto done;
+      break;
+    }
+    if (pgno <= prev || pgno > s->commit || fh[4] || fh[5] != 1)
+      goto done;
+    prev = pgno;
+    if (sb_ltx_read(fd, fh, 4, offset))
+      goto done;
+    hash = sb_ltx_crc(hash, fh, 4);
+    offset += 4;
+    uint32_t size = sb_ltx_be32(fh), literal = 15;
+    uint64_t end = offset + size;
+    unsigned char c;
+    if (size > s->page_size + s->page_size / 255 + 16 || sb_ltx_read(fd, &c, 1, offset++) ||
+        c != 0xf0)
+      goto done;
+    do {
+      if (sb_ltx_read(fd, &c, 1, offset++))
+        goto done;
+      literal += c;
+      if (literal > s->page_size)
+        goto done;
+    } while (c == 255);
+    if (literal != s->page_size || offset + s->page_size != end ||
+        sb_ltx_read(fd, page, s->page_size, offset))
+      goto done;
+    hash = sb_ltx_crc(hash, page, s->page_size);
+    offset = end;
+  }
+  if (index_size > (uint64_t)st.st_size || offset + index_size + 24 != (uint64_t)st.st_size)
+    goto done;
+  // Index bytes, its size field and post-apply checksum are all hashed.
+  while (offset < (uint64_t)st.st_size - 8) {
+    size_t n = (uint64_t)st.st_size - 8 - offset;
+    if (n > 65536)
+      n = 65536;
+    if (sb_ltx_read(fd, page, n, offset))
+      goto done;
+    hash = sb_ltx_crc(hash, page, n);
+    offset += n;
+  }
+  valid = (SB_LTX_FLAG | ~hash) == file_crc;
+done:
+  if (fd >= 0)
+    close(fd);
+  free(page);
+  return valid;
+}
+static int sb_ltx_load_position(sb_ltx_state *s) {
+  char path[SB_LTX_PATH], text[768];
+  if (snprintf(path, sizeof(path), "%s/position", s->root) >= sizeof(path))
+    return 0;
+  FILE *f = fopen(path, "rb");
+  if (!f)
+    return 0;
+  size_t n = fread(text, 1, sizeof(text) - 1, f);
+  int bad = ferror(f) || !feof(f);
+  fclose(f);
+  if (bad)
+    return 0;
+  text[n] = 0;
+  sb_ltx_state candidate = *s;
+  unsigned long long txid, offset, checksum, digest;
+  char mode;
+  int used = 0, tail = 0;
+  if (sscanf(text, "LTXPOS2\n%63s\n%c %llu %u %u %llu %16llx %u %u %u %u\n%n", candidate.epoch,
+             &mode, &txid, &candidate.salt1, &candidate.salt2, &offset, &checksum,
+             &candidate.wal_c1, &candidate.wal_c2, &candidate.page_size, &candidate.commit,
+             &used) != 11)
+    return 0;
+  if (!used || sscanf(text + used, "%16llx\n%n", &digest, &tail) != 1 ||
+      (size_t)(used + tail) != n || digest != ~sb_ltx_crc(UINT64_MAX, text, (size_t)used))
+    return 0;
+  if (strncmp(candidate.epoch, "epoch-", 6) || strlen(candidate.epoch) != 12 ||
+      strspn(candidate.epoch, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-") !=
+          12 ||
+      !txid || txid == UINT64_MAX || !(checksum & SB_LTX_FLAG) || !candidate.commit)
+    return 0;
+  uint32_t ps = candidate.page_size;
+  if (ps < 512 || ps > 65536 || (ps & (ps - 1)))
+    return 0;
+  if (mode == 'C') {
+    if (offset || candidate.salt1 || candidate.salt2 || candidate.wal_c1 || candidate.wal_c2)
+      return 0;
+  } else if (mode != 'W' || offset < 32 || offset > sb_ltx_max_bytes || (offset - 32) % (ps + 24))
+    return 0;
+  candidate.checkpointed = mode == 'C';
+  candidate.txid = txid;
+  candidate.offset = offset;
+  candidate.checksum = checksum;
+  if (!sb_ltx_verify_last(&candidate))
+    return 0;
+  // A published orphan ahead of the record is never overwritten. A new base
+  // captures the recovered source and preserves the old generation for restore.
+  char tmp[SB_LTX_PATH], final[SB_LTX_PATH], dir[SB_LTX_PATH];
+  if (sb_ltx_names(&candidate, txid + 1, tmp, final, dir) || access(final, F_OK) == 0)
+    return 0;
+  *s = candidate;
+  return 1;
+}
+// A clean marker means the checkpointed file is the entire captured state.
+// Verify its full page checksum before trusting an absent/empty WAL. Opening no
+// additional database fd preserves SQLite's process-level POSIX locks.
+static int sb_ltx_verify_database(sb_ltx_state *s) {
+  struct stat st;
+  if (fstat(s->read_fd, &st) || (uint64_t)st.st_size != (uint64_t)s->commit * s->page_size)
+    return 0;
+  unsigned char *page = malloc(s->page_size);
+  if (!page)
+    return 0;
+  uint64_t checksum = SB_LTX_FLAG;
+  int valid = 1;
+  for (uint32_t p = 1; p <= s->commit; p++) {
+    if (p == (0x40000000u / s->page_size) + 1)
+      continue;
+    if (sb_ltx_read(s->read_fd, page, s->page_size, (uint64_t)(p - 1) * s->page_size)) {
+      valid = 0;
+      break;
+    }
+    checksum = SB_LTX_FLAG | (checksum ^ sb_ltx_page_crc(p, page, s->page_size));
+  }
+  free(page);
+  return valid && checksum == s->checksum;
+}
+static int sb_ltx_resume(sb_ltx_state *s) {
+  if (!sb_ltx_load_position(s))
+    return 0;
+  char path[SB_LTX_PATH];
+  if (snprintf(path, sizeof(path), "%s-wal", s->path) >= sizeof(path))
+    return 0;
+  if (s->checkpointed) {
+    struct stat wal;
+    if (stat(path, &wal) == 0) {
+      if (wal.st_size != 0)
+        return 0;
+    } else if (errno != ENOENT)
+      return 0;
+    return sb_ltx_verify_database(s);
+  }
+  int fd = open(path, O_RDONLY);
+  unsigned char h[32], fh[24];
+  unsigned char *page = malloc(s->page_size);
+  struct stat st;
+  int valid = 0;
+  uint32_t last = 0;
+  if (fd < 0 || !page || fstat(fd, &st) || st.st_size < (off_t)s->offset ||
+      st.st_size > (off_t)sb_ltx_max_bytes || sb_ltx_read(fd, h, 32, 0))
+    goto done;
+  uint32_t magic = sb_ltx_be32(h), a = 0, b = 0;
+  if ((magic != 0x377f0682 && magic != 0x377f0683) || sb_ltx_be32(h + 4) != 3007000 ||
+      sb_ltx_be32(h + 8) != s->page_size || sb_ltx_be32(h + 16) != s->salt1 ||
+      sb_ltx_be32(h + 20) != s->salt2)
+    goto done;
+  sb_ltx_wal_checksum(h, 24, magic & 1, &a, &b);
+  if (a != sb_ltx_be32(h + 24) || b != sb_ltx_be32(h + 28))
+    goto done;
+  uint32_t prior = (uint32_t)((s->offset - 32) / (s->page_size + 24));
+  uint32_t count = (uint32_t)(((uint64_t)st.st_size - 32) / (s->page_size + 24));
+  for (uint32_t i = 1; i <= count; i++) {
+    uint64_t off = 32 + (uint64_t)(i - 1) * (s->page_size + 24);
+    if (sb_ltx_read(fd, fh, 24, off) || sb_ltx_read(fd, page, s->page_size, off + 24) ||
+        !sb_ltx_be32(fh) || sb_ltx_be32(fh + 8) != s->salt1 || sb_ltx_be32(fh + 12) != s->salt2)
+      break;
+    sb_ltx_wal_checksum(fh, 8, magic & 1, &a, &b);
+    sb_ltx_wal_checksum(page, s->page_size, magic & 1, &a, &b);
+    if (a != sb_ltx_be32(fh + 16) || b != sb_ltx_be32(fh + 20))
+      break;
+    if (sb_ltx_be32(fh + 4))
+      last = i;
+    if (i == prior)
+      valid = a == s->wal_c1 && b == s->wal_c2 && sb_ltx_be32(fh + 4) == s->commit;
+  }
+done:
+  if (fd >= 0)
+    close(fd);
+  free(page);
+  if (!valid || last < (s->offset - 32) / (s->page_size + 24))
+    return 0;
+  if (last > (s->offset - 32) / (s->page_size + 24)) {
+    char tmp[SB_LTX_PATH], final[SB_LTX_PATH], dir[SB_LTX_PATH];
+    if (sb_ltx_names(s, s->txid + 1, tmp, final, dir))
+      return -1;
+    if (unlink(tmp) && errno != ENOENT)
+      return -1;
+    if (sb_ltx_capture(s, last))
+      return -1;
+  }
+  if (sb_ltx_checkpoint(s, 1))
+    return -1;
+  return 1;
+}
+
+static int sb_ltx_start(int idx, sqlite3 *db, const char *path, int lock) {
+  sb_ltx_state *s = &sb_ltx_states[idx];
+  memset(s, 0, sizeof(*s));
+  s->db = db;
+  s->lock = lock;
+  s->read_fd = -1;
+  if (snprintf(s->path, sizeof(s->path), "%s", path) >= sizeof(s->path) ||
+      snprintf(s->root, sizeof(s->root), "%s.ltx", path) >= sizeof(s->root))
+    return -1;
+  if (mkdir(s->root, 0700) && errno != EEXIST)
+    return -1;
+  char parent[SB_LTX_PATH];
+  snprintf(parent, sizeof(parent), "%s", path);
+  char *slash = strrchr(parent, '/');
+  if (slash) {
+    *slash = 0;
+    if (sb_ltx_sync_dir(*parent ? parent : "/"))
+      return -1;
+  } else if (sb_ltx_sync_dir("."))
+    return -1;
+  if (sqlite3_exec(db,
+                   "PRAGMA wal_autocheckpoint=0; PRAGMA synchronous=FULL; PRAGMA "
+                   "locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; COMMIT;",
+                   0, 0, 0))
+    return -1;
+  sqlite3_stmt *mode = 0;
+  if (sqlite3_prepare_v2(db, "PRAGMA journal_mode", -1, &mode, 0) || !mode)
+    return -1;
+  int is_wal =
+      sqlite3_step(mode) == 100 && !strcmp((const char *)sqlite3_column_text(mode, 0), "wal");
+  sqlite3_finalize(mode);
+  if (!is_wal)
+    return -1;
+  struct stat st;
+  if (stat(path, &st))
+    return -1;
+  if (st.st_size == 0 && sqlite3_exec(db, "PRAGMA user_version=0;", 0, 0, 0))
+    return -1;
+  // POSIX fcntl locks belong to the process, not its descriptors. Closing any
+  // raw fd for this inode would silently release SQLite's locks. Keep this fd
+  // for the database handle's entire lifetime, including failed captures.
+  s->read_fd = open(path, O_RDONLY);
+  if (s->read_fd < 0)
+    return -1;
+  int resumed = sb_ltx_resume(s);
+  if (resumed < 0 || (resumed == 0 && sb_ltx_snapshot(s)))
+    return -1;
+  sqlite3_wal_hook(db, sb_ltx_hook, s);
+  sqlite3_set_authorizer(db, sb_ltx_authorize, s);
+  return 0;
+}
+static int sb_ltx_opted(const char *path) {
+  const char *v = getenv("SB_LTX_ENABLE"), *name = getenv("SB_LTX_DATABASE");
+  if (!sb_ltx_compat || !v || strcmp(v, "1"))
+    return 0;
+  if (!name || !*name ||
+      strspn(name, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") !=
+          strlen(name))
+    return -1;
+  char suffix[300];
+  if (snprintf(suffix, sizeof(suffix), "/d1/%s.sqlite", name) >= sizeof(suffix))
+    return -1;
+  size_t n = strlen(path), k = strlen(suffix);
+  return n >= k && strcmp(path + n - k, suffix) == 0;
+}
+// END LTX NATIVE
+
 // One handle per path, opened once and kept for the process lifetime — the same
 // lifetime the broker gives a Database. Returns an index, or -1.
 // Create every parent directory of path, like mkdir -p. A standalone binary
@@ -97,12 +1131,21 @@ static void sb_mkdirs(const char* path) {
 
 static int sb_db_for(const char* path) {
   for (int i = 0; i < sb_db_count; i++) {
-    if (strcmp(sb_db_names[i], path) == 0) return i;
+    if (strcmp(sb_db_names[i], path) == 0) return sb_ltx_states[i].failed ? -1 : i;
   }
   if (sb_db_count >= SB_MAX_DB) return -1;
   sqlite3* db = 0;
   sb_mkdirs(path);
-  if (sqlite3_open(path, &db) != 0) return -1;
+  int replicated = sb_ltx_opted(path), lock = -1;
+  if (replicated < 0 || (replicated && strlen(path) >= sizeof(sb_db_names[0]))) return -1;
+  if (replicated) {
+    char lockpath[SB_LTX_PATH];
+    if (snprintf(lockpath, sizeof(lockpath), "%s.ltx.lock", path) >= sizeof(lockpath) || sb_ltx_register()) return -1;
+    lock = open(lockpath, O_RDWR | O_CREAT, 0600);
+    if (lock < 0 || flock(lock, LOCK_EX | LOCK_NB)) { if (lock >= 0) close(lock); return -1; }
+  }
+  int open_rc = replicated ? sqlite3_open_v2(path, &db, 6, "sb-ltx-bounded") : sqlite3_open(path, &db);
+  if (open_rc != 0) { if (db) sqlite3_close(db); if (lock >= 0) close(lock); return -1; }
   // No mmap_size on purpose: mapping the database makes every page a read
   // touches count toward RSS, and measured on Linux that cost more than the
   // copy it saves once the file holds a few large objects. The page cache is
@@ -119,6 +1162,16 @@ static int sb_db_for(const char* path) {
     0, 0, 0);
   sb_dbs[sb_db_count] = db;
   snprintf(sb_db_names[sb_db_count], 256, "%s", path);
+  if (replicated && sb_ltx_start(sb_db_count, db, path, lock)) {
+    sb_ltx_states[sb_db_count].failed = 1;
+    fprintf(stderr, "LTX initialization failed for %s\n", path);
+    sqlite3_close(db);
+    if (sb_ltx_states[sb_db_count].read_fd >= 0) close(sb_ltx_states[sb_db_count].read_fd);
+    sb_ltx_states[sb_db_count].read_fd = -1;
+    sb_dbs[sb_db_count] = 0;
+    sb_db_count++;
+    close(lock); return -1;
+  }
   return sb_db_count++;
 }
 
@@ -865,9 +1918,22 @@ static char* sb_sql_script(const char* path, const char* sql) {
   int idx = sb_db_for(path);
   if (idx < 0) { sb_puts(&b, "{\"ok\":false,\"error\":\"cannot open database\"}"); return b.p; }
   char* err = 0;
-  if (sqlite3_exec(sb_dbs[idx], sql, 0, 0, &err) != 0) {
+  int script_rc = 0;
+  if (sb_ltx_states[idx].db) {
+    const char *next = sql;
+    while (*next && !script_rc) {
+      sqlite3_stmt *st = 0; const char *tail = 0;
+      script_rc = sqlite3_prepare_v2(sb_dbs[idx], next, -1, &st, &tail);
+      if (!script_rc && st) { do { script_rc = sqlite3_step(st); } while (script_rc == SB_SQLITE_ROW); if (script_rc == SB_SQLITE_DONE) script_rc = 0; }
+      if (st) sqlite3_finalize(st);
+      if (sb_ltx_after(idx)) script_rc = 10;
+      if (!tail || tail <= next) break;
+      next = tail;
+    }
+  } else script_rc = sqlite3_exec(sb_dbs[idx], sql, 0, 0, &err);
+  if (script_rc != 0) {
     sb_puts(&b, "{\"ok\":false,\"error\":");
-    sb_putjson_text(&b, err ? err : "exec failed", err ? strlen(err) : 11);
+    sb_putjson_text(&b, err ? err : sqlite3_errmsg(sb_dbs[idx]), err ? strlen(err) : strlen(sqlite3_errmsg(sb_dbs[idx])));
     sb_puts(&b, "}");
     return b.p;
   }
@@ -930,6 +1996,7 @@ static char* sb_sql_run(const char* path, const char* sql, const char* params) {
   // Reset, don't finalize: the statement stays compiled in sb_stmt_cache. Reset
   // now (not just on next reuse) so a SELECT stops holding its read transaction.
   sqlite3_reset(st);
+  if (sb_ltx_after(idx)) rc = 10;
   if (rc != SB_SQLITE_DONE && rc != SB_SQLITE_ROW) {
     free(b.p);
     sb_buf e = { 0, 0, 0 };
@@ -3002,7 +4069,13 @@ globalThis.__sbAssetsGet = function (path) {
 };
 
 /** The transport contract: one request string in, one reply string out. */
+function __sbLtxConfigure() {
+  // oxlint-disable-next-line no-unused-expressions -- configures the inline C transport.
+  Porffor.c`sb_ltx_compat = 1;`;
+}
+
 function __sbCall(reqJson) {
+  if (globalThis.__sbCompat >= "2026-10-22") __sbLtxConfigure();
   try {
     return JSON.stringify(__sbEmbeddedDispatch(JSON.parse(reqJson)));
   } catch (err) {

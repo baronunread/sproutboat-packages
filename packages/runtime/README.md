@@ -78,3 +78,10 @@ generation with its matching size and etag.
 Unfinished uploads expire after seven days. The broker removes expired parts
 when another multipart upload starts; a standalone binary removes them when it
 initializes its embedded store.
+
+## Experimental SQLite replication
+
+The embedded transport can capture bounded, durable local LTX files for one D1
+binding. It requires explicit opt-in and compatibility date 2026-10-22 or later.
+See [LTX replication](LTX_REPLICATION.md) for bounds, recovery, file durability,
+qualification evidence and current limitations. No remote uploader is included.
