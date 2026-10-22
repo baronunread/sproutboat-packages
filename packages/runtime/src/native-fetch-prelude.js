@@ -4809,17 +4809,80 @@ function __sbRpc(op, extra) {
 
 // D1: a Cloudflare-shaped `env.<DB>` (prepare / bind / all / run / raw / first,
 // plus batch and exec). Every call is one broker roundtrip.
+//
+// Bytes (an ArrayBuffer or a typed array) bind as a BLOB at every compatibility date:
+// before, they were stored as NULL. From compatibility date 2026-10-24 D1 calls are
+// strict, as in workerd: a parameter must be null, a number, a string, a boolean or
+// bytes (D1_TYPE_ERROR otherwise), the count must match the statement, foreign keys
+// are enforced, errors read "D1_ERROR: ...", and a BLOB comes back as an array of
+// byte values. Earlier dates keep the old behaviour.
+function __sbD1Strict() {
+  return globalThis.__sbCompat >= "2026-10-24";
+}
+function __sbD1Param(value, strict) {
+  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
+    const bytes = value instanceof ArrayBuffer ? new Uint8Array(value) : new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    let hex = "";
+    for (let i = 0; i < bytes.length; i++) hex += (bytes[i] < 16 ? "0" : "") + bytes[i].toString(16);
+    return { $blob: hex };
+  }
+  if (!strict || value === null || value === true || value === false || Object(value) instanceof Number || __sbIsStr(value)) return value;
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- workerd's D1_TYPE_ERROR names the value's typeof
+  throw new Error("D1_TYPE_ERROR: Type '" + typeof value + "' not supported for value '" + String(value) + "'");
+}
+function __sbD1Rpc(op, extra, strict) {
+  if (!strict) return __sbRpc(op, extra);
+  extra.strict = true;
+  try {
+    return __sbRpc(op, extra);
+  } catch (err) {
+    // "sproutboat d1.query: D1_ERROR: ..." -> "D1_ERROR: ...", as workerd words it.
+    const message = String((err && err.message) || err);
+    const at = message.indexOf("D1_");
+    throw new Error(at > 0 ? message.slice(at) : message);
+  }
+}
+// Strict replies carry columns and rows; build workerd's result objects from them.
+function __sbD1Rows(r) {
+  const rows = r.rows || [];
+  for (let i = 0; i < rows.length; i++)
+    for (let c = 0; c < rows[i].length; c++) {
+      const cell = rows[i][c];
+      if (__sbIsObj(cell) && __sbIsStr(cell.$blob)) {
+        const out = [];
+        for (let k = 0; k + 1 < cell.$blob.length; k += 2) out.push(parseInt(cell.$blob.slice(k, k + 2), 16));
+        rows[i][c] = out;
+      }
+    }
+  return rows;
+}
+function __sbD1Objects(columns, rows) {
+  const out = [];
+  for (let i = 0; i < rows.length; i++) {
+    const row = {};
+    for (let c = 0; c < columns.length; c++) row[columns[c]] = rows[i][c];
+    out.push(row);
+  }
+  return out;
+}
+function __sbD1Result(r, strict) {
+  if (!strict) return { results: r.results || [], success: true, meta: r.meta || {} };
+  return { results: __sbD1Objects(r.columns || [], __sbD1Rows(r)), success: true, meta: r.meta || {} };
+}
 function __sbMakeD1(dbName) {
   function stmt(sql, params) {
     const s = {
       __sql: sql,
       __params: params,
       bind() {
-        return stmt(sql, Array.prototype.slice.call(arguments));
+        const strict = __sbD1Strict();
+        const list = [];
+        for (let i = 0; i < arguments.length; i++) list.push(__sbD1Param(arguments[i], strict));
+        return stmt(sql, list);
       },
       all() {
-        const r = __sbRpc("d1.query", { db: dbName, sql, params });
-        return { results: r.results || [], success: true, meta: r.meta || {} };
+        const strict = __sbD1Strict();
+        return __sbD1Result(__sbD1Rpc("d1.query", { db: dbName, sql, params }, strict), strict);
       },
       run() {
         return s.all();
@@ -4847,17 +4910,17 @@ function __sbMakeD1(dbName) {
       return stmt(String(sql), []);
     },
     batch(statements) {
+      const strict = __sbD1Strict();
       const list = [];
       for (let i = 0; i < (statements || []).length; i++)
         list.push({ sql: statements[i].__sql, params: statements[i].__params });
-      const r = __sbRpc("d1.batch", { db: dbName, statements: list });
+      const r = __sbD1Rpc("d1.batch", { db: dbName, statements: list }, strict);
       const out = [];
-      for (let i = 0; i < (r.results || []).length; i++)
-        out.push({ results: r.results[i].results || [], success: true, meta: r.results[i].meta || {} });
+      for (let i = 0; i < (r.results || []).length; i++) out.push(__sbD1Result(r.results[i], strict));
       return out;
     },
     exec(sql) {
-      __sbRpc("d1.exec", { db: dbName, sql: String(sql) });
+      __sbD1Rpc("d1.exec", { db: dbName, sql: String(sql) }, __sbD1Strict());
       return { count: (String(sql).match(/;/g) || []).length, duration: 0 };
     },
     // Sproutboat extension (not in CF Workers D1): an online, integrity-checked

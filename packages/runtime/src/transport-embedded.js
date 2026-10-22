@@ -57,6 +57,10 @@ extern int sqlite3_changes(sqlite3*);
 extern int64_t sqlite3_last_insert_rowid(sqlite3*);
 extern const char* sqlite3_errmsg(sqlite3*);
 extern int sqlite3_close(sqlite3*);
+extern int sqlite3_bind_parameter_count(sqlite3_stmt*);
+extern int sqlite3_stmt_readonly(sqlite3_stmt*);
+extern int sqlite3_extended_errcode(sqlite3*);
+extern int sqlite3_error_offset(sqlite3*);
 
 // baronunread/sproutboat#176 — defined in render.js, alongside
 // porf_native_fetch_read_value (which every inline-C block below already
@@ -1293,6 +1297,19 @@ static void sb_putjson_text(sb_buf* b, const char* s, size_t n) {
 // binds as NULL rather than guessing.
 static const char* sb_skip_ws(const char* p) { while (*p == ' ' || *p == '\n' || *p == '\t' || *p == '\r') p++; return p; }
 
+static int sb_hex_nibble(char c) { return c >= 'a' ? c - 'a' + 10 : c >= 'A' ? c - 'A' + 10 : c - '0'; }
+// Past one JSON object (strings and nesting respected), or to the end of the text.
+static const char* sb_json_skip_object(const char* p) {
+  int depth = 0, quoted = 0;
+  for (; *p; p++) {
+    if (quoted) { if (*p == '\\' && p[1]) p++; else if (*p == '"') quoted = 0; continue; }
+    if (*p == '"') quoted = 1;
+    else if (*p == '{' || *p == '[') depth++;
+    else if ((*p == '}' || *p == ']') && --depth == 0) return p + 1;
+  }
+  return p;
+}
+
 static int sb_bind_params(sqlite3_stmt* st, const char* json) {
   const char* p = sb_skip_ws(json);
   if (*p != '[') return 0;
@@ -1338,6 +1355,25 @@ static int sb_bind_params(sqlite3_stmt* st, const char* json) {
       free(out);
       continue;
     }
+    // {"$blob":"HEX"}: the bytes of a D1 bind (an ArrayBuffer or a typed array), bound
+    // as a BLOB. Any other object binds NULL. Before this an object stopped the parse,
+    // so a Uint8Array and every parameter after it were silently stored as NULL.
+    if (*p == '{') {
+      const char* end = sb_json_skip_object(p);
+      const char* hex = strstr(p, "\"$blob\":\"");
+      if (hex && hex < end) {
+        hex += 9;
+        size_t n = 0;
+        while (hex + 2 * n < end && hex[2 * n] != '"' && hex[2 * n + 1] != '"') n++;
+        unsigned char* bytes = (unsigned char*)malloc(n ? n : 1);
+        for (size_t i = 0; i < n; i++)
+          bytes[i] = (unsigned char)(sb_hex_nibble(hex[2 * i]) << 4 | sb_hex_nibble(hex[2 * i + 1]));
+        sqlite3_bind_blob(st, index++, bytes, (int)n, SB_SQLITE_TRANSIENT);
+        free(bytes);
+      } else sqlite3_bind_null(st, index++);
+      p = end;
+      continue;
+    }
     // number (or true/false, bound as 1/0)
     if (*p == 't') { sqlite3_bind_double(st, index++, 1); p += 4; continue; }
     if (*p == 'f') { sqlite3_bind_double(st, index++, 0); p += 5; continue; }
@@ -1349,7 +1385,7 @@ static int sb_bind_params(sqlite3_stmt* st, const char* json) {
       p = endp;
     }
   }
-  return 0;
+  return index - 1; // how many were bound
 }
 
 // --- R2 bodies, without the JSON detour or the SQLite detour ----------------
@@ -1941,23 +1977,52 @@ static char* sb_sql_script(const char* path, const char* sql) {
   return b.p;
 }
 
+// An error reply with SQLite's extended result code and, when SQLite knows it, the byte
+// offset of the error in the SQL (D1 reports both). A message of our own comes with its
+// own code (code < 0: take SQLite's).
+static char* sb_sql_error(sqlite3* db, const char* message, int code, int skip) {
+  sb_buf e = { 0, 0, 0 };
+  const char* m = message ? message : sqlite3_errmsg(db);
+  sb_puts(&e, "{\"ok\":false,\"error\":");
+  sb_putjson_text(&e, m, strlen(m));
+  char tail[64];
+  int offset = message ? -1 : sqlite3_error_offset(db);
+  int k = snprintf(tail, sizeof(tail), ",\"code\":%d,\"offset\":%d}", code >= 0 ? code : sqlite3_extended_errcode(db), offset >= skip ? offset - skip : -1);
+  sb_put(&e, tail, (size_t)k);
+  return e.p;
+}
+
+// D1 calls from compatibility date 2026-10-24 put this comment first: the statement must
+// get exactly as many parameters as it has, like D1.
+#define SB_D1_STRICT "/*sb-d1-strict*/"
+// LTX capture (#141) failed after SQLite committed: the write is in the database but not in
+// the replication log, and the database refuses writes until the process restarts. Said as
+// such (SQLITE_IOERR), never as SQLite's own message, which still reads "not an error".
+#define SB_LTX_FAILED "LTX capture failed: the transaction may be committed locally but is not durable in the replication log; writes are refused until restart"
+static int sb_db_capture_failed(const char* path) {
+  for (int i = 0; i < sb_db_count; i++) if (strcmp(sb_db_names[i], path) == 0) return sb_ltx_states[i].failed;
+  return 0;
+}
+
 // Run one statement. Returns malloc'd JSON:
 //   {"ok":true,"cols":[...],"rows":[[...]],"changes":n,"rowid":n}
-// or {"ok":false,"error":"..."}.
+// or {"ok":false,"error":"...","code":n,"offset":n}. In a D1 database (a path under
+// /d1/) a BLOB comes back as {"$blob":"HEX"}; elsewhere as one char per byte.
 static char* sb_sql_run(const char* path, const char* sql, const char* params) {
   sb_buf b = { 0, 0, 0 };
   int idx = sb_db_for(path);
+  if (idx < 0 && sb_db_capture_failed(path)) return sb_sql_error(0, SB_LTX_FAILED, 10, 0);
   if (idx < 0) { sb_puts(&b, "{\"ok\":false,\"error\":\"cannot open database\"}"); return b.p; }
   sqlite3* db = sb_dbs[idx];
+  const int strict = strncmp(sql, SB_D1_STRICT, sizeof(SB_D1_STRICT) - 1) == 0;
+  const int d1 = strstr(path, "/d1/") != 0;
   sqlite3_stmt* st = sb_stmt_get(idx, db, sql);
-  if (!st) {
-    sb_puts(&b, "{\"ok\":false,\"error\":");
-    const char* m = sqlite3_errmsg(db);
-    sb_putjson_text(&b, m, strlen(m));
-    sb_puts(&b, "}");
-    return b.p;
+  if (!st) return sb_sql_error(db, 0, -1, strict ? (int)sizeof(SB_D1_STRICT) - 1 : 0);
+  int bound = params && *params ? sb_bind_params(st, params) : 0;
+  if (strict && bound != sqlite3_bind_parameter_count(st)) {
+    sqlite3_reset(st);
+    return sb_sql_error(db, "Wrong number of parameter bindings for SQL query.", 0, 0);
   }
-  if (params && *params) sb_bind_params(st, params);
 
   sb_puts(&b, "{\"ok\":true,\"cols\":[");
   int ncol = sqlite3_column_count(st);
@@ -1984,27 +2049,32 @@ static char* sb_sql_run(const char* path, const char* sql, const char* params) {
       }
       const unsigned char* txt = sqlite3_column_text(st, i);
       int n = sqlite3_column_bytes(st, i);
-      // TEXT is UTF-8 and decodes (#189); a BLOB stays one char per byte.
-      if (t == 4) sb_putjson(&b, txt ? (const char*)txt : "", txt ? (size_t)n : 0);
+      // TEXT is UTF-8 and decodes (#189); a BLOB stays one char per byte, or is hex in D1.
+      if (t == 4 && d1) {
+        static const char* digits = "0123456789abcdef";
+        const unsigned char* bytes = (const unsigned char*)sqlite3_column_blob(st, i);
+        sb_puts(&b, "{\"$blob\":\"");
+        for (int j = 0; j < n; j++) { char pair[2] = { digits[bytes[j] >> 4], digits[bytes[j] & 15] }; sb_put(&b, pair, 2); }
+        sb_puts(&b, "\"}");
+      }
+      else if (t == 4) sb_putjson(&b, txt ? (const char*)txt : "", txt ? (size_t)n : 0);
       else sb_putjson_text(&b, txt ? (const char*)txt : "", txt ? (size_t)n : 0);
     }
     sb_puts(&b, "]");
   }
   char tail[96];
-  int k = snprintf(tail, 96, "],\"changes\":%d,\"rowid\":%lld}", sqlite3_changes(db), (long long)sqlite3_last_insert_rowid(db));
+  // A read-only statement changed nothing: sqlite3_changes still holds the last write's count.
+  int k = snprintf(tail, 96, "],\"changes\":%d,\"rowid\":%lld}", sqlite3_stmt_readonly(st) ? 0 : sqlite3_changes(db), (long long)sqlite3_last_insert_rowid(db));
   sb_put(&b, tail, (size_t)k);
   // Reset, don't finalize: the statement stays compiled in sb_stmt_cache. Reset
   // now (not just on next reuse) so a SELECT stops holding its read transaction.
   sqlite3_reset(st);
-  if (sb_ltx_after(idx)) rc = 10;
+  const int capture_failed = sb_ltx_after(idx) != 0;
+  if (capture_failed) rc = 10;
   if (rc != SB_SQLITE_DONE && rc != SB_SQLITE_ROW) {
     free(b.p);
-    sb_buf e = { 0, 0, 0 };
-    sb_puts(&e, "{\"ok\":false,\"error\":");
-    const char* m = sqlite3_errmsg(db);
-    sb_putjson_text(&e, m, strlen(m));
-    sb_puts(&e, "}");
-    return e.p;
+    if (capture_failed) return sb_sql_error(db, SB_LTX_FAILED, 10, 0);
+    return sb_sql_error(db, 0, -1, strict ? (int)sizeof(SB_D1_STRICT) - 1 : 0);
   }
   return b.p;
 }
@@ -3513,19 +3583,16 @@ function __sbEmbeddedDispatch(msg) {
     if (op === "d1.exec") {
       // exec() takes a script; a single prepare would run only its first
       // statement and quietly drop the rest.
+      __sbD1Open(path, msg.strict === true);
       const reply = JSON.parse(__sbSqlScriptRaw(path, String(msg.sql)));
       if (reply.ok === false) throw new Error("sqlite: " + reply.error);
       return { ok: true };
     }
-    if (op === "d1.batch") {
-      const results = [];
-      const list = msg.statements || [];
-      for (let i = 0; i < list.length; i++)
-        results.push(__sbD1Run(path, list[i].sql, list[i].params));
-      return { ok: true, results };
-    }
-    const one = __sbD1Run(path, msg.sql, msg.params);
-    return { ok: true, results: one.results, meta: one.meta, success: true };
+    const strict = msg.strict === true;
+    __sbD1Open(path, strict);
+    if (op === "d1.batch") return { ok: true, results: __sbD1Batch(path, msg.statements || [], strict) };
+    const one = __sbD1Run(path, msg.sql, msg.params, strict);
+    return { ok: true, results: one.results, columns: one.columns, rows: one.rows, meta: one.meta, success: true };
   }
 
   if (op === "d1.backup") {
@@ -3979,16 +4046,99 @@ function __sbEmbeddedDispatch(msg) {
 }
 
 /** One D1 statement, shaped like the broker's d1Run. */
-function __sbD1Run(path, sql, params) {
-  const r = __sbSql(path, String(sql), params || []);
+// BEGIN D1 OPS (lifted by test/native-d1.ts)
+// D1 calls from compatibility date 2026-10-24 come with msg.strict (the shim sets it):
+// exact parameter counts, foreign keys enforced, D1's error text, and rows as arrays with
+// their column names (the shim builds the objects, so duplicate names survive in raw()).
+// A BLOB comes from C as {"$blob":"HEX"}; strict calls get it so, older ones get the one
+// char per byte string they always had.
+var __sbD1Opened = {};
+function __sbD1Open(path, strict) {
+  if (__sbD1Opened[path] === strict) return;
+  __sbD1Opened[path] = strict;
+  __sbSql(path, strict ? "PRAGMA foreign_keys = ON" : "PRAGMA foreign_keys = OFF", []);
+}
+var __sbSqliteCodes = ["", "SQLITE_ERROR", "SQLITE_INTERNAL", "SQLITE_PERM", "SQLITE_ABORT", "SQLITE_BUSY",
+  "SQLITE_LOCKED", "SQLITE_NOMEM", "SQLITE_READONLY", "SQLITE_INTERRUPT", "SQLITE_IOERR", "SQLITE_CORRUPT",
+  "SQLITE_NOTFOUND", "SQLITE_FULL", "SQLITE_CANTOPEN", "SQLITE_PROTOCOL", "SQLITE_EMPTY", "SQLITE_SCHEMA",
+  "SQLITE_TOOBIG", "SQLITE_CONSTRAINT", "SQLITE_MISMATCH", "SQLITE_MISUSE", "SQLITE_NOLFS", "SQLITE_AUTH",
+  "SQLITE_FORMAT", "SQLITE_RANGE", "SQLITE_NOTADB"];
+var __sbSqliteConstraints = { 275: "CHECK", 531: "COMMITHOOK", 787: "FOREIGNKEY", 1043: "FUNCTION",
+  1299: "NOTNULL", 1555: "PRIMARYKEY", 1811: "TRIGGER", 2067: "UNIQUE", 2323: "VTAB", 2579: "ROWID",
+  2835: "PINNED", 3091: "DATATYPE" };
+function __sbD1Error(reply) {
+  const code = Number(reply.code) || 0;
+  const base = __sbSqliteCodes[code & 255] || "";
+  let text = "D1_ERROR: " + reply.error;
+  if (reply.offset >= 0) text += " at offset " + reply.offset;
+  if (base) {
+    text += ": " + base;
+    if (__sbSqliteConstraints[code]) text += " (extended: SQLITE_CONSTRAINT_" + __sbSqliteConstraints[code] + ")";
+  }
+  return new Error(text);
+}
+function __sbD1Bytes(cell) {
+  let out = "";
+  const hex = String(cell.$blob);
+  for (let i = 0; i + 1 < hex.length; i += 2) out += String.fromCharCode(parseInt(hex.slice(i, i + 2), 16));
+  return out;
+}
+function __sbD1Run(path, sql, params, strict) {
+  const r = JSON.parse(__sbSqlRaw(path, (strict ? "/*sb-d1-strict*/" : "") + String(sql), JSON.stringify(params || [])));
+  if (r.ok === false) throw strict ? __sbD1Error(r) : new Error("sqlite: " + r.error);
+  const meta = { changes: r.changes, last_row_id: r.rowid, rows_read: r.rows.length };
+  if (strict) return { columns: r.cols, rows: r.rows, meta };
   const results = [];
   for (let i = 0; i < r.rows.length; i++) {
     const row = {};
-    for (let c = 0; c < r.cols.length; c++) row[r.cols[c]] = r.rows[i][c];
+    for (let c = 0; c < r.cols.length; c++) {
+      const cell = r.rows[i][c];
+      row[r.cols[c]] = cell !== null && Object(cell) === cell ? __sbD1Bytes(cell) : cell;
+    }
     results.push(row);
   }
-  return { results, meta: { changes: r.changes, last_row_id: r.rowid, rows_read: r.rows.length } };
+  return { results, meta };
 }
+// One statement of our own (SAVEPOINT, RELEASE, ...), failing in the caller's terms.
+function __sbD1Control(path, sql, strict) {
+  const r = JSON.parse(__sbSqlRaw(path, sql, "[]"));
+  if (r.ok === false) throw strict ? __sbD1Error(r) : new Error("sqlite: " + r.error);
+}
+// Undo after a failure, best effort: the error the caller sees is the first one. If LTX
+// capture failed, SQLite may already have committed; that error says so, and the database
+// stays closed to writes (the capture latch), so a cleanup failure must not replace it.
+function __sbD1Undo(path, savepoint) {
+  try {
+    __sbD1Control(path, "ROLLBACK TO " + savepoint, false);
+    __sbD1Control(path, "RELEASE " + savepoint, false);
+  } catch (ignored) {
+    return ignored;
+  }
+  return null;
+}
+// One transaction, like D1: a statement that fails undoes the ones before it.
+function __sbD1Batch(path, list, strict) {
+  const results = [];
+  __sbD1Control(path, "SAVEPOINT sb_d1_batch", strict);
+  try {
+    for (let i = 0; i < list.length; i++) results.push(__sbD1Run(path, list[i].sql, list[i].params, strict));
+  } catch (err) {
+    __sbD1Undo(path, "sb_d1_batch");
+    throw err;
+  }
+  __sbD1Release(path, "sb_d1_batch", strict);
+  return results;
+}
+// RELEASE of our outermost savepoint is the commit. A deferred constraint can fail it and
+// leave the transaction open: undo it. A capture failure (code 10) comes after SQLite has
+// committed: nothing to undo, and that error is the one to report.
+function __sbD1Release(path, savepoint, strict) {
+  const r = JSON.parse(__sbSqlRaw(path, "RELEASE " + savepoint, "[]"));
+  if (r.ok !== false) return;
+  if (Number(r.code) !== 10) __sbD1Undo(path, savepoint);
+  throw strict ? __sbD1Error(r) : new Error("sqlite: " + r.error);
+}
+// END D1 OPS
 
 /**
  * R2 object bodies, out of band (#56).
