@@ -419,9 +419,26 @@ static int sb_ltx_begin(sb_ltx_writer *w, const char *path, sb_ltx_state *s, uin
   memset(w, 0, sizeof(*w));
   w->hash = UINT64_MAX;
   w->page_size = s->page_size;
+  // Global temporary directories are outside a sandboxed worker's writable tree.
+  // After unlink, close (including process death) reclaims the scratch file.
+  char index_path[SB_LTX_PATH];
+  if (snprintf(index_path, sizeof(index_path), "%s/index-XXXXXX", s->root) >= sizeof(index_path))
+    return -1;
+  int index = mkstemp(index_path);
+  if (index < 0)
+    return -1;
+  sb_ltx_phase("index-created");
+  if (unlink(index_path)) {
+    close(index);
+    return -1;
+  }
+  w->index = fdopen(index, "w+b");
+  if (!w->index) {
+    close(index);
+    return -1;
+  }
   w->out = fopen(path, "wbx");
-  w->index = tmpfile();
-  if (!w->out || !w->index)
+  if (!w->out)
     return -1;
   unsigned char h[100] = {0};
   memcpy(h, "LTX1", 4);
@@ -1048,6 +1065,41 @@ done:
   return 1;
 }
 
+// The capture lock is already held. Remove only reserved, regular scratch files;
+// do not open them (a hard link could share the database's POSIX-locked inode).
+static int sb_ltx_sweep_indexes(const char *root) {
+  DIR *dir = opendir(root);
+  if (!dir)
+    return -1;
+  int rc = 0;
+  for (;;) {
+    errno = 0;
+    struct dirent *entry = readdir(dir);
+    if (!entry) {
+      if (errno)
+        rc = -1;
+      break;
+    }
+    const char *name = entry->d_name;
+    if (strlen(name) != 12 || strncmp(name, "index-", 6) ||
+        strspn(name + 6, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") != 6)
+      continue;
+    struct stat st;
+    if (fstatat(dirfd(dir), name, &st, AT_SYMLINK_NOFOLLOW)) {
+      if (errno == ENOENT)
+        continue;
+      rc = -1;
+      break;
+    }
+    if (S_ISREG(st.st_mode) && unlinkat(dirfd(dir), name, 0) && errno != ENOENT) {
+      rc = -1;
+      break;
+    }
+  }
+  if (closedir(dir))
+    rc = -1;
+  return rc;
+}
 static int sb_ltx_start(int idx, sqlite3 *db, const char *path, int lock) {
   sb_ltx_state *s = &sb_ltx_states[idx];
   memset(s, 0, sizeof(*s));
@@ -1058,6 +1110,8 @@ static int sb_ltx_start(int idx, sqlite3 *db, const char *path, int lock) {
       snprintf(s->root, sizeof(s->root), "%s.ltx", path) >= sizeof(s->root))
     return -1;
   if (mkdir(s->root, 0700) && errno != EEXIST)
+    return -1;
+  if (sb_ltx_sweep_indexes(s->root))
     return -1;
   char parent[SB_LTX_PATH];
   snprintf(parent, sizeof(parent), "%s", path);

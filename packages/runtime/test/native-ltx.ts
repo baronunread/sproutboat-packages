@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, readdir, rm, writeFile, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
@@ -24,12 +24,18 @@ const source = `
 #include <sys/stat.h>
 #include <time.h>
 #include <signal.h>
+#include <errno.h>
+// Reproduce denial of global temporary-file access on every test platform.
+// The sproutd sandbox qualification separately exercises real Linux Landlock.
+static FILE *forbidden_tmpfile(void) { errno=EACCES; return NULL; }
+#define tmpfile forbidden_tmpfile
 #define SB_MAX_DB 16
 ${transport.slice(start, end)}
 int main(int argc,char **argv) {
   if(argc!=2)return 2;sb_ltx_compat=1;if(sb_ltx_register())return 3;
   char lockpath[1024];snprintf(lockpath,sizeof(lockpath),"%s.ltx.lock",argv[1]);
   int lock=open(lockpath,O_RDWR|O_CREAT,0600);if(lock<0||flock(lock,LOCK_EX|LOCK_NB))return 4;
+  if(getenv("SB_LTX_TEST_HOLD_LOCK")){puts("locked");fflush(stdout);getchar();close(lock);return 0;}
   sqlite3 *db=0;if(sqlite3_open_v2(argv[1],&db,6,"sb-ltx-bounded"))return 5;
   if(getenv("SB_LTX_TEST_AUTO_VACUUM"))sqlite3_exec(db,"PRAGMA auto_vacuum=INCREMENTAL;",0,0,0);
   if(sqlite3_exec(db,"PRAGMA journal_mode=WAL;PRAGMA cache_size=-2000;",0,0,0)||sb_ltx_start(0,db,argv[1],lock))return 6;
@@ -153,6 +159,13 @@ async function restore(epoch: string, output: string) {
   await writeFile(output, db);
   return { files: files.length, txid };
 }
+async function noIndexScratch(path: string) {
+  const entries = await readdir(path + ".ltx", { withFileTypes: true });
+  assert(
+    !entries.some((entry) => entry.isFile() && /^index-[a-zA-Z0-9]{6}$/.test(entry.name)),
+    "index scratch file leaked",
+  );
+}
 async function run(path: string, sql: string, extra: Record<string, string> = {}) {
   const child = Bun.spawn([binary, path], {
     env: { ...process.env, ...extra },
@@ -169,6 +182,7 @@ async function run(path: string, sql: string, extra: Record<string, string> = {}
   ]);
   assert.equal(code, 0, error);
   assert(out.startsWith("ready\n"), out);
+  await noIndexScratch(path);
   return out.split("\n").slice(1).filter(Boolean);
 }
 async function stoppedCommit(path: string, phase: string, count = 1) {
@@ -212,6 +226,10 @@ async function stoppedCommit(path: string, phase: string, count = 1) {
   }
   child.kill("SIGKILL");
   await child.exited;
+  if (phase === "index-created") {
+    const entries = await readdir(path + ".ltx", { withFileTypes: true });
+    assert.equal(entries.filter((entry) => entry.isFile() && /^index-[a-zA-Z0-9]{6}$/.test(entry.name)).length, 1);
+  } else await noIndexScratch(path);
   assert(stopped, "did not reach crash boundary " + phase);
   return epoch;
 }
@@ -241,6 +259,45 @@ try {
   const cleanPosition = await readFile(root + "/position", "utf8");
   assert(cleanPosition.split("\n")[2].startsWith("C "));
   const finishedBefore = await readdir(join(root, epoch));
+  // SIGKILL can land between mkstemp and unlink. Only the next lock owner may
+  // discard that reserved scratch name; unrelated files and links stay intact.
+  const strayIndex = join(root, "index-abc123");
+  await writeFile(strayIndex, "stale index");
+  const unrelatedIndex = join(root, "index-not-scratch");
+  await writeFile(unrelatedIndex, "keep");
+  const indexDirectory = join(root, "index-DIR123");
+  await mkdir(indexDirectory);
+  await writeFile(join(indexDirectory, "keep"), "keep directory");
+  const outside = join(work, "outside-index-target");
+  await writeFile(outside, "keep target");
+  const indexLink = join(root, "index-LNK123");
+  await symlink(outside, indexLink);
+  const owner = Bun.spawn([binary, path], {
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+    env: { ...process.env, SB_LTX_TEST_HOLD_LOCK: "1" },
+  });
+  const lockReader = owner.stdout.getReader();
+  try {
+    const ready = await lockReader.read();
+    assert.equal(new TextDecoder().decode(ready.value), "locked\n");
+    const blocked = Bun.spawnSync([binary, path], { stdin: "ignore" });
+    assert.equal(blocked.exitCode, 4, "non-owner cannot initialize capture");
+    assert.equal(await readFile(strayIndex, "utf8"), "stale index", "non-owner must not sweep indexes");
+  } finally {
+    owner.stdin.end();
+    await owner.exited;
+    lockReader.releaseLock();
+  }
+  await run(path, "SELECT 1;\n");
+  assert(!(await readdir(root)).includes("index-abc123"), "resume must reclaim stale index");
+  assert.equal(await readFile(unrelatedIndex, "utf8"), "keep");
+  assert.equal(await readFile(join(indexDirectory, "keep"), "utf8"), "keep directory");
+  assert.equal(await readFile(indexLink, "utf8"), "keep target");
+  assert.equal(await readFile(outside, "utf8"), "keep target");
+  assert.equal(await readFile(root + "/position", "utf8"), cleanPosition);
+  assert.deepEqual(await readdir(join(root, epoch)), finishedBefore);
   for (let n = 0; n < 5; n++) {
     await run(path, "SELECT 1;\n");
     assert.equal(await readFile(root + "/position", "utf8"), cleanPosition, "idle restart must not rewrite position");
@@ -361,6 +418,7 @@ try {
   failedDb.close();
   const phases = [
     "wal-committed",
+    "index-created",
     "ltx-written",
     "ltx-fsynced",
     "ltx-published",
@@ -408,7 +466,7 @@ try {
   assert.equal(pdb.query("PRAGMA integrity_check").get()?.integrity_check, "ok");
   pdb.close();
   console.log(
-    "PASS restart: 10 SIGKILL durability boundaries, matching-prefix resume, orphan/missing/reset fallback, pending committed WAL tail captured before serving",
+    "PASS restart: 11 SIGKILL durability boundaries, matching-prefix resume, orphan/missing/reset fallback, pending committed WAL tail captured before serving",
   );
   console.log(
     "PASS native LTX: 102-file chain, independent CRC/index checks, byte-exact restore, integrity, hard WAL ceiling and oversized transaction rollback",

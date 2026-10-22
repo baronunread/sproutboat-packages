@@ -53,7 +53,18 @@ for this opted-in binding. Use the base LTX file for replication.
 
 Files live under `<database-path>.ltx/epoch-XXXXXX/`. Completed names are
 `<minTXID as 16 hex digits>-<maxTXID as 16 hex digits>.ltx`.
-The encoder streams one page at a time and spools index records with `tmpfile()`.
+The encoder streams one page at a time. It creates its index scratch file with
+`mkstemp()` beneath `<database-path>.ltx/`, immediately unlinks the name, and uses
+the open descriptor until the writer closes. This needs no access to a global
+temporary directory, which a sandboxed worker may not have. The scratch file is
+private (0600). A kill between creation and unlink can leave a named index file.
+On startup, after acquiring the capture lock and before recovery, the owner removes
+only regular root-level files matching the reserved `index-` plus six alphanumeric
+characters. It does not follow symlinks or remove directories or unrelated names.
+After unlink, process death releases the anonymous scratch space automatically.
+Its transient disk usage grows with the index records and is not visible to the
+directory-walk storage quota after unlink. Allow disk headroom for that scratch
+space as well as the LTX output; the quota is not a hard filesystem limit.
 
 For every LTX file:
 
@@ -78,7 +89,10 @@ applications must use idempotent transaction identifiers for retries.
 ## Qualification status
 
 Capture is tested against the exact inline C through `bun run test:native-ltx`,
-including independent BigInt CRC and index verification, a 102-file chain,
+with global `tmpfile()` access deliberately denied in the driver so the capture
+path cannot depend on it. This portable regression does not itself qualify the
+Linux Landlock/seccomp sandbox; sproutd's capture-on lifecycle smoke must do that.
+The tests cover independent BigInt CRC and index verification, a 102-file chain,
 byte-exact restore, integrity checking, oversized transaction rollback, database truncation, explicit rollback and late position-write failure latching.
 The workspace prototype additionally tests the compiled Porffor executable,
 including external writer exclusion and invariant PRAGMA rejection.
@@ -103,8 +117,9 @@ time. It also checks the last LTX file. Five native restarts each at 4.2 MB and
 The 51.1 MB verification took 399 to 446 ms on macOS arm64 (plus about 13 ms to
 health readiness); this is not a 9 ms cold-start claim for large databases.
 
-The regression SIGKILLs at ten durability boundaries, including both sides of
-clean-marker publication, and verifies matching-prefix resume and fallback cases.
+The regression SIGKILLs at eleven durability boundaries, including the interval
+between index creation and unlink and both sides of clean-marker publication,
+and verifies scratch cleanup, matching-prefix resume and fallback cases.
 It also recovers a committed tail beyond the durable cursor. The full Porffor executable passed 200 seeded random SIGKILL iterations on macOS
 arm64: 1,675 acknowledged writes retained, 88 same-generation resumes and 112
 fresh-base recoveries. Every finished chain passed file/database CRC verification,
