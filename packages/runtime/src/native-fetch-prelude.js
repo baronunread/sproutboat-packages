@@ -3034,7 +3034,10 @@ if (globalThis.clearInterval == null) globalThis.clearInterval = clearInterval;
 // these express the same spec-mandated checks and are verified under Porffor
 // alpha-10 by examples/kitchen-sink/harness.ts).
 function __sbIsStr(v) {
-  return Object(v) !== v && v === String(v);
+  // sproutd #22: not `Object(v) !== v`, which wraps (copies) a string in Porffor: two such
+  // checks on a 5 MiB part took 20 MiB.
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- the one check that does not copy its argument
+  return typeof v === "string";
 }
 function __sbIsFn(v) {
   return v instanceof Function;
@@ -3936,6 +3939,9 @@ const __SB_BYTES_WINDOW = 512;
 // TextEncoder); ArrayBuffer / typed-array input is copied byte for byte.
 function __sbToBytes(input) {
   if (input == null) return "";
+  // sproutd #22: one C pass when the input allows it (see __sbToBytesNative).
+  const native = __sbToBytesNative(input);
+  if (native !== "") return native;
   // Windowed accumulation (#180, then #181). Plain `s +=` in a loop is O(n^2)
   // here, since Porffor's strings have no rope/cons optimization and every
   // append copies the whole accumulated string -- that's #180, a 43KB body
@@ -4015,6 +4021,9 @@ function __sbBufFrom(latin1) {
 // regardless of whether it holds real Latin-1 text or raw bytes, so this
 // decode is only safe where the caller already knows which one it has.
 function __sbFromUtf8(bytes) {
+  // sproutd #22: one C pass for a string of bytes (see __sbFromUtf8Native).
+  const native = __sbFromUtf8Native(bytes);
+  if (native !== "") return native;
   // Collected into an array and joined once at the end, not built with
   // repeated `out +=` -- Porffor's strings have no rope/cons optimization, so
   // `+=` in a loop copies the whole accumulated string on every append,
@@ -4672,7 +4681,166 @@ static int sb_os_random(unsigned char* buf, size_t n) {
   return 0;
 }
 
+// sproutd #22: text and bytes converted in one C pass. The JS loops in
+// __sbFromUtf8 and __sbToBytes made one string per character, so a 5 MiB R2
+// object read with text() took about 400 MiB of heap before the next collection.
+u32 porf_native_fetch_alloc(u32 bytes, u32 type);
+
+// Lenient UTF-8 decode, exactly as __sbFromUtf8's JS: a lead byte whose
+// continuation bytes are not all 10xxxxxx passes through as its own unit.
+// OUT has room for LEN units. Returns the unit count; *WIDE is set when a unit
+// is above 0xff (the result then needs a UTF-16 string).
+static size_t sb_utf8_decode_units(const unsigned char* b, size_t len, uint16_t* out, int* wide) {
+  size_t k = 0;
+  *wide = 0;
+  for (size_t i = 0; i < len; i++) {
+    const unsigned b0 = b[i];
+    if (b0 >= 0x80) {
+      if ((b0 & 0xe0) == 0xc0 && i + 1 < len && (b[i + 1] & 0xc0) == 0x80) {
+        out[k] = (uint16_t)(((b0 & 0x1f) << 6) | (b[i + 1] & 0x3f));
+        if (out[k] > 0xff) *wide = 1;
+        k++; i += 1; continue;
+      }
+      if ((b0 & 0xf0) == 0xe0 && i + 2 < len && (b[i + 1] & 0xc0) == 0x80 && (b[i + 2] & 0xc0) == 0x80) {
+        out[k] = (uint16_t)(((b0 & 0x0f) << 12) | ((b[i + 1] & 0x3f) << 6) | (b[i + 2] & 0x3f));
+        if (out[k] > 0xff) *wide = 1;
+        k++; i += 2; continue;
+      }
+      if ((b0 & 0xf8) == 0xf0 && i + 3 < len && (b[i + 1] & 0xc0) == 0x80 && (b[i + 2] & 0xc0) == 0x80 && (b[i + 3] & 0xc0) == 0x80) {
+        int32_t cp = (int32_t)(((b0 & 0x07) << 18) | ((b[i + 1] & 0x3f) << 12) | ((b[i + 2] & 0x3f) << 6) | (b[i + 3] & 0x3f));
+        cp -= 0x10000;
+        out[k++] = (uint16_t)(0xd800 + (cp >> 10));
+        out[k++] = (uint16_t)(0xdc00 + (cp & 0x3ff));
+        *wide = 1;
+        i += 3; continue;
+      }
+    }
+    out[k++] = (uint16_t)b0;
+  }
+  return k;
+}
+
+// UTF-8 encode, exactly as __sbToBytes's JS: a high surrogate takes the next
+// unit as its pair. OUT has room for 3 bytes per unit. Returns the byte count.
+static size_t sb_utf8_encode_units(const uint16_t* s, size_t len, unsigned char* out) {
+  size_t k = 0;
+  for (size_t i = 0; i < len; i++) {
+    const uint32_t c = s[i];
+    if (c < 0x80) out[k++] = (unsigned char)c;
+    else if (c < 0x800) { out[k++] = (unsigned char)(0xc0 | (c >> 6)); out[k++] = (unsigned char)(0x80 | (c & 0x3f)); }
+    else if (c >= 0xd800 && c < 0xdc00 && i + 1 < len) {
+      const int32_t cp = 0x10000 + (int32_t)((c - 0xd800) << 10) + ((int32_t)s[++i] - 0xdc00);
+      out[k++] = (unsigned char)(0xf0 | ((cp >> 18) & 0xff));
+      out[k++] = (unsigned char)(0x80 | ((cp >> 12) & 0x3f));
+      out[k++] = (unsigned char)(0x80 | ((cp >> 6) & 0x3f));
+      out[k++] = (unsigned char)(0x80 | (cp & 0x3f));
+    } else {
+      out[k++] = (unsigned char)(0xe0 | ((c >> 12) & 0xff));
+      out[k++] = (unsigned char)(0x80 | ((c >> 6) & 0x3f));
+      out[k++] = (unsigned char)(0x80 | (c & 0x3f));
+    }
+  }
+  return k;
+}
+
 `;
+
+// sproutd #22: __sbFromUtf8 for a string of bytes (one byte per unit), in C.
+// Returns "" when it cannot (not a string, or out of memory), so the caller
+// falls back to the JS loop. All-ASCII byte strings are already their text.
+// oxlint-disable-next-line no-unused-vars -- `bytes` is read inside the RawC block below, not by JS.
+function __sbFromUtf8Native(bytes) {
+  let out = "";
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    if (bytes.type == 195 || bytes.type == 67) {
+      const u32 __p = (u32)bytes.val;
+      const size_t __n = (size_t)*(u32*)(MEM + __p);
+      int __ascii = bytes.type == 195;
+      if (__ascii) {
+        const unsigned char* __s = (const unsigned char*)(MEM + __p + 4);
+        for (size_t __i = 0; __i < __n; __i++) if (__s[__i] >= 0x80) { __ascii = 0; break; }
+      }
+      if (__ascii) out = bytes;
+      else {
+        unsigned char* __b = (unsigned char*)malloc(__n + 1);
+        uint16_t* __u = (uint16_t*)malloc(__n * 2 + 2);
+        if (__b && __u) {
+          if (bytes.type == 195) memcpy(__b, MEM + __p + 4, __n);
+          else { const uint16_t* __w = (const uint16_t*)(MEM + __p + 4); for (size_t __i = 0; __i < __n; __i++) __b[__i] = (unsigned char)(__w[__i] & 0xff); }
+          int __wide = 0;
+          const size_t __k = sb_utf8_decode_units(__b, __n, __u, &__wide);
+          if (__wide) {
+            const u32 __s = porf_native_fetch_alloc((u32)(4 + __k * 2), 67);
+            *(u32*)(MEM + __s) = (u32)__k;
+            memcpy(MEM + __s + 4, __u, __k * 2);
+            out = porf_box((f64)__s, 67);
+          } else {
+            for (size_t __i = 0; __i < __k; __i++) __b[__i] = (unsigned char)__u[__i];
+            out = porf_box((f64)porf_native_fetch_alloc_bytestring((const char*)__b, __k), 195);
+          }
+        }
+        free(__b); free(__u);
+      }
+    }
+  `;
+  return out;
+}
+
+// sproutd #22: __sbToBytes for a string, a Uint8Array or an ArrayBuffer, in C.
+// Returns "" when it cannot (another type, a length-tracking view, out of
+// memory), so the caller falls back to the JS loop.
+// oxlint-disable-next-line no-unused-vars -- `input` is read inside the RawC block below, not by JS.
+function __sbToBytesNative(input) {
+  let out = "";
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    const u32 __p = (u32)input.val;
+    if (input.type == 195) {
+      const size_t __n = (size_t)*(u32*)(MEM + __p);
+      const unsigned char* __s = (const unsigned char*)(MEM + __p + 4);
+      size_t __high = 0;
+      for (size_t __i = 0; __i < __n; __i++) if (__s[__i] >= 0x80) __high++;
+      if (!__high) out = input;
+      else {
+        unsigned char* __o = (unsigned char*)malloc(__n + __high + 1);
+        if (__o) {
+          const unsigned char* __src = (const unsigned char*)(MEM + __p + 4);
+          size_t __k = 0;
+          for (size_t __i = 0; __i < __n; __i++) {
+            const unsigned char __c = __src[__i];
+            if (__c < 0x80) __o[__k++] = __c;
+            else { __o[__k++] = (unsigned char)(0xc0 | (__c >> 6)); __o[__k++] = (unsigned char)(0x80 | (__c & 0x3f)); }
+          }
+          out = porf_box((f64)porf_native_fetch_alloc_bytestring((const char*)__o, __k), 195);
+          free(__o);
+        }
+      }
+    } else if (input.type == 67) {
+      const size_t __n = (size_t)*(u32*)(MEM + __p);
+      uint16_t* __w = (uint16_t*)malloc(__n * 2 + 2);
+      unsigned char* __o = (unsigned char*)malloc(__n * 3 + 1);
+      if (__w && __o) {
+        memcpy(__w, MEM + __p + 4, __n * 2);
+        const size_t __k = sb_utf8_encode_units(__w, __n, __o);
+        out = porf_box((f64)porf_native_fetch_alloc_bytestring((const char*)__o, __k), 195);
+      }
+      free(__w); free(__o);
+    } else if (input.type == 13 || input.type == 81) {
+      const int32_t __len = *(int32_t*)(MEM + __p);
+      if (__len > 0) {
+        const u32 __data = input.type == 13 ? __p + 8 : *(u32*)(MEM + __p + 4) + 4;
+        unsigned char* __o = (unsigned char*)malloc((size_t)__len);
+        if (__o) {
+          memcpy(__o, MEM + __data, (size_t)__len);
+          out = porf_box((f64)porf_native_fetch_alloc_bytestring((const char*)__o, (size_t)__len), 195);
+          free(__o);
+        }
+      }
+    }
+  `;
+  return out;
+}
 
 // TRANSPORT: wrap.ts splices one of transport-broker.js / transport-embedded.js here.
 
@@ -5218,6 +5386,15 @@ function __sbR2Object(meta, body) {
   return obj;
 }
 
+// A part's value for the transport: an ArrayBuffer or a view as its bytes (String() of one
+// stored "[object ArrayBuffer]", at every date), anything else as text, as before.
+function __sbR2PartValue(value) {
+  value = __sbUnwrapBody(value);
+  if (value == null) return "";
+  if (!__sbIsStr(value) && value.byteLength !== undefined)
+    return __sbToBytes(value.buffer !== undefined ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength) : new Uint8Array(value));
+  return String(value);
+}
 function __sbR2Multipart(bucket, key, uploadId) {
   return {
     key,
@@ -5226,7 +5403,7 @@ function __sbR2Multipart(bucket, key, uploadId) {
       const number = Number(partNumber);
       if (!Number.isInteger(number) || number < 1 || number > 10000)
         throw new TypeError("partNumber must be an integer between 1 and 10000");
-      return __sbR2MultipartPut(bucket, key, uploadId, number, value == null ? "" : String(value)).part;
+      return __sbR2MultipartPut(bucket, key, uploadId, number, __sbR2PartValue(value)).part;
     },
     complete(parts) {
       const r = __sbRpc("r2.multipart.complete", { bucket, key, uploadId, parts: parts || [] });
@@ -5361,7 +5538,16 @@ function __sbR2StrictObject(meta, bytes, range, include) {
     used = true;
     return bytes;
   };
-  obj.body = new Response(__sbBufFrom(bytes)).body;
+  // The stream is made when first asked for: text() and friends read the bytes directly,
+  // so an object read as text never holds a second copy (sproutd #22).
+  let stream = null;
+  Object.defineProperty(obj, "body", {
+    get: () => {
+      if (stream === null) stream = new Response(__sbBufFrom(bytes)).body;
+      return stream;
+    },
+    enumerable: true,
+  });
   Object.defineProperty(obj, "bodyUsed", { get: () => used, enumerable: true });
   obj.text = async () => __sbFromUtf8(take());
   obj.json = async () => JSON.parse(__sbFromUtf8(take()));
@@ -5392,7 +5578,13 @@ function __sbMakeR2(name) {
     return {
       key,
       uploadId,
-      uploadPart: (partNumber, value) => attempt(() => inner.uploadPart(partNumber, value)),
+      // A part is any value put() takes; text is stored as its UTF-8 bytes, as in workerd.
+      uploadPart: async (partNumber, value) => {
+        value = __sbUnwrapBody(value);
+        if (value instanceof Blob) value = await value.arrayBuffer();
+        else if (value != null && __sbIsFn(value.getReader)) value = await new Response(value).arrayBuffer();
+        return inner.uploadPart(partNumber, __sbIsStr(value) ? __sbToBytes(value) : value);
+      },
       // ponytail: a multipart object's etag stays the transport's sha256; workerd's is
       // MD5-of-part-MD5s-N. Add when an app compares multipart etags.
       complete: (parts) => attempt(() => __sbR2StrictObject(__sbRpc("r2.multipart.complete", { bucket: name, key, uploadId, parts: parts || [] }).object, null)),
@@ -5415,7 +5607,8 @@ function __sbMakeR2(name) {
         if (!__sbR2OnlyIf(o.onlyIf, meta.md5 || meta.etag, meta.uploaded)) return __sbR2StrictObject(meta, null, { offset: 0, length: meta.size });
         const bytes = r.body == null ? "" : r.body;
         const range = o.range == null ? { offset: 0, length: meta.size } : __sbR2Range(o.range, meta.size);
-        return __sbR2StrictObject(meta, bytes.slice(range.offset, range.offset + range.length), range);
+        const whole = range.offset === 0 && range.length >= bytes.length;
+        return __sbR2StrictObject(meta, whole ? bytes : bytes.slice(range.offset, range.offset + range.length), range);
       });
     },
     async put(key, value, options) {

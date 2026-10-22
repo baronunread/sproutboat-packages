@@ -2,17 +2,15 @@ import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 const src = readFileSync(new URL("./native-fetch-prelude.js", import.meta.url), "utf8");
 const decoder = src.slice(src.indexOf("function __sbFromUtf8("), src.indexOf("// sproutboat #181"));
-const ingress = src.slice(
-  src.indexOf("function __sbDecodeIngress("),
-  src.indexOf("globalThis.__sbEntry ="),
-);
+const ingress = src.slice(src.indexOf("function __sbDecodeIngress("), src.indexOf("globalThis.__sbEntry ="));
 const rawBody = src.slice(src.indexOf("function __sbRawBody("), src.indexOf("function __sbHasStreamBody("));
 if (!decoder || !ingress || !rawBody) throw new Error("Ingress decoder source not found");
 // oxlint-disable-next-line no-function-constructor -- Exercise the text-only runtime prelude.
-const load = new Function(`${decoder}\n${rawBody}\n${ingress}\nreturn __sbDecodeIngress;`);
+const load = new Function(
+  `// The C fast paths (Porffor.c) cannot run here: the stubs make the JS fallback run.\nfunction __sbFromUtf8Native() { return ""; }\nfunction __sbToBytesNative() { return ""; }\n${decoder}\n${rawBody}\n${ingress}\nreturn __sbDecodeIngress;`,
+);
 const decode = load();
-const raw = (text) =>
-  Array.from(new TextEncoder().encode(text), (byte) => String.fromCharCode(byte)).join("");
+const raw = (text) => Array.from(new TextEncoder().encode(text), (byte) => String.fromCharCode(byte)).join("");
 
 test("native ingress text and JSON decode Unicode without changing raw bytes", async () => {
   const body = raw('{"id":"caffè-🚤"}');
