@@ -4807,6 +4807,125 @@ function __sbRpc(op, extra) {
   return reply;
 }
 
+// KV from compatibility date 2026-10-25: workerd's surface. Every method returns a
+// Promise; keys and options are checked with KV's errors; get() takes a list of keys and
+// the "stream" type; getWithMetadata(); put() takes a ReadableStream and metadata; list()
+// pages with limit and cursor and returns each key's expiration and metadata. Earlier
+// dates keep the synchronous shim below.
+function __sbKvStrict() {
+  return globalThis.__sbCompat >= "2026-10-25";
+}
+function __sbKvKey(key, verb) {
+  const name = String(key);
+  if (name === "") throw new TypeError("Key name cannot be empty.");
+  if (name === "." || name === "..") throw new TypeError('"' + name + '" is not allowed as a key name.');
+  const length = new TextEncoder().encode(name).length;
+  if (length > 512) throw new Error("KV " + verb + " failed: 414 UTF-8 encoded length of " + length + " exceeds key length limit of 512.");
+  return name;
+}
+function __sbKvType(typeOrOptions) {
+  const type = typeOrOptions == null ? "text" : __sbIsStr(typeOrOptions) ? typeOrOptions : typeOrOptions.type || "text";
+  if (type !== "text" && type !== "json" && type !== "arrayBuffer" && type !== "stream")
+    throw new TypeError('Unknown response type. Possible types are "text", "arrayBuffer", "json", and "stream".');
+  return type;
+}
+function __sbKvDecode(r, type) {
+  if (type === "arrayBuffer") return __sbBufFrom(r.binary ? r.value : __sbToBytes(r.value));
+  if (type === "stream") return new Response(__sbBufFrom(r.binary ? r.value : __sbToBytes(r.value))).body;
+  const text = r.binary ? __sbFromUtf8(r.value) : r.value;
+  return type === "json" ? JSON.parse(text) : text;
+}
+function __sbKvMetadata(text) {
+  return text == null ? null : JSON.parse(text);
+}
+function __sbMakeKv(ns) {
+  const one = (key, type) => {
+    const r = __sbRpc("kv.get", { ns, key: __sbKvKey(key, "GET") });
+    return r.found ? { value: __sbKvDecode(r, type), metadata: __sbKvMetadata(r.metadata) } : { value: null, metadata: null };
+  };
+  const attempt = (run) => {
+    try {
+      return Promise.resolve(run());
+    } catch (err) {
+      return Promise.reject(err);
+    }
+  };
+  return {
+    get(key, typeOrOptions) {
+      return attempt(() => {
+        const type = __sbKvType(typeOrOptions);
+        if (!Array.isArray(key)) return one(key, type).value;
+        const out = new Map();
+        for (let i = 0; i < key.length; i++) out.set(String(key[i]), one(key[i], type).value);
+        return out;
+      });
+    },
+    getWithMetadata(key, typeOrOptions) {
+      return attempt(() => {
+        const r = one(key, __sbKvType(typeOrOptions));
+        return { value: r.value, metadata: r.metadata, cacheStatus: null };
+      });
+    },
+    async put(key, value, options) {
+      const msg = { ns, key: __sbKvKey(key, "PUT"), value: "" };
+      value = __sbUnwrapBody(value);
+      if (value != null && __sbIsFn(value.getReader)) value = new Uint8Array(await new Response(value).arrayBuffer());
+      if (value != null && !__sbIsStr(value) && value.byteLength !== undefined) {
+        const bytes = value.buffer !== undefined ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength) : new Uint8Array(value);
+        msg.value = __sbToBytes(bytes);
+        msg.binary = true;
+      } else if (__sbIsStr(value) || value === Number(value) || value === true || value === false) msg.value = String(value);
+      else throw new TypeError("KV put() accepts only strings, ArrayBuffers, ArrayBufferViews, and ReadableStreams as values.");
+      const o = options || {};
+      if (o.expirationTtl != null) {
+        const ttl = Math.floor(Number(o.expirationTtl)) || 0;
+        if (ttl <= 0) throw new Error("KV PUT failed: 400 Invalid expiration_ttl of " + ttl + ". Please specify integer greater than 0.");
+        if (ttl < 60) throw new Error("KV PUT failed: 400 Invalid expiration_ttl of " + ttl + ". Expiration TTL must be at least 60.");
+        msg.expirationTtl = ttl;
+      } else if (o.expiration != null) {
+        const at = Math.floor(Number(o.expiration)) || 0;
+        if (at <= Math.floor(Date.now() / 1000))
+          throw new Error("KV PUT failed: 400 Invalid expiration of " + at + ". Please specify integer greater than the current number of seconds since the UNIX epoch.");
+        msg.expiration = at;
+      }
+      if (o.metadata !== undefined) {
+        const json = JSON.stringify(o.metadata);
+        const length = new TextEncoder().encode(json).length;
+        if (length > 1024) throw new Error("KV PUT failed: 413 Metadata length of " + length + " exceeds limit of 1024.");
+        msg.metadata = json;
+      }
+      __sbRpc("kv.put", msg);
+    },
+    delete(key) {
+      return attempt(() => {
+        __sbRpc("kv.delete", { ns, key: __sbKvKey(key, "DELETE") });
+      });
+    },
+    list(options) {
+      return attempt(() => {
+        const o = options || {};
+        const limit = o.limit == null ? 1000 : Math.floor(Number(o.limit));
+        if (!(limit >= 0) || limit > 1000)
+          throw new Error("KV GET failed: 400 Invalid key_count_limit of " + o.limit + ". Please specify an integer less than 1000.");
+        if (limit === 0) return { keys: [], list_complete: true, cacheStatus: null };
+        const r = __sbRpc("kv.list", { ns, prefix: o.prefix == null ? "" : String(o.prefix), limit, cursor: o.cursor == null ? "" : String(o.cursor) });
+        const keys = [];
+        const entries = r.entries || [];
+        for (let i = 0; i < entries.length; i++) {
+          const k = { name: entries[i].name };
+          if (entries[i].expiration != null) k.expiration = entries[i].expiration;
+          if (entries[i].metadata != null) k.metadata = __sbKvMetadata(entries[i].metadata);
+          keys.push(k);
+        }
+        const out = { keys, list_complete: r.list_complete !== false };
+        if (!out.list_complete) out.cursor = r.cursor;
+        out.cacheStatus = null;
+        return out;
+      });
+    },
+  };
+}
+
 // D1: a Cloudflare-shaped `env.<DB>` (prepare / bind / all / run / raw / first,
 // plus batch and exec). Every call is one broker roundtrip.
 //
@@ -5185,7 +5304,7 @@ globalThis.__sbInstallBindings = function (target, bindings) {
 
   for (let i = 0; i < (bindings.kv || []).length; i++) {
     const ns = bindings.kv[i];
-    target[ns] = {
+    target[ns] = __sbKvStrict() ? __sbMakeKv(ns) : {
       // #233 — Workers' get(key, type | { type }): "text" (default), "json",
       // "arrayBuffer". A value put as bytes is stored one char per byte and
       // flagged, so text decodes it as UTF-8 and arrayBuffer returns it

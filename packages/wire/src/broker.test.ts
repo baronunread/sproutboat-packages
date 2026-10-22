@@ -114,7 +114,7 @@ test("#233: a KV value put as bytes is flagged binary and survives an existing s
   const bytes = Array.from({ length: 256 }, (_, i) => String.fromCharCode(i)).join("");
   await b.dispatch({ op: "kv.put", ns: "CACHE", key: "bin", value: bytes, binary: true });
   await b.dispatch({ op: "kv.put", ns: "CACHE", key: "txt", value: "café" });
-  expect(await b.dispatch({ op: "kv.get", ns: "CACHE", key: "bin" })).toEqual({ ok: true, found: true, value: bytes, binary: true });
+  expect(await b.dispatch({ op: "kv.get", ns: "CACHE", key: "bin" })).toMatchObject({ ok: true, found: true, value: bytes, binary: true });
   expect(await b.dispatch({ op: "kv.get", ns: "CACHE", key: "txt" })).toMatchObject({ value: "café", binary: false });
   // Overwriting a binary value with text clears the flag.
   await b.dispatch({ op: "kv.put", ns: "CACHE", key: "bin", value: "now text" });
@@ -126,10 +126,34 @@ test("KV put / get / list / delete, scoped to a bound namespace", async () => {
   expect(await b.dispatch({ op: "kv.get", ns: "CACHE", key: "k" })).toEqual({ ok: true, found: false, value: null });
   await b.dispatch({ op: "kv.put", ns: "CACHE", key: "k", value: "v" });
   await b.dispatch({ op: "kv.put", ns: "CACHE", key: "k2", value: "v2" });
-  expect(await b.dispatch({ op: "kv.get", ns: "CACHE", key: "k" })).toEqual({ ok: true, found: true, value: "v", binary: false });
-  expect(await b.dispatch({ op: "kv.list", ns: "CACHE", prefix: "k" })).toEqual({ ok: true, keys: ["k", "k2"] });
+  expect(await b.dispatch({ op: "kv.get", ns: "CACHE", key: "k" })).toMatchObject({ ok: true, found: true, value: "v", binary: false });
+  expect(await b.dispatch({ op: "kv.list", ns: "CACHE", prefix: "k" })).toMatchObject({ ok: true, keys: ["k", "k2"] });
   await b.dispatch({ op: "kv.delete", ns: "CACHE", key: "k" });
   expect(await b.dispatch({ op: "kv.get", ns: "CACHE", key: "k" })).toMatchObject({ found: false });
+});
+
+test("KV metadata, expiration and paged list (the shim from 2026-10-25); the prefix matches exactly", async () => {
+  const b = make({ bindings: { kv: ["CACHE"] } });
+  const at = Math.floor(Date.now() / 1000) + 3600;
+  await b.dispatch({ op: "kv.put", ns: "CACHE", key: "a", value: "1", metadata: '{"t":1}' });
+  await b.dispatch({ op: "kv.put", ns: "CACHE", key: "b", value: "2", expiration: at });
+  await b.dispatch({ op: "kv.put", ns: "CACHE", key: "c", value: "3" });
+  await b.dispatch({ op: "kv.put", ns: "CACHE", key: "a_x", value: "4" });
+  await b.dispatch({ op: "kv.put", ns: "CACHE", key: "AB", value: "5" });
+  expect(await b.dispatch({ op: "kv.get", ns: "CACHE", key: "a" })).toMatchObject({ metadata: '{"t":1}', expiration: null });
+  expect(await b.dispatch({ op: "kv.get", ns: "CACHE", key: "b" })).toMatchObject({ metadata: null, expiration: at });
+  // LIKE matched "ab" for "a_" and "AB" for "a"; the prefix is now exact and case-sensitive.
+  expect((await b.dispatch({ op: "kv.list", ns: "CACHE", prefix: "a_" })).keys).toEqual(["a_x"]);
+  expect((await b.dispatch({ op: "kv.list", ns: "CACHE", prefix: "a" })).keys).toEqual(["a", "a_x"]);
+  const first = await b.dispatch({ op: "kv.list", ns: "CACHE", prefix: "", limit: 2, cursor: "" });
+  expect(first).toMatchObject({ keys: ["AB", "a"], list_complete: false, cursor: "a" });
+  expect(first.entries).toEqual([
+    { name: "AB", expiration: null, metadata: null },
+    { name: "a", expiration: null, metadata: '{"t":1}' },
+  ]);
+  const rest = await b.dispatch({ op: "kv.list", ns: "CACHE", prefix: "", limit: 2, cursor: "a" });
+  expect(rest).toMatchObject({ keys: ["a_x", "b"], list_complete: false, cursor: "b" });
+  expect(await b.dispatch({ op: "kv.list", ns: "CACHE", prefix: "", limit: 2, cursor: "b" })).toMatchObject({ keys: ["c"], list_complete: true, cursor: "" });
 });
 
 test("KV expirationTtl under 60 seconds is rejected, matching CF", async () => {
@@ -149,7 +173,7 @@ test("a key past its expiration reads as absent and is omitted from list", async
     found: false,
     value: null,
   });
-  expect(await b.dispatch({ op: "kv.list", ns: "CACHE", prefix: "" })).toEqual({ ok: true, keys: ["fresh"] });
+  expect(await b.dispatch({ op: "kv.list", ns: "CACHE", prefix: "" })).toMatchObject({ ok: true, keys: ["fresh"] });
 });
 
 test("an unbound KV namespace is rejected", async () => {
@@ -883,7 +907,7 @@ test("resource-backed KV persists across brokers and is shared by id", async () 
       resourceDir,
       bindings: { kv: ["SHORTENER"], resources: { SHORTENER: { kind: "kv", id: kvId } } },
     });
-    expect(await second.dispatch({ op: "kv.get", ns: "SHORTENER", key: "a" })).toEqual({
+    expect(await second.dispatch({ op: "kv.get", ns: "SHORTENER", key: "a" })).toMatchObject({
       ok: true,
       found: true,
       binary: false,

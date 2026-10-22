@@ -3499,6 +3499,10 @@ function __sbEnsureSchema() {
   let hasKvBinary = false;
   for (let i = 0; i < kvColumns.length; i++) if (kvColumns[i][1] === "binary") hasKvBinary = true;
   if (!hasKvBinary) __sbSql(s, "ALTER TABLE kv ADD COLUMN binary INTEGER NOT NULL DEFAULT 0", []);
+  // A key's metadata (put(key, value, { metadata })), as JSON text; same column as the broker's.
+  let hasKvMetadata = false;
+  for (let i = 0; i < kvColumns.length; i++) if (kvColumns[i][1] === "metadata") hasKvMetadata = true;
+  if (!hasKvMetadata) __sbSql(s, "ALTER TABLE kv ADD COLUMN metadata TEXT", []);
   // #56 — no `body` column: an object's bytes live in their own file under
   // "<data-dir>/r2-blobs/" (sb_r2_put_c/sb_r2_get_c), never in the sqlite row.
   __sbSql(
@@ -3602,7 +3606,7 @@ function __sbEmbeddedDispatch(msg) {
   if (op === "ping") return { ok: true, op: "pong", echo: msg.msg };
 
   if (op === "kv.get") {
-    const r = __sbSql(store, "SELECT value, expires_at, binary FROM kv WHERE ns = ? AND key = ?", [
+    const r = __sbSql(store, "SELECT value, expires_at, binary, metadata FROM kv WHERE ns = ? AND key = ?", [
       msg.ns,
       msg.key,
     ]);
@@ -3612,7 +3616,14 @@ function __sbEmbeddedDispatch(msg) {
       __sbSql(store, "DELETE FROM kv WHERE ns = ? AND key = ?", [msg.ns, msg.key]);
       return { ok: true, found: false, value: null };
     }
-    return { ok: true, found: true, value: r.rows[0][0], binary: r.rows[0][2] === 1 };
+    return {
+      ok: true,
+      found: true,
+      value: r.rows[0][0],
+      binary: r.rows[0][2] === 1,
+      metadata: r.rows[0][3],
+      expiration: expiresAt == null ? null : Math.floor(expiresAt / 1000),
+    };
   }
   if (op === "kv.put") {
     // #58 — CF rejects expirationTtl under 60 seconds; matched here.
@@ -3626,8 +3637,8 @@ function __sbEmbeddedDispatch(msg) {
     }
     __sbSql(
       store,
-      "INSERT INTO kv (ns, key, value, expires_at, binary) VALUES (?1,?2,?3,?4,?5) ON CONFLICT (ns, key) DO UPDATE SET value = ?3, expires_at = ?4, binary = ?5",
-      [msg.ns, msg.key, msg.value, expiresAt, msg.binary === true ? 1 : 0],
+      "INSERT INTO kv (ns, key, value, expires_at, binary, metadata) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT (ns, key) DO UPDATE SET value = ?3, expires_at = ?4, binary = ?5, metadata = ?6",
+      [msg.ns, msg.key, msg.value, expiresAt, msg.binary === true ? 1 : 0, msg.metadata == null ? null : String(msg.metadata)],
     );
     return { ok: true };
   }
@@ -3636,14 +3647,28 @@ function __sbEmbeddedDispatch(msg) {
     return { ok: true };
   }
   if (op === "kv.list") {
+    // The prefix matches exactly: LIKE ignored case and read "_" and "%" in it as wildcards.
+    // With a limit (the shim from 2026-10-25), a page of entries after the cursor (the last
+    // key of the previous page), with each key's expiration and metadata; without one,
+    // every key, as before.
+    const prefix = msg.prefix || "";
+    const paged = msg.limit != null;
+    const limit = paged ? Math.max(0, Math.floor(Number(msg.limit))) : -1;
     const r = __sbSql(
       store,
-      "SELECT key FROM kv WHERE ns = ? AND key LIKE ? || '%' AND (expires_at IS NULL OR expires_at > ?) ORDER BY key",
-      [msg.ns, msg.prefix || "", Date.now()],
+      "SELECT key, expires_at, metadata FROM kv WHERE ns = ?1 AND substr(key, 1, length(?2)) = ?2 AND key > ?3 " +
+        "AND (expires_at IS NULL OR expires_at > ?4) ORDER BY key LIMIT ?5",
+      [msg.ns, prefix, paged && msg.cursor ? String(msg.cursor) : "", Date.now(), paged ? limit + 1 : -1],
     );
     const keys = [];
-    for (let i = 0; i < r.rows.length; i++) keys.push(r.rows[i][0]);
-    return { ok: true, keys };
+    const entries = [];
+    const count = paged ? Math.min(r.rows.length, limit) : r.rows.length;
+    for (let i = 0; i < count; i++) {
+      keys.push(r.rows[i][0]);
+      entries.push({ name: r.rows[i][0], expiration: r.rows[i][1] == null ? null : Math.floor(r.rows[i][1] / 1000), metadata: r.rows[i][2] });
+    }
+    const complete = !paged || r.rows.length <= limit;
+    return { ok: true, keys, entries, list_complete: complete, cursor: complete ? "" : keys[keys.length - 1] };
   }
 
   if (op === "assets.get") {

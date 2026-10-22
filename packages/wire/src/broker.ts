@@ -301,6 +301,8 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     // #233 — 1 when the value was put as bytes (stored one char per byte), so get()
     // can hand back exact bytes or decoded text depending on the requested type.
     if (!kvColumns.some((column) => column.name === "binary")) conn.exec("ALTER TABLE kv ADD COLUMN binary INTEGER NOT NULL DEFAULT 0");
+    // A key's metadata (put(key, value, { metadata })), as JSON text.
+    if (!kvColumns.some((column) => column.name === "metadata")) conn.exec("ALTER TABLE kv ADD COLUMN metadata TEXT");
     // #56 — no `body` column: an object's bytes live in their own file under
     // `r2Dir` (or an in-memory map for `:memory:`), never in the SQLite row.
     // Doubling every object through SQLite's own page cache on top of the
@@ -521,29 +523,31 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   };
 
   type KvStmts = {
-    get: Statement<{ value: string; expires_at: number | null; binary: number }, [string, string]>;
-    put: Statement<unknown, [string, string, string, number | null, number]>;
+    get: Statement<{ value: string; expires_at: number | null; binary: number; metadata: string | null }, [string, string]>;
+    put: Statement<unknown, [string, string, string, number | null, number, string | null]>;
     del: Statement<unknown, [string, string]>;
-    list: Statement<{ key: string }, [string, string, number]>;
+    list: Statement<{ key: string; expires_at: number | null; metadata: string | null }, [string, string, string, number, number]>;
   };
   const kvStmtCache = new Map<Database, KvStmts>();
   const kvStmts = (store: Database): KvStmts => {
     let stmts = kvStmtCache.get(store);
     if (!stmts) {
       stmts = {
-        get: store.query<{ value: string; expires_at: number | null; binary: number }, [string, string]>(
-          "SELECT value, expires_at, binary FROM kv WHERE ns = ? AND key = ?",
+        get: store.query<{ value: string; expires_at: number | null; binary: number; metadata: string | null }, [string, string]>(
+          "SELECT value, expires_at, binary, metadata FROM kv WHERE ns = ? AND key = ?",
         ),
         put: store.query(
-          "INSERT INTO kv (ns, key, value, expires_at, binary) VALUES (?1, ?2, ?3, ?4, ?5) " +
-            "ON CONFLICT (ns, key) DO UPDATE SET value = ?3, expires_at = ?4, binary = ?5",
+          "INSERT INTO kv (ns, key, value, expires_at, binary, metadata) VALUES (?1, ?2, ?3, ?4, ?5, ?6) " +
+            "ON CONFLICT (ns, key) DO UPDATE SET value = ?3, expires_at = ?4, binary = ?5, metadata = ?6",
         ),
         del: store.query("DELETE FROM kv WHERE ns = ? AND key = ?"),
         // #58 — an expired row is filtered out here; a periodic sweep to hard-delete
         // it is a separate concern (ponytail: rows accumulate until touched by a
         // get/list/put on the same key/prefix, add a cron sweep if that matters).
-        list: store.query<{ key: string }, [string, string, number]>(
-          "SELECT key FROM kv WHERE ns = ? AND key LIKE ? || '%' AND (expires_at IS NULL OR expires_at > ?) ORDER BY key LIMIT 1000",
+        // The prefix matches exactly: LIKE ignored case and read "_" and "%" as wildcards.
+        list: store.query<{ key: string; expires_at: number | null; metadata: string | null }, [string, string, string, number, number]>(
+          "SELECT key, expires_at, metadata FROM kv WHERE ns = ?1 AND substr(key, 1, length(?2)) = ?2 AND key > ?3 " +
+            "AND (expires_at IS NULL OR expires_at > ?4) ORDER BY key LIMIT ?5",
         ),
       };
       kvStmtCache.set(store, stmts);
@@ -1285,11 +1289,25 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
           stmts.del.run(part, str(msg.key));
           return { ok: true, found: false, value: null };
         }
-        return { ok: true, found: true, value: row.value, binary: row.binary === 1 };
+        return {
+          ok: true,
+          found: true,
+          value: row.value,
+          binary: row.binary === 1,
+          metadata: row.metadata,
+          expiration: row.expires_at == null ? null : Math.floor(row.expires_at / 1000),
+        };
       }
       case "kv.put": {
         const { store, part } = storeFor("kv", requireKv(msg.ns));
-        kvStmts(store).put.run(part, str(msg.key), str(msg.value), kvExpiresAt(msg), msg.binary === true ? 1 : 0);
+        kvStmts(store).put.run(
+          part,
+          str(msg.key),
+          str(msg.value),
+          kvExpiresAt(msg),
+          msg.binary === true ? 1 : 0,
+          msg.metadata == null ? null : str(msg.metadata),
+        );
         return { ok: true };
       }
       case "kv.delete": {
@@ -1299,11 +1317,23 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       }
       case "kv.list": {
         const { store, part } = storeFor("kv", requireKv(msg.ns));
+        // With a limit (the shim from 2026-10-25): a page after the cursor (the previous page's
+        // last key), with expirations and metadata. Without one: up to 1,000 keys, as before.
+        const paged = isNumber(msg.limit);
+        const limit = paged ? Math.max(0, Math.floor(Number(msg.limit))) : 1000;
+        const rows = kvStmts(store).list.all(part, str(msg.prefix), paged ? str(msg.cursor) : "", Date.now(), paged ? limit + 1 : limit);
+        const page = rows.slice(0, limit);
+        const complete = !paged || rows.length <= limit;
         return {
           ok: true,
-          keys: kvStmts(store)
-            .list.all(part, str(msg.prefix), Date.now())
-            .map((r) => r.key),
+          keys: page.map((r) => r.key),
+          entries: page.map((r) => ({
+            name: r.key,
+            expiration: r.expires_at == null ? null : Math.floor(r.expires_at / 1000),
+            metadata: r.metadata,
+          })),
+          list_complete: complete,
+          cursor: complete ? "" : (page[page.length - 1]?.key ?? ""),
         };
       }
       case "cache.match": {
