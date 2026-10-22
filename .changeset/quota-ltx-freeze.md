@@ -6,6 +6,8 @@ The storage quota is a hard bound when LTX capture is on. A D1 database under ca
 
 - Reads, read-only batches and transaction control still run.
 - No LTX file is ever dropped to make room: the policy fails closed.
-- Writes resume once the app is under its quota again (for example after the operator raises it).
+- Writes resume once the app is under its quota again, at the next rescan: for example after the operator raises the quota, or the app deletes R2 or KV data. The freeze holds across a restart.
+
+This freezes statements after the quota scan; it is not a hard filesystem cap. The write that crosses the quota is accepted.
 
 Databases without capture are unchanged: they are pinned at their size, so deletes still work.

@@ -7,4 +7,4 @@ A storage quota for standalone sprouts and sproutd. An app's data directory (KV,
 - writes fail with an error that says so, such as `KV put() failed: storage quota exceeded (this app stores N bytes; the limit is M)`, or `D1_ERROR: database or disk is full: SQLITE_FULL` for D1;
 - reads and deletes keep working, so an app can make room (for D1, `DELETE` and then `VACUUM`).
 
-The size is measured at most once a second, so writes can overshoot the limit by up to a second's worth.
+This is a check after a scan, not a hard filesystem cap with zero overshoot. The size is measured at most once a second, by walking the directory, and a write is checked against the last measurement. The write that crosses the limit is accepted (an R2 object, say), and so is anything else written within that second. Writes after it are refused.
