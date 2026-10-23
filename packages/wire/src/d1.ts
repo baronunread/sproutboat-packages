@@ -77,7 +77,10 @@ export function d1Error(error: Error): Error {
 }
 export type D1Request = { owner: string; key: string; path: string; name: string; msg: Frame };
 
-export function createD1Store(executionMs = 0, capability = "") {
+/** maxOpen > 0 (Durable Object SQL, one file per object): at most that many connections stay
+ * open, and the one used longest ago is closed for a new one. A closed database reopens on
+ * its next call. */
+export function createD1Store(executionMs = 0, capability = "", maxOpen = 0) {
   if (executionMs && !/^[a-f0-9]{64}$/.test(capability)) throw new Error("invalid host budget capability");
   const connections = new Map<string, { db: Database; owners: Set<string> }>();
   // Strict calls (the shim's compatibility date 2026-10-24): the parameter count must match
@@ -145,6 +148,18 @@ export function createD1Store(executionMs = 0, capability = "") {
   return {
     execute({ owner, key, path, name, msg }: D1Request): Frame {
       let entry = connections.get(key);
+      if (entry && maxOpen) {
+        // Most recently used last: Map iteration follows insertion order.
+        connections.delete(key);
+        connections.set(key, entry);
+      }
+      if (!entry && maxOpen && connections.size >= maxOpen) {
+        const [oldest, old] = connections.entries().next().value ?? [];
+        if (oldest !== undefined && old) {
+          connections.delete(oldest);
+          old.db.close();
+        }
+      }
       if (!entry) {
         if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
         const db = new Database(path, { create: true });
@@ -200,7 +215,9 @@ export function createD1Store(executionMs = 0, capability = "") {
                 try {
                   db.exec(line);
                 } catch (error) {
-                  throw new Error(`D1_EXEC_ERROR: Error in line ${i + 1}: ${line}: ${error instanceof Error ? error.message : String(error)}`);
+                  throw new Error(
+                    `D1_EXEC_ERROR: Error in line ${i + 1}: ${line}: ${error instanceof Error ? error.message : String(error)}`,
+                  );
                 }
               }),
             )();

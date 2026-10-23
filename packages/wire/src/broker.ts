@@ -675,6 +675,27 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     return d1Session ? d1Session.execute(request) : d1Store.execute({ ...request, owner: "dedicated" });
   };
 
+  // Durable Objects storage.sql (the shim's compatibility date 2026-10-29): one SQLite file per
+  // object, `<do-sql>/CLASS/FILE.sqlite`, run as a strict D1 query. The directory is named
+  // after the DO store file: several projects keep their doDb side by side.
+  // FILE is the object's 64-hex id (or a hash of an older id); the class must be bound.
+  // Without a SQL pool, at most 64 stay open; the one used longest ago closes first.
+  const doSqlDir = opts.doDb
+    ? `${resolve(opts.doDb).replace(/\.sqlite$/, "")}.do-sql`
+    : inMemory
+      ? null
+      : join(dirname(resolve(dbPath)), "do-sql");
+  const doSqlStore = createD1Store(0, "", 64);
+  const doSql = (msg: Frame): Frame | Promise<Frame> => {
+    const cls = requireDoClass(msg.cls);
+    const file = str(msg.file);
+    if (!/^[0-9a-f]{64}$/.test(file)) throw new Error("invalid Durable Object SQL database");
+    const path = doSqlDir ? resolve(doSqlDir, cls, `${file}.sqlite`) : ":memory:";
+    const key = path === ":memory:" ? `${token}:${dbPath}:do-sql:${cls}:${file}` : path;
+    const request = { key, path, name: `do-sql:${cls}`, msg: { ...msg, op: "d1.query", strict: true } };
+    return d1Session ? d1Session.execute(request) : doSqlStore.execute({ ...request, owner: "dedicated" });
+  };
+
   /**
    * #56 — an object's bytes never enter SQLite; they live in their own file,
    * named by a hash of bucket+key (so unicode keys and directory traversal
@@ -1548,6 +1569,8 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       case "d1.exec":
       case "d1.backup":
         return await d1(requireD1(msg.db), msg);
+      case "do.sql":
+        return await doSql(msg);
 
       case "ratelimit.check": {
         // #69 — fixed window; limit/period arrive in the message. Same upsert as
@@ -2058,6 +2081,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     "d1.exec",
     "d1.batch",
     "d1.backup",
+    "do.sql",
     "ratelimit.check",
     "r2.put",
     "r2.multipart.create",
@@ -2340,6 +2364,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       for (const t of timers) clearInterval(t);
       d1Session?.close();
       d1Store.close();
+      doSqlStore.close();
       for (const conn of resourceDbs.values()) conn.close();
       if (doDb !== db) doDb.close();
       db.close();

@@ -1079,6 +1079,49 @@ test("cronMatches: fields, steps, ranges, lists (UTC)", () => {
 // #74 — a binding wired to an account-level resource stores in its own file
 // under resourceDir, keyed by id, so the data outlives a "redeploy" (a new
 // broker with a fresh per-deployment db but the same resourceDir).
+test("Durable Object SQL: one database per object, beside its project's doDb, D1-strict replies", async () => {
+  const root = mkdtempSync(join(tmpdir(), "sb-broker-do-sql-"));
+  try {
+    for (const dep of ["dep", "dep2", "dep3"]) mkdirSync(join(root, dep));
+    const bindings = { do: [{ binding: "SQL", className: "SqlObject" }] };
+    const a = "a".repeat(64);
+    const b2 = "b".repeat(64);
+    const sql = (b: ReturnType<typeof createBroker>, file: string, text: string, params: JsonValue[] = []) =>
+      b.dispatch({ op: "do.sql", cls: "SqlObject", file, sql: text, params });
+    const one = createBroker({ db: join(root, "dep", "state.sqlite"), doDb: join(root, "do_p1.sqlite"), bindings });
+    await sql(one, a, "CREATE TABLE t (v, b BLOB)");
+    expect(await sql(one, a, "INSERT INTO t VALUES (?, ?), (?, ?)", [1, { $blob: "0102" }, 2, null])).toMatchObject({
+      meta: { changes: 2 },
+    });
+    expect(await sql(one, a, "SELECT v, b FROM t ORDER BY v")).toMatchObject({
+      columns: ["v", "b"],
+      rows: [
+        [1, { $blob: "0102" }],
+        [2, null],
+      ],
+    });
+    // Another object has its own database.
+    await expect(sql(one, b2, "SELECT v FROM t")).rejects.toThrow("D1_ERROR: no such table: t");
+    await expect(sql(one, a, "SELEKT 1")).rejects.toThrow('near "SELEKT": syntax error');
+    await expect(sql(one, "../x", "SELECT 1")).rejects.toThrow("invalid Durable Object SQL database");
+    await expect(one.dispatch({ op: "do.sql", cls: "Nope", file: a, sql: "SELECT 1", params: [] })).rejects.toThrow(
+      "not bound",
+    );
+    one.close();
+    expect(existsSync(join(root, "do_p1.do-sql", "SqlObject", `${a}.sqlite`))).toBe(true);
+
+    // A redeploy keeps it; another project with the same class and id does not see it.
+    const again = createBroker({ db: join(root, "dep2", "state.sqlite"), doDb: join(root, "do_p1.sqlite"), bindings });
+    expect((await sql(again, a, "SELECT count(*) AS n FROM t")).rows).toEqual([[2]]);
+    again.close();
+    const other = createBroker({ db: join(root, "dep3", "state.sqlite"), doDb: join(root, "do_p2.sqlite"), bindings });
+    await expect(sql(other, a, "SELECT v FROM t")).rejects.toThrow("no such table: t");
+    other.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("#207: Durable Object storage and alarms in doDb outlive a redeploy", async () => {
   const root = mkdtempSync(join(tmpdir(), "sb-broker-do-"));
   try {

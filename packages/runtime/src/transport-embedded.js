@@ -1187,15 +1187,41 @@ static void sb_mkdirs(const char* path) {
   }
 }
 
+// Durable Objects SQL (storage.sql): one database per object, under "/do-sql/". At most
+// SB_DO_SQL_OPEN of them stay open; the one used longest ago is closed for the next.
+#define SB_DO_SQL_OPEN 8
+static unsigned long sb_db_used[SB_MAX_DB];
+static unsigned long sb_db_tick = 0;
+static int sb_is_do_sql(const char* path) { return strstr(path, "/do-sql/") != 0; }
+static void sb_db_evict(int idx);
+
 static int sb_db_for(const char* path) {
   for (int i = 0; i < sb_db_count; i++) {
-    if (strcmp(sb_db_names[i], path) == 0) return sb_ltx_states[i].failed ? -1 : i;
+    if (sb_dbs[i] && strcmp(sb_db_names[i], path) == 0) {
+      sb_db_used[i] = ++sb_db_tick;
+      return sb_ltx_states[i].failed ? -1 : i;
+    }
   }
-  if (sb_db_count >= SB_MAX_DB) return -1;
+  const int do_sql = sb_is_do_sql(path);
+  // A name that would not fit could never be found again.
+  if (do_sql && strlen(path) >= sizeof(sb_db_names[0])) return -1;
+  int replicated = do_sql ? 0 : sb_ltx_opted(path), lock = -1;
+  if (replicated < 0 || (replicated && strlen(path) >= sizeof(sb_db_names[0]))) return -1;
+  // A Durable Object SQL database reuses the slot of the one used longest ago once
+  // SB_DO_SQL_OPEN are open; any other database takes one when every slot is in use.
+  int slot = sb_db_count, lru = -1, open_do_sql = 0;
+  for (int i = 0; i < sb_db_count; i++) {
+    if (!sb_dbs[i] || !sb_is_do_sql(sb_db_names[i])) continue;
+    open_do_sql++;
+    if (lru < 0 || sb_db_used[i] < sb_db_used[lru]) lru = i;
+  }
+  if (lru >= 0 && !replicated && ((do_sql && open_do_sql >= SB_DO_SQL_OPEN) || sb_db_count >= SB_MAX_DB)) {
+    sb_db_evict(lru);
+    slot = lru;
+  }
+  if (slot >= SB_MAX_DB) return -1;
   sqlite3* db = 0;
   sb_mkdirs(path);
-  int replicated = sb_ltx_opted(path), lock = -1;
-  if (replicated < 0 || (replicated && strlen(path) >= sizeof(sb_db_names[0]))) return -1;
   if (replicated) {
     char lockpath[SB_LTX_PATH];
     if (snprintf(lockpath, sizeof(lockpath), "%s.ltx.lock", path) >= sizeof(lockpath) || sb_ltx_register()) return -1;
@@ -1218,19 +1244,23 @@ static int sb_db_for(const char* path) {
     "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;"
     "PRAGMA cache_size=-2000; PRAGMA journal_size_limit=16777216;",
     0, 0, 0);
-  sb_dbs[sb_db_count] = db;
-  snprintf(sb_db_names[sb_db_count], 256, "%s", path);
-  if (replicated && sb_ltx_start(sb_db_count, db, path, lock)) {
-    sb_ltx_states[sb_db_count].failed = 1;
+  // Durable Object SQLite enforces foreign keys, as in workerd.
+  if (do_sql) sqlite3_exec(db, "PRAGMA foreign_keys=ON", 0, 0, 0);
+  sb_db_used[slot] = ++sb_db_tick;
+  sb_dbs[slot] = db;
+  snprintf(sb_db_names[slot], 256, "%s", path);
+  if (replicated && sb_ltx_start(slot, db, path, lock)) {
+    sb_ltx_states[slot].failed = 1;
     fprintf(stderr, "LTX initialization failed for %s\n", path);
     sqlite3_close(db);
-    if (sb_ltx_states[sb_db_count].read_fd >= 0) close(sb_ltx_states[sb_db_count].read_fd);
-    sb_ltx_states[sb_db_count].read_fd = -1;
-    sb_dbs[sb_db_count] = 0;
-    sb_db_count++;
+    if (sb_ltx_states[slot].read_fd >= 0) close(sb_ltx_states[slot].read_fd);
+    sb_ltx_states[slot].read_fd = -1;
+    sb_dbs[slot] = 0;
+    if (slot == sb_db_count) sb_db_count++;
     close(lock); return -1;
   }
-  return sb_db_count++;
+  if (slot == sb_db_count) sb_db_count++;
+  return slot;
 }
 
 // #155 — a prepared-statement cache per database. Every binding op (KV, D1, DO
@@ -1267,6 +1297,22 @@ static sqlite3_stmt* sb_stmt_get(int idx, sqlite3* db, const char* sql) {
   if (slots[slot].sql) memcpy(slots[slot].sql, sql, n + 1);
   slots[slot].st = st;
   return st;
+}
+
+// Close a Durable Object SQL database to reuse its slot: its cached statements first.
+static unsigned char sb_quota_frozen[SB_MAX_DB];
+static void sb_db_evict(int idx) {
+  for (int i = 0; i < SB_STMT_CACHE; i++) {
+    if (sb_stmt_cache[idx][i].st) sqlite3_finalize(sb_stmt_cache[idx][i].st);
+    free(sb_stmt_cache[idx][i].sql);
+    sb_stmt_cache[idx][i].st = 0;
+    sb_stmt_cache[idx][i].sql = 0;
+  }
+  sb_stmt_fifo[idx] = 0;
+  sqlite3_close(sb_dbs[idx]);
+  sb_dbs[idx] = 0;
+  sb_db_names[idx][0] = 0;
+  sb_quota_frozen[idx] = 0;
 }
 
 // --- a growable output buffer, for building the reply JSON ------------------
@@ -2007,7 +2053,7 @@ void sb_r2_transfer_download_close(sb_r2_transfer_ctx* ctx) { if (ctx) { if (ctx
 // every write is refused (a same-size UPDATE or a DELETE still adds an LTX file to the
 // spool, which counts toward the quota). Reads and transaction control still run.
 #define SB_QUOTA_FULL "storage quota exceeded: writes are refused while this app's data, including its replication log, is over its quota"
-static unsigned char sb_quota_frozen[SB_MAX_DB];
+// sb_quota_frozen (per database slot) is declared with sb_db_evict, which clears it.
 static int sb_db_capture_failed(const char* path) {
   for (int i = 0; i < sb_db_count; i++) if (strcmp(sb_db_names[i], path) == 0) return sb_ltx_states[i].failed;
   return 0;
@@ -2083,7 +2129,8 @@ static char* sb_sql_run(const char* path, const char* sql, const char* params) {
   if (idx < 0) { sb_puts(&b, "{\"ok\":false,\"error\":\"cannot open database\"}"); return b.p; }
   sqlite3* db = sb_dbs[idx];
   const int strict = strncmp(sql, SB_D1_STRICT, sizeof(SB_D1_STRICT) - 1) == 0;
-  const int d1 = strstr(path, "/d1/") != 0;
+  // Durable Object SQL databases return BLOBs as D1 does.
+  const int d1 = strstr(path, "/d1/") != 0 || sb_is_do_sql(path);
   sqlite3_stmt* st = sb_stmt_get(idx, db, sql);
   if (!st) return sb_sql_error(db, 0, -1, strict ? (int)sizeof(SB_D1_STRICT) - 1 : 0);
   int bound = params && *params ? sb_bind_params(st, params) : 0;
@@ -3544,6 +3591,25 @@ function __sbD1Quota(path) {
 function __sbStore() {
   return __sbDir() + "/store.sqlite";
 }
+// "<data>/do-sql/CLASS/FILE.sqlite". The shim sends the file as 64 hex digits (the id, or a
+// hash of an older id); both parts are checked so nothing leaves the directory.
+function __sbDOSqlName(text, hex) {
+  if (!text.length || text.length > (hex ? 64 : 200) || (hex && text.length !== 64)) return false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    const ok = hex
+      ? (c >= 48 && c <= 57) || (c >= 97 && c <= 102)
+      : (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95 || c === 36;
+    if (!ok) return false;
+  }
+  return true;
+}
+function __sbDOSqlPath(cls, file) {
+  const c = String(cls);
+  const f = String(file);
+  if (!__sbDOSqlName(c, false) || !__sbDOSqlName(f, true)) throw new Error("invalid Durable Object SQL database");
+  return __sbDir() + "/do-sql/" + c + "/" + f + ".sqlite";
+}
 function __sbD1Path(name) {
   return __sbDir() + "/d1/" + name + ".sqlite";
 }
@@ -3911,6 +3977,19 @@ function __sbEmbeddedDispatch(msg) {
     if (op === "d1.batch") return { ok: true, results: __sbD1Batch(path, msg.statements || [], strict) };
     const one = __sbD1Run(path, msg.sql, msg.params, strict);
     return { ok: true, results: one.results, columns: one.columns, rows: one.rows, meta: one.meta, success: true };
+  }
+
+  // Durable Objects storage.sql (compatibility date 2026-10-29): one database per object,
+  // run like a strict D1 query (BLOBs as hex, D1_ERROR text the shim rewords).
+  if (op === "do.sql") {
+    const path = __sbDOSqlPath(msg.cls, msg.file);
+    // Its handle may have been closed and reopened since (SB_DO_SQL_OPEN), which drops the
+    // size cap: set it again.
+    delete __sbD1Capped[path];
+    __sbD1Quota(path);
+    const r = JSON.parse(__sbSqlRaw(path, "/*sb-d1-strict*/" + String(msg.sql), JSON.stringify(msg.params || [])));
+    if (r.ok === false) throw __sbD1Error(r);
+    return { ok: true, columns: r.cols, rows: r.rows, meta: { changes: r.changes } };
   }
 
   if (op === "d1.backup") {
