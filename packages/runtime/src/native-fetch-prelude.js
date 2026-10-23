@@ -6531,6 +6531,7 @@ globalThis.__sbInstallFetch = function () {
 // multi-sprout deployment needs the broker to hold a per-id lock (cloud).
 
 function __sbMakeDONamespace(binding, className) {
+  if (__sbDOv2()) return __sbMakeDONamespaceV2(className);
   return {
     idFromName(name) {
       return {
@@ -6591,18 +6592,228 @@ function __sbMakeDONamespace(binding, className) {
   };
 }
 
+// From compatibility date 2026-10-29 Durable Objects also match workerd in these ways:
+//
+// - Ids are 64 hex digits. The first 48 are the object's (a SHA-256 of the class and the
+//   name for idFromName, random for newUniqueId); the last 16 are a SHA-256 of the class
+//   and those 48, so idFromString refuses an id made for another class, as workerd does.
+//   An id has equals() and, from idFromName, its name. The format is part of storage (it
+//   is the object's storage scope), so it must never change.
+// - Storage written under an earlier date's "name:NAME" id moves to the 64-hex id the
+//   first time this process creates the object, and idFromString still accepts the old
+//   "name:" and "uid:" strings, so moving an app's date loses no data.
+// - namespace.getByName(name), and stub.id and stub.name.
+// - RPC: every other method of a stub calls the object's method of that name (any
+//   method its class defines, not instance properties), through the input gate. The
+//   arguments and the result are copied with the storage codec (__sbDOPack), so the
+//   object never shares a value with its caller; a function becomes a callback that
+//   runs the original, as workerd's stubs do. A getter is read with `await stub.prop`.
+//   A throw rejects the call with the original error.
+// - stub.fetch() rejects with the object's exception instead of resolving to a 500.
+//
+// The object runs in this sprout on every transport (see above), so an RPC call is a
+// direct call; only its storage goes to the broker.
+function __sbDOv2() {
+  return globalThis.__sbCompat >= "2026-10-29";
+}
+
+function __sbDOSha(text) {
+  return __sbR2HexOf(__sbDigestRaw("256", __sbToBytes(text)));
+}
+
+// The 64-hex id whose own part (48 hex digits) is `body`.
+function __sbDOSeal(cls, body) {
+  return body + __sbDOSha("sbdo-id:" + cls + ":" + body).slice(0, 16);
+}
+
+function __sbDOMakeId(hex, name) {
+  return {
+    name,
+    toString() {
+      return hex;
+    },
+    equals(other) {
+      return other != null && __sbIsFn(other.toString) && other.toString() === hex;
+    },
+  };
+}
+
+function __sbDONamedId(cls, name) {
+  const n = String(name);
+  return __sbDOMakeId(__sbDOSeal(cls, __sbDOSha("sbdo-name:" + cls + ":" + n).slice(0, 48)), n);
+}
+
+function __sbDOIsHex64(text) {
+  if (text.length !== 64) return false;
+  for (let i = 0; i < 64; i++) {
+    const c = text.charCodeAt(i);
+    if (!((c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70))) return false;
+  }
+  return true;
+}
+
+function __sbMakeDONamespaceV2(className) {
+  const ns = {
+    idFromName(name) {
+      return __sbDONamedId(className, name);
+    },
+    idFromString(text) {
+      const s = String(text);
+      // Ids an app saved before 2026-10-29.
+      if (s.indexOf("name:") === 0) return __sbDONamedId(className, s.slice(5));
+      if (s.indexOf("uid:") === 0) return __sbDOMakeId(s, undefined);
+      if (!__sbDOIsHex64(s)) throw new TypeError("Invalid Durable Object ID: must be 64 hex digits");
+      const hex = s.toLowerCase();
+      if (__sbDOSeal(className, hex.slice(0, 48)) !== hex)
+        throw new TypeError("Durable Object ID is not valid for this namespace.");
+      return __sbDOMakeId(hex, undefined);
+    },
+    newUniqueId() {
+      return __sbDOMakeId(__sbDOSeal(className, __sbDOHex(crypto.getRandomValues(new Uint8Array(24)))), undefined);
+    },
+    get(id) {
+      return __sbDOStub(className, __sbIsStr(id) ? ns.idFromString(id) : id);
+    },
+    getByName(name) {
+      return __sbDOStub(className, __sbDONamedId(className, name));
+    },
+    // One location here, so a jurisdiction's namespace is this one.
+    jurisdiction() {
+      return ns;
+    },
+  };
+  return ns;
+}
+
+// The class's own method or accessor `name`, from its prototype chain (not Object's).
+function __sbDOFind(Ctor, name) {
+  if (name === "constructor" || !Ctor) return undefined;
+  let p = Ctor.prototype;
+  while (p && p !== Object.prototype) {
+    const d = Object.getOwnPropertyDescriptor(p, name);
+    if (d) return d;
+    p = Object.getPrototypeOf(p);
+  }
+  return undefined;
+}
+
+function __sbDOStub(className, id) {
+  const base = {
+    id,
+    name: id.name,
+    fetch(input, init) {
+      return __sbDOFetchV2(className, id, input, init);
+    },
+  };
+  return new Proxy(base, {
+    get(t, prop) {
+      if (prop in t) return t[prop];
+      // "then" stays undefined, so awaiting a stub is not a call.
+      if (!__sbIsStr(prop) || prop === "then") return undefined;
+      const d = __sbDOFind(__sbDOClasses[className], prop);
+      if (d && d.get) return __sbDOInvoke(className, id, prop, null);
+      return (...args) => __sbDOInvoke(className, id, prop, args);
+    },
+  });
+}
+
+// A copy of `value` as the codec makes it; functions become callbacks.
+function __sbDOCopy(value) {
+  const fns = [];
+  return __sbDOUnpack(__sbDOPack(value, [], fns), fns);
+}
+
+function __sbDOCallback(fn, args) {
+  let copied;
+  try {
+    copied = __sbDOCopy(args);
+  } catch (error) {
+    return Promise.reject(error);
+  }
+  return Promise.resolve()
+    .then(() => fn.apply(undefined, copied))
+    .then(__sbDOCopy);
+}
+
+// One RPC call: method `method` with `args`, or the getter `method` when args is null.
+function __sbDOInvoke(cls, id, method, args) {
+  let copied = null;
+  let inst;
+  try {
+    if (args !== null) copied = __sbDOCopy(args);
+    inst = __sbGetDOInstance(cls, id.toString(), id);
+  } catch (error) {
+    return Promise.reject(error);
+  }
+  const run = () => {
+    const d = __sbDOFind(__sbDOClasses[cls], method);
+    if (args === null) return d.get.call(inst);
+    if (!d || !__sbIsFn(d.value)) throw new TypeError('The RPC receiver does not implement the method "' + method + '".');
+    return d.value.apply(inst, copied);
+  };
+  return __sbDOEnter(inst.__sbGate, run).then(
+    (value) => {
+      __sbDrainWaitUntil(inst.__sbTasks);
+      return __sbDOCopy(value);
+    },
+    (error) => {
+      __sbDrainWaitUntil(inst.__sbTasks);
+      throw error;
+    },
+  );
+}
+
+function __sbDOFetchV2(className, id, input, init) {
+  let req;
+  let inst;
+  try {
+    req = new Request(input, init);
+    inst = __sbGetDOInstance(className, id.toString(), id);
+  } catch (error) {
+    return Promise.reject(error);
+  }
+  return __sbDOEnter(inst.__sbGate, () => __sbFetchWithDrain(inst.fetch(req), inst.__sbTasks, false, true));
+}
+
+// Moves an object's storage and alarm from its earlier id to its 64-hex one. Each key
+// is written before it is deleted, so a crash part-way loses nothing and the next run
+// finishes the move.
+function __sbDOAdopt(cls, from, to) {
+  for (;;) {
+    const entries = __sbRpc("do.storage.list", { cls, id: from, prefix: "", limit: 1000 }).entries || [];
+    if (!entries.length) break;
+    for (let i = 0; i < entries.length; i++) {
+      __sbRpc("do.storage.put", { cls, id: to, key: entries[i][0], value: entries[i][1] });
+      __sbRpc("do.storage.delete", { cls, id: from, key: entries[i][0] });
+    }
+  }
+  const alarm = __sbRpc("do.alarm.get", { cls, id: from });
+  if (alarm.at != null) {
+    __sbRpc("do.alarm.set", { cls, id: to, at: alarm.at });
+    __sbRpc("do.alarm.delete", { cls, id: from });
+  }
+}
+
 const __sbDOClasses = {};
 const __sbDOInstances = {};
 globalThis.__sbRegisterDO = function (map) {
   for (const k in map) __sbDOClasses[k] = map[k];
 };
 
-function __sbGetDOInstance(cls, id) {
+function __sbGetDOInstance(cls, idText, idObj) {
   const Ctor = __sbDOClasses[cls];
   if (!Ctor) throw new Error("no such Durable Object class: " + cls);
+  let id = idText;
+  let stateId = null;
+  if (__sbDOv2()) {
+    // An alarm set under an earlier date's id names the object by its old id.
+    stateId = idObj || (id.indexOf("name:") === 0 ? __sbDONamedId(cls, id.slice(5)) : __sbDOMakeId(id, undefined));
+    id = stateId.toString();
+  }
   const cacheKey = cls + " " + id;
   let inst = __sbDOInstances[cacheKey];
   if (!inst) {
+    if (stateId !== null && stateId.name !== undefined) __sbDOAdopt(cls, "name:" + stateId.name, id);
     // #57 — was a no-op: a DO calling `state.waitUntil(p)` had `p` vanish with
     // no error. The instance outlives any one call (cached in
     // `__sbDOInstances`), so the queue lives on `state` too and is drained by
@@ -6610,7 +6821,7 @@ function __sbGetDOInstance(cls, id) {
     const __sbTasks = [];
     const gate = __sbDOMakeGate();
     const state = {
-      id: {
+      id: stateId || {
         toString() {
           return id;
         },
@@ -6815,7 +7026,8 @@ function __sbDOView(name, bytes) {
 // A value as JSON: null, booleans, strings and finite numbers are themselves; everything
 // else is an array whose first element names its type, so no plain value is ambiguous.
 /* oxlint-disable anti-slop/no-runtime-typeof -- structured clone branches on the value's type, as the HTML spec's StructuredSerialize does. */
-function __sbDOPack(v, seen) {
+// fns (RPC only): functions go there, packed as ["F", index]; storage passes none.
+function __sbDOPack(v, seen, fns) {
   if (v === null || v === true || v === false || __sbIsStr(v)) return v;
   const t = typeof v;
   if (t === "number") {
@@ -6824,6 +7036,11 @@ function __sbDOPack(v, seen) {
   }
   if (t === "bigint") return ["B", String(v)];
   if (t === "undefined") return ["U"];
+  if (t === "function" && fns) {
+    fns.push(v);
+    return ["F", fns.length - 1];
+  }
+  if (t === "symbol") throw __sbDOCloneError(v.toString());
   if (t !== "object") throw __sbDOCloneError(v);
   if (seen.indexOf(v) !== -1) throw __sbDOCloneError("a circular value");
   seen.push(v);
@@ -6832,12 +7049,12 @@ function __sbDOPack(v, seen) {
   else if (v instanceof Map) {
     out = ["M"];
     v.forEach((x, k) => {
-      out.push(__sbDOPack(k, seen), __sbDOPack(x, seen));
+      out.push(__sbDOPack(k, seen, fns), __sbDOPack(x, seen, fns));
     });
   } else if (v instanceof Set) {
     out = ["S"];
     v.forEach((x) => {
-      out.push(__sbDOPack(x, seen));
+      out.push(__sbDOPack(x, seen, fns));
     });
   } else if (v instanceof ArrayBuffer) out = ["AB", __sbDOHex(new Uint8Array(v))];
   else if (ArrayBuffer.isView(v)) {
@@ -6852,22 +7069,26 @@ function __sbDOPack(v, seen) {
   else if (v instanceof RegExp) out = ["R", v.source, v.flags];
   else if (Array.isArray(v)) {
     out = ["A"];
-    for (let i = 0; i < v.length; i++) out.push(__sbDOPack(v[i], seen));
+    for (let i = 0; i < v.length; i++) out.push(__sbDOPack(v[i], seen, fns));
   } else if (v instanceof Error) out = ["E", String(v.name), String(v.message)];
   else {
     out = ["O"];
     const keys = Object.keys(v);
-    for (let i = 0; i < keys.length; i++) out.push(keys[i], __sbDOPack(v[keys[i]], seen));
+    for (let i = 0; i < keys.length; i++) out.push(keys[i], __sbDOPack(v[keys[i]], seen, fns));
   }
   seen.pop();
   return out;
 }
 /* oxlint-enable anti-slop/no-runtime-typeof */
 
-function __sbDOUnpack(p) {
+function __sbDOUnpack(p, fns) {
   if (!Array.isArray(p)) return p;
   const tag = p[0];
   if (tag === "U") return undefined;
+  if (tag === "F" && fns) {
+    const fn = fns[p[1]];
+    return (...args) => __sbDOCallback(fn, args);
+  }
   if (tag === "N") return p[1] === "-0" ? -0 : Number(p[1]);
   if (tag === "B") return BigInt(p[1]);
   if (tag === "D") return new Date(p[1]);
@@ -6881,21 +7102,21 @@ function __sbDOUnpack(p) {
   }
   if (tag === "M") {
     const m = new Map();
-    for (let i = 1; i + 1 < p.length; i += 2) m.set(__sbDOUnpack(p[i]), __sbDOUnpack(p[i + 1]));
+    for (let i = 1; i + 1 < p.length; i += 2) m.set(__sbDOUnpack(p[i], fns), __sbDOUnpack(p[i + 1], fns));
     return m;
   }
   if (tag === "S") {
     const s = new Set();
-    for (let i = 1; i < p.length; i++) s.add(__sbDOUnpack(p[i]));
+    for (let i = 1; i < p.length; i++) s.add(__sbDOUnpack(p[i], fns));
     return s;
   }
   if (tag === "A") {
     const a = [];
-    for (let i = 1; i < p.length; i++) a.push(__sbDOUnpack(p[i]));
+    for (let i = 1; i < p.length; i++) a.push(__sbDOUnpack(p[i], fns));
     return a;
   }
   const o = {};
-  for (let i = 1; i + 1 < p.length; i += 2) o[p[i]] = __sbDOUnpack(p[i + 1]);
+  for (let i = 1; i + 1 < p.length; i += 2) o[p[i]] = __sbDOUnpack(p[i + 1], fns);
   return o;
 }
 
@@ -7455,7 +7676,7 @@ function __sbStreamResponse(response) {
   return response;
 }
 
-async function __sbFetchWithDrain(res, tasks, bindingCall) {
+async function __sbFetchWithDrain(res, tasks, bindingCall, rethrow) {
   let r;
   try {
     r = res && __sbIsFn(res.then) ? await res : res;
@@ -7464,6 +7685,11 @@ async function __sbFetchWithDrain(res, tasks, bindingCall) {
       else r.body = await __sbCollectBody(__sbRawBody(r));
     }
   } catch (error) {
+    // A Durable Object's stub.fetch() from 2026-10-29: the caller gets the exception.
+    if (rethrow) {
+      __sbDrainWaitUntil(tasks);
+      throw error;
+    }
     // #179 — a rejected handler promise must not take the process down with it.
     r = __sbErrorResponse(error, bindingCall);
   }
