@@ -1,6 +1,6 @@
 {
   "name": "@sproutboat/wire",
-  "version": "0.17.0",
+  "version": "0.18.0",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -23,6 +23,6 @@
   },
   "dependencies": {
     "@sproutboat/assets": "^0.3.0",
-    "@sproutboat/runtime": "^0.28.0"
+    "@sproutboat/runtime": "^0.29.0"
   }
 }
