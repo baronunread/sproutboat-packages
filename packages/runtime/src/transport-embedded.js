@@ -4194,12 +4194,17 @@ function __sbEmbeddedDispatch(msg) {
   }
 
   if (op === "queue.send" || op === "queue.send_batch") {
-    const items = op === "queue.send" ? [msg.body] : msg.messages || [];
+    // send_batch's items are { body, delaySeconds } objects, like the broker's. They were
+    // stored with String(item), so every sendBatch() body arrived as "[object Object]"
+    // (data loss), and delaySeconds was ignored on both calls.
+    const items = op === "queue.send" ? [{ body: msg.body, delaySeconds: msg.delaySeconds }] : msg.messages || [];
     for (let i = 0; i < items.length; i++) {
+      const item = items[i] || {};
+      const delay = Math.max(0, Number(item.delaySeconds) || 0) * 1000;
       __sbSql(
         store,
         "INSERT INTO mq (queue, id, body, visible_at, attempts, dead) VALUES (?1,?2,?3,?4,0,0)",
-        [msg.queue, __sbHex(12), String(items[i]), Date.now()],
+        [msg.queue, __sbHex(12), String(item.body), Date.now() + delay],
       );
     }
     return { ok: true };
@@ -4240,8 +4245,21 @@ function __sbEmbeddedDispatch(msg) {
       store,
       // Same clamp as the broker: an unbounded list builds the whole result in
       // memory before the caller sees any of it.
-      "SELECT key, value FROM do_storage WHERE cls = ? AND id = ? AND key LIKE ? || '%' ORDER BY key LIMIT ?",
-      [msg.cls, msg.id, msg.prefix || "", Math.min(Math.max(Number(msg.limit) || 1000, 1), 10000)],
+      // start, startAfter, end and reverse come from 2026-10-28 storage (null when unset).
+      // The prefix match is exact: LIKE also matched _ and % as wildcards, case-insensitively.
+      "SELECT key, value FROM do_storage WHERE cls = ?1 AND id = ?2 AND substr(key, 1, length(?3)) = ?3" +
+        " AND (?5 IS NULL OR key >= ?5) AND (?6 IS NULL OR key > ?6) AND (?7 IS NULL OR key < ?7)" +
+        (msg.reverse ? " ORDER BY key DESC" : " ORDER BY key") +
+        " LIMIT ?4",
+      [
+        msg.cls,
+        msg.id,
+        msg.prefix || "",
+        Math.min(Math.max(Number(msg.limit) || 1000, 1), 10000),
+        msg.start == null ? null : String(msg.start),
+        msg.startAfter == null ? null : String(msg.startAfter),
+        msg.end == null ? null : String(msg.end),
+      ],
     );
     const entries = [];
     for (let i = 0; i < r.rows.length; i++) entries.push([r.rows[i][0], r.rows[i][1]]);
@@ -4799,7 +4817,7 @@ globalThis.__sbStartLocalTriggers = function (handlers, bindings) {
         try {
           const instance = __sbGetDOInstance(cls, id);
           if (__sbIsFn(instance.alarm)) {
-            const res = instance.alarm();
+            const res = __sbDOGated() ? __sbDOEnter(instance.__sbGate, () => instance.alarm()) : instance.alarm();
             if (res && __sbIsFn(res.then)) await res;
             if (instance.__sbTasks.length) await __sbDrainWaitUntil(instance.__sbTasks);
           }

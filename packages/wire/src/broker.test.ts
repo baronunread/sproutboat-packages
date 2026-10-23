@@ -39,31 +39,59 @@ function make(opts: Parameters<typeof createBroker>[0] = {}): Broker {
 
 test("a stale queue acknowledgement cannot remove a newer delivery claim", async () => {
   const root = mkdtempSync(join(tmpdir(), "sb-claim-fence-"));
-  const path = join(root,"state.sqlite");
+  const path = join(root, "state.sqlite");
   const first = Promise.withResolvers<void>();
   const second = Promise.withResolvers<void>();
   const finishFirst = Promise.withResolvers<Response>();
   const finishSecond = Promise.withResolvers<Response>();
   let enabled = false;
-  const a = createBroker({db:path,bindings:{queues:["JOBS"]},sproutUrl:"http://127.0.0.1:1/",deliveryTimeoutMs:2_000,deliveryLeaseMs:3_000,fetchImpl:async()=>{first.resolve();return finishFirst.promise;}});
-  const b = createBroker({db:path,bindings:{queues:["JOBS"]},sproutUrl:"http://127.0.0.1:1/",dispatchEnabled:()=>enabled,deliveryTimeoutMs:2_000,deliveryLeaseMs:3_000,fetchImpl:async()=>{second.resolve();return finishSecond.promise;}});
+  const a = createBroker({
+    db: path,
+    bindings: { queues: ["JOBS"] },
+    sproutUrl: "http://127.0.0.1:1/",
+    deliveryTimeoutMs: 2_000,
+    deliveryLeaseMs: 3_000,
+    fetchImpl: async () => {
+      first.resolve();
+      return finishFirst.promise;
+    },
+  });
+  const b = createBroker({
+    db: path,
+    bindings: { queues: ["JOBS"] },
+    sproutUrl: "http://127.0.0.1:1/",
+    dispatchEnabled: () => enabled,
+    deliveryTimeoutMs: 2_000,
+    deliveryLeaseMs: 3_000,
+    fetchImpl: async () => {
+      second.resolve();
+      return finishSecond.promise;
+    },
+  });
   const inspect = new Database(path);
   try {
-    await a.dispatch({op:"queue.send",queue:"JOBS",body:"work"});
+    await a.dispatch({ op: "queue.send", queue: "JOBS", body: "work" });
     await first.promise;
-    const row=inspect.query<{id:string;claim_token:string},[]>("SELECT id,claim_token FROM mq").get()!;
+    const row = inspect.query<{ id: string; claim_token: string }, []>("SELECT id,claim_token FROM mq").get()!;
     inspect.query("UPDATE mq SET visible_at=0").run();
-    enabled=true;
+    enabled = true;
     await second.promise;
-    expect(inspect.query<{claim_token:string},[]>("SELECT claim_token FROM mq").get()!.claim_token).not.toBe(row.claim_token);
-    finishFirst.resolve(Response.json({ack:[row.id],retry:[]}));
+    expect(inspect.query<{ claim_token: string }, []>("SELECT claim_token FROM mq").get()!.claim_token).not.toBe(
+      row.claim_token,
+    );
+    finishFirst.resolve(Response.json({ ack: [row.id], retry: [] }));
     await Bun.sleep(30);
-    expect(inspect.query<{count:number},[]>("SELECT count(*) AS count FROM mq").get()!.count).toBe(1);
-    finishSecond.resolve(Response.json({ack:[row.id],retry:[]}));
+    expect(inspect.query<{ count: number }, []>("SELECT count(*) AS count FROM mq").get()!.count).toBe(1);
+    finishSecond.resolve(Response.json({ ack: [row.id], retry: [] }));
     await Bun.sleep(30);
-    expect(inspect.query<{count:number},[]>("SELECT count(*) AS count FROM mq").get()!.count).toBe(0);
-  } finally {a.close();b.close();inspect.close();rmSync(root,{recursive:true,force:true});}
-},5_000);
+    expect(inspect.query<{ count: number }, []>("SELECT count(*) AS count FROM mq").get()!.count).toBe(0);
+  } finally {
+    a.close();
+    b.close();
+    inspect.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 5_000);
 
 test("ping round-trips", async () => {
   const b = make();
@@ -71,42 +99,70 @@ test("ping round-trips", async () => {
 });
 
 test("a new alarm replaces exhausted delivery state and delete cancels durable retries", async () => {
-  const root=mkdtempSync(join(tmpdir(),"sb-alarm-replace-"));
-  const path=join(root,"state.sqlite");
-  const broker=createBroker({db:path,bindings:{do:[{binding:"COUNTER",className:"Counter"}]}});
-  const inspect=new Database(path);
+  const root = mkdtempSync(join(tmpdir(), "sb-alarm-replace-"));
+  const path = join(root, "state.sqlite");
+  const broker = createBroker({ db: path, bindings: { do: [{ binding: "COUNTER", className: "Counter" }] } });
+  const inspect = new Database(path);
   try {
     inspect.query("INSERT INTO do_alarm_delivery VALUES ('Counter','one',1,5,'old',0)").run();
-    await broker.dispatch({op:"do.alarm.set",cls:"Counter",id:"one",at:Date.now()+60_000});
-    expect(inspect.query<{count:number},[]>("SELECT count(*) AS count FROM do_alarm_delivery").get()!.count).toBe(0);
-    expect((await broker.dispatch({op:"do.alarm.get",cls:"Counter",id:"one"})).at).toBeGreaterThan(Date.now());
+    await broker.dispatch({ op: "do.alarm.set", cls: "Counter", id: "one", at: Date.now() + 60_000 });
+    expect(inspect.query<{ count: number }, []>("SELECT count(*) AS count FROM do_alarm_delivery").get()!.count).toBe(
+      0,
+    );
+    expect((await broker.dispatch({ op: "do.alarm.get", cls: "Counter", id: "one" })).at).toBeGreaterThan(Date.now());
     inspect.query("INSERT INTO do_alarm_delivery VALUES ('Counter','one',1,1,'active',9999999999999)").run();
-    expect((await broker.dispatch({op:"do.alarm.delete",cls:"Counter",id:"one"})).deleted).toBe(true);
-    expect(inspect.query<{count:number},[]>("SELECT count(*) AS count FROM do_alarm_delivery").get()!.count).toBe(0);
-    expect((await broker.dispatch({op:"do.alarm.get",cls:"Counter",id:"one"})).at).toBeNull();
-  } finally {inspect.close();broker.close();rmSync(root,{recursive:true,force:true});}
+    expect((await broker.dispatch({ op: "do.alarm.delete", cls: "Counter", id: "one" })).deleted).toBe(true);
+    expect(inspect.query<{ count: number }, []>("SELECT count(*) AS count FROM do_alarm_delivery").get()!.count).toBe(
+      0,
+    );
+    expect((await broker.dispatch({ op: "do.alarm.get", cls: "Counter", id: "one" })).at).toBeNull();
+  } finally {
+    inspect.close();
+    broker.close();
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("oversized queue acknowledgement bodies are cancelled and retried", async () => {
-  let cancelled=false;
-  const delivered=Promise.withResolvers<void>();
-  const root=mkdtempSync(join(tmpdir(),"sb-ack-bound-"));
-  const path=join(root,"state.sqlite");
-  const broker=createBroker({db:path,bindings:{queues:["JOBS"]},sproutUrl:"http://127.0.0.1:1/",fetchImpl:async()=>{
-    delivered.resolve();
-    return new Response(new ReadableStream({pull(controller){controller.enqueue(new Uint8Array(65_536));},cancel(){cancelled=true;}}));
-  }});
-  const inspect=new Database(path);
+  let cancelled = false;
+  const delivered = Promise.withResolvers<void>();
+  const root = mkdtempSync(join(tmpdir(), "sb-ack-bound-"));
+  const path = join(root, "state.sqlite");
+  const broker = createBroker({
+    db: path,
+    bindings: { queues: ["JOBS"] },
+    sproutUrl: "http://127.0.0.1:1/",
+    fetchImpl: async () => {
+      delivered.resolve();
+      return new Response(
+        new ReadableStream({
+          pull(controller) {
+            controller.enqueue(new Uint8Array(65_536));
+          },
+          cancel() {
+            cancelled = true;
+          },
+        }),
+      );
+    },
+  });
+  const inspect = new Database(path);
   try {
-    await broker.dispatch({op:"queue.send",queue:"JOBS",body:"work"});
+    await broker.dispatch({ op: "queue.send", queue: "JOBS", body: "work" });
     await delivered.promise;
     await Bun.sleep(40);
     expect(cancelled).toBe(true);
-    const row=inspect.query<{attempts:number;claim_token:string},[]>("SELECT attempts,claim_token FROM mq").get()!;
+    const row = inspect
+      .query<{ attempts: number; claim_token: string }, []>("SELECT attempts,claim_token FROM mq")
+      .get()!;
     expect(row.attempts).toBe(1);
     expect(row.claim_token).toBe("");
-  } finally {inspect.close();broker.close();rmSync(root,{recursive:true,force:true});}
-},3_000);
+  } finally {
+    inspect.close();
+    broker.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 3_000);
 
 test("#233: a KV value put as bytes is flagged binary and survives an existing store", async () => {
   const b = make({ bindings: { kv: ["CACHE"] } });
@@ -114,11 +170,19 @@ test("#233: a KV value put as bytes is flagged binary and survives an existing s
   const bytes = Array.from({ length: 256 }, (_, i) => String.fromCharCode(i)).join("");
   await b.dispatch({ op: "kv.put", ns: "CACHE", key: "bin", value: bytes, binary: true });
   await b.dispatch({ op: "kv.put", ns: "CACHE", key: "txt", value: "café" });
-  expect(await b.dispatch({ op: "kv.get", ns: "CACHE", key: "bin" })).toMatchObject({ ok: true, found: true, value: bytes, binary: true });
+  expect(await b.dispatch({ op: "kv.get", ns: "CACHE", key: "bin" })).toMatchObject({
+    ok: true,
+    found: true,
+    value: bytes,
+    binary: true,
+  });
   expect(await b.dispatch({ op: "kv.get", ns: "CACHE", key: "txt" })).toMatchObject({ value: "café", binary: false });
   // Overwriting a binary value with text clears the flag.
   await b.dispatch({ op: "kv.put", ns: "CACHE", key: "bin", value: "now text" });
-  expect(await b.dispatch({ op: "kv.get", ns: "CACHE", key: "bin" })).toMatchObject({ value: "now text", binary: false });
+  expect(await b.dispatch({ op: "kv.get", ns: "CACHE", key: "bin" })).toMatchObject({
+    value: "now text",
+    binary: false,
+  });
 });
 
 test("KV put / get / list / delete, scoped to a bound namespace", async () => {
@@ -126,7 +190,12 @@ test("KV put / get / list / delete, scoped to a bound namespace", async () => {
   expect(await b.dispatch({ op: "kv.get", ns: "CACHE", key: "k" })).toEqual({ ok: true, found: false, value: null });
   await b.dispatch({ op: "kv.put", ns: "CACHE", key: "k", value: "v" });
   await b.dispatch({ op: "kv.put", ns: "CACHE", key: "k2", value: "v2" });
-  expect(await b.dispatch({ op: "kv.get", ns: "CACHE", key: "k" })).toMatchObject({ ok: true, found: true, value: "v", binary: false });
+  expect(await b.dispatch({ op: "kv.get", ns: "CACHE", key: "k" })).toMatchObject({
+    ok: true,
+    found: true,
+    value: "v",
+    binary: false,
+  });
   expect(await b.dispatch({ op: "kv.list", ns: "CACHE", prefix: "k" })).toMatchObject({ ok: true, keys: ["k", "k2"] });
   await b.dispatch({ op: "kv.delete", ns: "CACHE", key: "k" });
   expect(await b.dispatch({ op: "kv.get", ns: "CACHE", key: "k" })).toMatchObject({ found: false });
@@ -140,7 +209,10 @@ test("KV metadata, expiration and paged list (the shim from 2026-10-25); the pre
   await b.dispatch({ op: "kv.put", ns: "CACHE", key: "c", value: "3" });
   await b.dispatch({ op: "kv.put", ns: "CACHE", key: "a_x", value: "4" });
   await b.dispatch({ op: "kv.put", ns: "CACHE", key: "AB", value: "5" });
-  expect(await b.dispatch({ op: "kv.get", ns: "CACHE", key: "a" })).toMatchObject({ metadata: '{"t":1}', expiration: null });
+  expect(await b.dispatch({ op: "kv.get", ns: "CACHE", key: "a" })).toMatchObject({
+    metadata: '{"t":1}',
+    expiration: null,
+  });
   expect(await b.dispatch({ op: "kv.get", ns: "CACHE", key: "b" })).toMatchObject({ metadata: null, expiration: at });
   // LIKE matched "ab" for "a_" and "AB" for "a"; the prefix is now exact and case-sensitive.
   expect((await b.dispatch({ op: "kv.list", ns: "CACHE", prefix: "a_" })).keys).toEqual(["a_x"]);
@@ -153,7 +225,11 @@ test("KV metadata, expiration and paged list (the shim from 2026-10-25); the pre
   ]);
   const rest = await b.dispatch({ op: "kv.list", ns: "CACHE", prefix: "", limit: 2, cursor: "a" });
   expect(rest).toMatchObject({ keys: ["a_x", "b"], list_complete: false, cursor: "b" });
-  expect(await b.dispatch({ op: "kv.list", ns: "CACHE", prefix: "", limit: 2, cursor: "b" })).toMatchObject({ keys: ["c"], list_complete: true, cursor: "" });
+  expect(await b.dispatch({ op: "kv.list", ns: "CACHE", prefix: "", limit: 2, cursor: "b" })).toMatchObject({
+    keys: ["c"],
+    list_complete: true,
+    cursor: "",
+  });
 });
 
 test("KV expirationTtl under 60 seconds is rejected, matching CF", async () => {
@@ -426,17 +502,33 @@ test("R2: put / get / head / list / delete on a bound bucket", async () => {
 
 test("R2: exact list prefix at every date; md5, paged list and delimiter for the shim from 2026-10-26", async () => {
   const b = make({ bindings: { r2: ["ASSETS"] } });
-  for (const key of ["a_x", "ab", "AB", "d/1", "d/2", "e/1", "f"]) await b.dispatch({ op: "r2.put", bucket: "ASSETS", key, body: "v" });
+  for (const key of ["a_x", "ab", "AB", "d/1", "d/2", "e/1", "f"])
+    await b.dispatch({ op: "r2.put", bucket: "ASSETS", key, body: "v" });
   // LIKE listed "ab" for "a_" and "AB" for "a".
-  expect(arr((await b.dispatch({ op: "r2.list", bucket: "ASSETS", prefix: "a_" })).objects).map((o) => obj(o).key)).toEqual(["a_x"]);
-  expect(arr((await b.dispatch({ op: "r2.list", bucket: "ASSETS", prefix: "a" })).objects).map((o) => obj(o).key)).toEqual(["a_x", "ab"]);
+  expect(
+    arr((await b.dispatch({ op: "r2.list", bucket: "ASSETS", prefix: "a_" })).objects).map((o) => obj(o).key),
+  ).toEqual(["a_x"]);
+  expect(
+    arr((await b.dispatch({ op: "r2.list", bucket: "ASSETS", prefix: "a" })).objects).map((o) => obj(o).key),
+  ).toEqual(["a_x", "ab"]);
   const put = await b.dispatch({ op: "r2.put", bucket: "ASSETS", key: "m", body: "hello" });
-  await b.dispatch({ op: "r2.md5", bucket: "ASSETS", key: "m", etag: obj(put.object).etag, md5: "5d41402abc4b2a76b9719d911017c592" });
-  expect(obj((await b.dispatch({ op: "r2.head", bucket: "ASSETS", key: "m" })).object).md5).toBe("5d41402abc4b2a76b9719d911017c592");
+  await b.dispatch({
+    op: "r2.md5",
+    bucket: "ASSETS",
+    key: "m",
+    etag: obj(put.object).etag,
+    md5: "5d41402abc4b2a76b9719d911017c592",
+  });
+  expect(obj((await b.dispatch({ op: "r2.head", bucket: "ASSETS", key: "m" })).object).md5).toBe(
+    "5d41402abc4b2a76b9719d911017c592",
+  );
   // A stale etag (the object was written again since) records nothing.
   await b.dispatch({ op: "r2.md5", bucket: "ASSETS", key: "m", etag: "stale", md5: "x" });
-  expect(obj((await b.dispatch({ op: "r2.head", bucket: "ASSETS", key: "m" })).object).md5).toBe("5d41402abc4b2a76b9719d911017c592");
-  const page = (cursor: string) => b.dispatch({ op: "r2.list", bucket: "ASSETS", page: true, prefix: "", cursor, limit: 3, delimiter: "/" });
+  expect(obj((await b.dispatch({ op: "r2.head", bucket: "ASSETS", key: "m" })).object).md5).toBe(
+    "5d41402abc4b2a76b9719d911017c592",
+  );
+  const page = (cursor: string) =>
+    b.dispatch({ op: "r2.list", bucket: "ASSETS", page: true, prefix: "", cursor, limit: 3, delimiter: "/" });
   const first = await page("");
   expect(arr(first.objects).map((o) => obj(o).key)).toEqual(["AB", "a_x", "ab"]);
   expect(first).toMatchObject({ truncated: true, cursor: "ab", delimitedPrefixes: [] });
@@ -451,14 +543,22 @@ test("R2 direct transfer: streamed upload, metadata, one-use ticket and ranged d
   try {
     const b = make({ db: join(root, "state.sqlite"), bindings: { r2: ["UPLOADS"] } });
     const upload = await b.dispatch({
-      op: "r2.transfer.create", bucket: "UPLOADS", key: "large.bin", method: "upload",
-      maxBytes: 100, sha256: createHash("sha256").update("abcdef").digest("hex"),
+      op: "r2.transfer.create",
+      bucket: "UPLOADS",
+      key: "large.bin",
+      method: "upload",
+      maxBytes: 100,
+      sha256: createHash("sha256").update("abcdef").digest("hex"),
       httpMetadata: { contentType: "application/octet-stream" },
     });
     const url = `http://127.0.0.1${upload.url}`;
     const bytes = new TextEncoder().encode("abcdef");
     const body = new ReadableStream<Uint8Array>({
-      pull(controller) { controller.enqueue(bytes.subarray(0, 3)); controller.enqueue(bytes.subarray(3)); controller.close(); },
+      pull(controller) {
+        controller.enqueue(bytes.subarray(0, 3));
+        controller.enqueue(bytes.subarray(3));
+        controller.close();
+      },
     });
     // SAFETY: Bun accepts duplex for streamed bodies; the bundled DOM type omits this runtime field.
     const put = await b.transfer(new Request(url, { method: "PUT", body, duplex: "half" } as RequestInit));
@@ -467,7 +567,12 @@ test("R2 direct transfer: streamed upload, metadata, one-use ticket and ranged d
     const head = await b.dispatch({ op: "r2.head", bucket: "UPLOADS", key: "large.bin" });
     expect(obj(head.object).size).toBe(6);
 
-    const download = await b.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "large.bin", method: "download" });
+    const download = await b.dispatch({
+      op: "r2.transfer.create",
+      bucket: "UPLOADS",
+      key: "large.bin",
+      method: "download",
+    });
     const get = await b.transfer(new Request(`http://127.0.0.1${download.url}`, { headers: { range: "bytes=2-4" } }));
     expect(get.status).toBe(206);
     expect(get.headers.get("content-range")).toBe("bytes 2-4/6");
@@ -484,16 +589,32 @@ test("R2 direct transfer: invalid ranges and oversized bodies never replace an o
   try {
     const b = make({ db: join(root, "state.sqlite"), bindings: { r2: ["UPLOADS"] } });
     await b.dispatch({ op: "r2.put", bucket: "UPLOADS", key: "k", body: "old" });
-    const upload = await b.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "k", method: "upload", maxBytes: 2 });
+    const upload = await b.dispatch({
+      op: "r2.transfer.create",
+      bucket: "UPLOADS",
+      key: "k",
+      method: "upload",
+      maxBytes: 2,
+    });
     const url = `http://127.0.0.1${upload.url}`;
     expect((await b.transfer(new Request(url, { method: "PUT", body: "large" }))).status).toBe(413);
     expect((await b.transfer(new Request(url, { method: "PUT", body: "ok" }))).status).toBe(410);
-    const retry = await b.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "k", method: "upload", maxBytes: 2 });
-    expect((await b.transfer(new Request(`http://127.0.0.1${retry.url}`, { method: "PUT", body: "ok" }))).status).toBe(201);
+    const retry = await b.dispatch({
+      op: "r2.transfer.create",
+      bucket: "UPLOADS",
+      key: "k",
+      method: "upload",
+      maxBytes: 2,
+    });
+    expect((await b.transfer(new Request(`http://127.0.0.1${retry.url}`, { method: "PUT", body: "ok" }))).status).toBe(
+      201,
+    );
     const after = await b.dispatch({ op: "r2.get", bucket: "UPLOADS", key: "k" });
     expect(after.body).toBe("ok");
     const dl = await b.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "k", method: "download" });
-    expect((await b.transfer(new Request(`http://127.0.0.1${dl.url}`, { headers: { range: "bytes=1-0" } }))).status).toBe(416);
+    expect(
+      (await b.transfer(new Request(`http://127.0.0.1${dl.url}`, { headers: { range: "bytes=1-0" } }))).status,
+    ).toBe(416);
     expect((await b.transfer(new Request(`http://127.0.0.1${dl.url}`))).status).toBe(200);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -521,25 +642,46 @@ test("R2 direct transfer: account quota includes objects and shared in-flight re
     await first.dispatch({ op: "r2.put", bucket: "UPLOADS", key: "existing", body: "four" });
     const resource = new Database(join(resourceDir, "uploads.sqlite"));
     try {
-      resource.query("INSERT INTO r2_part (bucket, key, upload_id, part_number, size, etag) VALUES (?1, ?2, ?3, 1, 2, ?4)")
+      resource
+        .query("INSERT INTO r2_part (bucket, key, upload_id, part_number, size, etag) VALUES (?1, ?2, ?3, 1, 2, ?4)")
         .run("uploads", "partial", "upload-1", "part");
     } finally {
       resource.close();
     }
-    await expect(first.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "large", method: "upload", maxBytes: 7 }))
-      .rejects.toThrow("quota");
-    const ticket = await first.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "large", method: "upload", maxBytes: 6 });
-    await expect(second.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "other", method: "upload", maxBytes: 1 }))
-      .rejects.toThrow("quota");
+    await expect(
+      first.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "large", method: "upload", maxBytes: 7 }),
+    ).rejects.toThrow("quota");
+    const ticket = await first.dispatch({
+      op: "r2.transfer.create",
+      bucket: "UPLOADS",
+      key: "large",
+      method: "upload",
+      maxBytes: 6,
+    });
+    await expect(
+      second.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "other", method: "upload", maxBytes: 1 }),
+    ).rejects.toThrow("quota");
 
-    expect((await first.transfer(new Request(`http://127.0.0.1${ticket.url}`, { method: "PUT", body: "five!" }))).status).toBe(201);
-    const replacement = await second.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "other", method: "upload", maxBytes: 1 });
+    expect(
+      (await first.transfer(new Request(`http://127.0.0.1${ticket.url}`, { method: "PUT", body: "five!" }))).status,
+    ).toBe(201);
+    const replacement = await second.dispatch({
+      op: "r2.transfer.create",
+      bucket: "UPLOADS",
+      key: "other",
+      method: "upload",
+      maxBytes: 1,
+    });
     expect(replacement.ok).toBe(true);
     const ledger = new Database(join(resourceDir, "r2-quota.sqlite"), { readonly: true });
     try {
-      expect(ledger.query<{ tickets_issued: number; rejected_quota: number }, [string]>(
-        "SELECT tickets_issued, rejected_quota FROM r2_transfer_metric WHERE owner = ?",
-      ).get("owner-1")).toEqual({ tickets_issued: 2, rejected_quota: 2 });
+      expect(
+        ledger
+          .query<{ tickets_issued: number; rejected_quota: number }, [string]>(
+            "SELECT tickets_issued, rejected_quota FROM r2_transfer_metric WHERE owner = ?",
+          )
+          .get("owner-1"),
+      ).toEqual({ tickets_issued: 2, rejected_quota: 2 });
     } finally {
       ledger.close();
     }
@@ -561,15 +703,31 @@ test("R2 direct transfer: failed uploads release their reservation and retain th
     };
     const b = make(config);
     const ticket = await b.dispatch({
-      op: "r2.transfer.create", bucket: "UPLOADS", key: "bad", method: "upload", maxBytes: 5,
+      op: "r2.transfer.create",
+      bucket: "UPLOADS",
+      key: "bad",
+      method: "upload",
+      maxBytes: 5,
       sha256: createHash("sha256").update("expected").digest("hex"),
     });
-    expect((await b.transfer(new Request(`http://127.0.0.1${ticket.url}`, { method: "PUT", body: "wrong" }))).status).toBe(422);
-    expect((await b.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "retry", method: "upload", maxBytes: 5 })).ok).toBe(true);
+    expect(
+      (await b.transfer(new Request(`http://127.0.0.1${ticket.url}`, { method: "PUT", body: "wrong" }))).status,
+    ).toBe(422);
+    expect(
+      (await b.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "retry", method: "upload", maxBytes: 5 }))
+        .ok,
+    ).toBe(true);
 
-    const floor = make({ ...config, db: join(root, "floor.sqlite"), r2QuotaBytes: 100, r2MinFreeBytes: 10, freeBytes: () => 11 });
-    await expect(floor.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "no-space", method: "upload", maxBytes: 2 }))
-      .rejects.toThrow("temporarily unavailable");
+    const floor = make({
+      ...config,
+      db: join(root, "floor.sqlite"),
+      r2QuotaBytes: 100,
+      r2MinFreeBytes: 10,
+      freeBytes: () => 11,
+    });
+    await expect(
+      floor.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "no-space", method: "upload", maxBytes: 2 }),
+    ).rejects.toThrow("temporarily unavailable");
 
     let freeBytes = 20;
     const duringUpload = make({
@@ -579,15 +737,25 @@ test("R2 direct transfer: failed uploads release their reservation and retain th
       r2MinFreeBytes: 10,
       freeBytes: () => freeBytes,
     });
-    const unknownLength = await duringUpload.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "during", method: "upload", maxBytes: 5 });
+    const unknownLength = await duringUpload.dispatch({
+      op: "r2.transfer.create",
+      bucket: "UPLOADS",
+      key: "during",
+      method: "upload",
+      maxBytes: 5,
+    });
     freeBytes = 10;
-    expect((await duringUpload.transfer(new Request(`http://127.0.0.1${unknownLength.url}`, { method: "PUT", body: "x" }))).status).toBe(507);
+    expect(
+      (await duringUpload.transfer(new Request(`http://127.0.0.1${unknownLength.url}`, { method: "PUT", body: "x" })))
+        .status,
+    ).toBe(507);
 
     const abandoned = join(config.resourceDir, "r2-blobs", "a".repeat(24) + ".upload.tmp");
     mkdirSync(join(config.resourceDir, "r2-blobs"), { recursive: true });
     writeFileSync(abandoned, "partial");
-    await expect(b.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "quota-full", method: "upload", maxBytes: 1 }))
-      .rejects.toThrow("quota");
+    await expect(
+      b.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "quota-full", method: "upload", maxBytes: 1 }),
+    ).rejects.toThrow("quota");
     expect(existsSync(abandoned)).toBe(false);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -599,7 +767,13 @@ test("R2 direct transfer: live HTTP listener accepts a chunked binary PUT", asyn
   const b = make({ db: join(root, "state.sqlite"), bindings: { r2: ["UPLOADS"] } });
   const server = listenTransfers(b, "127.0.0.1", 0);
   try {
-    const ticket = await b.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "stream.bin", method: "upload", maxBytes: 2 * 1024 * 1024 });
+    const ticket = await b.dispatch({
+      op: "r2.transfer.create",
+      bucket: "UPLOADS",
+      key: "stream.bin",
+      method: "upload",
+      maxBytes: 2 * 1024 * 1024,
+    });
     let chunks = 0;
     const body = new ReadableStream<Uint8Array>({
       pull(controller) {
@@ -608,10 +782,21 @@ test("R2 direct transfer: live HTTP listener accepts a chunked binary PUT", asyn
       },
     });
     // SAFETY: Bun accepts duplex for streamed bodies; the bundled DOM type omits this runtime field.
-    const uploaded = await fetch(`http://127.0.0.1:${server.port}${ticket.url}`, { method: "PUT", body, duplex: "half" } as RequestInit);
+    const uploaded = await fetch(`http://127.0.0.1:${server.port}${ticket.url}`, {
+      method: "PUT",
+      body,
+      duplex: "half",
+    } as RequestInit);
     expect(uploaded.status).toBe(201);
-    const download = await b.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "stream.bin", method: "download" });
-    const response = await fetch(`http://127.0.0.1:${server.port}${download.url}`, { headers: { range: "bytes=65535-65537" } });
+    const download = await b.dispatch({
+      op: "r2.transfer.create",
+      bucket: "UPLOADS",
+      key: "stream.bin",
+      method: "download",
+    });
+    const response = await fetch(`http://127.0.0.1:${server.port}${download.url}`, {
+      headers: { range: "bytes=65535-65537" },
+    });
     expect(response.status).toBe(206);
     expect(new Uint8Array(await response.arrayBuffer())).toEqual(new Uint8Array([1, 2, 2]));
   } finally {
@@ -732,15 +917,38 @@ test("R2 direct overwrite also preserves the old generation on metadata failure"
     const b = make({ db: databasePath, bindings: { r2: ["UPLOADS"] } });
     await b.dispatch({ op: "r2.put", bucket: "UPLOADS", key: "object", body: "old" });
     const control = new Database(databasePath);
-    control.exec("CREATE TRIGGER fail_r2_metadata BEFORE UPDATE ON r2 BEGIN SELECT RAISE(ABORT, 'forced metadata failure'); END");
+    control.exec(
+      "CREATE TRIGGER fail_r2_metadata BEFORE UPDATE ON r2 BEGIN SELECT RAISE(ABORT, 'forced metadata failure'); END",
+    );
     const ticket = await b.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "object", method: "upload" });
-    await expect(b.transfer(new Request(`http://127.0.0.1${ticket.url}`, { method: "PUT", body: "new" })))
-      .rejects.toThrow("forced metadata failure");
-    expect(await b.dispatch({ op: "r2.get", bucket: "UPLOADS", key: "object" })).toMatchObject({ found: true, body: "old" });
+    await expect(
+      b.transfer(new Request(`http://127.0.0.1${ticket.url}`, { method: "PUT", body: "new" })),
+    ).rejects.toThrow("forced metadata failure");
+    expect(await b.dispatch({ op: "r2.get", bucket: "UPLOADS", key: "object" })).toMatchObject({
+      found: true,
+      body: "old",
+    });
     control.close();
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("Durable Object storage list: exact prefix, start / startAfter / end, reverse, limit", async () => {
+  const b = make({ bindings: { do: [{ binding: "COUNTER", className: "Counter" }] } });
+  for (const key of ["a", "b", "c", "d", "a_x", "A1", "aZ"])
+    await b.dispatch({ op: "do.storage.put", cls: "Counter", id: "r", key, value: "1" });
+  const keys = async (opts: Record<string, string | number | boolean | null>) => {
+    const entries = (await b.dispatch({ op: "do.storage.list", cls: "Counter", id: "r", prefix: "", ...opts }))
+      ?.entries;
+    return Array.isArray(entries) ? entries.map((e) => (Array.isArray(e) ? e[0] : null)) : null;
+  };
+  expect(await keys({ start: "b", end: "d" })).toEqual(["b", "c"]);
+  expect(await keys({ startAfter: "a_x" })).toEqual(["b", "c", "d"]);
+  expect(await keys({ reverse: true, limit: 2 })).toEqual(["d", "c"]);
+  // LIKE matched "_" as a wildcard and ignored case: "a_" used to list "aZ" and "A1" too.
+  expect(await keys({ prefix: "a_" })).toEqual(["a_x"]);
+  expect(await keys({ start: null, end: null })).toEqual(["A1", "a", "aZ", "a_x", "b", "c", "d"]);
 });
 
 test("Durable Object storage: get / put / delete / list / deleteAll scoped to (class, id)", async () => {
@@ -1482,10 +1690,20 @@ test("TCP: large replies survive backpressure and stay ordered with a pipelined 
   const second = encodeFrame({ ok: true, id: 2 });
   let calls = 0;
   const broker = make();
-  const server = listen({ ...broker, async handleFrame() {
-    if (calls++ === 0) { await Bun.sleep(10); return first; }
-    return second;
-  } }, "127.0.0.1", 0);
+  const server = listen(
+    {
+      ...broker,
+      async handleFrame() {
+        if (calls++ === 0) {
+          await Bun.sleep(10);
+          return first;
+        }
+        return second;
+      },
+    },
+    "127.0.0.1",
+    0,
+  );
   const socket = createConnection({ host: "127.0.0.1", port: server.port });
   let resume: ReturnType<typeof setTimeout> | undefined;
   let next: ReturnType<typeof setTimeout> | undefined;
@@ -1497,7 +1715,8 @@ test("TCP: large replies survive backpressure and stay ordered with a pipelined 
       timeout = setTimeout(() => reject(new Error("large broker reply stalled or truncated")), 3000);
       socket.on("error", reject);
       socket.on("data", (chunk: Buffer) => {
-        chunks.push(chunk); size += chunk.length;
+        chunks.push(chunk);
+        size += chunk.length;
         if (size >= first.length + second.length) done(Buffer.concat(chunks));
       });
       socket.on("connect", () => {
@@ -1512,8 +1731,11 @@ test("TCP: large replies survive backpressure and stay ordered with a pipelined 
     expect(received.subarray(first.length).equals(second)).toBe(true);
     expect(calls).toBe(2);
   } finally {
-    clearTimeout(timeout); clearTimeout(next); clearTimeout(resume);
-    socket.destroy(); server.stop();
+    clearTimeout(timeout);
+    clearTimeout(next);
+    clearTimeout(resume);
+    socket.destroy();
+    server.stop();
   }
 }, 10_000);
 
@@ -1523,7 +1745,12 @@ test("R2 direct download: If-None-Match supports wildcard, lists and weak compar
   try {
     const put = await broker.dispatch({ op: "r2.put", bucket: "UPLOADS", key: "object", body: "content" });
     const etag = `"${String(obj(put.object).etag)}"`;
-    const ticket = await broker.dispatch({ op: "r2.transfer.create", bucket: "UPLOADS", key: "object", method: "download" });
+    const ticket = await broker.dispatch({
+      op: "r2.transfer.create",
+      bucket: "UPLOADS",
+      key: "object",
+      method: "download",
+    });
     const url = `http://127.0.0.1${ticket.url}`;
     for (const value of ["*", etag, `W/${etag}`, `"other", W/${etag}`]) {
       const response = await broker.transfer(new Request(url, { headers: { "if-none-match": value } }));
@@ -1535,7 +1762,10 @@ test("R2 direct download: If-None-Match supports wildcard, lists and weak compar
     expect(fresh.status).toBe(200);
     expect(await fresh.text()).toBe("content");
     expect((await broker.transfer(new Request(url))).status).toBe(410);
-  } finally { broker.close(); rmSync(dir, { recursive: true, force: true }); }
+  } finally {
+    broker.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("listen(): a service.fetch body streamed in FRAME_V1_MORE frames reaches the upstream as it arrives", async () => {
