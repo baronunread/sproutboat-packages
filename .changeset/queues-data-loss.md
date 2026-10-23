@@ -14,5 +14,5 @@ Queues fixes at every compatibility date (data loss, so not gated):
   those too).
 
 From compatibility date `2026-10-28`, `sendBatch(messages, { delaySeconds })` delays
-every message that sets no `delaySeconds` of its own. Earlier dates ignore the batch
+every message whose own `delaySeconds` is unset or 0. Earlier dates ignore the batch
 option.

@@ -5914,7 +5914,8 @@ globalThis.__sbInstallBindings = function (target, bindings) {
           const m = messages[j];
           list.push({
             body: __sbIsStr(m.body) ? m.body : JSON.stringify(m.body),
-            delaySeconds: m.delaySeconds == null ? batchDelay : m.delaySeconds || 0,
+            // A message delay of 0 (or none) takes the batch delay, as miniflare does.
+            delaySeconds: m.delaySeconds || batchDelay,
           });
         }
         __sbRpc("queue.send_batch", { queue: name, messages: list });
