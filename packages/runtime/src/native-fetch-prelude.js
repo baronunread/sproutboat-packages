@@ -7236,7 +7236,7 @@ function __sbDOAsyncStorage(cls, id, gate) {
     __sbDOHold(gate);
     return settle(f);
   };
-  return {
+  const storage = {
     get: (key) => read(() => s.get(key)),
     list: (options) => read(() => s.list(options)),
     getAlarm: () => read(() => s.getAlarm()),
@@ -7248,6 +7248,142 @@ function __sbDOAsyncStorage(cls, id, gate) {
     sync: () => Promise.resolve(),
     transaction: (fn) => __sbDOTransaction(cls, id, s, gate, fn),
   };
+  if (__sbDOv2()) {
+    const sql = __sbDOSql(cls, id);
+    storage.sql = sql;
+    storage.transactionSync = (fn) => sql.__sbTransaction(fn);
+  }
+  return storage;
+}
+
+// ctx.storage.sql from compatibility date 2026-10-29: the object's own SQLite database
+// (transport op "do.sql", one file per object). exec() runs one statement at once and returns
+// a cursor over its rows: toArray(), one(), raw(), next() and iteration, columnNames,
+// rowsRead and rowsWritten. BLOBs come back as ArrayBuffers. Transactions go through
+// transactionSync() (a savepoint), so BEGIN and SAVEPOINT are refused, as in workerd.
+// Every class gets it here: sproutboat.jsonc has no new_sqlite_classes switch.
+const __sbDOSqlTxnError =
+  "To execute a transaction, please use the state.storage.transaction() or state.storage.transactionSync() APIs " +
+  "instead of the SQL BEGIN TRANSACTION or SAVEPOINT statements. The JavaScript API is safer because it will " +
+  "automatically roll back on exceptions, and because it interacts correctly with Durable Objects' automatic " +
+  "atomic write coalescing.";
+
+// The first word of a statement, upper-cased, past spaces and comments.
+function __sbDOSqlVerb(q) {
+  let i = 0;
+  for (;;) {
+    while (i < q.length && q.charCodeAt(i) <= 32) i++;
+    if (q.startsWith("--", i)) {
+      const nl = q.indexOf("\n", i);
+      i = nl < 0 ? q.length : nl + 1;
+    } else if (q.startsWith("/*", i)) {
+      const end = q.indexOf("*/", i + 2);
+      i = end < 0 ? q.length : end + 2;
+    } else break;
+  }
+  let j = i;
+  while (j < q.length) {
+    const c = q.charCodeAt(j) | 32;
+    if (c < 97 || c > 122) break;
+    j++;
+  }
+  return q.slice(i, j).toUpperCase();
+}
+
+function __sbDOSql(cls, id) {
+  const file = __sbDOIsHex64(id) ? id.toLowerCase() : __sbDOSha("sbdo-file:" + id);
+  const run = (sql, params) => {
+    try {
+      return __sbRpc("do.sql", { cls, file, sql, params });
+    } catch (err) {
+      // "sproutboat do.sql: D1_ERROR: near ..." -> "near ...", as workerd words it.
+      const message = String((err && err.message) || err);
+      const at = message.indexOf("D1_ERROR: ");
+      throw new Error(at >= 0 ? message.slice(at + 10) : message);
+    }
+  };
+  return {
+    exec(query, ...bindings) {
+      const q = String(query);
+      const verb = __sbDOSqlVerb(q);
+      if (verb === "BEGIN" || verb === "COMMIT" || verb === "END" || verb === "ROLLBACK" || verb === "SAVEPOINT" || verb === "RELEASE")
+        throw new Error(__sbDOSqlTxnError);
+      const params = [];
+      for (let i = 0; i < bindings.length; i++) params.push(__sbD1Param(bindings[i], true));
+      return __sbDOCursor(run(q, params));
+    },
+    get databaseSize() {
+      return Number(run("PRAGMA page_count", []).rows[0][0]) * Number(run("PRAGMA page_size", []).rows[0][0]);
+    },
+    __sbTransaction(fn) {
+      run("SAVEPOINT sb_do_txn", []);
+      let result;
+      try {
+        result = fn();
+      } catch (error) {
+        run("ROLLBACK TO sb_do_txn", []);
+        run("RELEASE sb_do_txn", []);
+        throw error;
+      }
+      run("RELEASE sb_do_txn", []);
+      return result;
+    },
+  };
+}
+
+function __sbDOCursor(r) {
+  const columns = r.columns || [];
+  const rows = r.rows || [];
+  for (let i = 0; i < rows.length; i++)
+    for (let c = 0; c < rows[i].length; c++) {
+      const cell = rows[i][c];
+      if (__sbIsObj(cell) && __sbIsStr(cell.$blob)) rows[i][c] = __sbDOUnhex(cell.$blob).buffer;
+    }
+  let next = 0;
+  const object = (row) => {
+    const o = {};
+    for (let c = 0; c < columns.length; c++) o[columns[c]] = row[c];
+    return o;
+  };
+  const cursor = {
+    columnNames: columns,
+    rowsRead: rows.length,
+    rowsWritten: Number(r.meta && r.meta.changes) || 0,
+    next() {
+      return next < rows.length ? { done: false, value: object(rows[next++]) } : { done: true, value: undefined };
+    },
+    toArray() {
+      const out = [];
+      while (next < rows.length) out.push(object(rows[next++]));
+      return out;
+    },
+    one() {
+      const left = rows.length - next;
+      if (left === 0) throw new Error("Expected exactly one result from SQL query, but got no results.");
+      if (left > 1) throw new Error("Expected exactly one result from SQL query, but got multiple results.");
+      return object(rows[next++]);
+    },
+    raw() {
+      const it = {
+        next() {
+          return next < rows.length ? { done: false, value: rows[next++] } : { done: true, value: undefined };
+        },
+        toArray() {
+          const out = [];
+          while (next < rows.length) out.push(rows[next++]);
+          return out;
+        },
+        [Symbol.iterator]() {
+          return it;
+        },
+      };
+      return it;
+    },
+    [Symbol.iterator]() {
+      return cursor;
+    },
+  };
+  return cursor;
 }
 
 // storage.transaction(fn): fn gets a txn with the storage methods; its writes stay in
