@@ -4745,7 +4745,7 @@ static size_t sb_utf8_encode_units(const uint16_t* s, size_t len, unsigned char*
 
 `;
 
-// sproutd #22: __sbFromUtf8 for a string of bytes (one byte per unit), in C.
+// sproutd #22: __sbFromUtf8 for a string of bytes (one byte per unit) or a Uint8Array, in C.
 // Returns "" when it cannot (not a string, or out of memory), so the caller
 // falls back to the JS loop. All-ASCII byte strings are already their text.
 // oxlint-disable-next-line no-unused-vars -- `bytes` is read inside the RawC block below, not by JS.
@@ -4753,9 +4753,10 @@ function __sbFromUtf8Native(bytes) {
   let out = "";
   // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
   Porffor.c`
-    if (bytes.type == 195 || bytes.type == 67) {
-      const u32 __p = (u32)bytes.val;
-      const size_t __n = (size_t)*(u32*)(MEM + __p);
+    const int __view = bytes.type == 81 && *(int32_t*)(MEM + (u32)bytes.val) >= 0;
+    if (bytes.type == 195 || bytes.type == 67 || __view) {
+      const u32 __p = __view ? *(u32*)(MEM + (u32)bytes.val + 4) : (u32)bytes.val;
+      const size_t __n = __view ? (size_t)*(int32_t*)(MEM + (u32)bytes.val) : (size_t)*(u32*)(MEM + __p);
       int __ascii = bytes.type == 195;
       if (__ascii) {
         const unsigned char* __s = (const unsigned char*)(MEM + __p + 4);
@@ -4766,7 +4767,7 @@ function __sbFromUtf8Native(bytes) {
         unsigned char* __b = (unsigned char*)malloc(__n + 1);
         uint16_t* __u = (uint16_t*)malloc(__n * 2 + 2);
         if (__b && __u) {
-          if (bytes.type == 195) memcpy(__b, MEM + __p + 4, __n);
+          if (bytes.type != 67) memcpy(__b, MEM + __p + 4, __n);
           else { const uint16_t* __w = (const uint16_t*)(MEM + __p + 4); for (size_t __i = 0; __i < __n; __i++) __b[__i] = (unsigned char)(__w[__i] & 0xff); }
           int __wide = 0;
           const size_t __k = sb_utf8_decode_units(__b, __n, __u, &__wide);
@@ -6010,9 +6011,14 @@ globalThis.__sbInstallBindings = function (target, bindings) {
 async function __sbServiceFetch(binding, input, init) {
   const parts = __sbFetchParts(input, init);
   if (parts.signal) parts.signal.throwIfAborted();
-  // A stream body is read to the end first: the wire carries a whole body.
+  // A stream body goes out as it is read where the transport can (__sbStreamsBody), else it
+  // is read to the end first.
   const body = __sbUnwrapBody(parts.body);
-  const wire = body instanceof ReadableStream ? __sbRequestBody(await __sbCollectBody(body)) : __sbPartsBody({ ...parts, body });
+  const wire = __sbStreamsBody(body)
+    ? { bodyStream: true, __sbBodySource: body }
+    : body instanceof ReadableStream
+      ? __sbRequestBody(await __sbCollectBody(body))
+      : __sbPartsBody({ ...parts, body });
   const msg = { binding, url: parts.url, method: parts.method, headers: parts.headers, ...wire };
   const response = await __sbFetchFollowing("service.fetch", msg, "sproutboat service " + binding, parts.redirect, parts.signal);
   // The callee threw: as in workerd, its error is thrown here.
@@ -6270,7 +6276,52 @@ function __sbUpstreamResponse(r) {
 // whole (a broker from before streaming, or sproutd's embedded transport) is handled
 // as before. Cancelling the body, or the signal, drops the exchange, which stops the
 // upstream request.
+// Streamed request bodies, from compatibility date 2026-10-27, on a transport that sends
+// them in frames (the broker's, on an async host, against a broker that takes them):
+// fetch() and service bindings send a ReadableStream body as it is read, instead of
+// reading it to the end first. As in workerd, a streamed body can't follow a 307 or 308.
+function __sbStreamsBody(body) {
+  return (
+    body instanceof ReadableStream &&
+    globalThis.__sbCompat >= "2026-10-27" &&
+    globalThis.__sbBodyStreamable != null &&
+    globalThis.__sbBodyStreamable()
+  );
+}
+// Reads source into the exchange under timer id `id`, a frame per chunk, while ended()
+// is false. Above 4 MiB not yet written it waits for the socket to catch up.
+async function __sbPumpRequestBody(id, source, ended) {
+  const reader = source.getReader();
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (ended()) {
+        reader.cancel();
+        return;
+      }
+      let bytes = null;
+      if (value instanceof Uint8Array) bytes = value;
+      else if (value instanceof ArrayBuffer) bytes = new Uint8Array(value);
+      else if (ArrayBuffer.isView(value)) bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+      else throw new TypeError("This ReadableStream did not return bytes.");
+      if (bytes.length === 0) continue;
+      let backlog = Number(globalThis.__sbAsyncBody(id, "c", __sbToBytes(bytes)));
+      while (backlog > 4 * 1024 * 1024 && !ended()) {
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        backlog = Number(globalThis.__sbAsyncBody(id, "q", ""));
+      }
+    }
+    globalThis.__sbAsyncBody(id, "e", "");
+  } catch (error) {
+    globalThis.__sbAsyncBody(id, "x", "");
+    __sbLogUncaught("fetch", error);
+  }
+}
+
 function __sbUpstreamStreamed(op, msg, label, signal) {
+  const source = msg.__sbBodySource;
+  if (source !== undefined) delete msg.__sbBodySource;
   return new Promise((resolve, reject) => {
     let controller = null;
     let onAbort = null;
@@ -6338,6 +6389,7 @@ function __sbUpstreamStreamed(op, msg, label, signal) {
       msg.asyncId = id;
       msg.stream = true;
       globalThis.__sbFetchUpstream(op, msg);
+      if (source !== undefined) __sbPumpRequestBody(id, source, () => done);
     } catch (e) {
       finish();
       reject(e);
@@ -6375,7 +6427,8 @@ function __sbFollowHop(op, msg, label, mode, signal, hops) {
       next.method = "GET";
       next.body = null;
       delete next.bodyBinary;
-    }
+      delete next.bodyStream;
+    } else if (msg.bodyStream === true) throw new TypeError(label + ": a streamed request body can't follow a " + res.status + " redirect");
     return __sbFollowHop(op, next, label, mode, signal, hops + 1);
   };
   const out = __sbUpstream(op, msg, label, signal);
@@ -6435,6 +6488,7 @@ function __sbUpstream(op, msg, label, signal, always) {
 // Worker's fetch. Installed by the generated module (wrap.ts), not here: the
 // prelude must not replace fetch just by being evaluated.
 globalThis.__sbInstallFetch = function () {
+  __sbIngressStreamingSetup();
   globalThis.fetch = function (input, init) {
     let parts;
     try {
@@ -6448,9 +6502,11 @@ globalThis.__sbInstallFetch = function () {
       const msg = { url: parts.url, method: parts.method, headers: parts.headers, ...body };
       return __sbFetchFollowing("fetch", msg, "sproutboat fetch", parts.redirect, parts.signal);
     };
-    // A stream body is read to the end first, as for a service binding: the wire carries a
-    // whole body. It was sent as the text "[object ReadableStream]".
+    // A stream body goes out as it is read, from 2026-10-27 where the transport can
+    // (__sbStreamsBody); else it is read to the end first. It was sent as the text
+    // "[object ReadableStream]".
     const stream = __sbUnwrapBody(parts.body);
+    if (__sbStreamsBody(stream)) return send({ bodyStream: true, __sbBodySource: stream });
     if (stream instanceof ReadableStream) return __sbCollectBody(stream).then((bytes) => send(__sbRequestBody(bytes)));
     return send(__sbPartsBody(parts));
   };
@@ -7031,11 +7087,133 @@ async function __sbQueueWithDrain(result, tasks) {
   return new Response(JSON.stringify(r), { headers: { "content-type": "application/json" } });
 }
 
+// Streamed request bodies, from compatibility date 2026-10-27, on a native server that
+// streams them (a standalone or platform sprout; request-streaming.ts in the toolchain).
+// The handler runs once the headers are in, and request.body hands out the bytes as they
+// arrive: the server pauses the socket while more than 1 MiB waits unread. Before that
+// date the server buffers the whole body and the handler gets it at once, as before.
+// op: "e" enable (at startup), "t" take the current request's body id, "p" poll (a byte
+// count, "0" nothing yet, "-1" ended, "-2" failed), "i" copy into the Uint8Array in data,
+// "w" wait on the timer id in data, "c" close. Returns a short string.
+// oxlint-disable-next-line no-unused-vars -- read inside the RawC block, not by JS.
+function __sbReqBodyOp(op, id, data) {
+  let out = "";
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    extern int sb_reqbody_enable(void);
+    extern unsigned int sb_reqbody_take_current(void);
+    extern long long sb_reqbody_poll(unsigned int);
+    extern size_t sb_reqbody_take(unsigned int, char*, size_t);
+    extern void sb_reqbody_wait(unsigned int, unsigned int);
+    extern void sb_reqbody_close(unsigned int);
+    const char* __o; size_t __ol; char* __oo = 0;
+    porf_native_fetch_read_value(op, &__o, &__ol, &__oo);
+    char __op = __ol ? __o[0] : 0;
+    if (__oo) free(__oo);
+    const unsigned int __id = id.type == 1 && id.val > 0 ? (unsigned int)id.val : 0;
+    char __r[32]; __r[0] = 0;
+    if (__op == 'e') snprintf(__r, sizeof(__r), "%d", sb_reqbody_enable());
+    else if (__op == 't') snprintf(__r, sizeof(__r), "%u", sb_reqbody_take_current());
+    else if (__op == 'p') snprintf(__r, sizeof(__r), "%lld", sb_reqbody_poll(__id));
+    else if (__op == 'i' && data.type == 81) {
+      const u32 __ta = (u32)data.val;
+      const int32_t __len = *(int32_t*)(MEM + __ta);
+      if (__len > 0) {
+        const u32 __at = *(u32*)(MEM + __ta + 4) + 4;
+        snprintf(__r, sizeof(__r), "%zu", sb_reqbody_take(__id, (char*)(MEM + __at), (size_t)__len));
+      }
+    } else if (__op == 'w' && data.type == 1 && data.val > 0) sb_reqbody_wait(__id, (unsigned int)data.val);
+    else if (__op == 'c') sb_reqbody_close(__id);
+    out = porf_box((f64)porf_native_fetch_alloc_bytestring(__r, strlen(__r)), 195);
+  `;
+  return out;
+}
+
+// Turns streaming on in the native server, from 2026-10-27. Called once at startup, after
+// the compatibility date is set (__sbInstallFetch).
+function __sbIngressStreamingSetup() {
+  if (globalThis.__sbCompat >= "2026-10-27") __sbReqBodyOp("e", 0, "");
+}
+
+// request.body for a streamed request: chunks as the server receives them.
+function __sbIngressStream(request, id) {
+  let closed = false;
+  const close = () => {
+    if (!closed) {
+      closed = true;
+      __sbReqBodyOp("c", id, "");
+    }
+  };
+  const step = (controller, resolve) => {
+    const state = Number(__sbReqBodyOp("p", id, ""));
+    if (state === 0) {
+      // Nothing yet: the server fires this timer when bytes, the end or an error arrive.
+      const timer = setTimeout(() => step(controller, resolve), 2147483647);
+      __sbReqBodyOp("w", id, timer);
+      return;
+    }
+    if (state > 0) {
+      const chunk = new Uint8Array(state);
+      __sbReqBodyOp("i", id, chunk);
+      controller.enqueue(chunk);
+    } else {
+      close();
+      if (state === -1) controller.close();
+      else controller.error(new TypeError("Network connection lost."));
+    }
+    resolve();
+  };
+  const stream = new ReadableStream({
+    pull(controller) {
+      return new Promise((resolve) => step(controller, resolve));
+    },
+    cancel() {
+      close();
+    },
+  });
+  request.body = stream;
+  // The bytes of the whole body, read through the stream (so bodyUsed and locking hold).
+  const all = async () => {
+    const body = request.body;
+    if (request.bodyUsed) throw new TypeError("Body has already been used. It can only be used once. Use tee() first if you need to read it twice.");
+    request._bodyUsed = true;
+    const reader = body.getReader();
+    const chunks = [];
+    let size = 0;
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      size += value.length;
+    }
+    if (chunks.length === 1) return chunks[0];
+    const out = new Uint8Array(size);
+    let at = 0;
+    for (const chunk of chunks) {
+      out.set(chunk, at);
+      at += chunk.length;
+    }
+    return out;
+  };
+  request.text = async () => __sbFromUtf8(await all());
+  request.json = async () => JSON.parse(__sbFromUtf8(await all()));
+  request.arrayBuffer = async () => {
+    const bytes = await all();
+    return bytes.byteLength === bytes.buffer.byteLength ? bytes.buffer : bytes.slice().buffer;
+  };
+  request.bytes = async () => await all();
+}
+
 // Native HTTP ingress stores the body as one character per raw byte. Keep
 // that representation for binary consumers, but decode text lazily before
 // handing the request to user code. Request.text() in Porffor otherwise treats
 // the raw bytes as already-decoded characters and corrupts Unicode/HMAC input.
 function __sbDecodeIngress(request) {
+  const streamed = globalThis.__sbCompat >= "2026-10-27" ? Number(__sbReqBodyOp("t", 0, "")) : 0;
+  if (streamed > 0) {
+    __sbIngressStream(request, streamed);
+    return;
+  }
   const raw = __sbRawBody(request);
   if (raw == null) return;
   // A GET or HEAD has no body, as in workerd (from 2026-10-23): request.body is null, and

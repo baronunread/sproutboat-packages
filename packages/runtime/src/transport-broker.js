@@ -335,6 +335,11 @@ typedef struct sb_async_job {
   int fd, reused, attempt, connecting;
   // Asked for a streamed response; and has delivered part of one, so never retried.
   int stream, delivered;
+  // Its request body follows the head in frames (sb_async_body), from compatibility date
+  // 2026-10-27: never retried, never pooled, and it reads replies while it still writes.
+  int body_stream;
+  // Bytes of body frames in out not yet written, counted in sb_async_body_backlog.
+  size_t body_unsent;
   long long retry_at;  // ms; 0 = not waiting to retry
   char* json; size_t json_len;
   char* bin; size_t bin_len;
@@ -357,6 +362,15 @@ static int sb_io_started = 0, sb_io_wake[2] = { -1, -1 };
 static u32* sb_async_cancels = 0;
 static size_t sb_async_cancels_n = 0, sb_async_cancels_cap = 0;
 static void (*sb_async_waker)(void) = 0;
+// Request-body frames from the loop (sb_async_body), for the I/O thread to append to
+// their exchanges; and the bytes of them not yet written, which the JS pump keeps low.
+typedef struct sb_async_bodyframe {
+  struct sb_async_bodyframe* next;
+  u32 id;
+  unsigned char* data; size_t len;
+} sb_async_bodyframe;
+static sb_async_bodyframe *sb_async_bodyq = 0, *sb_async_bodyq_tail = 0;
+static size_t sb_async_body_backlog = 0;
 
 void sb_async_set_waker(void (*wake)(void)) { sb_async_waker = wake; }
 int sb_async_enabled(void) { return sb_async_waker != 0; }
@@ -392,6 +406,11 @@ static void sb_async_deliver(u32 id, int final, char* json, size_t json_len, cha
 
 // Hands a finished job (json set) back to the loop, and frees it.
 static void sb_async_finish(sb_async_job* j) {
+  if (j->body_unsent) {
+    pthread_mutex_lock(&sb_async_lock);
+    sb_async_body_backlog -= j->body_unsent;
+    pthread_mutex_unlock(&sb_async_lock);
+  }
   sb_async_deliver(j->id, 1, j->json, j->json_len, j->bin, j->bin_len);
   free(j->out);
   free(j->in);
@@ -440,7 +459,7 @@ static void sb_io_begin(sb_async_job* j, int* idle, int* idle_n) {
 static int sb_io_failed(sb_async_job* j, int rc) {
   if (j->fd >= 0) { close(j->fd); j->fd = -1; }
   int unsent = j->out_off < j->out_len;
-  if (!j->delivered && (unsent || j->reused) && ++j->attempt < 4) {
+  if (!j->delivered && !j->body_stream && (unsent || j->reused) && ++j->attempt < 4) {
     static const long ms[4] = { 0, 5, 25, 100 };
     j->retry_at = sb_now_ms() + ms[j->attempt];
     return 0;
@@ -458,9 +477,26 @@ static int sb_io_step(sb_async_job* j, int* idle, int* idle_n) {
   }
   while (j->out_off < j->out_len) {
     long n = write(j->fd, j->out + j->out_off, j->out_len - j->out_off);
-    if (n > 0) { j->out_off += (size_t)n; continue; }
+    if (n > 0) {
+      j->out_off += (size_t)n;
+      if (j->body_stream) {
+        // Body bytes sit at the end of out: whatever is left unsent beyond them was the head.
+        size_t left = j->out_len - j->out_off;
+        if (left < j->body_unsent) {
+          pthread_mutex_lock(&sb_async_lock);
+          sb_async_body_backlog -= j->body_unsent - left;
+          pthread_mutex_unlock(&sb_async_lock);
+          j->body_unsent = left;
+        }
+      }
+      continue;
+    }
     if (n < 0 && errno == EINTR) continue;
-    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      // A streamed body: the reply may come before the body is all out, so read too.
+      if (j->body_stream) break;
+      return 0;
+    }
     return sb_io_failed(j, -3);
   }
   for (;;) {
@@ -497,7 +533,8 @@ static int sb_io_step(sb_async_job* j, int* idle, int* idle_n) {
       sb_async_deliver(j->id, 0, json, json_len, bin, bin_len);
       continue;
     }
-    if (*idle_n < SB_IO_IDLE) idle[(*idle_n)++] = j->fd; else close(j->fd);
+    // A streamed body may still have frames on the way: that connection is not reused.
+    if (*idle_n < SB_IO_IDLE && !j->body_stream) idle[(*idle_n)++] = j->fd; else close(j->fd);
     j->fd = -1;
     j->json = sb_io_reply_json(payload, payload_len, &j->json_len, &j->bin, &j->bin_len);
     if (!j->json) sb_async_error(j, -4);
@@ -524,6 +561,35 @@ static void* sb_io_thread(void* unused) {
       sb_io_begin(j, idle, &idle_n);
       j->next = active;
       active = j;
+    }
+    // Request-body frames: appended to their exchanges (an ended one drops them).
+    pthread_mutex_lock(&sb_async_lock);
+    sb_async_bodyframe* frames = sb_async_bodyq;
+    sb_async_bodyq = sb_async_bodyq_tail = 0;
+    pthread_mutex_unlock(&sb_async_lock);
+    while (frames) {
+      sb_async_bodyframe* bf = frames;
+      frames = bf->next;
+      sb_async_job* j = active;
+      while (j && j->id != bf->id) j = j->next;
+      if (j && j->body_stream) {
+        if (j->out_off > 0) {
+          memmove(j->out, j->out + j->out_off, j->out_len - j->out_off);
+          j->out_len -= j->out_off;
+          j->out_off = 0;
+        }
+        j->out = (unsigned char*)realloc(j->out, j->out_len + bf->len);
+        if (!j->out) abort();
+        memcpy(j->out + j->out_len, bf->data, bf->len);
+        j->out_len += bf->len;
+        j->body_unsent += bf->len;
+      } else {
+        pthread_mutex_lock(&sb_async_lock);
+        sb_async_body_backlog -= bf->len;
+        pthread_mutex_unlock(&sb_async_lock);
+      }
+      free(bf->data);
+      free(bf);
     }
     // Exchanges given up on: their connections close, which tells the broker to stop.
     pthread_mutex_lock(&sb_async_lock);
@@ -572,7 +638,9 @@ static void* sb_io_thread(void* unused) {
     for (sb_async_job* j = active; j; j = j->next) {
       if (j->retry_at) continue;
       fds[n].fd = j->fd;
-      fds[n].events = j->connecting || j->out_off < j->out_len ? POLLOUT : POLLIN;
+      fds[n].events = j->connecting ? POLLOUT
+        : j->body_stream ? (short)(POLLIN | (j->out_off < j->out_len ? POLLOUT : 0))
+        : j->out_off < j->out_len ? POLLOUT : POLLIN;
       fds[n].revents = 0;
       owners[n++] = j;
     }
@@ -595,11 +663,13 @@ static void* sb_io_thread(void* unused) {
 
 // The inline C of __sbCallAsync calls this by prototype: Porffor may emit a
 // function's body before this block.
+// stream: bit 1 a streamed response may come; bit 2 the request body follows in frames.
 void sb_async_submit_v1(u32 id, int stream, const char* json, size_t json_len, const char* body, size_t body_len) {
   sb_async_job* j = (sb_async_job*)calloc(1, sizeof(sb_async_job));
   if (!j) abort();
   j->id = id;
-  j->stream = stream;
+  j->stream = stream & 1;
+  j->body_stream = (stream & 2) != 0;
   j->fd = -1;
   size_t req_len = 0;
   char* req = sb_v1_request(json, json_len, body, body_len, &req_len);
@@ -650,6 +720,44 @@ void sb_async_submit_v1(u32 id, int stream, const char* json, size_t json_len, c
   }
   char one = 1;
   while (write(sb_io_wake[1], &one, 1) < 0 && errno == EINTR) {}
+}
+
+// One frame of exchange id's streamed request body: kind 0 a chunk of data, 1 the end,
+// 2 a failure; 3 queues nothing. Returns the bytes of body frames not yet written, all
+// exchanges together.
+size_t sb_async_body(u32 id, int kind, const char* data, size_t len) {
+  if (kind == 3) {
+    pthread_mutex_lock(&sb_async_lock);
+    size_t backlog = sb_async_body_backlog;
+    pthread_mutex_unlock(&sb_async_lock);
+    return backlog;
+  }
+  const char* json = kind == 0 ? "{\"chunk\":true}" : kind == 1 ? "{\"end\":true}" : "{\"error\":\"the request body stream failed\"}";
+  const size_t json_len = strlen(json), payload = 1 + 4 + json_len + (kind == 0 ? len : 0);
+  sb_async_bodyframe* bf = (sb_async_bodyframe*)calloc(1, sizeof(sb_async_bodyframe));
+  if (!bf) abort();
+  bf->id = id;
+  bf->len = 4 + payload;
+  bf->data = (unsigned char*)malloc(bf->len);
+  if (!bf->data) abort();
+  for (int k = 0; k < 4; k++) bf->data[k] = (unsigned char)((payload >> (8 * k)) & 0xff);
+  bf->data[4] = 2;  // FRAME_V1_MORE
+  for (int k = 0; k < 4; k++) bf->data[5 + k] = (unsigned char)((json_len >> (8 * k)) & 0xff);
+  memcpy(bf->data + 9, json, json_len);
+  if (kind == 0 && len) memcpy(bf->data + 9 + json_len, data, len);
+  pthread_mutex_lock(&sb_async_lock);
+  int started = sb_io_started;
+  if (started) {
+    if (sb_async_bodyq_tail) sb_async_bodyq_tail->next = bf; else sb_async_bodyq = bf;
+    sb_async_bodyq_tail = bf;
+    sb_async_body_backlog += bf->len;
+  }
+  size_t backlog = sb_async_body_backlog;
+  pthread_mutex_unlock(&sb_async_lock);
+  if (!started) { free(bf->data); free(bf); return 0; }
+  char one = 1;
+  while (write(sb_io_wake[1], &one, 1) < 0 && errno == EINTR) {}
+  return backlog;
 }
 
 // The caller gave up on exchange id: the I/O thread drops it and closes its
@@ -849,7 +957,8 @@ globalThis.__sbFetchUpstream = function (op, msg) {
   // Queued (async host); the reply reaches the callback registered under asyncId, in
   // several frames when msg.stream asks for a streamed response.
   if (msg.asyncId > 0) {
-    __sbCallAsync(JSON.stringify(req), "", msg.asyncId, msg.stream === true ? "1" : "0");
+    // "1" a streamed response may come, "2" the body follows in frames (__sbAsyncBody).
+    __sbCallAsync(JSON.stringify(req), "", msg.asyncId, String((msg.stream === true ? 1 : 0) + (msg.bodyStream === true ? 2 : 0)));
     return { ok: true, pending: true };
   }
   const reply = JSON.parse(__sbCallBin(JSON.stringify(req), ""));
@@ -876,7 +985,7 @@ function __sbCallAsync(reqJson, body, asyncId, stream) {
     }
     const char* __s; size_t __sl; char* __so = 0;
     porf_native_fetch_read_value(stream, &__s, &__sl, &__so);
-    const int __stream = __sl > 0 && __s[0] == '1';
+    const int __stream = __sl > 0 && __s[0] >= '0' && __s[0] <= '3' ? __s[0] - '0' : 0;
     if (__so) free(__so);
     if (asyncId.type == 1 && asyncId.val > 0) sb_async_submit_v1((u32)asyncId.val, __stream, __j, __jl, __b, __bl);
     if (__jo) free(__jo);
@@ -894,6 +1003,48 @@ function __sbCancelAsync(asyncId) {
     if (asyncId.type == 1 && asyncId.val > 0) sb_async_cancel((u32)asyncId.val);
   `;
 }
+
+// One frame of the streamed request body of the exchange under timer id `asyncId`:
+// kind "c" a chunk (data, one char per byte), "e" the end, "x" a failure, "q" nothing. Returns the
+// bytes of body frames not yet written, as a string.
+// oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
+function __sbAsyncBody(asyncId, kind, data) {
+  let res = "";
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    size_t sb_async_body(u32, int, const char*, size_t);
+    const char* __k; size_t __kl; char* __ko = 0;
+    porf_native_fetch_read_value(kind, &__k, &__kl, &__ko);
+    const int __kind = __kl && __k[0] == 'c' ? 0 : __kl && __k[0] == 'e' ? 1 : __kl && __k[0] == 'q' ? 3 : 2;
+    if (__ko) free(__ko);
+    const char* __d = 0; size_t __dl = 0;
+    if (__kind == 0 && porf_native_fetch_read_raw_bytes(data, &__d, &__dl) != 0) { __d = 0; __dl = 0; }
+    size_t __backlog = asyncId.type == 1 && asyncId.val > 0 ? sb_async_body((u32)asyncId.val, __kind, __d, __dl) : 0;
+    char __r[32];
+    int __n = snprintf(__r, sizeof(__r), "%zu", __backlog);
+    res = porf_box((f64)porf_native_fetch_alloc_bytestring(__r, (size_t)__n), 195);
+  `;
+  return res;
+}
+globalThis.__sbAsyncBody = __sbAsyncBody;
+
+// Whether request bodies can stream to the broker (2026-10-27): an async host, and a
+// broker that says it takes them (bodyStream in its pong). Asked once.
+let __sbBodyStreamCache = -1;
+globalThis.__sbBodyStreamable = function () {
+  if (__sbBodyStreamCache < 0) {
+    __sbBodyStreamCache = 0;
+    if (__sbHttpAsyncEnabled()) {
+      try {
+        const pong = JSON.parse(__sbCall(JSON.stringify({ op: "ping" })));
+        if (pong.bodyStream === true) __sbBodyStreamCache = 1;
+      } catch {
+        // An old broker or none: bodies are sent whole.
+      }
+    }
+  }
+  return __sbBodyStreamCache === 1;
+};
 
 // Before compatibility date 2026-10-22, fetch() through the broker answered at once.
 function __sbAsyncAtAnyDate() {

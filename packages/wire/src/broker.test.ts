@@ -1537,3 +1537,60 @@ test("R2 direct download: If-None-Match supports wildcard, lists and weak compar
     expect((await broker.transfer(new Request(url))).status).toBe(410);
   } finally { broker.close(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("listen(): a service.fetch body streamed in FRAME_V1_MORE frames reaches the upstream as it arrives", async () => {
+  const arrivals: { text: string; at: number }[] = [];
+  const fetchImpl: FetchLike = async (_url, init) => {
+    // SAFETY: the broker passes the BodySink's ReadableStream as the body of a streamed request.
+    const reader = (init?.body as ReadableStream<Uint8Array>).getReader();
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      arrivals.push({ text: new TextDecoder().decode(value), at: Date.now() });
+    }
+    return new Response(arrivals.map((a) => a.text).join(""));
+  };
+  const b = make({
+    token: "tok",
+    bindings: { services: [{ binding: "PEER", service: "peer" }] },
+    services: { PEER: "peer.example.com" },
+    edgeUrl: "http://127.0.0.1:8080/",
+    fetchImpl,
+  });
+  const server = listen(b, "127.0.0.1", 0);
+  const socket = createConnection({ host: "127.0.0.1", port: server.port });
+  const replies: Buffer[] = [];
+  let pending = Buffer.alloc(0);
+  socket.on("data", (data: Buffer) => {
+    pending = Buffer.concat([pending, data]);
+    while (pending.length >= 4 && pending.length >= 4 + pending.readUInt32LE(0)) {
+      replies.push(pending.subarray(4, 4 + pending.readUInt32LE(0)));
+      pending = pending.subarray(4 + pending.readUInt32LE(0));
+    }
+  });
+  await new Promise((done) => socket.once("connect", done));
+  const head = {
+    v: 1,
+    token: "tok",
+    op: "service.fetch",
+    binding: "PEER",
+    url: "https://peer/up",
+    method: "POST",
+    bodyStream: true,
+  };
+  socket.write(frameOf(encodeV1(head)));
+  socket.write(frameOf(encodeV1({ chunk: true }, new TextEncoder().encode("first "), true)));
+  await Bun.sleep(300);
+  expect(arrivals.map((a) => a.text)).toEqual(["first "]);
+  socket.write(frameOf(encodeV1({ chunk: true }, new TextEncoder().encode("second"), true)));
+  socket.write(frameOf(encodeV1({ end: true }, undefined, true)));
+  for (let i = 0; i < 100 && replies.length === 0; i++) await Bun.sleep(20);
+  const jsonLength = replies[0].readUInt32LE(1);
+  expect(JSON.parse(replies[0].subarray(5, 5 + jsonLength).toString())).toMatchObject({ ok: true, status: 200 });
+  expect(replies[0].subarray(5 + jsonLength).toString()).toBe("first second");
+  expect(arrivals[1].at - arrivals[0].at).toBeGreaterThan(200);
+  // The broker says it takes streamed bodies.
+  expect(await b.dispatch({ op: "ping" })).toMatchObject({ bodyStream: true });
+  socket.destroy();
+  server.stop();
+});
