@@ -20,6 +20,7 @@ import { TEXT_DECODER_SOURCE } from "./text-decoder";
 import { CASE_LOWER_RUNS, CASE_UPPER_RUNS } from "./case-map";
 import { HEADERS_CLASS_SOURCE } from "./headers-class";
 import { BLOB_CLASS_SOURCE, REQUEST_CLASS_SOURCE, RESPONSE_BYTES_ANCHOR, RESPONSE_BYTES_INJECT, RESPONSE_CLASS_SOURCE } from "./fetch-classes";
+import * as requestStreaming from "./request-streaming";
 import * as streaming from "./streaming";
 import { PORFFOR_COMMIT_FULL } from "./pin";
 import { PATCH_FINGERPRINT } from "./fingerprint";
@@ -2018,6 +2019,27 @@ export async function patchStreamingResponses(root: string): Promise<void> {
   await writeFile(file, src);
 }
 
+/** Streamed request bodies in the uWebSockets shim (request-streaming.ts). After patchStreamingResponses. */
+export async function patchStreamingRequests(root: string): Promise<void> {
+  const renderFile = resolve(root, "compiler/render.js");
+  let render = await readFile(renderFile, "utf8");
+  if (!render.includes("sproutboat: request-body streaming fallbacks")) {
+    if (render.split(streaming.STREAM_STUBS_ANCHOR).length !== 2)
+      throw new Error(`could not patch Porffor's request-body fallbacks: anchor not found in ${renderFile}`);
+    render = render.replace(streaming.STREAM_STUBS_ANCHOR, requestStreaming.REQBODY_STUBS + streaming.STREAM_STUBS_ANCHOR);
+    await writeFile(renderFile, render);
+  }
+  const file = resolve(root, "compiler/uwebsockets.js");
+  let src = await readFile(file, "utf8");
+  if (src.includes(requestStreaming.REQBODY_MARKER)) return;
+  for (const [anchor, inject] of requestStreaming.REQBODY_EDITS) {
+    if (src.split(anchor).length !== 2)
+      throw new Error(`could not patch Porffor's streamed request bodies: anchor not found in ${file}`);
+    src = src.replace(anchor, inject);
+  }
+  await writeFile(file, src);
+}
+
 /**
  * True when root is a finished cache entry that this toolchain version and patch
  * chain patched (ensurePorffor patches before it writes the manifest). The CLI calls
@@ -2075,6 +2097,7 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchCaseMapping(root);
   await patchZeroDelayTimers(root);
   await patchSplitGlobals(root);
+  await patchStreamingRequests(root);
   // Last of the builtin edits: its precompile picks up the promise, replaceAll,
   // local function and repeat patches above too.
   await precompileBuiltins(root);

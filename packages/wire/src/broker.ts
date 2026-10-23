@@ -196,9 +196,11 @@ export type Broker = {
    * `service.fetch` in flight then stops its upstream request too. With `emit`, a
    * `fetch` or `service.fetch` that asks to stream (`stream: true`) sends its head and
    * each body chunk through it as they arrive (FRAME_V1_MORE frames); the returned
-   * frame ends the response.
+   * frame ends the response. With `body`, a `fetch` or `service.fetch` whose head asked
+   * for it (`bodyStream: true`) sends that stream as its request body: the listener feeds
+   * it from the FRAME_V1_MORE frames that follow the head on the same connection.
    */
-  handleFrame(payload: Buffer, signal?: AbortSignal, emit?: FrameEmitter): Promise<Buffer>;
+  handleFrame(payload: Buffer, signal?: AbortSignal, emit?: FrameEmitter, body?: ReadableStream<Uint8Array>): Promise<Buffer>;
   /** Serve one reserved direct R2 upload or download request. */
   transfer(request: Request): Promise<Response>;
   close(): void;
@@ -1228,7 +1230,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     }
   }
 
-  async function proxyFetch(msg: Frame, signal?: AbortSignal, emit?: FrameEmitter): Promise<Upstream> {
+  async function proxyFetch(msg: Frame, signal?: AbortSignal, emit?: FrameEmitter, body?: ReadableStream<Uint8Array>): Promise<Upstream> {
     let url: URL;
     try {
       url = new URL(str(msg.url));
@@ -1247,7 +1249,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     const init: RequestInit = {
       method,
       headers,
-      body: method === "GET" || method === "HEAD" ? undefined : upstreamBody(msg),
+      body: method === "GET" || method === "HEAD" ? undefined : (body ?? upstreamBody(msg)),
       redirect: "manual",
       signal,
     };
@@ -1268,7 +1270,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
    * minus the trip through the network (and therefore minus TLS and the
    * default-deny egress rules, which is why this is not `fetch`).
    */
-  async function serviceFetch(msg: Frame, signal?: AbortSignal, emit?: FrameEmitter): Promise<Upstream> {
+  async function serviceFetch(msg: Frame, signal?: AbortSignal, emit?: FrameEmitter, body?: ReadableStream<Uint8Array>): Promise<Upstream> {
     const binding = str(msg.binding);
     const declared = bindings.services.find((entry) => entry.binding === binding);
     if (!declared) throw new Error(`service not bound: ${binding}`);
@@ -1302,7 +1304,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     const res = await doFetch(target, {
       method,
       headers,
-      body: method === "GET" || method === "HEAD" ? undefined : upstreamBody(msg),
+      body: method === "GET" || method === "HEAD" ? undefined : (body ?? upstreamBody(msg)),
       redirect: "manual",
       signal,
     });
@@ -1315,7 +1317,8 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   async function dispatch(msg: Frame): Promise<Frame> {
     switch (msg.op) {
       case "ping":
-        return { ok: true, op: "pong", echo: msg.msg ?? null, pid: process.pid };
+        // bodyStream: this broker takes streamed request bodies (FRAME_V1_MORE frames after a head).
+        return { ok: true, op: "pong", echo: msg.msg ?? null, pid: process.pid, bodyStream: true };
       case "kv.get": {
         const { store, part } = storeFor("kv", requireKv(msg.ns));
         const stmts = kvStmts(store);
@@ -1785,6 +1788,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     binary: Uint8Array,
     signal?: AbortSignal,
     emit?: FrameEmitter,
+    body?: ReadableStream<Uint8Array>,
   ): Promise<{ reply: Frame; bytes?: Uint8Array }> {
     if (msg.op === "r2.put") {
       // The body arrived as bytes; write it straight to its own file rather
@@ -1835,8 +1839,8 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     }
 
     // #232 — a v1 fetch gets the upstream body as raw bytes, not decoded text.
-    if (msg.op === "fetch") return proxyFetch(msg, signal, emit);
-    if (msg.op === "service.fetch") return serviceFetch(msg, signal, emit);
+    if (msg.op === "fetch") return proxyFetch(msg, signal, emit, body);
+    if (msg.op === "service.fetch") return serviceFetch(msg, signal, emit, body);
 
     if (msg.op === "assets.get") {
       if (!bindings.assets) throw new Error("assets not bound");
@@ -1868,7 +1872,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   }
 
   /** One wire frame in, one out. See `handleFrame` on the Broker type. */
-  async function handleFrame(payload: Buffer, signal?: AbortSignal, emit?: FrameEmitter): Promise<Buffer> {
+  async function handleFrame(payload: Buffer, signal?: AbortSignal, emit?: FrameEmitter, body?: ReadableStream<Uint8Array>): Promise<Buffer> {
     if (payload.length === 0 || payload[0] !== FRAME_V1) {
       return encodeFrame(await handlePayload(payload.toString("utf8")));
     }
@@ -1884,7 +1888,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         const seen = replayed.get(replayKey);
         if (seen) return frameOf(encodeV1(seen));
       }
-      const { reply, bytes } = await dispatchBinary(msg, binary, signal, emit);
+      const { reply, bytes } = await dispatchBinary(msg, binary, signal, emit, body);
       if (replayKey && REPLAYABLE.has(str(msg.op))) rememberReplay(replayKey, reply);
       return frameOf(encodeV1(reply, bytes));
     } catch (e) {
@@ -2238,6 +2242,85 @@ export function encodeFrame(obj: Frame): Buffer {
 /** The bound TCP listener: the port actually assigned, and its shutdown handle. */
 export type BrokerServer = { port: number; stop(): void };
 
+/** Whether a payload is the head of a fetch whose request body follows in FRAME_V1_MORE frames. */
+function bodyStreamHead(payload: Buffer): boolean {
+  if (payload.length < 5 || payload[0] !== FRAME_V1) return false;
+  const jsonLen = payload.readUInt32LE(1);
+  if (5 + jsonLen > payload.length) return false;
+  const head = payload.subarray(5, 5 + jsonLen).toString("utf8");
+  // Cheap first: most frames are not this.
+  if (!head.includes('"bodyStream":true')) return false;
+  const msg = jsonObject(parseJsonValue(head));
+  return msg?.bodyStream === true;
+}
+
+/** The request body of a streamed-body request, fed by the frames after its head. */
+type BodySink = {
+  stream: ReadableStream<Uint8Array>;
+  /** A FRAME_V1_MORE payload: `{ chunk: true }` plus bytes, `{ end: true }`, or `{ error }`. */
+  frame(payload: Buffer): void;
+  fail(reason: string): void;
+};
+/** Bytes a streamed request body may hold unread before the sprout's connection is paused. */
+const BODY_SINK_HIGH = 4 * 1024 * 1024;
+function bodySink(socket: { pause(): void; resume(): void }): BodySink {
+  let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
+  let finished = false;
+  let paused = false;
+  const resume = () => {
+    if (paused) {
+      paused = false;
+      socket.resume();
+    }
+  };
+  const finish = () => {
+    finished = true;
+    resume();
+  };
+  const stream = new ReadableStream<Uint8Array>(
+    {
+      start(c) {
+        controller = c;
+      },
+      pull() {
+        resume();
+      },
+      cancel() {
+        finish();
+      },
+    },
+    new ByteLengthQueuingStrategy({ highWaterMark: BODY_SINK_HIGH }),
+  );
+  return {
+    stream,
+    frame(payload) {
+      if (finished || !controller || payload.length < 5) return;
+      const jsonLen = payload.readUInt32LE(1);
+      const msg = jsonObject(parseJsonValue(payload.subarray(5, 5 + jsonLen).toString("utf8")));
+      if (msg?.chunk === true) {
+        const bytes = payload.subarray(5 + jsonLen);
+        if (bytes.length) controller.enqueue(new Uint8Array(bytes));
+        if ((controller.desiredSize ?? 1) <= 0 && !paused) {
+          paused = true;
+          socket.pause();
+        }
+        return;
+      }
+      finish();
+      if (msg?.end === true) controller.close();
+      else {
+        const error = msg?.error;
+        controller.error(new Error(isString(error) ? error : "the request body failed"));
+      }
+    },
+    fail(reason) {
+      if (finished) return;
+      finish();
+      controller?.error(new Error(reason));
+    },
+  };
+}
+
 /** Start the TCP listener. Returns the bound port. */
 export function listen(broker: Broker, hostname: string, port: number): BrokerServer {
   // Chunks are held in a list and joined once, when a whole frame has arrived.
@@ -2254,6 +2337,8 @@ export function listen(broker: Broker, hostname: string, port: number): BrokerSe
     written: (() => void) | null;
     /** Aborted when the connection closes, so upstream requests it started stop. */
     abort: AbortController;
+    /** The request body a streamed-body request on this connection is reading, if any. */
+    sink: BodySink | null;
   };
   const flush = (socket: Bun.Socket<SocketState>): void => {
     const state = socket.data;
@@ -2291,6 +2376,7 @@ export function listen(broker: Broker, hostname: string, port: number): BrokerSe
           offset: 0,
           written: null,
           abort: new AbortController(),
+          sink: null,
         };
       },
       drain: flush,
@@ -2301,6 +2387,7 @@ export function listen(broker: Broker, hostname: string, port: number): BrokerSe
         state.chunks = [];
         state.size = 0;
         state.output = null;
+        state.sink?.fail("the sprout closed the connection");
         const done = state.written;
         state.written = null;
         done?.();
@@ -2331,6 +2418,23 @@ export function listen(broker: Broker, hostname: string, port: number): BrokerSe
           const rest = buf.subarray(4 + len);
           state.chunks = rest.length ? [Buffer.from(rest)] : [];
           state.size = rest.length;
+          // A frame of a streamed request body: to its request's stream.
+          if (payload.length > 0 && payload[0] === FRAME_V1_MORE) {
+            state.sink?.frame(payload);
+            continue;
+          }
+          // A request whose body follows in frames: it runs while this loop feeds them.
+          if (bodyStreamHead(payload)) {
+            const sink = bodySink(socket);
+            state.sink = sink;
+            void (async () => {
+              const reply = await broker.handleFrame(payload, state.abort.signal, (frame) => send(socket, frame), sink.stream);
+              await send(socket, reply);
+              // Body frames the sprout still sends (the upstream answered early) are dropped.
+              sink.fail("the request already ended");
+            })();
+            continue;
+          }
           // Bun does not buffer unwritten bytes. Serialize replies and retain
           // the unsent suffix until drain, including binary R2 responses.
           await send(socket, await broker.handleFrame(payload, state.abort.signal, (frame) => send(socket, frame)));

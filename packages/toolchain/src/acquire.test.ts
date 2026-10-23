@@ -99,7 +99,10 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "  const i32 method_ptr = get_method_ptr(method);\n" +
       "  if (method_ptr == 0) return;\n" +
       "  __porffor_js_enter();\n  const i32 url_ptr = alloc_request_url(req);\n" +
-      "  const i32 headers_ptr = collect_headers(req);\n}\n" +
+      "  const i32 headers_ptr = collect_headers(req);\n" +
+      "  if (declared_content_length > REQUEST_BODY_MAX_BYTES || REQUEST_BODY_MAX_BYTES == 0) {\n  }\n}\n" +
+      "static bool handle_request(uWS::HttpResponse<false>* res, i32 method_ptr, i32 url_ptr, i32 headers_ptr, std::string_view request_body, bool* aborted, NativeRequestRoots* roots) {\n" +
+      "      res->onAborted([pending]() {\n        pending->aborted = true;\n        pending->res = nullptr;\n      });\n}\n" +
       "static bool is_forbidden_response_header(std::string_view key) {\n" +
       '  return key == "connection" ||\n' +
       '         key == "content-length" ||\n' +
