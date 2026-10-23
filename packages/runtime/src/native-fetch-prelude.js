@@ -6805,19 +6805,11 @@ function __sbDOUnhex(text) {
   return out;
 }
 
+// Uint8Array and DataView only. Each other typed-array constructor named here links that
+// builtin into every app: the eight of them added about 7 s (45%) to a cold standalone
+// build. __sbDOPack refuses the other views instead of changing their type.
 function __sbDOView(name, bytes) {
-  const buf = bytes.buffer;
-  if (name === "Uint8Array") return bytes;
-  if (name === "Int8Array") return new Int8Array(buf);
-  if (name === "Uint8ClampedArray") return new Uint8ClampedArray(buf);
-  if (name === "Uint16Array") return new Uint16Array(buf);
-  if (name === "Int16Array") return new Int16Array(buf);
-  if (name === "Uint32Array") return new Uint32Array(buf);
-  if (name === "Int32Array") return new Int32Array(buf);
-  if (name === "Float32Array") return new Float32Array(buf);
-  if (name === "Float64Array") return new Float64Array(buf);
-  if (name === "DataView") return new DataView(buf);
-  return bytes;
+  return name === "DataView" ? new DataView(bytes.buffer) : bytes;
 }
 
 // A value as JSON: null, booleans, strings and finite numbers are themselves; everything
@@ -6848,8 +6840,15 @@ function __sbDOPack(v, seen) {
       out.push(__sbDOPack(x, seen));
     });
   } else if (v instanceof ArrayBuffer) out = ["AB", __sbDOHex(new Uint8Array(v))];
-  else if (ArrayBuffer.isView(v))
-    out = ["V", Object.prototype.toString.call(v).slice(8, -1), __sbDOHex(new Uint8Array(v.buffer, v.byteOffset, v.byteLength))];
+  else if (ArrayBuffer.isView(v)) {
+    const name = Object.prototype.toString.call(v).slice(8, -1);
+    if (name !== "Uint8Array" && name !== "DataView") {
+      const error = new Error(name + " is not supported in Durable Object storage here yet; store a Uint8Array of its bytes.");
+      error.name = "DataCloneError";
+      throw error;
+    }
+    out = ["V", name, __sbDOHex(new Uint8Array(v.buffer, v.byteOffset, v.byteLength))];
+  }
   else if (v instanceof RegExp) out = ["R", v.source, v.flags];
   else if (Array.isArray(v)) {
     out = ["A"];
