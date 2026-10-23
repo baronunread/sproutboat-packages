@@ -21,6 +21,13 @@ import { CASE_LOWER_RUNS, CASE_UPPER_RUNS } from "./case-map";
 import { HEADERS_CLASS_SOURCE } from "./headers-class";
 import { BLOB_CLASS_SOURCE, REQUEST_CLASS_SOURCE, RESPONSE_BYTES_ANCHOR, RESPONSE_BYTES_INJECT, RESPONSE_CLASS_SOURCE } from "./fetch-classes";
 import * as requestStreaming from "./request-streaming";
+import {
+  NATIVE_BYTES_LAYOUT,
+  NATIVE_BYTES_MARKER,
+  NATIVE_BYTES_RENDER_ANCHOR,
+  NATIVE_BYTES_RENDER_GUARD,
+  NATIVE_BYTES_SOURCE,
+} from "./native-bytes";
 import * as streaming from "./streaming";
 import { PORFFOR_COMMIT_FULL } from "./pin";
 import { PATCH_FINGERPRINT } from "./fingerprint";
@@ -2065,6 +2072,38 @@ async function patchedByThisVersion(root: string): Promise<boolean> {
   }
 }
 
+/** Lazy native bytes primitives; no generated C changes without a reference. */
+export async function patchNativeBytes(root: string): Promise<void> {
+  const file = resolve(root, "compiler/render.js");
+  const builtin = resolve(root, "compiler/builtins/sproutboat-native-bytes.ts");
+  const src = await readFile(file, "utf8");
+  const layout = await readFile(resolve(root, "compiler/builtins/typedarray.js"), "utf8");
+  const buffers = await readFile(resolve(root, "compiler/builtins/arraybuffer.ts"), "utf8");
+  if (
+    !layout.includes(NATIVE_BYTES_LAYOUT) ||
+    !buffers.includes("// maxByteLength -1 for fixed length, -2 for immutable")
+  )
+    throw new Error("could not patch Porffor native bytes v1: typed-array layout changed");
+  if (src.split(NATIVE_BYTES_RENDER_ANCHOR).length !== 2)
+    throw new Error(`could not patch Porffor native bytes v1: renderer anchor changed in ${file}`);
+  if (src.includes(NATIVE_BYTES_MARKER) && src.split(NATIVE_BYTES_RENDER_GUARD).length !== 2)
+    throw new Error(`could not patch Porffor native bytes v1: renderer guard changed in ${file}`);
+  let existing: string | null = null;
+  try {
+    existing = await readFile(builtin, "utf8");
+  } catch (error) {
+    if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+  }
+  if (existing !== null && existing !== NATIVE_BYTES_SOURCE)
+    throw new Error(`could not patch Porffor native bytes v1: unexpected builtin contents in ${builtin}`);
+  if (!src.includes(NATIVE_BYTES_MARKER))
+    await writeFile(
+      file,
+      src.replace(NATIVE_BYTES_RENDER_ANCHOR, NATIVE_BYTES_RENDER_GUARD + NATIVE_BYTES_RENDER_ANCHOR),
+    );
+  if (existing === null) await writeFile(builtin, NATIVE_BYTES_SOURCE);
+}
+
 export async function ensurePorfforPatched(root: string): Promise<void> {
   if (done.has(root)) return;
   if (await patchedByThisVersion(root)) {
@@ -2098,6 +2137,7 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchZeroDelayTimers(root);
   await patchSplitGlobals(root);
   await patchStreamingRequests(root);
+  await patchNativeBytes(root);
   // Last of the builtin edits: its precompile picks up the promise, replaceAll,
   // local function and repeat patches above too.
   await precompileBuiltins(root);

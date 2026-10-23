@@ -7,6 +7,7 @@ export const PATCH_SOURCES = [
   "case-map.ts",
   "fetch-classes.ts",
   "headers-class.ts",
+  "native-bytes.ts",
   "patch.ts",
   "pin.ts",
   "request-streaming.ts",
@@ -22,7 +23,7 @@ export const PATCH_SOURCES = [
  * patch.ts as the module patch.ts is everywhere else. Kept current by fingerprint.test.ts
  * (UPDATE_FINGERPRINT=1 bun test packages/toolchain/src/fingerprint.test.ts).
  */
-export const RELEASED_FINGERPRINT = "13b749f7c0f3";
+export const RELEASED_FINGERPRINT = "1f2eb590a437";
 
 /** The fingerprint of the sources in dir, or null where they are not on disk. */
 export function sourceFingerprint(dir: string): string | null {

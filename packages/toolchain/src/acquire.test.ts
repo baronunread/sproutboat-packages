@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { ensurePorffor, PORFFOR_COMMIT_FULL, PorfforToolchainError } from "./index";
 import { PATCH_FINGERPRINT } from "./fingerprint";
+import { NATIVE_BYTES_LAYOUT, NATIVE_BYTES_RENDER_ANCHOR } from "./native-bytes";
 
 const temporary: string[] = [];
 afterEach(async () => {
@@ -17,7 +18,7 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
   const source = join(root, `porffor-${PORFFOR_COMMIT_FULL}`);
   const files = {
     "runtime/index.js": "fixture:runtime/index.js\n",
-    "compiler/render.js": "// sb_native_utf8_scalar_v1\n" +
+    "compiler/render.js": NATIVE_BYTES_RENDER_ANCHOR + "// sb_native_utf8_scalar_v1\n" +
       "static void porf_gc_cons_candidate(u32 c);\n" +
       // Both conservative scanners consume raw f64 values.
       ("    if (d > 0.0 && d < 4294967296.0) {\n" +
@@ -69,7 +70,8 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "fs.writeFileSync(path.join(__dirname, 'builtins_precompiled.js'), fs.readFileSync(path.join(__dirname, 'builtins/typedarray.js')));\n",
     "compiler/builtins_precompiled.js": "fixture:precompiled\n",
     "compiler/builtins/date.ts": "export const __ecma262_ParseDTSF = (string: string) => {\n};\n",
-    "compiler/builtins/typedarray.js":
+    "compiler/builtins/arraybuffer.ts": "// maxByteLength -1 for fixed length, -2 for immutable\n",
+    "compiler/builtins/typedarray.js": NATIVE_BYTES_LAYOUT + "\n" +
       "${typedArrayFuncs.reduce((acc, x) => acc + x.replace('// @porf-typed-array\\n', '').replaceAll('Array', name).replaceAll('any[]', name) + '\\n\\n', '')}`;\n" +
       "  offset = Math.trunc(offset);\n  if (Porffor.fastOr(offset < 0, offset > len)) throw new RangeError('Offset out of bounds');\n" +
       "export const __${name}_from = (arg: any, mapFn: any): ${name} => {\n" +
