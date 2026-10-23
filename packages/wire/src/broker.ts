@@ -21,7 +21,18 @@ import { createD1Store } from "./d1";
 import type { D1Pool } from "./d1-pool";
 import { Database, type Statement } from "bun:sqlite";
 import { createHash, randomBytes } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statfsSync, statSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statfsSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { open } from "node:fs/promises";
 import { dirname, join, normalize, resolve } from "node:path";
 import { parseArgs } from "node:util";
@@ -200,7 +211,12 @@ export type Broker = {
    * for it (`bodyStream: true`) sends that stream as its request body: the listener feeds
    * it from the FRAME_V1_MORE frames that follow the head on the same connection.
    */
-  handleFrame(payload: Buffer, signal?: AbortSignal, emit?: FrameEmitter, body?: ReadableStream<Uint8Array>): Promise<Buffer>;
+  handleFrame(
+    payload: Buffer,
+    signal?: AbortSignal,
+    emit?: FrameEmitter,
+    body?: ReadableStream<Uint8Array>,
+  ): Promise<Buffer>;
   /** Serve one reserved direct R2 upload or download request. */
   transfer(request: Request): Promise<Response>;
   close(): void;
@@ -300,10 +316,12 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         "expires_at INTEGER, PRIMARY KEY (ns, key))",
     );
     const kvColumns = conn.query<{ name: string }, []>("PRAGMA table_info(kv)").all();
-    if (!kvColumns.some((column) => column.name === "expires_at")) conn.exec("ALTER TABLE kv ADD COLUMN expires_at INTEGER");
+    if (!kvColumns.some((column) => column.name === "expires_at"))
+      conn.exec("ALTER TABLE kv ADD COLUMN expires_at INTEGER");
     // #233 — 1 when the value was put as bytes (stored one char per byte), so get()
     // can hand back exact bytes or decoded text depending on the requested type.
-    if (!kvColumns.some((column) => column.name === "binary")) conn.exec("ALTER TABLE kv ADD COLUMN binary INTEGER NOT NULL DEFAULT 0");
+    if (!kvColumns.some((column) => column.name === "binary"))
+      conn.exec("ALTER TABLE kv ADD COLUMN binary INTEGER NOT NULL DEFAULT 0");
     // A key's metadata (put(key, value, { metadata })), as JSON text.
     if (!kvColumns.some((column) => column.name === "metadata")) conn.exec("ALTER TABLE kv ADD COLUMN metadata TEXT");
     // #56 — no `body` column: an object's bytes live in their own file under
@@ -344,7 +362,12 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     // Every queue poll filters one partition's live rows and takes its earliest
     // visible batch. This additive index also upgrades existing resource files.
     conn.exec("CREATE INDEX IF NOT EXISTS mq_due ON mq (queue, dead, visible_at)");
-    if (!conn.query<{ name: string }, []>("PRAGMA table_info(mq)").all().some((c) => c.name === "claim_token"))
+    if (
+      !conn
+        .query<{ name: string }, []>("PRAGMA table_info(mq)")
+        .all()
+        .some((c) => c.name === "claim_token")
+    )
       conn.exec("ALTER TABLE mq ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''");
     return conn;
   };
@@ -373,7 +396,9 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   );
   // Alarm polling reads the earliest due objects across classes.
   doDb.exec("CREATE INDEX IF NOT EXISTS do_alarm_due ON do_alarm (at)");
-  doDb.exec("CREATE TABLE IF NOT EXISTS do_alarm_delivery (cls TEXT NOT NULL, id TEXT NOT NULL, at INTEGER NOT NULL, attempts INTEGER NOT NULL, token TEXT NOT NULL, expires INTEGER NOT NULL, PRIMARY KEY(cls,id))");
+  doDb.exec(
+    "CREATE TABLE IF NOT EXISTS do_alarm_delivery (cls TEXT NOT NULL, id TEXT NOT NULL, at INTEGER NOT NULL, attempts INTEGER NOT NULL, token TEXT NOT NULL, expires INTEGER NOT NULL, PRIMARY KEY(cls,id))",
+  );
   // #69 — fixed-window rate-limiter counters, per binding name + key.
   db.exec(
     "CREATE TABLE IF NOT EXISTS ratelimit (name TEXT NOT NULL, key TEXT NOT NULL, window_start INTEGER NOT NULL, " +
@@ -407,9 +432,10 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   // One ledger for every account, shared by the brokers of all its deployments.
   // Ticket reservations are recorded before an upload begins, so four accepted
   // requests cannot each independently decide that the same remaining bytes fit.
-  const quotaDb = quotaOwner && quotaDirectory && quotaBytes
-    ? new Database(join(quotaDirectory, "r2-quota.sqlite"), { create: true })
-    : null;
+  const quotaDb =
+    quotaOwner && quotaDirectory && quotaBytes
+      ? new Database(join(quotaDirectory, "r2-quota.sqlite"), { create: true })
+      : null;
   if (quotaDb) {
     const owner = quotaOwner!;
     quotaDb.exec("PRAGMA journal_mode = WAL");
@@ -422,7 +448,9 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     quotaDb.exec(
       "CREATE TABLE IF NOT EXISTS r2_transfer_metric (owner TEXT PRIMARY KEY, tickets_issued INTEGER NOT NULL DEFAULT 0, rejected_quota INTEGER NOT NULL DEFAULT 0, rejected_disk INTEGER NOT NULL DEFAULT 0, rejected_size INTEGER NOT NULL DEFAULT 0)",
     );
-    const existing = quotaDb.query<{ owner: string }, [string]>("SELECT owner FROM r2_account_quota WHERE owner = ?").get(owner);
+    const existing = quotaDb
+      .query<{ owner: string }, [string]>("SELECT owner FROM r2_account_quota WHERE owner = ?")
+      .get(owner);
     if (!existing) {
       quotaDb.query("INSERT INTO r2_account_quota (owner, used_bytes, reserved_bytes) VALUES (?1, 0, 0)").run(owner);
     }
@@ -436,9 +464,12 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       // Open through resourceDb so older resource files gain the multipart
       // tables before the aggregate is queried.
       const store = resourceDb(id);
-      used += store.query<{ bytes: number }, []>(
-        "SELECT (SELECT COALESCE(SUM(size), 0) FROM r2) + (SELECT COALESCE(SUM(size), 0) FROM r2_part) AS bytes",
-      ).get()?.bytes ?? 0;
+      used +=
+        store
+          .query<{ bytes: number }, []>(
+            "SELECT (SELECT COALESCE(SUM(size), 0) FROM r2) + (SELECT COALESCE(SUM(size), 0) FROM r2_part) AS bytes",
+          )
+          .get()?.bytes ?? 0;
     }
     return used;
   };
@@ -453,9 +484,12 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   const releaseExpiredR2Reservations = (now = Date.now()): void => {
     if (!quotaDb || !quotaOwner) return;
     quotaDb.query("DELETE FROM r2_quota_reservation WHERE owner = ?1 AND expires < ?2").run(quotaOwner, now);
-    const reserved = quotaDb.query<{ bytes: number }, [string]>(
-      "SELECT COALESCE(SUM(bytes), 0) AS bytes FROM r2_quota_reservation WHERE owner = ?",
-    ).get(quotaOwner)?.bytes ?? 0;
+    const reserved =
+      quotaDb
+        .query<{ bytes: number }, [string]>(
+          "SELECT COALESCE(SUM(bytes), 0) AS bytes FROM r2_quota_reservation WHERE owner = ?",
+        )
+        .get(quotaOwner)?.bytes ?? 0;
     quotaDb.query("UPDATE r2_account_quota SET reserved_bytes = ?1 WHERE owner = ?2").run(reserved, quotaOwner);
   };
 
@@ -465,10 +499,15 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     try {
       releaseExpiredR2Reservations();
       const used = committedR2Bytes();
-      const reserved = quotaDb.query<{ bytes: number }, [string]>(
-        "SELECT COALESCE(SUM(bytes), 0) AS bytes FROM r2_quota_reservation WHERE owner = ?",
-      ).get(quotaOwner)?.bytes ?? 0;
-      quotaDb.query("UPDATE r2_account_quota SET used_bytes = ?1, reserved_bytes = ?2 WHERE owner = ?3").run(used, reserved, quotaOwner);
+      const reserved =
+        quotaDb
+          .query<{ bytes: number }, [string]>(
+            "SELECT COALESCE(SUM(bytes), 0) AS bytes FROM r2_quota_reservation WHERE owner = ?",
+          )
+          .get(quotaOwner)?.bytes ?? 0;
+      quotaDb
+        .query("UPDATE r2_account_quota SET used_bytes = ?1, reserved_bytes = ?2 WHERE owner = ?3")
+        .run(used, reserved, quotaOwner);
       if (used + reserved + bytes > quotaBytes) {
         quotaDb.exec("ROLLBACK");
         return "quota";
@@ -478,8 +517,12 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         quotaDb.exec("ROLLBACK");
         return "disk";
       }
-      quotaDb.query("INSERT INTO r2_quota_reservation (token, owner, bytes, expires) VALUES (?1, ?2, ?3, ?4)").run(token, quotaOwner, bytes, expires);
-      quotaDb.query("UPDATE r2_account_quota SET reserved_bytes = ?1 WHERE owner = ?2").run(reserved + bytes, quotaOwner);
+      quotaDb
+        .query("INSERT INTO r2_quota_reservation (token, owner, bytes, expires) VALUES (?1, ?2, ?3, ?4)")
+        .run(token, quotaOwner, bytes, expires);
+      quotaDb
+        .query("UPDATE r2_account_quota SET reserved_bytes = ?1 WHERE owner = ?2")
+        .run(reserved + bytes, quotaOwner);
       quotaDb.exec("COMMIT");
       return "ok";
     } catch (error) {
@@ -492,17 +535,24 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     if (!quotaDb || !quotaOwner) return;
     quotaDb.exec("BEGIN IMMEDIATE");
     try {
-      const reservation = quotaDb.query<{ bytes: number }, [string]>("SELECT bytes FROM r2_quota_reservation WHERE token = ?").get(token);
+      const reservation = quotaDb
+        .query<{ bytes: number }, [string]>("SELECT bytes FROM r2_quota_reservation WHERE token = ?")
+        .get(token);
       if (!reservation) {
         quotaDb.exec("COMMIT");
         return;
       }
       quotaDb.query("DELETE FROM r2_quota_reservation WHERE token = ?").run(token);
       const used = committedR2Bytes();
-      const reserved = quotaDb.query<{ bytes: number }, [string]>(
-        "SELECT COALESCE(SUM(bytes), 0) AS bytes FROM r2_quota_reservation WHERE owner = ?",
-      ).get(quotaOwner)?.bytes ?? 0;
-      quotaDb.query("UPDATE r2_account_quota SET used_bytes = ?1, reserved_bytes = ?2 WHERE owner = ?3").run(used, reserved, quotaOwner);
+      const reserved =
+        quotaDb
+          .query<{ bytes: number }, [string]>(
+            "SELECT COALESCE(SUM(bytes), 0) AS bytes FROM r2_quota_reservation WHERE owner = ?",
+          )
+          .get(quotaOwner)?.bytes ?? 0;
+      quotaDb
+        .query("UPDATE r2_account_quota SET used_bytes = ?1, reserved_bytes = ?2 WHERE owner = ?3")
+        .run(used, reserved, quotaOwner);
       quotaDb.exec("COMMIT");
     } catch (error) {
       quotaDb.exec("ROLLBACK");
@@ -510,7 +560,9 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     }
   };
 
-  const recordR2TransferMetric = (field: "tickets_issued" | "rejected_quota" | "rejected_disk" | "rejected_size"): void => {
+  const recordR2TransferMetric = (
+    field: "tickets_issued" | "rejected_quota" | "rejected_disk" | "rejected_size",
+  ): void => {
     if (!quotaDb || !quotaOwner) return;
     quotaDb.query(`UPDATE r2_transfer_metric SET ${field} = ${field} + 1 WHERE owner = ?`).run(quotaOwner);
   };
@@ -528,19 +580,26 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   };
 
   type KvStmts = {
-    get: Statement<{ value: string; expires_at: number | null; binary: number; metadata: string | null }, [string, string]>;
+    get: Statement<
+      { value: string; expires_at: number | null; binary: number; metadata: string | null },
+      [string, string]
+    >;
     put: Statement<unknown, [string, string, string, number | null, number, string | null]>;
     del: Statement<unknown, [string, string]>;
-    list: Statement<{ key: string; expires_at: number | null; metadata: string | null }, [string, string, string, number, number]>;
+    list: Statement<
+      { key: string; expires_at: number | null; metadata: string | null },
+      [string, string, string, number, number]
+    >;
   };
   const kvStmtCache = new Map<Database, KvStmts>();
   const kvStmts = (store: Database): KvStmts => {
     let stmts = kvStmtCache.get(store);
     if (!stmts) {
       stmts = {
-        get: store.query<{ value: string; expires_at: number | null; binary: number; metadata: string | null }, [string, string]>(
-          "SELECT value, expires_at, binary, metadata FROM kv WHERE ns = ? AND key = ?",
-        ),
+        get: store.query<
+          { value: string; expires_at: number | null; binary: number; metadata: string | null },
+          [string, string]
+        >("SELECT value, expires_at, binary, metadata FROM kv WHERE ns = ? AND key = ?"),
         put: store.query(
           "INSERT INTO kv (ns, key, value, expires_at, binary, metadata) VALUES (?1, ?2, ?3, ?4, ?5, ?6) " +
             "ON CONFLICT (ns, key) DO UPDATE SET value = ?3, expires_at = ?4, binary = ?5, metadata = ?6",
@@ -550,7 +609,10 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         // it is a separate concern (ponytail: rows accumulate until touched by a
         // get/list/put on the same key/prefix, add a cron sweep if that matters).
         // The prefix matches exactly: LIKE ignored case and read "_" and "%" as wildcards.
-        list: store.query<{ key: string; expires_at: number | null; metadata: string | null }, [string, string, string, number, number]>(
+        list: store.query<
+          { key: string; expires_at: number | null; metadata: string | null },
+          [string, string, string, number, number]
+        >(
           "SELECT key, expires_at, metadata FROM kv WHERE ns = ?1 AND substr(key, 1, length(?2)) = ?2 AND key > ?3 " +
             "AND (expires_at IS NULL OR expires_at > ?4) ORDER BY key LIMIT ?5",
         ),
@@ -566,7 +628,8 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
    *  seconds) -> ms epoch, or `null` for no expiry. */
   const kvExpiresAt = (msg: Frame): number | null => {
     if (isNumber(msg.expirationTtl)) {
-      if (msg.expirationTtl < MIN_KV_TTL_SECONDS) throw new Error(`expirationTtl must be at least ${MIN_KV_TTL_SECONDS} seconds`);
+      if (msg.expirationTtl < MIN_KV_TTL_SECONDS)
+        throw new Error(`expirationTtl must be at least ${MIN_KV_TTL_SECONDS} seconds`);
       return Date.now() + msg.expirationTtl * 1000;
     }
     if (isNumber(msg.expiration)) return msg.expiration * 1000;
@@ -761,7 +824,10 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     });
   };
 
-  const validateCompletedParts = (stored: R2PartRow[], requested: Array<{ partNumber: number; etag: string }>): void => {
+  const validateCompletedParts = (
+    stored: R2PartRow[],
+    requested: Array<{ partNumber: number; etag: string }>,
+  ): void => {
     if (stored.length !== requested.length) throw new Error("uploaded parts do not match");
     for (let index = 0; index < stored.length; index++) {
       const actual = stored[index];
@@ -862,7 +928,9 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       const path = join(directory, name);
       try {
         const tokenValue = name.slice(0, 24);
-        const ticket = store.query<{ expires: number }, [string]>("SELECT expires FROM r2_transfer WHERE token = ?").get(tokenValue);
+        const ticket = store
+          .query<{ expires: number }, [string]>("SELECT expires FROM r2_transfer WHERE token = ?")
+          .get(tokenValue);
         if (!ticket || ticket.expires < now || statSync(path).mtimeMs < cutoff) rmSync(path);
       } catch (error) {
         if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
@@ -884,7 +952,14 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     }
     const start = Number(match[1]);
     const requestedEnd = match[2] ? Number(match[2]) : size - 1;
-    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(requestedEnd) || start < 0 || start >= size || requestedEnd < start) return null;
+    if (
+      !Number.isSafeInteger(start) ||
+      !Number.isSafeInteger(requestedEnd) ||
+      start < 0 ||
+      start >= size ||
+      requestedEnd < start
+    )
+      return null;
     return { start, end: Math.min(requestedEnd, size - 1) };
   };
 
@@ -911,11 +986,16 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     if (!ticket || ticket.bucket !== bucket || ticket.used || ticket.expires < Date.now()) {
       return new Response("transfer ticket expired or already used", { status: 410 });
     }
-    if ((ticket.method === "upload" && method !== "PUT") || (ticket.method === "download" && method !== "GET" && method !== "HEAD")) {
+    if (
+      (ticket.method === "upload" && method !== "PUT") ||
+      (ticket.method === "download" && method !== "GET" && method !== "HEAD")
+    ) {
       return new Response("method not allowed", { status: 405, headers: { allow: allowedMethod } });
     }
     if (ticket.method === "download") {
-      const row = store.query<R2Row, [string, string]>("SELECT * FROM r2 WHERE bucket = ? AND key = ?").get(bucket, ticket.key);
+      const row = store
+        .query<R2Row, [string, string]>("SELECT * FROM r2 WHERE bucket = ? AND key = ?")
+        .get(bucket, ticket.key);
       if (!row) return new Response("not found", { status: 404 });
       const etag = `"${row.etag}"`;
       const noneMatch = request.headers.get("if-none-match");
@@ -947,7 +1027,8 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     if (request.headers.has("content-length") && (!Number.isSafeInteger(declared) || declared < 0)) {
       return new Response("invalid content length", { status: 400 });
     }
-    if (Number.isFinite(declared) && declared > ticket.max_bytes) return new Response("upload too large", { status: 413 });
+    if (Number.isFinite(declared) && declared > ticket.max_bytes)
+      return new Response("upload too large", { status: 413 });
     const directory = r2BlobDir(store);
     if (!directory) return new Response("direct transfers require a file-backed store", { status: 503 });
     if (activeUploads >= maxActiveUploads) {
@@ -1000,7 +1081,9 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       const destination = r2BlobPath(store, bucket, ticket.key, etag)!;
       renameSync(temporary, destination);
       const previous = store
-        .query<Pick<R2Row, "blob_id" | "size">, [string, string]>("SELECT blob_id, size FROM r2 WHERE bucket = ? AND key = ?")
+        .query<Pick<R2Row, "blob_id" | "size">, [string, string]>(
+          "SELECT blob_id, size FROM r2 WHERE bucket = ? AND key = ?",
+        )
         .get(bucket, ticket.key);
       const row: R2Row = {
         key: ticket.key,
@@ -1059,7 +1142,8 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       try {
         for (const part of parts) {
           const bytes = r2ReadPart(store, bucket, key, uploadId, part.part_number);
-          if (!bytes || bytes.byteLength !== part.size) throw new Error(`multipart part ${part.part_number} is missing`);
+          if (!bytes || bytes.byteLength !== part.size)
+            throw new Error(`multipart part ${part.part_number} is missing`);
           appendFileSync(temporary, bytes);
           hash.update(bytes);
           size += bytes.byteLength;
@@ -1105,7 +1189,14 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   // group counts as one entry). Same rules as the embedded transport's __sbR2ListPage.
   // ponytail: with a delimiter every key after the cursor is read; an index on the
   // delimited prefix if buckets grow past ~100k keys.
-  const r2ListPage = (store: Database, bucket: string, prefix: string, cursor: string, limit: number, delimiter: string) => {
+  const r2ListPage = (
+    store: Database,
+    bucket: string,
+    prefix: string,
+    cursor: string,
+    limit: number,
+    delimiter: string,
+  ) => {
     const rows = store
       .query<R2Row, [string, string, string]>(
         "SELECT * FROM r2 WHERE bucket = ?1 AND substr(key, 1, length(?2)) = ?2 AND key > ?3 ORDER BY key" +
@@ -1230,7 +1321,12 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     }
   }
 
-  async function proxyFetch(msg: Frame, signal?: AbortSignal, emit?: FrameEmitter, body?: ReadableStream<Uint8Array>): Promise<Upstream> {
+  async function proxyFetch(
+    msg: Frame,
+    signal?: AbortSignal,
+    emit?: FrameEmitter,
+    body?: ReadableStream<Uint8Array>,
+  ): Promise<Upstream> {
     let url: URL;
     try {
       url = new URL(str(msg.url));
@@ -1270,7 +1366,12 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
    * minus the trip through the network (and therefore minus TLS and the
    * default-deny egress rules, which is why this is not `fetch`).
    */
-  async function serviceFetch(msg: Frame, signal?: AbortSignal, emit?: FrameEmitter, body?: ReadableStream<Uint8Array>): Promise<Upstream> {
+  async function serviceFetch(
+    msg: Frame,
+    signal?: AbortSignal,
+    emit?: FrameEmitter,
+    body?: ReadableStream<Uint8Array>,
+  ): Promise<Upstream> {
     const binding = str(msg.binding);
     const declared = bindings.services.find((entry) => entry.binding === binding);
     if (!declared) throw new Error(`service not bound: ${binding}`);
@@ -1360,7 +1461,13 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         // last key), with expirations and metadata. Without one: up to 1,000 keys, as before.
         const paged = isNumber(msg.limit);
         const limit = paged ? Math.max(0, Math.floor(Number(msg.limit))) : 1000;
-        const rows = kvStmts(store).list.all(part, str(msg.prefix), paged ? str(msg.cursor) : "", Date.now(), paged ? limit + 1 : limit);
+        const rows = kvStmts(store).list.all(
+          part,
+          str(msg.prefix),
+          paged ? str(msg.cursor) : "",
+          Date.now(),
+          paged ? limit + 1 : limit,
+        );
         const page = rows.slice(0, limit);
         const complete = !paged || rows.length <= limit;
         return {
@@ -1379,17 +1486,22 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         const name = str(msg.name) || "default";
         const key = str(msg.key);
         const row = db
-          .query<
-            { status: number; headers_json: string; body: string; expires_at: number | null },
-            [string, string]
-          >("SELECT status, headers_json, body, expires_at FROM cache WHERE name = ? AND cache_key = ?")
+          .query<{ status: number; headers_json: string; body: string; expires_at: number | null }, [string, string]>(
+            "SELECT status, headers_json, body, expires_at FROM cache WHERE name = ? AND cache_key = ?",
+          )
           .get(name, key);
         if (!row) return { ok: true, found: false };
         if (row.expires_at != null && row.expires_at <= Date.now()) {
           db.query("DELETE FROM cache WHERE name = ? AND cache_key = ?").run(name, key);
           return { ok: true, found: false };
         }
-        return { ok: true, found: true, status: row.status, headers: jsonObject(parseJsonValue(row.headers_json)) ?? {}, body: row.body };
+        return {
+          ok: true,
+          found: true,
+          status: row.status,
+          headers: jsonObject(parseJsonValue(row.headers_json)) ?? {},
+          body: row.body,
+        };
       }
       case "cache.put": {
         const name = str(msg.name) || "default";
@@ -1503,9 +1615,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         const expiresIn = Math.min(Math.max(Number(msg.expiresIn) || 900, 30), 3600);
         const expires = Date.now() + expiresIn * 1000;
         const maxBytes =
-          method === "upload"
-            ? Math.min(Math.max(Number(msg.maxBytes) || 100 * 1024 * 1024, 1), transferLimit())
-            : 0;
+          method === "upload" ? Math.min(Math.max(Number(msg.maxBytes) || 100 * 1024 * 1024, 1), transferLimit()) : 0;
         const expectedSha256 = str(msg.sha256).toLowerCase();
         if (expectedSha256 && !/^[0-9a-f]{64}$/.test(expectedSha256)) {
           throw new Error("sha256 must be 64 hexadecimal characters");
@@ -1565,11 +1675,14 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       case "r2.head": {
         const { store, part: bucket } = storeFor("r2", requireR2(msg.bucket));
         const key = str(msg.key);
-        const row = store.query<R2Row, [string, string]>("SELECT * FROM r2 WHERE bucket = ? AND key = ?").get(bucket, key);
+        const row = store
+          .query<R2Row, [string, string]>("SELECT * FROM r2 WHERE bucket = ? AND key = ?")
+          .get(bucket, key);
         if (!row) return { ok: true, found: false };
-        const body = msg.op === "r2.get"
-          ? new TextDecoder().decode(r2ReadBlob(store, bucket, key, row.blob_id) ?? new Uint8Array(0))
-          : undefined;
+        const body =
+          msg.op === "r2.get"
+            ? new TextDecoder().decode(r2ReadBlob(store, bucket, key, row.blob_id) ?? new Uint8Array(0))
+            : undefined;
         return { ok: true, found: true, object: r2Row(row), body };
       }
       case "r2.delete": {
@@ -1585,7 +1698,9 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       case "r2.md5": {
         // Recorded after the put that wrote these bytes (etag): the shim from 2026-10-26 hashes them.
         const { store, part: bucket } = storeFor("r2", requireR2(msg.bucket));
-        store.query("UPDATE r2 SET md5 = ?1 WHERE bucket = ?2 AND key = ?3 AND etag = ?4").run(str(msg.md5), bucket, str(msg.key), str(msg.etag));
+        store
+          .query("UPDATE r2 SET md5 = ?1 WHERE bucket = ?2 AND key = ?3 AND etag = ?4")
+          .run(str(msg.md5), bucket, str(msg.key), str(msg.etag));
         return { ok: true };
       }
       case "r2.list": {
@@ -1673,10 +1788,12 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         return row ? { ok: true, found: true, value: row.value } : { ok: true, found: false };
       }
       case "do.storage.put":
-        doDb.query(
-          "INSERT INTO do_storage (cls, id, key, value) VALUES (?1,?2,?3,?4) " +
-            "ON CONFLICT (cls, id, key) DO UPDATE SET value = ?4",
-        ).run(requireDoClass(msg.cls), str(msg.id), str(msg.key), str(msg.value));
+        doDb
+          .query(
+            "INSERT INTO do_storage (cls, id, key, value) VALUES (?1,?2,?3,?4) " +
+              "ON CONFLICT (cls, id, key) DO UPDATE SET value = ?4",
+          )
+          .run(requireDoClass(msg.cls), str(msg.id), str(msg.key), str(msg.value));
         return { ok: true };
       case "do.storage.delete": {
         const r = doDb
@@ -1690,11 +1807,20 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       case "do.storage.list": {
         const cls = requireDoClass(msg.cls);
         const limit = Math.min(Math.max(Number(msg.limit) || 1000, 1), 10000);
+        // start, startAfter, end and reverse come from the runtime's 2026-10-28 storage.
+        // The prefix match is exact: LIKE also matched _ and % as wildcards, case-insensitively.
+        const bound = (v: JsonValue | undefined): string | null => (v == null ? null : str(v));
         const rows = doDb
-          .query<{ key: string; value: string }, [string, string, string, number]>(
-            "SELECT key, value FROM do_storage WHERE cls = ? AND id = ? AND key LIKE ? || '%' ORDER BY key LIMIT ?",
+          .query<
+            { key: string; value: string },
+            [string, string, string, number, string | null, string | null, string | null]
+          >(
+            "SELECT key, value FROM do_storage WHERE cls = ?1 AND id = ?2 AND substr(key, 1, length(?3)) = ?3" +
+              " AND (?5 IS NULL OR key >= ?5) AND (?6 IS NULL OR key > ?6) AND (?7 IS NULL OR key < ?7)" +
+              (msg.reverse === true ? " ORDER BY key DESC" : " ORDER BY key") +
+              " LIMIT ?4",
           )
-          .all(cls, str(msg.id), str(msg.prefix), limit);
+          .all(cls, str(msg.id), str(msg.prefix), limit, bound(msg.start), bound(msg.startAfter), bound(msg.end));
         return { ok: true, entries: rows.map((r) => [r.key, r.value]) };
       }
 
@@ -1702,17 +1828,23 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       // for that object, and attempts resets because this is a fresh schedule.
       case "do.alarm.set": {
         const cls = requireDoClass(msg.cls);
-        doDb.transaction(() => {
-          doDb.query("DELETE FROM do_alarm_delivery WHERE cls=? AND id=? AND expires<=?").run(cls,str(msg.id),Date.now());
-          doDb.query("INSERT INTO do_alarm (cls,id,at,attempts) VALUES (?1,?2,?3,0) ON CONFLICT (cls,id) DO UPDATE SET at=?3,attempts=0").run(cls,str(msg.id),Math.trunc(Number(msg.at)||0));
-        }).immediate();
-        return {ok:true};
+        doDb
+          .transaction(() => {
+            doDb
+              .query("DELETE FROM do_alarm_delivery WHERE cls=? AND id=? AND expires<=?")
+              .run(cls, str(msg.id), Date.now());
+            doDb
+              .query(
+                "INSERT INTO do_alarm (cls,id,at,attempts) VALUES (?1,?2,?3,0) ON CONFLICT (cls,id) DO UPDATE SET at=?3,attempts=0",
+              )
+              .run(cls, str(msg.id), Math.trunc(Number(msg.at) || 0));
+          })
+          .immediate();
+        return { ok: true };
       }
       case "do.alarm.get": {
         const row = doDb
-          .query<{ at: number }, [string, string]>(
-            "SELECT at FROM do_alarm WHERE cls = ? AND id = ?",
-          )
+          .query<{ at: number }, [string, string]>("SELECT at FROM do_alarm WHERE cls = ? AND id = ?")
           .get(requireDoClass(msg.cls), str(msg.id));
         const retry = row
           ? null
@@ -1725,12 +1857,14 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       }
       case "do.alarm.delete": {
         const cls = requireDoClass(msg.cls);
-        const deleted = doDb.transaction(() => {
-          const pending = doDb.query("DELETE FROM do_alarm WHERE cls=? AND id=?").run(cls,str(msg.id));
-          const delivery = doDb.query("DELETE FROM do_alarm_delivery WHERE cls=? AND id=?").run(cls,str(msg.id));
-          return pending.changes > 0 || delivery.changes > 0;
-        }).immediate();
-        return {ok:true,deleted};
+        const deleted = doDb
+          .transaction(() => {
+            const pending = doDb.query("DELETE FROM do_alarm WHERE cls=? AND id=?").run(cls, str(msg.id));
+            const delivery = doDb.query("DELETE FROM do_alarm_delivery WHERE cls=? AND id=?").run(cls, str(msg.id));
+            return pending.changes > 0 || delivery.changes > 0;
+          })
+          .immediate();
+        return { ok: true, deleted };
       }
 
       case "assets.get": {
@@ -1830,7 +1964,9 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     if (msg.op === "r2.get") {
       const { store, part: bucket } = storeFor("r2", requireR2(msg.bucket));
       const key = str(msg.key);
-      const row = store.query<R2Row, [string, string]>("SELECT * FROM r2 WHERE bucket = ? AND key = ?").get(bucket, key);
+      const row = store
+        .query<R2Row, [string, string]>("SELECT * FROM r2 WHERE bucket = ? AND key = ?")
+        .get(bucket, key);
       if (!row) return { reply: { ok: true, found: false } };
       return {
         reply: { ok: true, found: true, object: r2Row(row) },
@@ -1861,7 +1997,8 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       } else if (!hit && assetManifest?.notFound === "404-page") {
         hit = readAsset("/404.html");
       }
-      if (!hit) return { reply: { ok: true, found: false, status: 404, rules }, bytes: new TextEncoder().encode("Not Found") };
+      if (!hit)
+        return { reply: { ok: true, found: false, status: 404, rules }, bytes: new TextEncoder().encode("Not Found") };
       return {
         reply: { ok: true, found, status, type: hit.type, hash: hit.hash, rules },
         bytes: hit.body,
@@ -1872,7 +2009,12 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   }
 
   /** One wire frame in, one out. See `handleFrame` on the Broker type. */
-  async function handleFrame(payload: Buffer, signal?: AbortSignal, emit?: FrameEmitter, body?: ReadableStream<Uint8Array>): Promise<Buffer> {
+  async function handleFrame(
+    payload: Buffer,
+    signal?: AbortSignal,
+    emit?: FrameEmitter,
+    body?: ReadableStream<Uint8Array>,
+  ): Promise<Buffer> {
     if (payload.length === 0 || payload[0] !== FRAME_V1) {
       return encodeFrame(await handlePayload(payload.toString("utf8")));
     }
@@ -1983,14 +2125,10 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
 
   const timeoutMs = opts.deliveryTimeoutMs ?? 25_000;
   const leaseMs = opts.deliveryLeaseMs ?? 30_000;
-  if (!(timeoutMs > 0 && leaseMs > timeoutMs))
-    throw new Error("delivery lease must exceed its timeout");
+  if (!(timeoutMs > 0 && leaseMs > timeoutMs)) throw new Error("delivery lease must exceed its timeout");
   let closed = false;
   const deliveries = new Set<AbortController>();
-  async function deliverTrigger(
-    kind: "scheduled" | "queue" | "alarm",
-    body: JsonObject,
-  ): Promise<Response | null> {
+  async function deliverTrigger(kind: "scheduled" | "queue" | "alarm", body: JsonObject): Promise<Response | null> {
     if (!opts.sproutUrl || !dispatchEnabled() || closed) return null;
     const abort = new AbortController();
     deliveries.add(abort);
@@ -2007,21 +2145,30 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
           },
           body: JSON.stringify(body),
         }).then(async (res) => {
-            if (kind !== "queue") { await res.body?.cancel(); return new Response(null,{status:res.status}); }
-            const chunks: Uint8Array[] = [];
-            let size = 0;
-            const reader = res.body?.getReader();
-            try {
-              if (reader) for (;;) {
+          if (kind !== "queue") {
+            await res.body?.cancel();
+            return new Response(null, { status: res.status });
+          }
+          const chunks: Uint8Array[] = [];
+          let size = 0;
+          const reader = res.body?.getReader();
+          try {
+            if (reader)
+              for (;;) {
                 const part = await reader.read();
                 if (part.done) break;
                 size += part.value.byteLength;
-                if (size > 65_536) { await reader.cancel(); throw new Error("delivery acknowledgement exceeds 64 KiB"); }
+                if (size > 65_536) {
+                  await reader.cancel();
+                  throw new Error("delivery acknowledgement exceeds 64 KiB");
+                }
                 chunks.push(part.value);
               }
-            } finally { reader?.releaseLock(); }
-            return new Response(size ? Buffer.concat(chunks) : null,{status:res.status,headers:res.headers});
-          }),
+          } finally {
+            reader?.releaseLock();
+          }
+          return new Response(size ? Buffer.concat(chunks) : null, { status: res.status, headers: res.headers });
+        }),
         new Promise<never>((_, reject) =>
           abort.signal.addEventListener("abort", () => reject(new Error("delivery interrupted")), {
             once: true,
@@ -2098,9 +2245,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
             for (const id of ack)
               if (!retrySet.has(id))
                 store
-                  .query(
-                    "DELETE FROM mq WHERE queue = ? AND id = ? AND claim_token = ? AND visible_at > ?",
-                  )
+                  .query("DELETE FROM mq WHERE queue = ? AND id = ? AND claim_token = ? AND visible_at > ?")
                   .run(part, id, claim, Date.now());
             for (const id of retry)
               store
@@ -2120,7 +2265,11 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     const now = Date.now();
     const claimed = doDb
       .transaction(() => {
-        doDb.query("DELETE FROM do_alarm_delivery WHERE expires<=? AND attempts>=5 AND EXISTS (SELECT 1 FROM do_alarm a WHERE a.cls=do_alarm_delivery.cls AND a.id=do_alarm_delivery.id)").run(now);
+        doDb
+          .query(
+            "DELETE FROM do_alarm_delivery WHERE expires<=? AND attempts>=5 AND EXISTS (SELECT 1 FROM do_alarm a WHERE a.cls=do_alarm_delivery.cls AND a.id=do_alarm_delivery.id)",
+          )
+          .run(now);
         const due = doDb
           .query<{ cls: string; id: string; at: number; attempts: number }, [number]>(
             "SELECT cls,id,at,attempts FROM do_alarm WHERE at <= ? AND NOT EXISTS (SELECT 1 FROM do_alarm_delivery d WHERE d.cls=do_alarm.cls AND d.id=do_alarm.id) ORDER BY at LIMIT 10",
@@ -2128,9 +2277,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
           .all(now)
           .filter((r) => bindings.do.some((b) => b.className === r.cls));
         for (const r of due) {
-          doDb
-            .query("INSERT INTO do_alarm_delivery VALUES (?,?,?,?,?,?)")
-            .run(r.cls, r.id, r.at, r.attempts, "", 0);
+          doDb.query("INSERT INTO do_alarm_delivery VALUES (?,?,?,?,?,?)").run(r.cls, r.id, r.at, r.attempts, "", 0);
           doDb.query("DELETE FROM do_alarm WHERE cls=? AND id=? AND at=?").run(r.cls, r.id, r.at);
         }
         const expired = doDb
@@ -2142,9 +2289,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         return expired.map((r) => {
           const claim = randomBytes(24).toString("hex");
           doDb
-            .query(
-              "UPDATE do_alarm_delivery SET token=?,expires=?,attempts=attempts+1 WHERE cls=? AND id=?",
-            )
+            .query("UPDATE do_alarm_delivery SET token=?,expires=?,attempts=attempts+1 WHERE cls=? AND id=?")
             .run(claim, now + leaseMs, r.cls, r.id);
           return { ...r, claim };
         });
@@ -2159,9 +2304,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
             .run(r.cls, r.id, r.claim, Date.now());
         else
           doDb
-            .query(
-              "UPDATE do_alarm_delivery SET expires=? WHERE cls=? AND id=? AND token=? AND expires > ?",
-            )
+            .query("UPDATE do_alarm_delivery SET expires=? WHERE cls=? AND id=? AND token=? AND expires > ?")
             .run(Date.now() + 5_000, r.cls, r.id, r.claim, Date.now());
       });
   }
@@ -2179,8 +2322,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
           if (stamp === lastTick) return; // once per minute
           lastTick = stamp;
           for (const expr of bindings.crons) {
-            if (cronMatches(expr, now))
-              void deliverTrigger("scheduled", { cron: expr, scheduledTime: now.getTime() });
+            if (cronMatches(expr, now)) void deliverTrigger("scheduled", { cron: expr, scheduledTime: now.getTime() });
           }
         }, 15_000),
       );
@@ -2344,7 +2486,10 @@ export function listen(broker: Broker, hostname: string, port: number): BrokerSe
     const state = socket.data;
     if (state.closed || !state.output) return;
     const accepted = socket.write(state.output.subarray(state.offset));
-    if (accepted < 0) { socket.end(); return; }
+    if (accepted < 0) {
+      socket.end();
+      return;
+    }
     state.offset += accepted;
     if (state.offset === state.output.length) {
       state.output = null;
@@ -2398,47 +2543,56 @@ export function listen(broker: Broker, hostname: string, port: number): BrokerSe
         state.size += chunk.length;
         if (state.processing) return;
         state.processing = true;
-        try { for (;;) {
-          if (state.closed) return;
-          if (state.size < 4) return;
-          if (state.chunks.length > 1) {
-            state.chunks = [Buffer.concat(state.chunks, state.size)];
+        try {
+          for (;;) {
+            if (state.closed) return;
+            if (state.size < 4) return;
+            if (state.chunks.length > 1) {
+              state.chunks = [Buffer.concat(state.chunks, state.size)];
+            }
+            const buf = state.chunks[0];
+            const len = buf.readUInt32LE(0);
+            if (len > MAX_FRAME) {
+              await send(socket, encodeFrame({ ok: false, error: "frame too large" }));
+              socket.end();
+              return;
+            }
+            if (state.size < 4 + len) return;
+            // Kept as bytes: a v1 frame carries binary after its JSON, and
+            // decoding the whole payload as utf8 would corrupt it.
+            const payload = buf.subarray(4, 4 + len);
+            const rest = buf.subarray(4 + len);
+            state.chunks = rest.length ? [Buffer.from(rest)] : [];
+            state.size = rest.length;
+            // A frame of a streamed request body: to its request's stream.
+            if (payload.length > 0 && payload[0] === FRAME_V1_MORE) {
+              state.sink?.frame(payload);
+              continue;
+            }
+            // A request whose body follows in frames: it runs while this loop feeds them.
+            if (bodyStreamHead(payload)) {
+              const sink = bodySink(socket);
+              state.sink = sink;
+              void (async () => {
+                const reply = await broker.handleFrame(
+                  payload,
+                  state.abort.signal,
+                  (frame) => send(socket, frame),
+                  sink.stream,
+                );
+                await send(socket, reply);
+                // Body frames the sprout still sends (the upstream answered early) are dropped.
+                sink.fail("the request already ended");
+              })();
+              continue;
+            }
+            // Bun does not buffer unwritten bytes. Serialize replies and retain
+            // the unsent suffix until drain, including binary R2 responses.
+            await send(socket, await broker.handleFrame(payload, state.abort.signal, (frame) => send(socket, frame)));
           }
-          const buf = state.chunks[0];
-          const len = buf.readUInt32LE(0);
-          if (len > MAX_FRAME) {
-            await send(socket, encodeFrame({ ok: false, error: "frame too large" }));
-            socket.end();
-            return;
-          }
-          if (state.size < 4 + len) return;
-          // Kept as bytes: a v1 frame carries binary after its JSON, and
-          // decoding the whole payload as utf8 would corrupt it.
-          const payload = buf.subarray(4, 4 + len);
-          const rest = buf.subarray(4 + len);
-          state.chunks = rest.length ? [Buffer.from(rest)] : [];
-          state.size = rest.length;
-          // A frame of a streamed request body: to its request's stream.
-          if (payload.length > 0 && payload[0] === FRAME_V1_MORE) {
-            state.sink?.frame(payload);
-            continue;
-          }
-          // A request whose body follows in frames: it runs while this loop feeds them.
-          if (bodyStreamHead(payload)) {
-            const sink = bodySink(socket);
-            state.sink = sink;
-            void (async () => {
-              const reply = await broker.handleFrame(payload, state.abort.signal, (frame) => send(socket, frame), sink.stream);
-              await send(socket, reply);
-              // Body frames the sprout still sends (the upstream answered early) are dropped.
-              sink.fail("the request already ended");
-            })();
-            continue;
-          }
-          // Bun does not buffer unwritten bytes. Serialize replies and retain
-          // the unsent suffix until drain, including binary R2 responses.
-          await send(socket, await broker.handleFrame(payload, state.abort.signal, (frame) => send(socket, frame)));
-        } } finally { state.processing = false; }
+        } finally {
+          state.processing = false;
+        }
       },
     },
   });
@@ -2449,10 +2603,15 @@ export function listen(broker: Broker, hostname: string, port: number): BrokerSe
 export function listenTransfers(broker: Broker, hostname: string, port: number): BrokerServer {
   const configured = Number(process.env.SB_R2_TRANSFER_MAX_BYTES);
   const maxRequestBodySize = Number.isSafeInteger(configured) && configured > 0 ? configured : 5 * 1024 * 1024 * 1024;
-  const server = Bun.serve({ hostname, port, maxRequestBodySize, fetch(request, server) {
-    server.timeout(request, 255);
-    return broker.transfer(request);
-  } });
+  const server = Bun.serve({
+    hostname,
+    port,
+    maxRequestBodySize,
+    fetch(request, server) {
+      server.timeout(request, 255);
+      return broker.transfer(request);
+    },
+  });
   return { port: server.port ?? port, stop: () => server.stop(true) };
 }
 
@@ -2498,9 +2657,7 @@ export function startBroker(argv: string[], d1Pool?: D1Pool) {
       const parsed = jsonObject(parseJsonValue(values.services));
       if (parsed) {
         services = Object.fromEntries(
-          Object.entries(parsed).flatMap(([binding, host]) =>
-            isString(host) ? [[binding, host] as const] : [],
-          ),
+          Object.entries(parsed).flatMap(([binding, host]) => (isString(host) ? [[binding, host] as const] : [])),
         );
       }
     } catch {
@@ -2518,13 +2675,9 @@ export function startBroker(argv: string[], d1Pool?: D1Pool) {
     resourceDir: values["resource-dir"],
     doDb: values["do-db"],
     ownerId: values["owner-id"],
-    r2QuotaBytes:
-      Number(values["r2-quota-bytes"] ?? process.env.SPROUTBOAT_R2_QUOTA_BYTES) || undefined,
-    r2ResourceIds: values["r2-resource-ids"]
-      ? String(values["r2-resource-ids"]).split(",").filter(Boolean)
-      : undefined,
-    r2MinFreeBytes:
-      Number(values["r2-min-free-bytes"] ?? process.env.SPROUTBOAT_R2_MIN_FREE_BYTES) || undefined,
+    r2QuotaBytes: Number(values["r2-quota-bytes"] ?? process.env.SPROUTBOAT_R2_QUOTA_BYTES) || undefined,
+    r2ResourceIds: values["r2-resource-ids"] ? String(values["r2-resource-ids"]).split(",").filter(Boolean) : undefined,
+    r2MinFreeBytes: Number(values["r2-min-free-bytes"] ?? process.env.SPROUTBOAT_R2_MIN_FREE_BYTES) || undefined,
     token: values.token ?? process.env.SB_BROKER_TOKEN,
     bindings,
     secrets,

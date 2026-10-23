@@ -5905,11 +5905,17 @@ globalThis.__sbInstallBindings = function (target, bindings) {
           delaySeconds: o.delaySeconds || 0,
         });
       },
-      sendBatch(messages) {
+      sendBatch(messages, options) {
+        // From 2026-10-28 sendBatch(messages, { delaySeconds }) delays every message that
+        // sets none of its own, as on Workers; before, the batch option was ignored.
+        const batchDelay = globalThis.__sbCompat >= "2026-10-28" ? (options && options.delaySeconds) || 0 : 0;
         const list = [];
         for (let j = 0; j < (messages || []).length; j++) {
           const m = messages[j];
-          list.push({ body: __sbIsStr(m.body) ? m.body : JSON.stringify(m.body), delaySeconds: m.delaySeconds || 0 });
+          list.push({
+            body: __sbIsStr(m.body) ? m.body : JSON.stringify(m.body),
+            delaySeconds: m.delaySeconds == null ? batchDelay : m.delaySeconds || 0,
+          });
         }
         __sbRpc("queue.send_batch", { queue: name, messages: list });
       },
@@ -6514,14 +6520,14 @@ globalThis.__sbInstallFetch = function () {
 
 // ---------------------------------------------------------------------------
 // Durable Objects. The class runs here in the sandboxed sprout. There is exactly
-// one sprout process per deployment (the supervisor model) and the native-fetch
-// runtime processes one turn at a time, so calls to a given object id are
-// already serialized — `env.<NS>.get(id).fetch()` invokes the instance directly,
-// no round-trip. Only `state.storage.*` goes to the broker (so object state
-// outlives a sprout restart), scoped to (class, id).
-// ponytail: serialization relies on the single sprout process; a multi-sprout
-// deployment needs the broker to hold a per-id lock (cloud). Storage ops are one
-// key at a time; blockConcurrencyWhile just runs the fn.
+// one sprout process per deployment (the supervisor model), so one instance per
+// id: `env.<NS>.get(id).fetch()` invokes the instance directly, no round-trip.
+// Events still interleave at every await; from 2026-10-28 an input gate (below,
+// __sbDOEnter) keeps them out while a storage read is in flight, as in workerd.
+// Only `state.storage.*` goes to the broker (so object state outlives a sprout
+// restart), scoped to (class, id).
+// ponytail: one instance per id relies on the single sprout process; a
+// multi-sprout deployment needs the broker to hold a per-id lock (cloud).
 
 function __sbMakeDONamespace(binding, className) {
   return {
@@ -6570,9 +6576,14 @@ function __sbMakeDONamespace(binding, className) {
             if (opts.body != null) req.body = String(opts.body);
           }
           const inst = __sbGetDOInstance(className, idStr);
-          const res = inst.fetch(req);
-          if (inst.__sbTasks.length || (res && __sbIsFn(res.then)) || __sbHasStreamBody(res)) return __sbFetchWithDrain(res, inst.__sbTasks);
-          return res;
+          const deliver = () => {
+            const res = inst.fetch(req);
+            if (inst.__sbTasks.length || (res && __sbIsFn(res.then)) || __sbHasStreamBody(res)) return __sbFetchWithDrain(res, inst.__sbTasks);
+            return res;
+          };
+          // From 2026-10-28 the call waits at the object's input gate, as in workerd.
+          if (__sbDOGated()) return __sbDOEnter(inst.__sbGate, deliver);
+          return deliver();
         },
       };
     },
@@ -6596,15 +6607,39 @@ function __sbGetDOInstance(cls, id) {
     // `__sbDOInstances`), so the queue lives on `state` too and is drained by
     // whichever call site invoked `fetch`/`alarm` this turn.
     const __sbTasks = [];
+    const gate = __sbDOMakeGate();
     const state = {
       id: {
         toString() {
           return id;
         },
       },
-      storage: __sbDOStorage(cls, id),
+      storage: __sbDOGated() ? __sbDOAsyncStorage(cls, id, gate) : __sbDOStorage(cls, id),
       blockConcurrencyWhile(fn) {
-        return fn();
+        if (!__sbDOGated()) return fn();
+        // No event enters until fn settles (2026-10-28).
+        gate.locks++;
+        const done = () => {
+          gate.locks--;
+          __sbDOPump(gate);
+        };
+        let r;
+        try {
+          r = fn();
+        } catch (error) {
+          done();
+          return Promise.reject(error);
+        }
+        return Promise.resolve(r).then(
+          (v) => {
+            done();
+            return v;
+          },
+          (error) => {
+            done();
+            throw error;
+          },
+        );
       },
       waitUntil(p) {
         if (p && __sbIsFn(p.then)) __sbTasks.push(p);
@@ -6612,6 +6647,7 @@ function __sbGetDOInstance(cls, id) {
     };
     inst = new Ctor(state, globalThis.env);
     inst.__sbTasks = __sbTasks;
+    inst.__sbGate = gate;
     __sbDOInstances[cacheKey] = inst;
   }
   return inst;
@@ -6624,12 +6660,12 @@ function __sbDOStorage(cls, id) {
         const out = new Map();
         for (let i = 0; i < key.length; i++) {
           const r = __sbRpc("do.storage.get", { cls, id, key: String(key[i]) });
-          if (r.found) out.set(key[i], JSON.parse(r.value));
+          if (r.found) out.set(key[i], __sbDODecode(r.value));
         }
         return out;
       }
       const r = __sbRpc("do.storage.get", { cls, id, key: String(key) });
-      return r.found ? JSON.parse(r.value) : undefined;
+      return r.found ? __sbDODecode(r.value) : undefined;
     },
     put(key, value) {
       if (key != null && __sbIsObj(key)) {
@@ -6672,10 +6708,433 @@ function __sbDOStorage(cls, id) {
         limit: o.limit == null ? 1000 : o.limit,
       });
       const out = new Map();
-      for (let i = 0; i < (r.entries || []).length; i++) out.set(r.entries[i][0], JSON.parse(r.entries[i][1]));
+      for (let i = 0; i < (r.entries || []).length; i++) out.set(r.entries[i][0], __sbDODecode(r.entries[i][1]));
       return out;
     },
   };
+}
+
+
+// From compatibility date 2026-10-28 Durable Objects behave like workerd's in three ways:
+//
+// - Input gate. While a storage read is in flight, no other event (stub.fetch(), an alarm)
+//   enters the object; the reader's continuation runs first. Reads here are synchronous, so
+//   the gate stays shut until the next timer turn, by which point every microtask the read
+//   woke (the reader's code up to its next real await) has run. So
+//   `const v = await storage.get("n"); await storage.put("n", v + 1)` is safe under
+//   concurrent calls; it used to lose updates (10 concurrent increments ended at 1). An
+//   event that awaits anything else (fetch, a timer) lets the next one in, as in workerd.
+//   blockConcurrencyWhile() and transaction() shut it until they settle.
+// - Storage methods return Promises.
+// - Values are structured-cloned (Date, Map, Set, RegExp, ArrayBuffer and views, BigInt,
+//   undefined inside containers, NaN and the infinities), not JSON: put(k, undefined) and
+//   functions throw, and list() takes start, startAfter, end and reverse.
+//
+// Before that date storage is synchronous JSON and events interleave at every await.
+// Values written in the new format start with __sbDOTag (no JSON text starts with "#"),
+// so either side reads both.
+function __sbDOGated() {
+  return globalThis.__sbCompat >= "2026-10-28";
+}
+
+function __sbDOMakeGate() {
+  return { locks: 0, waiting: [] };
+}
+
+// Deliver queued events while the gate is open. A delivered event that reads storage shuts
+// the gate again, which stops the loop.
+function __sbDOPump(gate) {
+  while (gate.locks === 0 && gate.waiting.length > 0) gate.waiting.shift()();
+}
+
+// Shut the gate until the next timer turn (see above).
+function __sbDOHold(gate) {
+  gate.locks++;
+  setTimeout(function () {
+    gate.locks--;
+    __sbDOPump(gate);
+  }, 0);
+}
+
+// Run an event now if the gate is open and nothing is queued ahead of it, else queue it.
+// Always a Promise, like workerd's stub.fetch().
+function __sbDOEnter(gate, run) {
+  if (gate.locks === 0 && gate.waiting.length === 0) {
+    try {
+      return Promise.resolve(run());
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+  return new Promise(function (resolve, reject) {
+    gate.waiting.push(function () {
+      try {
+        resolve(run());
+      } catch (error) {
+        reject(error);
+      }
+    });
+  });
+}
+
+const __sbDOTag = "#sb1:";
+
+function __sbDOCloneError(value) {
+  let text = "value";
+  try {
+    text = String(value);
+  } catch {
+    /* a value whose String() throws still gets the error below */
+  }
+  const error = new Error(text + " could not be cloned.");
+  error.name = "DataCloneError";
+  return error;
+}
+
+function __sbDOHex(bytes) {
+  const digits = "0123456789abcdef";
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) out += digits[bytes[i] >> 4] + digits[bytes[i] & 15];
+  return out;
+}
+
+function __sbDOUnhex(text) {
+  const out = new Uint8Array(text.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(text.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+
+function __sbDOView(name, bytes) {
+  const buf = bytes.buffer;
+  if (name === "Uint8Array") return bytes;
+  if (name === "Int8Array") return new Int8Array(buf);
+  if (name === "Uint8ClampedArray") return new Uint8ClampedArray(buf);
+  if (name === "Uint16Array") return new Uint16Array(buf);
+  if (name === "Int16Array") return new Int16Array(buf);
+  if (name === "Uint32Array") return new Uint32Array(buf);
+  if (name === "Int32Array") return new Int32Array(buf);
+  if (name === "Float32Array") return new Float32Array(buf);
+  if (name === "Float64Array") return new Float64Array(buf);
+  if (name === "DataView") return new DataView(buf);
+  return bytes;
+}
+
+// A value as JSON: null, booleans, strings and finite numbers are themselves; everything
+// else is an array whose first element names its type, so no plain value is ambiguous.
+/* oxlint-disable anti-slop/no-runtime-typeof -- structured clone branches on the value's type, as the HTML spec's StructuredSerialize does. */
+function __sbDOPack(v, seen) {
+  if (v === null || v === true || v === false || __sbIsStr(v)) return v;
+  const t = typeof v;
+  if (t === "number") {
+    if (v === 0 && 1 / v < 0) return ["N", "-0"];
+    return Number.isFinite(v) ? v : ["N", String(v)];
+  }
+  if (t === "bigint") return ["B", String(v)];
+  if (t === "undefined") return ["U"];
+  if (t !== "object") throw __sbDOCloneError(v);
+  if (seen.indexOf(v) !== -1) throw __sbDOCloneError("a circular value");
+  seen.push(v);
+  let out;
+  if (v instanceof Date) out = ["D", v.getTime()];
+  else if (v instanceof Map) {
+    out = ["M"];
+    v.forEach((x, k) => {
+      out.push(__sbDOPack(k, seen), __sbDOPack(x, seen));
+    });
+  } else if (v instanceof Set) {
+    out = ["S"];
+    v.forEach((x) => {
+      out.push(__sbDOPack(x, seen));
+    });
+  } else if (v instanceof ArrayBuffer) out = ["AB", __sbDOHex(new Uint8Array(v))];
+  else if (ArrayBuffer.isView(v))
+    out = ["V", Object.prototype.toString.call(v).slice(8, -1), __sbDOHex(new Uint8Array(v.buffer, v.byteOffset, v.byteLength))];
+  else if (v instanceof RegExp) out = ["R", v.source, v.flags];
+  else if (Array.isArray(v)) {
+    out = ["A"];
+    for (let i = 0; i < v.length; i++) out.push(__sbDOPack(v[i], seen));
+  } else if (v instanceof Error) out = ["E", String(v.name), String(v.message)];
+  else {
+    out = ["O"];
+    const keys = Object.keys(v);
+    for (let i = 0; i < keys.length; i++) out.push(keys[i], __sbDOPack(v[keys[i]], seen));
+  }
+  seen.pop();
+  return out;
+}
+/* oxlint-enable anti-slop/no-runtime-typeof */
+
+function __sbDOUnpack(p) {
+  if (!Array.isArray(p)) return p;
+  const tag = p[0];
+  if (tag === "U") return undefined;
+  if (tag === "N") return p[1] === "-0" ? -0 : Number(p[1]);
+  if (tag === "B") return BigInt(p[1]);
+  if (tag === "D") return new Date(p[1]);
+  if (tag === "AB") return __sbDOUnhex(p[1]).buffer;
+  if (tag === "V") return __sbDOView(p[1], __sbDOUnhex(p[2]));
+  if (tag === "R") return new RegExp(p[1], p[2]);
+  if (tag === "E") {
+    const e = new Error(p[2]);
+    e.name = p[1];
+    return e;
+  }
+  if (tag === "M") {
+    const m = new Map();
+    for (let i = 1; i + 1 < p.length; i += 2) m.set(__sbDOUnpack(p[i]), __sbDOUnpack(p[i + 1]));
+    return m;
+  }
+  if (tag === "S") {
+    const s = new Set();
+    for (let i = 1; i < p.length; i++) s.add(__sbDOUnpack(p[i]));
+    return s;
+  }
+  if (tag === "A") {
+    const a = [];
+    for (let i = 1; i < p.length; i++) a.push(__sbDOUnpack(p[i]));
+    return a;
+  }
+  const o = {};
+  for (let i = 1; i + 1 < p.length; i += 2) o[p[i]] = __sbDOUnpack(p[i + 1]);
+  return o;
+}
+
+function __sbDOEncode(value) {
+  if (value === undefined) throw new TypeError("put() called with undefined value.");
+  return __sbDOTag + JSON.stringify(__sbDOPack(value, []));
+}
+
+// Reads both formats at every date: tagged (2026-10-28 writes) and plain JSON (earlier ones).
+function __sbDODecode(text) {
+  if (__sbIsStr(text) && text.indexOf(__sbDOTag) === 0) return __sbDOUnpack(JSON.parse(text.slice(__sbDOTag.length)));
+  return JSON.parse(text);
+}
+
+function __sbDOListLimit(options) {
+  const o = options || {};
+  if (o.limit != null && !(Number(o.limit) > 0)) throw new TypeError("List limit must be positive.");
+  return o;
+}
+
+function __sbDOInRange(key, o) {
+  if (o.prefix != null && key.indexOf(String(o.prefix)) !== 0) return false;
+  if (o.start != null && key < String(o.start)) return false;
+  if (o.startAfter != null && key <= String(o.startAfter)) return false;
+  if (o.end != null && key >= String(o.end)) return false;
+  return true;
+}
+
+// The synchronous core of the 2026-10-28 storage: structured values, list() ranges.
+function __sbDOStrictStorage(cls, id) {
+  const get = (key) => {
+    const r = __sbRpc("do.storage.get", { cls, id, key: String(key) });
+    return r.found ? __sbDODecode(r.value) : undefined;
+  };
+  const put = (key, value) => {
+    __sbRpc("do.storage.put", { cls, id, key: String(key), value: __sbDOEncode(value) });
+  };
+  const del = (key) => !!__sbRpc("do.storage.delete", { cls, id, key: String(key) }).deleted;
+  return {
+    get(key) {
+      if (!Array.isArray(key)) return get(key);
+      const out = new Map();
+      for (let i = 0; i < key.length; i++) {
+        const v = get(key[i]);
+        if (v !== undefined) out.set(key[i], v);
+      }
+      return out;
+    },
+    put(key, value) {
+      if (key != null && __sbIsObj(key)) {
+        // Encode every value before writing any, so one bad value writes nothing.
+        const keys = Object.keys(key);
+        const encoded = [];
+        for (let i = 0; i < keys.length; i++) encoded.push(__sbDOEncode(key[keys[i]]));
+        for (let i = 0; i < keys.length; i++) __sbRpc("do.storage.put", { cls, id, key: keys[i], value: encoded[i] });
+        return;
+      }
+      put(key, value);
+    },
+    delete(key) {
+      if (!Array.isArray(key)) return del(key);
+      let n = 0;
+      for (let i = 0; i < key.length; i++) n += del(key[i]) ? 1 : 0;
+      return n;
+    },
+    deleteAll() {
+      // workerd's deleteAll() also drops the alarm.
+      __sbRpc("do.storage.delete_all", { cls, id });
+      __sbRpc("do.alarm.delete", { cls, id });
+    },
+    setAlarm(when) {
+      const at = when instanceof Date ? when.getTime() : when;
+      if (!Number.isFinite(at))
+        throw new TypeError("Failed to execute 'setAlarm' on 'DurableObjectStorage': parameter 1 is not of type 'date'.");
+      __sbRpc("do.alarm.set", { cls, id, at: Number(at) });
+    },
+    getAlarm() {
+      const r = __sbRpc("do.alarm.get", { cls, id });
+      return r.at == null ? null : r.at;
+    },
+    deleteAlarm() {
+      __sbRpc("do.alarm.delete", { cls, id });
+    },
+    list(options) {
+      const o = __sbDOListLimit(options);
+      const r = __sbRpc("do.storage.list", {
+        cls,
+        id,
+        prefix: o.prefix == null ? "" : String(o.prefix),
+        start: o.start == null ? null : String(o.start),
+        startAfter: o.startAfter == null ? null : String(o.startAfter),
+        end: o.end == null ? null : String(o.end),
+        reverse: !!o.reverse,
+        limit: o.limit == null ? 10000 : Number(o.limit),
+      });
+      const out = new Map();
+      const entries = r.entries || [];
+      // A transport that predates the range fields returns a superset: filter it here.
+      for (let i = 0; i < entries.length; i++)
+        if (__sbDOInRange(entries[i][0], o)) out.set(entries[i][0], __sbDODecode(entries[i][1]));
+      return out;
+    },
+  };
+}
+
+// The 2026-10-28 storage: every method returns a Promise; reads shut the input gate.
+function __sbDOAsyncStorage(cls, id, gate) {
+  const s = __sbDOStrictStorage(cls, id);
+  const settle = (f) => {
+    try {
+      return Promise.resolve(f());
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  };
+  const read = (f) => {
+    __sbDOHold(gate);
+    return settle(f);
+  };
+  return {
+    get: (key) => read(() => s.get(key)),
+    list: (options) => read(() => s.list(options)),
+    getAlarm: () => read(() => s.getAlarm()),
+    put: (key, value) => settle(() => s.put(key, value)),
+    delete: (key) => settle(() => s.delete(key)),
+    deleteAll: () => settle(() => s.deleteAll()),
+    setAlarm: (when) => settle(() => s.setAlarm(when)),
+    deleteAlarm: () => settle(() => s.deleteAlarm()),
+    sync: () => Promise.resolve(),
+    transaction: (fn) => __sbDOTransaction(cls, id, s, gate, fn),
+  };
+}
+
+// storage.transaction(fn): fn gets a txn with the storage methods; its writes stay in
+// memory (read back by its own get and list) and are written when fn resolves, unless it
+// threw or called txn.rollback(). The input gate stays shut meanwhile, so no other event
+// sees a half-written transaction.
+function __sbDOTransaction(cls, id, s, gate, fn) {
+  const writes = new Map(); // key -> encoded value, or null for a delete
+  let rolledBack = false;
+  const getOne = (key) => {
+    const k = String(key);
+    if (!writes.has(k)) return s.get(k);
+    const v = writes.get(k);
+    return v === null ? undefined : __sbDODecode(v);
+  };
+  const putOne = (key, value) => {
+    writes.set(String(key), __sbDOEncode(value));
+  };
+  const delOne = (key) => {
+    const existed = getOne(key) !== undefined;
+    writes.set(String(key), null);
+    return existed;
+  };
+  const txn = {
+    get(key) {
+      if (!Array.isArray(key)) return Promise.resolve(getOne(key));
+      const out = new Map();
+      for (let i = 0; i < key.length; i++) {
+        const v = getOne(key[i]);
+        if (v !== undefined) out.set(key[i], v);
+      }
+      return Promise.resolve(out);
+    },
+    put(key, value) {
+      try {
+        if (key != null && __sbIsObj(key)) {
+          const keys = Object.keys(key);
+          for (let i = 0; i < keys.length; i++) putOne(keys[i], key[keys[i]]);
+        } else putOne(key, value);
+        return Promise.resolve();
+      } catch (error) {
+        return Promise.reject(error);
+      }
+    },
+    delete(key) {
+      if (!Array.isArray(key)) return Promise.resolve(delOne(key));
+      let n = 0;
+      for (let i = 0; i < key.length; i++) n += delOne(key[i]) ? 1 : 0;
+      return Promise.resolve(n);
+    },
+    list(options) {
+      try {
+        const o = __sbDOListLimit(options);
+        const merged = s.list({ prefix: o.prefix, start: o.start, startAfter: o.startAfter, end: o.end });
+        writes.forEach((v, k) => {
+          if (!__sbDOInRange(k, o)) return;
+          if (v === null) merged.delete(k);
+          else merged.set(k, __sbDODecode(v));
+        });
+        const keys = [];
+        merged.forEach((v, k) => keys.push(k));
+        keys.sort();
+        if (o.reverse) keys.reverse();
+        const out = new Map();
+        const limit = o.limit == null ? keys.length : Number(o.limit);
+        for (let i = 0; i < keys.length && i < limit; i++) out.set(keys[i], merged.get(keys[i]));
+        return Promise.resolve(out);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+    },
+    rollback() {
+      rolledBack = true;
+    },
+    getAlarm: () => Promise.resolve(s.getAlarm()),
+    setAlarm: (when) => Promise.resolve(s.setAlarm(when)),
+    deleteAlarm: () => Promise.resolve(s.deleteAlarm()),
+  };
+  gate.locks++;
+  const done = () => {
+    gate.locks--;
+    __sbDOPump(gate);
+  };
+  let r;
+  try {
+    r = fn(txn);
+  } catch (error) {
+    done();
+    return Promise.reject(error);
+  }
+  return Promise.resolve(r).then(
+    (v) => {
+      try {
+        if (!rolledBack)
+          writes.forEach((value, key) => {
+            if (value === null) __sbRpc("do.storage.delete", { cls, id, key });
+            else __sbRpc("do.storage.put", { cls, id, key, value });
+          });
+      } finally {
+        done();
+      }
+      return v;
+    },
+    (error) => {
+      done();
+      throw error;
+    },
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -7347,7 +7806,7 @@ globalThis.__sbEntry = function (handlers, request) {
     if (!__sbIsFn(inst.alarm)) return new Response("no alarm handler", { status: 404 });
     let __ares;
     try {
-      __ares = inst.alarm();
+      __ares = __sbDOGated() ? __sbDOEnter(inst.__sbGate, () => inst.alarm()) : inst.alarm();
     } catch (error) {
       // #179 — same rule as fetch: don't let a throw here crash the process.
       __sbLogUncaught("alarm", error);
@@ -7372,6 +7831,7 @@ globalThis.__sbEntry = function (handlers, request) {
 async function __sbRunQueueBatch(handlers, body, ctx) {
   const acked = [];
   const retried = [];
+  let threw = false;
   const raw = body.messages || [];
   const messages = [];
   for (let i = 0; i < raw.length; i++) {
@@ -7408,15 +7868,18 @@ async function __sbRunQueueBatch(handlers, body, ctx) {
     // the response go out) before its own `await`s did, so any ack()/retry()
     // past the first one never counted.
     if (__qres && __sbIsFn(__qres.then)) await __qres;
-  } catch {
+  } catch (error) {
     // #179 — a throw here must not crash the process. Whatever ack()/retry()
-    // calls the handler made before throwing still count; anything it never
-    // touched falls through to the default-ack pass below, same as a handler
-    // that returns without calling ack()/retry() on every message.
+    // calls the handler made before throwing still count.
+    threw = true;
+    __sbLogUncaught("queue", error);
   }
-  // default: any message neither acked nor retried is treated as acked
+  // A message neither acked nor retried is acked when the handler returns, and retried
+  // when it throws, as on Workers. A throw used to ack the whole batch on the embedded
+  // transport (standalone, sproutd), so a failing consumer lost its messages.
   for (let i = 0; i < messages.length; i++) {
-    if (acked.indexOf(messages[i].id) === -1 && retried.indexOf(messages[i].id) === -1) acked.push(messages[i].id);
+    if (acked.indexOf(messages[i].id) === -1 && retried.indexOf(messages[i].id) === -1)
+      (threw ? retried : acked).push(messages[i].id);
   }
   return { ack: acked, retry: retried };
 }
