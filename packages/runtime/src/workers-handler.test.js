@@ -13,17 +13,27 @@ const request = () => ({ headers: { get: () => null }, body: null });
 test("the Workers compatibility date passes env and ctx in their standard positions", async () => {
   globalThis.__sbCompat = "2026-09-28";
   globalThis.env = { GREETING: "hello" };
-  const response = entry({ fetch(_request, env, ctx) {
-    return new Response(env.GREETING + ":" + (ctx.waitUntil instanceof Function));
-  } }, request());
+  const response = entry(
+    {
+      fetch(_request, env, ctx) {
+        return new Response(env.GREETING + ":" + (ctx.waitUntil instanceof Function));
+      },
+    },
+    request(),
+  );
   expect(await response.text()).toBe("hello:true");
 });
 
 test("earlier compatibility dates retain ctx as the second argument", async () => {
   globalThis.__sbCompat = "2026-09-07";
-  const response = entry({ fetch(_request, ctx) {
-    return new Response(String(ctx.waitUntil instanceof Function));
-  } }, request());
+  const response = entry(
+    {
+      fetch(_request, ctx) {
+        return new Response(String(ctx.waitUntil instanceof Function));
+      },
+    },
+    request(),
+  );
   expect(await response.text()).toBe("true");
 });
 
@@ -38,9 +48,15 @@ test("queue handlers receive env and ctx with the Workers compatibility date", a
   globalThis.__sbCompat = "2026-09-28";
   globalThis.env = { GREETING: "hello" };
   let seen = "";
-  await queue({ queue(_batch, env, ctx) {
-    seen = env.GREETING + ":" + (ctx.waitUntil instanceof Function);
-  } }, { messages: [] }, { waitUntil() {} });
+  await queue(
+    {
+      queue(_batch, env, ctx) {
+        seen = env.GREETING + ":" + (ctx.waitUntil instanceof Function);
+      },
+    },
+    { messages: [] },
+    { waitUntil() {} },
+  );
   expect(seen).toBe("hello:true");
 });
 
@@ -48,12 +64,48 @@ test("scheduled handlers receive env and ctx with the Workers compatibility date
   globalThis.__sbCompat = "2026-09-28";
   globalThis.env = { GREETING: "hello" };
   let seen = "";
-  const response = entry({ scheduled(_event, env, ctx) {
-    seen = env.GREETING + ":" + (ctx.waitUntil instanceof Function);
-  } }, {
-    headers: { get: (name) => name === "x-sb-trigger" ? "scheduled" : null },
-    body: "{}",
-  });
+  const response = entry(
+    {
+      scheduled(_event, env, ctx) {
+        seen = env.GREETING + ":" + (ctx.waitUntil instanceof Function);
+      },
+    },
+    {
+      headers: { get: (name) => (name === "x-sb-trigger" ? "scheduled" : null) },
+      body: "{}",
+    },
+  );
   expect(response.status).toBe(204);
   expect(seen).toBe("hello:true");
+});
+
+test("a Worker without fetch() answers HTTP 500, as workerd does (B22)", async () => {
+  globalThis.__sbCompat = "2026-09-28";
+  const errors = [];
+  const original = console.error;
+  console.error = (line) => errors.push(String(line));
+  try {
+    const response = await entry({ scheduled() {} }, request());
+    expect(response.status).toBe(500);
+  } finally {
+    console.error = original;
+  }
+  expect(errors.join("\n")).toContain("Handler does not export a fetch() function.");
+});
+
+test("a host's due trigger reaches the transport's local delivery (B22)", async () => {
+  globalThis.__sbRunLocalDue = async () => new Response("delivered", { status: 202 });
+  const response = await entry(
+    {
+      fetch() {
+        return new Response("http");
+      },
+    },
+    {
+      headers: { get: (name) => (name === "x-sb-trigger" ? "due" : null) },
+      body: "{}",
+    },
+  );
+  expect(response.status).toBe(202);
+  delete globalThis.__sbRunLocalDue;
 });

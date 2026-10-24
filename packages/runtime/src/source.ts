@@ -1,4 +1,4 @@
-import { inlineWorkersImports, neutraliseExports } from "./wrap";
+import { hasEntryHandler, inlineWorkersImports, neutraliseExports } from "./wrap";
 
 export type SourceValidation = { ok: true } | { ok: false; errors: string[] };
 
@@ -25,7 +25,6 @@ const alwaysForbidden: Array<[RegExp, string]> = [
   // match would also flag it appearing in an ordinary string a dependency
   // happens to construct (a doc link, a log message).
   [/['"`]node:/, "Node, Bun, and Deno APIs are not supported"],
-
 ];
 
 export function validateHttpSyncSource(module: string): SourceValidation {
@@ -39,9 +38,12 @@ export function validateHttpSyncSource(module: string): SourceValidation {
   // A hand-written file exports inline; a bundled one re-exports at the end.
   // `neutraliseExports` is the same reader the compiler uses, so `check` cannot
   // accept a module the build would then reject.
-  // A WorkerEntrypoint may serve only RPC, with no fetch() at all.
-  if (neutraliseExports(source) === null || (!/\bfetch\s*\(/.test(source) && !/\bextends\s+WorkerEntrypoint\b/.test(source))) {
-    errors.push("handler must default-export an object with fetch(request), or a WorkerEntrypoint class");
+  // A WorkerEntrypoint may serve only RPC, and a Worker only scheduled() or queue() (a cron
+  // or queue consumer), with no fetch() at all, as in workerd.
+  if (neutraliseExports(source) === null || !hasEntryHandler(source)) {
+    errors.push(
+      "handler must default-export an object with fetch(request), scheduled() or queue(), or a WorkerEntrypoint class",
+    );
   }
   for (const [pattern, message] of alwaysForbidden) if (pattern.test(source)) errors.push(message);
   return errors.length ? { ok: false, errors } : { ok: true };

@@ -4277,15 +4277,20 @@ function __sbEmbeddedDispatch(msg) {
     // stored with String(item), so every sendBatch() body arrived as "[object Object]"
     // (data loss), and delaySeconds was ignored on both calls.
     const items = op === "queue.send" ? [{ body: msg.body, delaySeconds: msg.delaySeconds }] : msg.messages || [];
+    let first = -1;
     for (let i = 0; i < items.length; i++) {
       const item = items[i] || {};
       const delay = Math.max(0, Number(item.delaySeconds) || 0) * 1000;
+      const visible = Date.now() + delay;
+      if (first < 0 || visible < first) first = visible;
       __sbSql(
         store,
         "INSERT INTO mq (queue, id, body, visible_at, attempts, dead) VALUES (?1,?2,?3,?4,0,0)",
-        [msg.queue, __sbHex(12), String(item.body), Date.now() + delay],
+        [msg.queue, __sbHex(12), String(item.body), visible],
       );
     }
+    // B22: on sproutd, the host delivers the batch (waking the app if it sleeps by then).
+    if (first >= 0 && __sbLocal !== null && __sbLocal.queues.indexOf(msg.queue) !== -1) __sbHostDue(first);
     return { ok: true };
   }
 
@@ -4351,6 +4356,8 @@ function __sbEmbeddedDispatch(msg) {
       __sbSql(store,"INSERT INTO do_alarm (cls,id,at,attempts) VALUES (?1,?2,?3,0) ON CONFLICT (cls,id) DO UPDATE SET at=?3,attempts=0",[msg.cls,msg.id,Math.trunc(Number(msg.at)||0)]);
       __sbSql(store,"COMMIT",[]);
     } catch (error) {__sbSql(store,"ROLLBACK",[]);throw error;}
+    // B22: on sproutd, the host runs the alarm at its time, waking the app if it sleeps.
+    __sbHostDue(Math.trunc(Number(msg.at)||0));
     return {ok:true};
   }
   if (op === "do.alarm.get") {
@@ -4732,18 +4739,230 @@ function __sbCronMatches(expr, when) {
 
 var __sbLastCronTick = "";
 
+// One delivery pass over the queues this worker consumes: claims up to 10 due messages per
+// queue, hands them to queue() and applies its acks and retries.
+async function __sbQueuePass(handlers, queues) {
+  __sbEnsureSchema();
+  const store = __sbStore();
+  const now = Date.now();
+  for (let q = 0; q < queues.length; q++) {
+    const name = queues[q];
+    const claim = String(now) + ":" + String(Math.random());
+    __sbSql(store, "BEGIN IMMEDIATE", []);
+    let due;
+    try {
+      __sbSql(store, "UPDATE mq SET dead=1 WHERE queue=? AND visible_at<=? AND attempts>=5", [
+        name,
+        now,
+      ]);
+      due = __sbSql(
+        store,
+        "SELECT id,body,attempts FROM mq WHERE queue=? AND dead=0 AND visible_at<=? ORDER BY visible_at LIMIT 10",
+        [name, now],
+      );
+      for (let i = 0; i < due.rows.length; i++)
+        __sbSql(
+          store,
+          "UPDATE mq SET visible_at=?,claim_token=?,attempts=attempts+1 WHERE queue=? AND id=?",
+          [now + 30000, claim, name, due.rows[i][0]],
+        );
+      __sbSql(store, "COMMIT", []);
+    } catch (error) {
+      __sbSql(store, "ROLLBACK", []);
+      throw error;
+    }
+    if (due.rows.length === 0) continue;
+    // Hide the batch first, so a slow handler cannot have it delivered twice.
+    const messages = [];
+    for (let i = 0; i < due.rows.length; i++) {
+      const row = due.rows[i];
+
+      messages.push({ id: row[0], body: row[1], timestamp: now, attempts: Number(row[2]) + 1 });
+    }
+    // #171 — same ctx.waitUntil as the broker-delivered path, and the same
+    // fix for the handler's own promise: `__sbRunQueueBatch` used to be
+    // called fire-and-forget here too, so an async `queue()`'s ack/retry
+    // calls made after its first `await` never reached these SQL writes.
+    const __sbTasks = [];
+    const ctx = {
+      waitUntil(p) {
+        if (p && __sbIsFn(p.then)) __sbTasks.push(p);
+      },
+    };
+    let result = __sbRunQueueBatch(handlers, { queue: name, messages }, ctx);
+    if (result && __sbIsFn(result.then)) result = await result;
+    if (__sbTasks.length) await __sbDrainWaitUntil(__sbTasks);
+    for (let i = 0; i < result.ack.length; i++) {
+      __sbSql(
+        store,
+        "DELETE FROM mq WHERE queue=? AND id=? AND claim_token=? AND visible_at>?",
+        [name, result.ack[i], claim, Date.now()],
+      );
+    }
+    for (let i = 0; i < result.retry.length; i++) {
+      __sbSql(
+        store,
+        "UPDATE mq SET visible_at=?,claim_token='',dead=CASE WHEN attempts>=5 THEN 1 ELSE 0 END WHERE queue=? AND id=? AND claim_token=? AND visible_at>?",
+        [Date.now() + 5000, name, result.retry[i], claim, Date.now()],
+      );
+    }
+  }
+}
+
+// One pass over the Durable Object alarms that are due: claims up to 10 and runs alarm().
+async function __sbAlarmPass() {
+  __sbEnsureSchema();
+  const store = __sbStore();
+  const now = Date.now();
+  __sbSql(store, "BEGIN IMMEDIATE", []);
+  let due;
+  const claim = String(now) + ":" + String(Math.random());
+  try {
+    __sbSql(store,"DELETE FROM do_alarm_delivery WHERE expires<=? AND attempts>=5 AND EXISTS (SELECT 1 FROM do_alarm a WHERE a.cls=do_alarm_delivery.cls AND a.id=do_alarm_delivery.id)",[now]);
+    const pending = __sbSql(
+      store,
+      "SELECT cls,id,at,attempts FROM do_alarm WHERE at<=? AND NOT EXISTS (SELECT 1 FROM do_alarm_delivery d WHERE d.cls=do_alarm.cls AND d.id=do_alarm.id) ORDER BY at LIMIT 10",
+      [now],
+    );
+    for (let i = 0; i < pending.rows.length; i++) {
+      const r = pending.rows[i];
+      __sbSql(store, "INSERT INTO do_alarm_delivery VALUES (?,?,?,?,?,?)", [
+        r[0],
+        r[1],
+        r[2],
+        r[3],
+        "",
+        0,
+      ]);
+      __sbSql(store, "DELETE FROM do_alarm WHERE cls=? AND id=? AND at=?", [r[0], r[1], r[2]]);
+    }
+    due = __sbSql(
+      store,
+      "SELECT cls,id,at,attempts FROM do_alarm_delivery WHERE expires<=? AND attempts<5 LIMIT 10",
+      [now],
+    );
+    for (let i = 0; i < due.rows.length; i++)
+      __sbSql(
+        store,
+        "UPDATE do_alarm_delivery SET token=?,expires=?,attempts=attempts+1 WHERE cls=? AND id=?",
+        [claim, now + 30000, due.rows[i][0], due.rows[i][1]],
+      );
+    __sbSql(store, "COMMIT", []);
+  } catch (error) {
+    __sbSql(store, "ROLLBACK", []);
+    throw error;
+  }
+  for (let i = 0; i < due.rows.length; i++) {
+    const cls = due.rows[i][0];
+    const id = due.rows[i][1];
+    try {
+      const instance = __sbGetDOInstance(cls, id);
+      if (__sbIsFn(instance.alarm)) {
+        const res = __sbDOGated() ? __sbDOEnter(instance.__sbGate, () => instance.alarm()) : instance.alarm();
+        if (res && __sbIsFn(res.then)) await res;
+        if (instance.__sbTasks.length) await __sbDrainWaitUntil(instance.__sbTasks);
+      }
+      __sbSql(
+        store,
+        "DELETE FROM do_alarm_delivery WHERE cls=? AND id=? AND token=? AND expires>?",
+        [cls, id, claim, Date.now()],
+      );
+    } catch {
+      const scheduled = __sbSql(store, "SELECT 1 FROM do_alarm WHERE cls=? AND id=?", [
+        cls,
+        id,
+      ]);
+      if (scheduled.rows.length)
+        __sbSql(
+          store,
+          "DELETE FROM do_alarm_delivery WHERE cls=? AND id=? AND token=? AND expires>?",
+          [cls, id, claim, Date.now()],
+        );
+      else
+        __sbSql(
+          store,
+          "UPDATE do_alarm_delivery SET expires=? WHERE cls=? AND id=? AND token=? AND expires>?",
+          [Date.now() + 5000, cls, id, claim, Date.now()],
+        );
+    }
+  }
+}
+
+// B22: on a host that delivers triggers (sproutd), what this worker consumes. Set by
+// __sbStartLocalTriggers; null when the host does not drive this worker's triggers.
+var __sbLocal = null;
+
+// Tells the host when a queued message or an alarm falls due at `at` (epoch ms), so it
+// wakes the app then, even from a reap. The host keeps the earliest time it was told.
+function __sbHostDue(at) {
+  if (__sbLocal !== null && __sbLocal.consumes) __sbHostNote("due " + String(Math.max(0, Math.trunc(Number(at) || 0))));
+}
+
+// The earliest time something this worker consumes falls due: a message becomes visible
+// (or its claim expires), an alarm is set for, or a failed alarm is retried. -1 for none.
+function __sbNextDue() {
+  const store = __sbStore();
+  let next = -1;
+  const take = (r) => {
+    if (r.rows.length && r.rows[0][0] != null) {
+      const at = Number(r.rows[0][0]);
+      if (next < 0 || at < next) next = at;
+    }
+  };
+  const queues = __sbLocal.queues;
+  for (let q = 0; q < queues.length; q++)
+    take(__sbSql(store, "SELECT MIN(visible_at) FROM mq WHERE queue=? AND dead=0", [queues[q]]));
+  if (__sbLocal.alarms) {
+    take(__sbSql(store, "SELECT MIN(at) FROM do_alarm", []));
+    take(__sbSql(store, "SELECT MIN(expires) FROM do_alarm_delivery WHERE attempts<5", []));
+  }
+  return next;
+}
+
+// B22: the host's `due` trigger. Delivers what is due, then tells the host when to come back
+// ("next -1": nothing is pending). The host sends one at a time per app.
+globalThis.__sbRunLocalDue = async function () {
+  if (__sbLocal === null) return new Response("no local triggers", { status: 404 });
+  try {
+    if (__sbLocal.queues.length) await __sbQueuePass(__sbLocal.handlers, __sbLocal.queues);
+    if (__sbLocal.alarms) await __sbAlarmPass();
+  } catch (error) {
+    __sbLogUncaught("queue/alarm delivery", error);
+  }
+  let next = -1;
+  try {
+    next = __sbNextDue();
+  } catch {
+    // Unknown: the host asks again later rather than forgetting the app.
+    next = Date.now() + 30000;
+  }
+  __sbHostNote("next " + String(next));
+  return new Response(null, { status: 204 });
+};
+
 /**
  * Start the timers an embedded binary needs. Called from the generated module
  * once the handler object exists; the broker transport defines a no-op of the
  * same name, so the generated code is identical either way.
+ *
+ * B22: on sproutd the host delivers the triggers instead, and wakes a reaped app for
+ * them: this reports the crons and whether the worker consumes queues or alarms, and
+ * starts no timer (an interval would also keep the worker from ever going idle).
  */
 globalThis.__sbStartLocalTriggers = function (handlers, bindings) {
   const crons = bindings.crons || [];
-  const queues = bindings.queues || [];
   const dos = bindings.do || [];
-  const store = __sbStore();
+  const queues = __sbHandles(handlers, "queue") ? bindings.queues || [] : [];
+  const scheduled = crons.length > 0 && __sbHandles(handlers, "scheduled");
 
-  if (crons.length > 0 && __sbIsFn(handlers.scheduled)) {
+  if (__sbHosted()) {
+    __sbLocal = { handlers, queues, alarms: dos.length > 0, consumes: queues.length > 0 || dos.length > 0 };
+    if (scheduled) __sbHostNote("crons\n" + crons.join("\n"));
+    if (__sbLocal.consumes) __sbHostNote("local");
+    return;
+  }
+
+  if (scheduled) {
     setInterval(async function () {
       const now = new Date();
       const stamp =
@@ -4768,162 +4987,23 @@ globalThis.__sbStartLocalTriggers = function (handlers, bindings) {
               if (p && __sbIsFn(p.then)) __sbTasks.push(p);
             },
           };
-          const res = handlers.scheduled(
-            { cron: crons[i], scheduledTime: now.getTime(), noRetry() {} },
-            ctx,
-          );
-          if (res && __sbIsFn(res.then)) await res;
+          try {
+            const receiver = __sbReceiver(handlers, ctx);
+            const event = { cron: crons[i], scheduledTime: now.getTime(), noRetry() {} };
+            const res = globalThis.__sbCompat >= "2026-09-28"
+              ? receiver.scheduled(event, globalThis.env, ctx)
+              : receiver.scheduled(event, ctx);
+            if (res && __sbIsFn(res.then)) await res;
+          } catch (error) {
+            __sbLogUncaught("scheduled", error);
+          }
           if (__sbTasks.length) await __sbDrainWaitUntil(__sbTasks);
         }
       }
     }, 15000);
   }
 
-  if (queues.length > 0 && __sbIsFn(handlers.queue)) {
-    setInterval(async function () {
-      __sbEnsureSchema();
-      const now = Date.now();
-      for (let q = 0; q < queues.length; q++) {
-        const name = queues[q];
-        const claim = String(now) + ":" + String(Math.random());
-        __sbSql(store, "BEGIN IMMEDIATE", []);
-        let due;
-        try {
-          __sbSql(store, "UPDATE mq SET dead=1 WHERE queue=? AND visible_at<=? AND attempts>=5", [
-            name,
-            now,
-          ]);
-          due = __sbSql(
-            store,
-            "SELECT id,body,attempts FROM mq WHERE queue=? AND dead=0 AND visible_at<=? ORDER BY visible_at LIMIT 10",
-            [name, now],
-          );
-          for (let i = 0; i < due.rows.length; i++)
-            __sbSql(
-              store,
-              "UPDATE mq SET visible_at=?,claim_token=?,attempts=attempts+1 WHERE queue=? AND id=?",
-              [now + 30000, claim, name, due.rows[i][0]],
-            );
-          __sbSql(store, "COMMIT", []);
-        } catch (error) {
-          __sbSql(store, "ROLLBACK", []);
-          throw error;
-        }
-        if (due.rows.length === 0) continue;
-        // Hide the batch first, so a slow handler cannot have it delivered twice.
-        const messages = [];
-        for (let i = 0; i < due.rows.length; i++) {
-          const row = due.rows[i];
+  if (queues.length > 0) setInterval(() => __sbQueuePass(handlers, queues), 500);
 
-          messages.push({ id: row[0], body: row[1], timestamp: now, attempts: Number(row[2]) + 1 });
-        }
-        // #171 — same ctx.waitUntil as the broker-delivered path, and the same
-        // fix for the handler's own promise: `__sbRunQueueBatch` used to be
-        // called fire-and-forget here too, so an async `queue()`'s ack/retry
-        // calls made after its first `await` never reached these SQL writes.
-        const __sbTasks = [];
-        const ctx = {
-          waitUntil(p) {
-            if (p && __sbIsFn(p.then)) __sbTasks.push(p);
-          },
-        };
-        let result = __sbRunQueueBatch(handlers, { queue: name, messages }, ctx);
-        if (result && __sbIsFn(result.then)) result = await result;
-        if (__sbTasks.length) await __sbDrainWaitUntil(__sbTasks);
-        for (let i = 0; i < result.ack.length; i++) {
-          __sbSql(
-            store,
-            "DELETE FROM mq WHERE queue=? AND id=? AND claim_token=? AND visible_at>?",
-            [name, result.ack[i], claim, Date.now()],
-          );
-        }
-        for (let i = 0; i < result.retry.length; i++) {
-          __sbSql(
-            store,
-            "UPDATE mq SET visible_at=?,claim_token='',dead=CASE WHEN attempts>=5 THEN 1 ELSE 0 END WHERE queue=? AND id=? AND claim_token=? AND visible_at>?",
-            [Date.now() + 5000, name, result.retry[i], claim, Date.now()],
-          );
-        }
-      }
-    }, 500);
-  }
-
-  if (dos.length > 0) {
-    setInterval(async function () {
-      __sbEnsureSchema();
-      const now = Date.now();
-      __sbSql(store, "BEGIN IMMEDIATE", []);
-      let due;
-      const claim = String(now) + ":" + String(Math.random());
-      try {
-        __sbSql(store,"DELETE FROM do_alarm_delivery WHERE expires<=? AND attempts>=5 AND EXISTS (SELECT 1 FROM do_alarm a WHERE a.cls=do_alarm_delivery.cls AND a.id=do_alarm_delivery.id)",[now]);
-        const pending = __sbSql(
-          store,
-          "SELECT cls,id,at,attempts FROM do_alarm WHERE at<=? AND NOT EXISTS (SELECT 1 FROM do_alarm_delivery d WHERE d.cls=do_alarm.cls AND d.id=do_alarm.id) ORDER BY at LIMIT 10",
-          [now],
-        );
-        for (let i = 0; i < pending.rows.length; i++) {
-          const r = pending.rows[i];
-          __sbSql(store, "INSERT INTO do_alarm_delivery VALUES (?,?,?,?,?,?)", [
-            r[0],
-            r[1],
-            r[2],
-            r[3],
-            "",
-            0,
-          ]);
-          __sbSql(store, "DELETE FROM do_alarm WHERE cls=? AND id=? AND at=?", [r[0], r[1], r[2]]);
-        }
-        due = __sbSql(
-          store,
-          "SELECT cls,id,at,attempts FROM do_alarm_delivery WHERE expires<=? AND attempts<5 LIMIT 10",
-          [now],
-        );
-        for (let i = 0; i < due.rows.length; i++)
-          __sbSql(
-            store,
-            "UPDATE do_alarm_delivery SET token=?,expires=?,attempts=attempts+1 WHERE cls=? AND id=?",
-            [claim, now + 30000, due.rows[i][0], due.rows[i][1]],
-          );
-        __sbSql(store, "COMMIT", []);
-      } catch (error) {
-        __sbSql(store, "ROLLBACK", []);
-        throw error;
-      }
-      for (let i = 0; i < due.rows.length; i++) {
-        const cls = due.rows[i][0];
-        const id = due.rows[i][1];
-        try {
-          const instance = __sbGetDOInstance(cls, id);
-          if (__sbIsFn(instance.alarm)) {
-            const res = __sbDOGated() ? __sbDOEnter(instance.__sbGate, () => instance.alarm()) : instance.alarm();
-            if (res && __sbIsFn(res.then)) await res;
-            if (instance.__sbTasks.length) await __sbDrainWaitUntil(instance.__sbTasks);
-          }
-          __sbSql(
-            store,
-            "DELETE FROM do_alarm_delivery WHERE cls=? AND id=? AND token=? AND expires>?",
-            [cls, id, claim, Date.now()],
-          );
-        } catch {
-          const scheduled = __sbSql(store, "SELECT 1 FROM do_alarm WHERE cls=? AND id=?", [
-            cls,
-            id,
-          ]);
-          if (scheduled.rows.length)
-            __sbSql(
-              store,
-              "DELETE FROM do_alarm_delivery WHERE cls=? AND id=? AND token=? AND expires>?",
-              [cls, id, claim, Date.now()],
-            );
-          else
-            __sbSql(
-              store,
-              "UPDATE do_alarm_delivery SET expires=? WHERE cls=? AND id=? AND token=? AND expires>?",
-              [Date.now() + 5000, cls, id, claim, Date.now()],
-            );
-        }
-      }
-    }, 500);
-  }
+  if (dos.length > 0) setInterval(() => __sbAlarmPass(), 500);
 };

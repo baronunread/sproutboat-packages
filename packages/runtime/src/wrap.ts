@@ -24,10 +24,7 @@ export const preludePath = new URL("./native-fetch-prelude.js", import.meta.url)
  */
 export type Transport = "broker" | "embedded";
 export const transportPath = (transport: Transport): URL =>
-  new URL(
-    transport === "embedded" ? "./transport-embedded.js" : "./transport-broker.js",
-    import.meta.url,
-  );
+  new URL(transport === "embedded" ? "./transport-embedded.js" : "./transport-broker.js", import.meta.url);
 
 /** Where the prelude expects its transport spliced in. */
 export const TRANSPORT_MARKER =
@@ -87,6 +84,11 @@ export const EMPTY_BINDINGS: Bindings = {
   ratelimiters: [],
   assets: "",
 };
+
+/** A default export something can invoke: fetch(), scheduled(), queue(), or a WorkerEntrypoint (RPC). */
+export function hasEntryHandler(source: string): boolean {
+  return /\b(fetch|scheduled|queue)\s*\(/.test(source) || /\bextends\s+WorkerEntrypoint\b/.test(source);
+}
 
 function hasBindings(b: Bindings): boolean {
   return (
@@ -209,9 +211,12 @@ export function wrapNativeFetchHandler(
   versionMetadata?: { binding: string; id: string; tag: string; timestamp: string },
 ): string {
   const neutralised = neutraliseExports(inlineWorkersImports(source));
-  // A WorkerEntrypoint may serve only RPC, with no fetch() at all.
-  if (neutralised === null || (!/\bfetch\s*\(/.test(source) && !/\bextends\s+WorkerEntrypoint\b/.test(source))) {
-    throw new Error("handler must default-export an object with a fetch(request) method, or a WorkerEntrypoint class");
+  // A WorkerEntrypoint may serve only RPC, and a Worker only scheduled() or queue(), with
+  // no fetch() at all, as in workerd.
+  if (neutralised === null || !hasEntryHandler(source)) {
+    throw new Error(
+      "handler must default-export an object with a fetch(request), scheduled() or queue() method, or a WorkerEntrypoint class",
+    );
   }
 
   const env = `const env = ${JSON.stringify(vars)};\nglobalThis.env = env;\n`;
@@ -236,20 +241,21 @@ export function wrapNativeFetchHandler(
   const nativeTransferAbi =
     transport === "embedded"
       ? `Porffor.c\`const char* sb_standalone_app_name(void) { return ${JSON.stringify(appName)}; }\`;\n`
-      : "Porffor.c`typedef struct sb_r2_transfer_ctx { int unused; } sb_r2_transfer_ctx; int sb_r2_transfer_open(const char* a, const char* b, size_t c, sb_r2_transfer_ctx** d) { if (d) *d = 0; return 404; } int sb_r2_transfer_write(sb_r2_transfer_ctx* a, const char* b, size_t c) { return 404; } int sb_r2_transfer_finish(sb_r2_transfer_ctx* a) { return 404; } void sb_r2_transfer_abort(sb_r2_transfer_ctx* a) {} int sb_r2_transfer_download_open(const char* a, const char* b, sb_r2_transfer_ctx** c) { if (c) *c = 0; return 404; } size_t sb_r2_transfer_download_size(sb_r2_transfer_ctx* a) { return 0; } const char* sb_r2_transfer_download_etag(sb_r2_transfer_ctx* a) { return \"\"; } size_t sb_r2_transfer_download_read(sb_r2_transfer_ctx* a, size_t b, char* c, size_t d) { return 0; } void sb_r2_transfer_download_close(sb_r2_transfer_ctx* a) {}`;\n";
+      : 'Porffor.c`typedef struct sb_r2_transfer_ctx { int unused; } sb_r2_transfer_ctx; int sb_r2_transfer_open(const char* a, const char* b, size_t c, sb_r2_transfer_ctx** d) { if (d) *d = 0; return 404; } int sb_r2_transfer_write(sb_r2_transfer_ctx* a, const char* b, size_t c) { return 404; } int sb_r2_transfer_finish(sb_r2_transfer_ctx* a) { return 404; } void sb_r2_transfer_abort(sb_r2_transfer_ctx* a) {} int sb_r2_transfer_download_open(const char* a, const char* b, sb_r2_transfer_ctx** c) { if (c) *c = 0; return 404; } size_t sb_r2_transfer_download_size(sb_r2_transfer_ctx* a) { return 0; } const char* sb_r2_transfer_download_etag(sb_r2_transfer_ctx* a) { return ""; } size_t sb_r2_transfer_download_read(sb_r2_transfer_ctx* a, size_t b, char* c, size_t d) { return 0; } void sb_r2_transfer_download_close(sb_r2_transfer_ctx* a) {}`;\n';
   // #174 — fetch() needs no binding: every sprout gets it.
   const wire =
-    "__sbInstallFetch();\n" +
-    (hasBindings(bindings) ? `__sbInstallBindings(env, ${JSON.stringify(bindings)});\n` : "");
+    "__sbInstallFetch();\n" + (hasBindings(bindings) ? `__sbInstallBindings(env, ${JSON.stringify(bindings)});\n` : "");
   const registerDO = bindings.do.length
     ? `__sbRegisterDO({ ${bindings.do.map((d) => `${d.className}: ${d.className}`).join(", ")} });\n`
     : "";
   // Cron / queue / alarm timers, for a transport that has no broker to deliver
   // them. The broker transport defines this as a no-op, so the emitted module
   // is the same either way.
-  const triggers = hasBindings(bindings)
-    ? `__sbStartLocalTriggers(__sbHandlers, ${JSON.stringify(bindings)});\n`
-    : "";
+  // A Worker with crons and no other binding needs them too (B22): its crons never ran.
+  const triggers =
+    hasBindings(bindings) || bindings.crons.length > 0
+      ? `__sbStartLocalTriggers(__sbHandlers, ${JSON.stringify(bindings)});\n`
+      : "";
 
   // baronunread/sproutboat#238: the handler runs in its own function scope.
   // Spliced in at the prelude's top level, a bundle's own top-level
@@ -269,13 +275,7 @@ export function wrapNativeFetchHandler(
   );
 }
 
-type VarsJson =
-  | string
-  | number
-  | boolean
-  | null
-  | { readonly [key: string]: VarsJson }
-  | VarsJson[];
+type VarsJson = string | number | boolean | null | { readonly [key: string]: VarsJson } | VarsJson[];
 function isVarsObject(value: VarsJson): value is { readonly [key: string]: VarsJson } {
   return value !== null && Object(value) === value && !Array.isArray(value);
 }
@@ -330,12 +330,7 @@ export function readBindingsFromEnv(): Bindings {
   const ratelimiters: Array<{ binding: string; limit: number; period: number }> = [];
   if (Array.isArray(parsed.ratelimiters)) {
     for (const entry of parsed.ratelimiters) {
-      if (
-        isVarsObject(entry) &&
-        isVarsString(entry.binding) &&
-        isCount(entry.limit) &&
-        isCount(entry.period)
-      ) {
+      if (isVarsObject(entry) && isVarsString(entry.binding) && isCount(entry.limit) && isCount(entry.period)) {
         ratelimiters.push({ binding: entry.binding, limit: entry.limit, period: entry.period });
       }
     }
