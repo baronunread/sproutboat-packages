@@ -4293,6 +4293,8 @@ Porffor.c`
 u32 porf_native_fetch_alloc_bytestring(const char* input, size_t len);
 int porf_native_fetch_read_value(jsval value, const char** out_buf, size_t* out_len, char** out_owned);
 int porf_native_fetch_read_raw_bytes(jsval value, const char** out_buf, size_t* out_len);
+// B22: set only by sproutd's worker host (native-host-bridge.c, at init); null everywhere else.
+void (*sb_host_note_hook)(const char* text, size_t length) = 0;
 
 // --- #133: SHA-2 + HMAC ---------------------------------------------------
 // Standalone links BearSSL, but a deployed sprout does not, and this inline C
@@ -7500,6 +7502,33 @@ function __sbDOTransaction(cls, id, s, gate, fn) {
 // with SB_BROKER_TOKEN) to the right user handler, and everything else to
 // `handlers.fetch`.
 
+// B22: a note to the host that runs this worker. Only sproutd's worker host takes notes
+// (its bridge sets sb_host_note_hook); everywhere else the hook is null and this returns
+// false. sproutd delivers cron, queue and alarm triggers itself, waking a reaped app for
+// them, so the notes tell it what to wake the app for: its crons, and when queued messages
+// or alarms fall due.
+// oxlint-disable-next-line no-unused-vars -- `text` is read inside the RawC block below, not by JS.
+function __sbHostNote(text) {
+  let out = "";
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    if (sb_host_note_hook) {
+      const char* __t; size_t __tl; char* __to = 0;
+      porf_native_fetch_read_value(text, &__t, &__tl, &__to);
+      sb_host_note_hook(__t, __tl);
+      if (__to) free(__to);
+      out = porf_box((f64)porf_native_fetch_alloc_bytestring("1", 1), 195);
+    }
+  `;
+  return out === "1";
+}
+let __sbHostedState = -1;
+// Whether a host delivers this worker's triggers (sproutd). Asked once.
+function __sbHosted() {
+  if (__sbHostedState < 0) __sbHostedState = __sbHostNote("hosted") ? 1 : 0;
+  return __sbHostedState === 1;
+}
+
 // oxlint-disable-next-line no-unused-vars -- `name` is read inside the RawC block below, not by JS.
 function __sbEnv(name) {
   let res = "";
@@ -8098,6 +8127,8 @@ globalThis.__sbEntry = function (handlers, request) {
       const receiver = __sbReceiver(handlers, ctx);
       // An RPC call (a vouched binding call naming a method) runs that method instead.
       const rpc = bindingCall ? request.headers.get("x-sb-rpc") : null;
+      // A Worker with only scheduled() or queue() (B22) answers HTTP as workerd does.
+      if (rpc == null && !__sbHandles(handlers, "fetch")) throw new Error("Handler does not export a fetch() function.");
       __res = rpc != null
         ? __sbRpcDispatch(handlers, receiver, rpc, request)
         : globalThis.__sbCompat >= "2026-09-28"
@@ -8179,6 +8210,10 @@ globalThis.__sbEntry = function (handlers, request) {
     if (inst.__sbTasks.length || (__ares && __sbIsFn(__ares.then))) return __sb204WithDrain(__ares, inst.__sbTasks);
     return new Response(null, { status: 204 });
   }
+
+  // B22: a host that delivers this worker's triggers (sproutd) asks it to deliver the queue
+  // messages and alarms that are due; the embedded transport answers.
+  if (trigger === "due") return __sbRunLocalDue();
 
   return new Response("unknown trigger", { status: 400 });
 };

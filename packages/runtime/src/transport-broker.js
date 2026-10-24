@@ -853,6 +853,11 @@ function __sbCall(reqJson) {
  */
 globalThis.__sbStartLocalTriggers = function () {};
 
+/** B22: only a host-driven embedded worker (sproutd) has local triggers to run. */
+globalThis.__sbRunLocalDue = function () {
+  return new Response("no local triggers", { status: 404 });
+};
+
 // #63 — a v1 exchange carrying a body. Returns the reply JSON; any bytes in the
 // reply wait in __sbTakeBin.
 // oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
