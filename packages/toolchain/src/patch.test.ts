@@ -8,6 +8,7 @@ import {
   patchLocalFunctionTypes,
   patchFunctionSourcesScan,
   patchDeferredDiscard,
+  patchGcFootprint,
   patchRepeatDoubling,
   patchConsoleColors,
   patchCaseMapping,
@@ -740,6 +741,37 @@ test("split globals patch prefixes module globals so none binds to libc, idempot
     expect(await readFile(file, "utf8")).toBe(patched);
     await writeFile(file, "export const x = 1;\n");
     await expect(patchSplitGlobals(root)).rejects.toThrow("anchor not found");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("GC footprint patch returns every free run at idle and adds porf_gc_seal_heap, idempotently", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sb-gc-footprint-"));
+  try {
+    await mkdir(join(root, "compiler"));
+    const file = join(root, "compiler/render.js");
+    const source =
+      "static i32 porf_gc_discard_pending = 0;\n#define PORF_GC_PF_TAIL 8u\n" +
+      "static int porf_gc_install_run(i32 ci, u32 pg) {\n  return 1;\n}\n" +
+      "static void porf_gc_partial_push(u32 pg) {\n  struct porf_gc_page* m = &porf_gc_pages[pg];\n  if ((m->flags & PORF_GC_PF_PARTIAL) != 0u) return;\n}\n" +
+      "      if (run_len >= 32u) porf_gc_discard_range(a, b);\n  if (run_len >= 32u) porf_gc_discard_range(a, b);\n" +
+      "  memset(porf_gc_active, 0, sizeof(porf_gc_active));\n  porf_gc_minor_mode = 0;\n}\n";
+    await writeFile(file, source);
+    await patchGcFootprint(root);
+    const patched = await readFile(file, "utf8");
+    expect(patched).toContain("#define PORF_GC_PF_SEALED 16u");
+    expect(patched).toContain("  if ((porf_gc_pages[pg].flags & PORF_GC_PF_SEALED) != 0u) return 0;\n  return 1;");
+    expect(patched).toContain("(PORF_GC_PF_PARTIAL | PORF_GC_PF_SEALED)");
+    expect(patched).not.toContain("run_len >= 32u");
+    expect(patched.split("if (run_len > 0u) porf_gc_discard_range").length).toBe(3);
+    expect(patched).toContain("void porf_gc_seal_heap(void) {");
+    await patchGcFootprint(root);
+    expect(await readFile(file, "utf8")).toBe(patched);
+    await writeFile(file, source.replace("static i32 porf_gc_discard_pending = 0;\n", ""));
+    await expect(patchGcFootprint(root)).rejects.toThrow("deferred discard missing");
+    await writeFile(file, "static i32 porf_gc_discard_pending = 0;\n");
+    await expect(patchGcFootprint(root)).rejects.toThrow("anchor not found");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
