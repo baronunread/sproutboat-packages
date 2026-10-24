@@ -1727,6 +1727,76 @@ export async function patchDeferredDiscard(root: string): Promise<void> {
   await writeFile(file, src);
 }
 
+// sproutd #32: what a worker keeps after its first requests.
+// 1. The idle collection returned only free runs of 32 or more 8 KiB pages (256 KiB).
+//    A small sprout's free pages sit between live ones, so at idle it returned almost
+//    nothing and kept its request garbage resident. Since #287 discard happens only in
+//    the idle collection, so returning every free run costs no request time.
+// 2. porf_gc_seal_heap(): a fork template (sproutd) collects once before fork and marks
+//    every small-object page it filled as sealed. A sealed page is never reopened for
+//    allocation, so a worker's objects go to fresh pages instead of copy-on-write copies
+//    of template pages that hold a few free slots. A sealed page whose objects all die is
+//    released like any other page. Nothing else calls it, so other builds only gain the
+//    two flag tests.
+const GC_FOOTPRINT_MARKER = "#define PORF_GC_PF_SEALED 16u";
+const GC_SEAL_FUNCTION = `
+void porf_gc_seal_heap(void) {
+  if (porf_heap_base == 0) return;
+  porf_gc_discard_now = 1;
+  porf_gc_collect(0);
+  porf_gc_discard_now = 0;
+  porf_gc_discard_pending = 0;
+  for (i32 ci = 0; ci < PORF_GC_NCLASSES; ci++) {
+    u32 pg1 = porf_gc_partial[ci];
+    while (pg1 != 0) {
+      const u32 next = porf_gc_pages[pg1 - 1u].aux;
+      porf_gc_pages[pg1 - 1u].aux = 0;
+      porf_gc_pages[pg1 - 1u].flags &= (u8)~PORF_GC_PF_PARTIAL;
+      pg1 = next;
+    }
+    porf_gc_partial[ci] = 0;
+  }
+  const u32 top = porf_heap_top >> PORF_GC_SPAGE_SHIFT;
+  for (u32 pg = porf_heap_base >> PORF_GC_SPAGE_SHIFT; pg < top; pg++)
+    if (porf_gc_page_kind[pg] == PORF_GC_PK_SMALL && (porf_gc_pages[pg].flags & PORF_GC_PF_TAIL) == 0u)
+      porf_gc_pages[pg].flags |= PORF_GC_PF_SEALED;
+}
+`;
+const GC_FOOTPRINT_EDITS: [string, string, number][] = [
+  ["#define PORF_GC_PF_TAIL 8u\n", "#define PORF_GC_PF_TAIL 8u\n" + GC_FOOTPRINT_MARKER + "\n", 1],
+  [
+    "int porf_gc_install_run(i32 ci, u32 pg) {\n",
+    "int porf_gc_install_run(i32 ci, u32 pg) {\n  if ((porf_gc_pages[pg].flags & PORF_GC_PF_SEALED) != 0u) return 0;\n",
+    1,
+  ],
+  [
+    "void porf_gc_partial_push(u32 pg) {\n  struct porf_gc_page* m = &porf_gc_pages[pg];\n  if ((m->flags & PORF_GC_PF_PARTIAL) != 0u) return;",
+    "void porf_gc_partial_push(u32 pg) {\n  struct porf_gc_page* m = &porf_gc_pages[pg];\n  if ((m->flags & (PORF_GC_PF_PARTIAL | PORF_GC_PF_SEALED)) != 0u) return;",
+    1,
+  ],
+  ["if (run_len >= 32u) porf_gc_discard_range", "if (run_len > 0u) porf_gc_discard_range", 2],
+  [
+    "  memset(porf_gc_active, 0, sizeof(porf_gc_active));\n  porf_gc_minor_mode = 0;\n}\n",
+    "  memset(porf_gc_active, 0, sizeof(porf_gc_active));\n  porf_gc_minor_mode = 0;\n}\n" + GC_SEAL_FUNCTION,
+    1,
+  ],
+];
+
+/** sproutd #32: idle return of every free run, and porf_gc_seal_heap. After patchDeferredDiscard. */
+export async function patchGcFootprint(root: string): Promise<void> {
+  const file = resolve(root, "compiler/render.js");
+  let src = await readFile(file, "utf8");
+  if (src.includes(GC_FOOTPRINT_MARKER)) return;
+  if (!src.includes(DEFERRED_DISCARD_MARKER))
+    throw new Error(`could not patch Porffor's GC footprint: deferred discard missing in ${file}`);
+  for (const [anchor, inject, count] of GC_FOOTPRINT_EDITS) {
+    if (src.split(anchor).length !== count + 1)
+      throw new Error(`could not patch Porffor's GC footprint: anchor not found in ${file}`);
+    src = src.replaceAll(anchor, inject);
+  }
+  await writeFile(file, src);
+}
+
 // sproutd B16: String.prototype.repeat copied the source once per repetition, so
 // "ab".repeat(300000) made 300,000 two-byte copies (about 60 MB/s; a proof fixture
 // spent 64% of its load time here). Copy once, then double the filled prefix onto
@@ -2119,6 +2189,7 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchQuietCollection(root);
   await patchAsyncWaker(root);
   await patchDeferredDiscard(root);
+  await patchGcFootprint(root);
   await patchPromiseResolveNull(root);
   await patchReplaceAll(root);
   await patchLocalFunctionTypes(root);

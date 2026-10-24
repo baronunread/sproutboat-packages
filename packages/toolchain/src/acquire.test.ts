@@ -25,6 +25,11 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
         "      const i64 iv = (i64)d;\n" +
         "      if ((f64)iv == d) porf_gc_cons_candidate((u32)(u64)iv);\n    }\n").repeat(2) +
       "static i32 porf_gc_mark_queue_cap = 0;\n    porf_gc_discard_free_runs();\n" +
+      // patchGcFootprint's anchors.
+      "#define PORF_GC_PF_TAIL 8u\nstatic int porf_gc_install_run(i32 ci, u32 pg) {\n" +
+      "static void porf_gc_partial_push(u32 pg) {\n  struct porf_gc_page* m = &porf_gc_pages[pg];\n  if ((m->flags & PORF_GC_PF_PARTIAL) != 0u) return;\n" +
+      "if (run_len >= 32u) porf_gc_discard_range\nif (run_len >= 32u) porf_gc_discard_range\n" +
+      "  memset(porf_gc_active, 0, sizeof(porf_gc_active));\n  porf_gc_minor_mode = 0;\n}\n" +
       "  porf_native_fetch_timer_start(id, (i32)delay_ms, timer->repeat ? (i32)delay_ms : 0);\n" +
       "void porf_native_fetch_collect_normal_from(void* stack_top) {\n" +
       "  if (porf_heap_base == 0) return;\n" +
