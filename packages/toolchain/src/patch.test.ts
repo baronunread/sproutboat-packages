@@ -9,6 +9,7 @@ import {
   patchFunctionSourcesScan,
   patchDeferredDiscard,
   patchGcFootprint,
+  patchIdleTrim,
   patchRepeatDoubling,
   patchConsoleColors,
   patchCaseMapping,
@@ -181,13 +182,9 @@ test("#156: status-line fallback synthesizes a line for unlisted codes, idempote
     const once = await readFile(join(root, "compiler/uwebsockets.js"), "utf8");
 
     // Return type widened, empty fallback replaced, known cases untouched.
-    expect(once).toContain(
-      "static std::string lookup_status_line(i32 status) {",
-    );
+    expect(once).toContain("static std::string lookup_status_line(i32 status) {");
     expect(once).not.toContain("std::string_view lookup_status_line");
-    expect(once).toContain(
-      'default: return std::to_string(status) + " Status";',
-    );
+    expect(once).toContain('default: return std::to_string(status) + " Status";');
     expect(once).not.toContain("default: return {};");
     expect(once).toContain('case 302: return "302 Found";');
     // 303 gets its real phrase; the switch stays well-formed (302 still present once).
@@ -207,17 +204,11 @@ test("#156: status-line fallback synthesizes a line for unlisted codes, idempote
 
     // #163: collect_headers takes res, drops a client-sent x-sb-remote-addr, and
     // appends the real peer; the call site passes res through.
-    expect(once).toContain(
-      "static i32 collect_headers(uWS::HttpRequest* req, uWS::HttpResponse<false>* res) {",
-    );
-    expect(once).toContain(
-      "const i32 headers_ptr = collect_headers(req, res);",
-    );
+    expect(once).toContain("static i32 collect_headers(uWS::HttpRequest* req, uWS::HttpResponse<false>* res) {");
+    expect(once).toContain("const i32 headers_ptr = collect_headers(req, res);");
     expect(once).toContain('if (key == "x-sb-remote-addr") continue;');
     expect(once).toContain("res->getRemoteAddressAsText()");
-    expect(once).toContain(
-      'porf_native_fetch_alloc_bytestring("x-sb-remote-addr", 16)',
-    );
+    expect(once).toContain('porf_native_fetch_alloc_bytestring("x-sb-remote-addr", 16)');
     expect(once).toContain("header_capacity += 2;");
 
     // #176: a dedicated porf_native_fetch_read_raw_bytes, declared alongside
@@ -230,9 +221,7 @@ test("#156: status-line fallback synthesizes a line for unlisted codes, idempote
     );
     expect(once).toContain('key == "x-sb-raw-body"');
     expect(once).toContain("bool raw_body = false;");
-    expect(once).toContain(
-      'if (std::string_view(scan_buf, scan_bytes) == "x-sb-raw-body") raw_body = true;',
-    );
+    expect(once).toContain('if (std::string_view(scan_buf, scan_bytes) == "x-sb-raw-body") raw_body = true;');
     expect(once).toContain(
       "if (raw_body && porf_native_fetch_read_raw_bytes(body_value, &body_buf, &body_len) != 0 && body_value.type == 67) {",
     );
@@ -242,17 +231,11 @@ test("#156: status-line fallback synthesizes a line for unlisted codes, idempote
       "} else if (!raw_body || !body_buf) porf_native_fetch_read_value(body_value, &body_buf, &body_len, &body_owned);",
     );
     // Header reads are the original 4-arg call, unchanged.
-    expect(once).toContain(
-      "porf_native_fetch_read_value(name_value, &name_buf, &name_len, &name_owned);",
-    );
-    expect(once).toContain(
-      "porf_native_fetch_read_value(value_value, &value_buf, &value_len, &value_owned);",
-    );
+    expect(once).toContain("porf_native_fetch_read_value(name_value, &name_buf, &name_len, &name_owned);");
+    expect(once).toContain("porf_native_fetch_read_value(value_value, &value_buf, &value_len, &value_owned);");
 
     await patchUwebsockets(root);
-    expect(await readFile(join(root, "compiler/uwebsockets.js"), "utf8")).toBe(
-      once,
-    );
+    expect(await readFile(join(root, "compiler/uwebsockets.js"), "utf8")).toBe(once);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -262,10 +245,7 @@ test("a drifted shim fails loudly instead of silently no-op'ing", async () => {
   const root = await mkdtemp(join(tmpdir(), "sb-patch-uws-drift-"));
   try {
     await mkdir(join(root, "compiler"), { recursive: true });
-    await writeFile(
-      join(root, "compiler/uwebsockets.js"),
-      "// nothing the patch recognizes\n",
-    );
+    await writeFile(join(root, "compiler/uwebsockets.js"), "// nothing the patch recognizes\n");
     await expect(patchUwebsockets(root)).rejects.toThrow(/anchor not found/);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -278,11 +258,8 @@ test("broker transport defines every direct R2 transfer symbol the patched shim 
     await patchUwebsockets(root);
     const shim = await readFile(join(root, "compiler/uwebsockets.js"), "utf8");
     const abi = shim.match(/extern "C" \{([\s\S]*?)\n\}/)?.[1];
-    if (abi === undefined)
-      throw new Error("patched shim did not contain the R2 transfer ABI");
-    const required = [...abi.matchAll(/\b(sb_r2_transfer_[a-z_]+)\s*\(/g)].map(
-      (match) => match[1],
-    );
+    if (abi === undefined) throw new Error("patched shim did not contain the R2 transfer ABI");
+    const required = [...abi.matchAll(/\b(sb_r2_transfer_[a-z_]+)\s*\(/g)].map((match) => match[1]);
     const wrapped = wrapNativeFetchHandler(
       "export default { fetch() { return new Response('ok'); } }",
       "",
@@ -314,9 +291,7 @@ test("#165: render.js routes console output to stderr, unbuffered, idempotently"
     expect(once).toContain("dup2(2, 1);");
     expect(once).toContain("setvbuf(stdout, NULL, _IONBF, 0);");
     // Injected inside runtime_init, right after the SIGPIPE line.
-    expect(once).toMatch(
-      /signal\(SIGPIPE, SIG_IGN\);\n {2}\/\* sproutboat #165/,
-    );
+    expect(once).toMatch(/signal\(SIGPIPE, SIG_IGN\);\n {2}\/\* sproutboat #165/);
     // The $PORT edit still lands too.
     expect(once).toContain('getenv("PORT")');
 
@@ -372,7 +347,9 @@ test("function source patch checks the body before walking the program, idempote
     await writeFile(file, anchor);
     await patchFunctionSourcesScan(root);
     const patched = await readFile(file, "utf8");
-    expect(patched.indexOf("n.callee.name === 'Function').length === 0) continue;")).toBeLessThan(patched.indexOf("find(program,"));
+    expect(patched.indexOf("n.callee.name === 'Function').length === 0) continue;")).toBeLessThan(
+      patched.indexOf("find(program,"),
+    );
     await patchFunctionSourcesScan(root);
     expect(await readFile(file, "utf8")).toBe(patched);
     await writeFile(file, "const unrelated = 1;\n");
@@ -399,9 +376,7 @@ test("Response defaults patch types string bodies only, idempotently", async () 
     await patchResponseDefaults(root);
     expect(await readFile(file, "utf8")).toBe(patched);
     await writeFile(file, "class Response {}\n");
-    await expect(patchResponseDefaults(root)).rejects.toThrow(
-      "anchor not found",
-    );
+    await expect(patchResponseDefaults(root)).rejects.toThrow("anchor not found");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -418,9 +393,7 @@ test("Headers array-init patch sends arrays to the sequence branch, idempotently
     );
     await patchHeadersArrayInit(root);
     const patched = await readFile(file, "utf8");
-    expect(patched).toContain(
-      "if (!Array.isArray(init) && Porffor.type(init.entries) == Porffor.TYPES.function) {",
-    );
+    expect(patched).toContain("if (!Array.isArray(init) && Porffor.type(init.entries) == Porffor.TYPES.function) {");
     await patchHeadersArrayInit(root);
     expect(await readFile(file, "utf8")).toBe(patched);
   } finally {
@@ -452,6 +425,36 @@ test("URL patch replaces Porffor's URL class, idempotently", async () => {
   }
 });
 
+test("idle trim patch keeps 16 MiB above the heap top outside the idle collection, idempotently", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sb-idle-trim-"));
+  try {
+    await mkdir(join(root, "compiler"));
+    const file = join(root, "compiler/render.js");
+    const anchor = "  const u32 keep_slack = ${prefs.nativeFetch ? '0u' : '16u * 1024u * 1024u'};\n";
+    await writeFile(file, "static i32 porf_gc_discard_pending = 0;\n" + anchor);
+    await patchIdleTrim(root);
+    const patched = await readFile(file, "utf8");
+    expect(patched).not.toContain(anchor);
+    expect(patched).toContain("porf_gc_discard_now ? 0u : 16u * 1024u * 1024u");
+    expect(patched).toContain("porf_gc_discard_pending = 1;");
+    // The edited line is template source: render it both ways.
+    const body = patched.slice(patched.indexOf("  const u32 keep_slack"));
+    const render = (nativeFetch: boolean) => new Function("prefs", "return `" + body + "`;")({ nativeFetch });
+    expect(render(true)).toBe(
+      "  const u32 keep_slack = porf_gc_discard_now ? 0u : 16u * 1024u * 1024u;\n" +
+        "  if (!porf_gc_discard_now && (u64)porf_heap_top < porf_heap_committed) porf_gc_discard_pending = 1;\n",
+    );
+    expect(render(false)).toBe("  const u32 keep_slack = 16u * 1024u * 1024u;\n");
+    await patchIdleTrim(root);
+    expect(await readFile(file, "utf8")).toBe(patched);
+    await writeFile(file, anchor);
+    await expect(patchIdleTrim(root)).rejects.toThrow("deferred discard missing");
+    await writeFile(file, "static i32 porf_gc_discard_pending = 0;\n");
+    await expect(patchIdleTrim(root)).rejects.toThrow("anchor not found");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("deferred discard patch moves page discard to the idle collection, idempotently", async () => {
   const root = await mkdtemp(join(tmpdir(), "sb-deferred-discard-"));
@@ -467,9 +470,15 @@ test("deferred discard patch moves page discard to the idle collection, idempote
     );
     await patchDeferredDiscard(root);
     const patched = await readFile(file, "utf8");
-    expect(patched).toContain("if (porf_gc_discard_now) porf_gc_discard_free_runs(); else porf_gc_discard_pending = 1;");
-    expect(patched).toContain("porf_gc_discard_pending || porf_gc_claimed_since_full > 0 || porf_gc_promoted_since_full > 0);");
-    expect(patched).toContain("  porf_gc_discard_now = 1;\n  porf_gc_collect(0);\n  porf_gc_discard_now = 0;\n  porf_gc_discard_pending = 0;");
+    expect(patched).toContain(
+      "if (porf_gc_discard_now) porf_gc_discard_free_runs(); else porf_gc_discard_pending = 1;",
+    );
+    expect(patched).toContain(
+      "porf_gc_discard_pending || porf_gc_claimed_since_full > 0 || porf_gc_promoted_since_full > 0);",
+    );
+    expect(patched).toContain(
+      "  porf_gc_discard_now = 1;\n  porf_gc_collect(0);\n  porf_gc_discard_now = 0;\n  porf_gc_discard_pending = 0;",
+    );
     await patchDeferredDiscard(root);
     expect(await readFile(file, "utf8")).toBe(patched);
     await writeFile(file, "export const x = 1;\n");
@@ -510,14 +519,23 @@ test("ensurePorfforPatched trusts a cache entry this toolchain version and patch
   const root = await mkdtemp(join(tmpdir(), "sb-patched-stamp-"));
   try {
     // An empty tree: running the chain would throw on the first missing file.
-    await writeFile(join(root, ".sproutboat-complete"), JSON.stringify({ commit: PORFFOR_COMMIT_FULL, toolchainVersion: version, patchFingerprint: PATCH_FINGERPRINT }));
+    await writeFile(
+      join(root, ".sproutboat-complete"),
+      JSON.stringify({ commit: PORFFOR_COMMIT_FULL, toolchainVersion: version, patchFingerprint: PATCH_FINGERPRINT }),
+    );
     await ensurePorfforPatched(root);
     const stale = await mkdtemp(join(tmpdir(), "sb-patched-stale-"));
     try {
-      await writeFile(join(stale, ".sproutboat-complete"), JSON.stringify({ commit: PORFFOR_COMMIT_FULL, toolchainVersion: "0.0.0" }));
+      await writeFile(
+        join(stale, ".sproutboat-complete"),
+        JSON.stringify({ commit: PORFFOR_COMMIT_FULL, toolchainVersion: "0.0.0" }),
+      );
       await expect(ensurePorfforPatched(stale)).rejects.toThrow();
       // Same release, older patch chain (B19): the chain runs again.
-      await writeFile(join(stale, ".sproutboat-complete"), JSON.stringify({ commit: PORFFOR_COMMIT_FULL, toolchainVersion: version, patchFingerprint: "000000000000" }));
+      await writeFile(
+        join(stale, ".sproutboat-complete"),
+        JSON.stringify({ commit: PORFFOR_COMMIT_FULL, toolchainVersion: version, patchFingerprint: "000000000000" }),
+      );
       await expect(ensurePorfforPatched(stale)).rejects.toThrow();
     } finally {
       await rm(stale, { recursive: true, force: true });
@@ -532,7 +550,10 @@ test("console colour patch colours only on a terminal, idempotently", async () =
   try {
     await mkdir(join(root, "compiler/builtins"), { recursive: true });
     const file = join(root, "compiler/builtins/console.ts");
-    await writeFile(file, "export const __Porffor_consolePrint = (arg: any): void => {\n  if (x) return;\n  __Porffor_print(arg);\n};\n");
+    await writeFile(
+      file,
+      "export const __Porffor_consolePrint = (arg: any): void => {\n  if (x) return;\n  __Porffor_print(arg);\n};\n",
+    );
     await patchConsoleColors(root);
     const patched = await readFile(file, "utf8");
     expect(patched).toContain("Porffor.c`tty = isatty(1) ? 1 : 0;`;");
@@ -551,7 +572,10 @@ test("TextDecoder and Headers patches replace Porffor's classes once", async () 
   try {
     await mkdir(join(root, "runtime"));
     const file = join(root, "runtime/fetch-globals.js");
-    await writeFile(file, "class Headers {\n  old() {}\n}\nfunction setTimeout() {}\nclass TextDecoder {\n  old() {}\n}\nclass URL {\n}\n");
+    await writeFile(
+      file,
+      "class Headers {\n  old() {}\n}\nfunction setTimeout() {}\nclass TextDecoder {\n  old() {}\n}\nclass URL {\n}\n",
+    );
     await patchHeadersClass(root);
     await patchTextDecoder(root);
     const patched = await readFile(file, "utf8");
@@ -603,7 +627,10 @@ test("zero-delay timer patch arms timers at 1 ms, idempotently", async () => {
   try {
     await mkdir(join(root, "compiler"));
     const file = join(root, "compiler/render.js");
-    await writeFile(file, "x\n  porf_native_fetch_timer_start(id, (i32)delay_ms, timer->repeat ? (i32)delay_ms : 0);\n");
+    await writeFile(
+      file,
+      "x\n  porf_native_fetch_timer_start(id, (i32)delay_ms, timer->repeat ? (i32)delay_ms : 0);\n",
+    );
     await patchZeroDelayTimers(root);
     const patched = await readFile(file, "utf8");
     expect(patched).toContain("delay_ms < 1 ? 1 : (i32)delay_ms");
@@ -620,13 +647,21 @@ test("Request/Response, Blob and finalizer patches replace their targets once", 
   const root = await mkdtemp(join(tmpdir(), "sb-fetch-classes-"));
   try {
     await mkdir(join(root, "runtime"));
-    const globals = join(root, "runtime/fetch-globals.js"), entry = join(root, "runtime/native-fetch.js");
-    await writeFile(globals, "class Blob {\n  old() {}\n}\nclass TextEncoder {\n}\nclass Request {\n  old() {}\n}\nclass Response {\n  old() {}\n}\n");
-    await writeFile(entry, "x\n  const body = response.body == null ? '' : String(response.body);\n  const headersEntries = response.headers._entries;\n");
+    const globals = join(root, "runtime/fetch-globals.js"),
+      entry = join(root, "runtime/native-fetch.js");
+    await writeFile(
+      globals,
+      "class Blob {\n  old() {}\n}\nclass TextEncoder {\n}\nclass Request {\n  old() {}\n}\nclass Response {\n  old() {}\n}\n",
+    );
+    await writeFile(
+      entry,
+      "x\n  const body = response.body == null ? '' : String(response.body);\n  const headersEntries = response.headers._entries;\n",
+    );
     await patchFetchClasses(root);
     await patchBlobClass(root);
     await patchResponseBytes(root);
-    const g = await readFile(globals, "utf8"), e = await readFile(entry, "utf8");
+    const g = await readFile(globals, "utf8"),
+      e = await readFile(entry, "utf8");
     expect(g).toContain("sproutboat: Fetch-spec Request and Response");
     expect(g).toContain("sproutboat: byte-backed Blob and File");
     expect(g).toContain("class File extends Blob {");
@@ -669,7 +704,9 @@ test("streaming patch adds the stream registry and attaches marked responses, id
     expect(patched).toContain('extern "C" u32 sb_stream_open(void) {');
     expect(patched).toContain("if (stream_id) sb_stream_attach(stream_id, res);");
     expect(patched).toContain('key == "x-sb-stream"; // sproutboat B19');
-    expect(patched.indexOf("sproutboat B19: streamed responses")).toBeLessThan(patched.indexOf("static void write_response_value"));
+    expect(patched.indexOf("sproutboat B19: streamed responses")).toBeLessThan(
+      patched.indexOf("static void write_response_value"),
+    );
     const stubs = await readFile(render, "utf8");
     expect(stubs).toContain("__attribute__((weak)) int sb_stream_supported(void) { return 0; }");
     expect(stubs.indexOf("streaming fallbacks")).toBeLessThan(stubs.indexOf(streaming.STREAM_STUBS_ANCHOR));
@@ -698,7 +735,9 @@ test("async waker patch installs a loop waker in the native server, idempotently
     const patched = await readFile(file, "utf8");
     expect(patched).toContain('extern "C" __attribute__((weak)) void sb_async_set_waker(void (*wake)(void))');
     expect(patched).toContain("sb_async_loop->defer([] {");
-    expect(patched.indexOf("sb_async_set_waker(sb_async_wake);")).toBeGreaterThan(patched.indexOf("porf_native_fetch_static_init();"));
+    expect(patched.indexOf("sb_async_set_waker(sb_async_wake);")).toBeGreaterThan(
+      patched.indexOf("porf_native_fetch_static_init();"),
+    );
     expect(patched.indexOf("sb_async_set_waker(sb_async_wake);")).toBeLessThan(patched.indexOf("uWS::App();"));
     await patchAsyncWaker(root);
     expect(await readFile(file, "utf8")).toBe(patched);
@@ -733,7 +772,9 @@ test("split globals patch prefixes module globals so none binds to libc, idempot
     await patchSplitGlobals(root);
     const patched = await readFile(file, "utf8");
     expect(patched).toContain("const gname = n => sanitize(split && !n.startsWith('__') ? 'pg_' + n : n);");
-    expect(patched).toContain("return [gname(node[N_A]), P_PRIM];\n      case K.Local:\n        return [sanitize(node[N_A]), P_PRIM];");
+    expect(patched).toContain(
+      "return [gname(node[N_A]), P_PRIM];\n      case K.Local:\n        return [sanitize(node[N_A]), P_PRIM];",
+    );
     expect(patched).toContain("${st}${CT[g.type]} ${gname(g.name)}");
     expect(patched).toContain("text.push(`extern ${CT[globalTypes[x]]} ${gname(x)};\\n`);");
     expect(patched.match(/gname\(/g)?.length).toBe(9);
