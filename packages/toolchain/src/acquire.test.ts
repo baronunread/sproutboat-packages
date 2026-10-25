@@ -177,7 +177,20 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "export const __Porffor_json_serialize = (_buffer: i32, value: any): i32 => {\n" +
       "    for (const x of (value as any[])) {\n    }\n" +
       "      const val: any = value[key];\n" +
-      "};\nexport const __JSON_stringify = (value: any) => {\n  let cap: i32 = 4096;\n};\n",
+      "};\nexport const __JSON_stringify = (value: any) => {\n  let cap: i32 = 4096;\n};\n" +
+      "export const __Porffor_json_skipWhitespace = (text: any, pos: i32, len: i32): i32 => {\n" +
+      "  const c: i32 = text.charCodeAt(pos);\n".repeat(29) +
+      "};\nexport const __Porffor_json_internalize = (holder: any) => {};\n",
+    "compiler/builtins/string_f64.ts":
+      "export const __String_prototype_charCodeAt = function (this: string, _index: any) {\n  const len: i32 = this.length;\n};\n" +
+      "export const __ByteString_prototype_charCodeAt = function (this: bytestring, _index: any) {\n  const len: i32 = this.length;\n};\n",
+    "compiler/builtins/regexp.ts":
+      "export const __RegExp_prototype_Symbol_replace = function (this: any, string: any, replaceValue: any) {\n" +
+      "  if (pristine && !functional && __Porffor_regex_flagIn(replaceValue, 36) == false) return __Porffor_regex_replacePlain(rx, s, replaceValue);\n" +
+      "  let acc: any = '';\n" +
+      "      acc = __Porffor_strcat(__Porffor_strcat(acc, __Porffor_regex_inputSubstring(s, sType, nextPos, position)), replacement);\n" +
+      "  if (nextPos >= lengthS) return acc;\n  return __Porffor_strcat(acc, __Porffor_regex_inputSubstring(s, sType, nextPos, lengthS));\n" +
+      "};\nexport const __RegExp_prototype_Symbol_split = function (this: any, string: any, limit: any) {};\n",
     "runtime/native-fetch.js":
       "export function finalize(response) {\n  const body = response.body == null ? '' : String(response.body);\n  const headersEntries = response.headers._entries;\n}\n",
     "runtime/fetch-globals.js":
@@ -339,6 +352,19 @@ test("the default call (no url/expectedSha256 override) never touches the networ
   expect(await readFile(join(dir, "compiler/builtins/string.ts"), "utf8")).toContain(
     "return Porffor.callThis(__Array_prototype_join, pieces, '');",
   );
+  // Linear string building: the s += e pass, its builtins, replace(regex, fn) and character reads.
+  expect(await readFile(join(dir, "compiler/parse.js"), "utf8")).toContain("sbStringAppend(ast);");
+  expect(await readFile(join(dir, "compiler/sb-string-append.js"), "utf8")).toContain("__Porffor_strAppend");
+  expect(await readFile(join(dir, "compiler/builtins/string.ts"), "utf8")).toContain(
+    "export const __Porffor_strSettle = ",
+  );
+  expect(await readFile(join(dir, "compiler/builtins/regexp.ts"), "utf8")).toContain(
+    "return __Porffor_regex_replaceCallback(rx, s, replaceValue);",
+  );
+  expect(await readFile(join(dir, "compiler/builtins/string_f64.ts"), "utf8")).toContain(
+    "sproutboat: in-range number index",
+  );
+  expect(await readFile(join(dir, "compiler/builtins/json.ts"), "utf8")).not.toContain("text.charCodeAt(");
   // #236: the native-fetch build edits uWebSockets to accept HTTP/1.0.
   const index = await readFile(join(dir, "compiler/index.js"), "utf8");
   expect(index).toContain("import { sbPatchHttp10 } from './sb-http10.js';");
