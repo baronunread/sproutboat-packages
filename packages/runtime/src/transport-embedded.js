@@ -3700,8 +3700,14 @@ function __sbEnsureSchema() {
   __sbSql(s, "CREATE INDEX IF NOT EXISTS mq_due ON mq (queue, dead, visible_at)", []);
   const mqColumns = __sbSql(s, "PRAGMA table_info(mq)", []).rows;
   let mqClaim = false;
-  for (let i = 0; i < mqColumns.length; i++) if (mqColumns[i][1] === "claim_token") mqClaim = true;
+  let mqSent = false;
+  for (let i = 0; i < mqColumns.length; i++) {
+    if (mqColumns[i][1] === "claim_token") mqClaim = true;
+    if (mqColumns[i][1] === "sent_at") mqSent = true;
+  }
   if (!mqClaim) __sbSql(s, "ALTER TABLE mq ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''", []);
+  // When the message was sent (message.timestamp); 0 for messages queued before the column.
+  if (!mqSent) __sbSql(s, "ALTER TABLE mq ADD COLUMN sent_at INTEGER NOT NULL DEFAULT 0", []);
   __sbSql(
     s,
     "CREATE TABLE IF NOT EXISTS do_storage (cls TEXT NOT NULL, id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (cls, id, key))",
@@ -4278,21 +4284,24 @@ function __sbEmbeddedDispatch(msg) {
     // (data loss), and delaySeconds was ignored on both calls.
     const items = op === "queue.send" ? [{ body: msg.body, delaySeconds: msg.delaySeconds }] : msg.messages || [];
     let first = -1;
+    const now = Date.now();
     for (let i = 0; i < items.length; i++) {
       const item = items[i] || {};
       const delay = Math.max(0, Number(item.delaySeconds) || 0) * 1000;
-      const visible = Date.now() + delay;
+      const visible = now + delay;
       if (first < 0 || visible < first) first = visible;
       __sbSql(
         store,
-        "INSERT INTO mq (queue, id, body, visible_at, attempts, dead) VALUES (?1,?2,?3,?4,0,0)",
-        [msg.queue, __sbHex(12), String(item.body), visible],
+        "INSERT INTO mq (queue, id, body, visible_at, attempts, dead, sent_at) VALUES (?1,?2,?3,?4,0,0,?5)",
+        [msg.queue, __sbHex(12), String(item.body), visible, now],
       );
     }
     // B22: on sproutd, the host delivers the batch (waking the app if it sleeps by then).
     if (first >= 0 && __sbLocal !== null && __sbLocal.queues.indexOf(msg.queue) !== -1) __sbHostDue(first);
-    return { ok: true };
+    return msg.metrics ? { ok: true, metrics: __sbQueueBacklog(store, msg.queue) } : { ok: true };
   }
+
+  if (op === "queue.metrics") return { ok: true, metrics: __sbQueueBacklog(store, msg.queue) };
 
   if (op === "do.storage.get") {
     const r = __sbSql(store, "SELECT value FROM do_storage WHERE cls = ? AND id = ? AND key = ?", [
@@ -4739,27 +4748,57 @@ function __sbCronMatches(expr, when) {
 
 var __sbLastCronTick = "";
 
-// One delivery pass over the queues this worker consumes: claims up to 10 due messages per
-// queue, hands them to queue() and applies its acks and retries.
+// A queue's backlog as Queues reports it (send() results, batch.metadata): its live
+// messages, their bytes and the oldest one's send time.
+function __sbQueueBacklog(store, queue) {
+  const r = __sbSql(
+    store,
+    "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(body AS BLOB))),0), MIN(NULLIF(sent_at,0)) FROM mq WHERE queue=? AND dead=0",
+    [queue],
+  ).rows[0];
+  return { backlogCount: Number(r[0]) || 0, backlogBytes: Number(r[1]) || 0, oldestMessageTimestamp: Number(r[2]) || 0 };
+}
+
+function __sbQueueAttemptCap(settings) {
+  return Math.max(5, (settings.maxRetries !== undefined ? Number(settings.maxRetries) : 3) + 1);
+}
+
+// How long a queue's due messages wait to fill a batch (max_batch_timeout), in ms.
+function __sbQueueWaitMs(binding) {
+  return Math.max(0, Number(__sbQueueSettings(binding).maxBatchTimeout) || 0) * 1000;
+}
+
+// One delivery pass over the queues this worker consumes: claims up to max_batch_size (10)
+// due messages per queue, hands them to queue() and applies its acks and retries. With a
+// max_batch_timeout, a batch smaller than max_batch_size waits until its oldest message
+// has been due that long.
 async function __sbQueuePass(handlers, queues) {
   __sbEnsureSchema();
   const store = __sbStore();
   const now = Date.now();
   for (let q = 0; q < queues.length; q++) {
     const name = queues[q];
+    const settings = __sbQueueSettings(name);
+    const size = Math.min(100, Math.max(1, Number(settings.maxBatchSize) || 10));
+    const wait = __sbQueueWaitMs(name);
     const claim = String(now) + ":" + String(Math.random());
     __sbSql(store, "BEGIN IMMEDIATE", []);
     let due;
     try {
-      __sbSql(store, "UPDATE mq SET dead=1 WHERE queue=? AND visible_at<=? AND attempts>=5", [
+      // A message whose deliveries never came back (the worker died or timed out each time)
+      // stops after 5 attempts, or max_retries + 1 when that is more.
+      __sbSql(store, "UPDATE mq SET dead=1 WHERE queue=? AND visible_at<=? AND attempts>=?", [
         name,
         now,
+        __sbQueueAttemptCap(settings),
       ]);
       due = __sbSql(
         store,
-        "SELECT id,body,attempts FROM mq WHERE queue=? AND dead=0 AND visible_at<=? ORDER BY visible_at LIMIT 10",
-        [name, now],
+        "SELECT id,body,attempts,sent_at,visible_at FROM mq WHERE queue=? AND dead=0 AND visible_at<=? ORDER BY visible_at LIMIT ?",
+        [name, now, size],
       );
+      if (wait > 0 && due.rows.length > 0 && due.rows.length < size && Number(due.rows[0][4]) + wait > now)
+        due = { rows: [] };
       for (let i = 0; i < due.rows.length; i++)
         __sbSql(
           store,
@@ -4776,9 +4815,9 @@ async function __sbQueuePass(handlers, queues) {
     const messages = [];
     for (let i = 0; i < due.rows.length; i++) {
       const row = due.rows[i];
-
-      messages.push({ id: row[0], body: row[1], timestamp: now, attempts: Number(row[2]) + 1 });
+      messages.push({ id: row[0], body: row[1], timestamp: Number(row[3]) || now, attempts: Number(row[2]) + 1 });
     }
+    const metadata = { metrics: __sbQueueBacklog(store, name) };
     // #171 — same ctx.waitUntil as the broker-delivered path, and the same
     // fix for the handler's own promise: `__sbRunQueueBatch` used to be
     // called fire-and-forget here too, so an async `queue()`'s ack/retry
@@ -4789,24 +4828,55 @@ async function __sbQueuePass(handlers, queues) {
         if (p && __sbIsFn(p.then)) __sbTasks.push(p);
       },
     };
-    let result = __sbRunQueueBatch(handlers, { queue: name, messages }, ctx);
+    let result = __sbRunQueueBatch(handlers, { queue: name, messages, metadata }, ctx);
     if (result && __sbIsFn(result.then)) result = await result;
     if (__sbTasks.length) await __sbDrainWaitUntil(__sbTasks);
-    for (let i = 0; i < result.ack.length; i++) {
-      __sbSql(
-        store,
-        "DELETE FROM mq WHERE queue=? AND id=? AND claim_token=? AND visible_at>?",
-        [name, result.ack[i], claim, Date.now()],
-      );
-    }
-    for (let i = 0; i < result.retry.length; i++) {
-      __sbSql(
-        store,
-        "UPDATE mq SET visible_at=?,claim_token='',dead=CASE WHEN attempts>=5 THEN 1 ELSE 0 END WHERE queue=? AND id=? AND claim_token=? AND visible_at>?",
-        [Date.now() + 5000, name, result.retry[i], claim, Date.now()],
-      );
-    }
+    __sbQueueSettle(store, name, claim, result);
   }
+}
+
+// Applies a batch's outcome to the claimed rows. `dead` (past max_retries) move to the dead
+// letter queue `deadLetter` as new messages, or are marked dead; `delays` gives each retry's
+// delay in seconds (5 when the runtime sends none). A row whose claim expired meanwhile was
+// handed out again and is left alone.
+function __sbQueueSettle(store, name, claim, result) {
+  const now = Date.now();
+  const dead = result.dead || [];
+  const delays = result.delays || null;
+  for (let i = 0; i < dead.length; i++) {
+    if (result.deadLetter)
+      __sbSql(
+        store,
+        "UPDATE mq SET queue=?,visible_at=?,attempts=0,claim_token='',dead=0 WHERE queue=? AND id=? AND claim_token=? AND visible_at>?",
+        [String(result.deadLetter), now, name, dead[i], claim, now],
+      );
+    else
+      __sbSql(store, "UPDATE mq SET dead=1,claim_token='' WHERE queue=? AND id=? AND claim_token=? AND visible_at>?", [
+        name,
+        dead[i],
+        claim,
+        now,
+      ]);
+  }
+  for (let i = 0; i < result.ack.length; i++) {
+    __sbSql(
+      store,
+      "DELETE FROM mq WHERE queue=? AND id=? AND claim_token=? AND visible_at>?",
+      [name, result.ack[i], claim, now],
+    );
+  }
+  for (let i = 0; i < result.retry.length; i++) {
+    const id = result.retry[i];
+    if (dead.indexOf(id) !== -1) continue;
+    const delay = delays !== null && delays[id] != null ? Math.max(0, Number(delays[id]) || 0) * 1000 : 5000;
+    __sbSql(
+      store,
+      "UPDATE mq SET visible_at=?,claim_token='',dead=CASE WHEN attempts>=5 AND ?=0 THEN 1 ELSE 0 END WHERE queue=? AND id=? AND claim_token=? AND visible_at>?",
+      [now + delay, delays !== null ? 1 : 0, name, id, claim, now],
+    );
+  }
+  if (result.deadLetter && dead.length && __sbLocal !== null && __sbLocal.queues.indexOf(String(result.deadLetter)) !== -1)
+    __sbHostDue(now);
 }
 
 // One pass over the Durable Object alarms that are due: claims up to 10 and runs alarm().
@@ -4898,6 +4968,17 @@ function __sbHostDue(at) {
   if (__sbLocal !== null && __sbLocal.consumes) __sbHostNote("due " + String(Math.max(0, Math.trunc(Number(at) || 0))));
 }
 
+// When a queue next has a batch to deliver: its earliest visible message, plus the batch
+// timeout unless a whole batch is already there.
+function __sbQueueNextDue(store, queue) {
+  const r = __sbSql(store, "SELECT MIN(visible_at) FROM mq WHERE queue=? AND dead=0", [queue]);
+  const wait = __sbQueueWaitMs(queue);
+  if (wait === 0 || !r.rows.length || r.rows[0][0] == null) return r;
+  const size = Math.min(100, Math.max(1, Number(__sbQueueSettings(queue).maxBatchSize) || 10));
+  const full = __sbSql(store, "SELECT COUNT(*) FROM mq WHERE queue=? AND dead=0 AND visible_at<=?", [queue, Date.now()]);
+  return Number(full.rows[0][0]) >= size ? r : { rows: [[Number(r.rows[0][0]) + wait]] };
+}
+
 // The earliest time something this worker consumes falls due: a message becomes visible
 // (or its claim expires), an alarm is set for, or a failed alarm is retried. -1 for none.
 function __sbNextDue() {
@@ -4911,7 +4992,7 @@ function __sbNextDue() {
   };
   const queues = __sbLocal.queues;
   for (let q = 0; q < queues.length; q++)
-    take(__sbSql(store, "SELECT MIN(visible_at) FROM mq WHERE queue=? AND dead=0", [queues[q]]));
+    take(__sbQueueNextDue(store, queues[q]));
   if (__sbLocal.alarms) {
     take(__sbSql(store, "SELECT MIN(at) FROM do_alarm", []));
     take(__sbSql(store, "SELECT MIN(expires) FROM do_alarm_delivery WHERE attempts<5", []));

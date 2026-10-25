@@ -58,6 +58,10 @@ export type Bindings = {
   d1: string[];
   r2: string[];
   queues: string[];
+  /** Each queue binding's queue name and consumer settings (`queueSettings` in
+   *  @sproutboat/config). Absent from older artifacts: every queue is then named by its
+   *  binding, with the default settings. */
+  queueConfig?: QueueSettings[];
   analytics: string[];
   do: Array<{ binding: string; className: string }>;
   /** #48 — worker-to-worker: binding name -> the project it calls. The hostname
@@ -69,6 +73,17 @@ export type Bindings = {
   ratelimiters: Array<{ binding: string; limit: number; period: number }>;
   /** Static-asset binding name for `env.<NAME>.fetch(request)`; `""` when assets are edge-only. */
   assets: string;
+};
+
+/** One queue binding's name and consumer settings; unset settings are absent. */
+export type QueueSettings = {
+  binding: string;
+  queue: string;
+  maxBatchSize?: number;
+  maxBatchTimeout?: number;
+  maxRetries?: number;
+  retryDelay?: number;
+  deadLetterQueue?: string;
 };
 
 export const EMPTY_BINDINGS: Bindings = {
@@ -335,7 +350,21 @@ export function readBindingsFromEnv(): Bindings {
       }
     }
   }
-  return {
+  const queueConfig: QueueSettings[] = [];
+  if (Array.isArray(parsed.queueConfig)) {
+    const num = (v: VarsJson | undefined): v is number => Number(v) === v && Number.isFinite(v) && v >= 0;
+    for (const entry of parsed.queueConfig) {
+      if (!isVarsObject(entry) || !isVarsString(entry.binding) || !isVarsString(entry.queue)) continue;
+      const q: QueueSettings = { binding: entry.binding, queue: entry.queue };
+      if (num(entry.maxBatchSize)) q.maxBatchSize = entry.maxBatchSize;
+      if (num(entry.maxBatchTimeout)) q.maxBatchTimeout = entry.maxBatchTimeout;
+      if (num(entry.maxRetries)) q.maxRetries = entry.maxRetries;
+      if (num(entry.retryDelay)) q.retryDelay = entry.retryDelay;
+      if (isVarsString(entry.deadLetterQueue)) q.deadLetterQueue = entry.deadLetterQueue;
+      queueConfig.push(q);
+    }
+  }
+  const out: Bindings = {
     kv: strings(parsed.kv),
     secrets: strings(parsed.secrets),
     d1: strings(parsed.d1),
@@ -348,4 +377,6 @@ export function readBindingsFromEnv(): Bindings {
     ratelimiters,
     assets: isVarsString(parsed.assets) ? parsed.assets : "",
   };
+  if (queueConfig.length) out.queueConfig = queueConfig;
+  return out;
 }
