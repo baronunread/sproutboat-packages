@@ -9,11 +9,68 @@ const slugPattern = /^[a-z0-9](?:[a-z0-9-]{1,30}[a-z0-9])?$/;
 export type ResourceBinding = { binding: string; id: string };
 export type ResourceRef = string | ResourceBinding;
 
+/**
+ * A queue binding with its queue's name and consumer settings, named as in
+ * wrangler's `queues.consumers`. The worker consumes every queue it binds (with a
+ * `queue()` handler), so the settings sit on the binding. `queue` is the name
+ * `batch.queue` reports and `dead_letter_queue` refers to; it defaults to the
+ * binding name. `id` is optional here, unlike the other storage bindings.
+ */
+export type QueueBinding = {
+  binding: string;
+  id?: string;
+  queue?: string;
+  /** Messages per batch, 1 to 100 (default 10). */
+  max_batch_size?: number;
+  /** Seconds a batch waits to fill, 0 to 60 (default 0: delivered at once). */
+  max_batch_timeout?: number;
+  /** Retries before the message goes to the dead letter queue or is dropped, 0 to 100 (default 3). */
+  max_retries?: number;
+  /** Seconds before a retried message is delivered again, 0 to 86400 (default 0). */
+  retry_delay?: number;
+  /** The queue (by name) that receives messages out of retries. */
+  dead_letter_queue?: string;
+};
+export type QueueRef = string | QueueBinding;
+
 /** Normalizes a storage-binding array to `{ binding, id? }` rows. */
-export function resourceRefs(field: readonly ResourceRef[] | undefined): Array<{ binding: string; id?: string }> {
+export function resourceRefs(
+  field: readonly (string | { binding: string; id?: string })[] | undefined,
+): Array<{ binding: string; id?: string }> {
   return (field ?? []).map((entry) =>
-    isString(entry) ? { binding: entry } : { binding: entry.binding, id: entry.id },
+    isString(entry)
+      ? { binding: entry }
+      : entry.id === undefined
+        ? { binding: entry.binding }
+        : { binding: entry.binding, id: entry.id },
   );
+}
+
+/**
+ * The queues a config binds, each with its queue name (the binding name when unset) and
+ * its consumer settings in camelCase; settings left unset are absent. This is what the
+ * build bakes into the artifact as `bindings.queueConfig`.
+ */
+export type QueueSettings = {
+  binding: string;
+  queue: string;
+  maxBatchSize?: number;
+  maxBatchTimeout?: number;
+  maxRetries?: number;
+  retryDelay?: number;
+  deadLetterQueue?: string;
+};
+export function queueSettings(field: readonly QueueRef[] | undefined): QueueSettings[] {
+  return (field ?? []).map((entry) => {
+    if (isString(entry)) return { binding: entry, queue: entry };
+    const out: QueueSettings = { binding: entry.binding, queue: entry.queue ?? entry.binding };
+    if (entry.max_batch_size !== undefined) out.maxBatchSize = entry.max_batch_size;
+    if (entry.max_batch_timeout !== undefined) out.maxBatchTimeout = entry.max_batch_timeout;
+    if (entry.max_retries !== undefined) out.maxRetries = entry.max_retries;
+    if (entry.retry_delay !== undefined) out.retryDelay = entry.retry_delay;
+    if (entry.dead_letter_queue !== undefined) out.deadLetterQueue = entry.dead_letter_queue;
+    return out;
+  });
 }
 
 /**
@@ -29,10 +86,15 @@ export function pinBindingId(source: string, field: string, binding: string, id:
   // right after a comma — never `"binding": "NAME"` inside an already-pinned
   // { … } object.
   const element = new RegExp(`(^\\s*|,\\s*)"${binding}"(\\s*,|\\s*$)`);
+  // A queue may also be `{ "binding": "NAME", ...settings }` with no id: the id goes
+  // first in that object. The objects are flat, so `{[^{}]*}` is one whole entry.
+  const object = new RegExp(`\\{(?![^{}]*"id"\\s*:)([^{}]*"binding"\\s*:\\s*"${binding}"[^{}]*)\\}`);
   return source.replace(array, (whole, open: string, inner: string, close: string) =>
     element.test(inner)
       ? open + inner.replace(element, `$1{ "binding": "${binding}", "id": "${id}" }$2`) + close
-      : whole,
+      : object.test(inner)
+        ? open + inner.replace(object, `{ "id": "${id}",$1}`) + close
+        : whole,
   );
 }
 
@@ -51,7 +113,7 @@ export type SproutboatConfig = {
   /** R2 (object storage) bucket bindings, exposed as `env.<NAME>`. */
   r2_buckets?: ResourceRef[];
   /** Queue producer bindings, exposed as `env.<NAME>.send()`. A `queue(batch)` handler consumes them. */
-  queues?: ResourceRef[];
+  queues?: QueueRef[];
   /** Analytics Engine dataset binding names, exposed as `env.<NAME>.writeDataPoint()`. No id — the dataset is created on first write. */
   analytics_engine_datasets?: string[];
   /** Durable Object bindings: `{ BINDING_NAME: "ClassName" }`. The class is defined in the handler module. */
@@ -221,6 +283,79 @@ function validateConfig(value: ConfigInput): ConfigValidation {
     return out;
   };
 
+  /**
+   * `queues`: a bare `"BINDING"`, or `{ binding, id?, queue?, ...consumer settings }`
+   * (see QueueBinding). Queue names are unique, and a dead letter queue is another queue's
+   * name; it need not be bound here (its messages then wait, as on Cloudflare, until a
+   * worker binds it).
+   */
+  const queueArray = (): QueueRef[] | undefined => {
+    if (value.queues === undefined) return undefined;
+    const raw = value.queues;
+    if (!Array.isArray(raw)) {
+      errors.push("queues must be an array of binding names or { binding, ... } objects");
+      return undefined;
+    }
+    const queueName = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+    const idPattern = /^queue_[0-9a-f]{24}$/;
+    const settings = [
+      ["max_batch_size", 1, 100, true],
+      ["max_batch_timeout", 0, 60, false],
+      ["max_retries", 0, 100, true],
+      ["retry_delay", 0, 86400, true],
+    ] as const;
+    const out: QueueRef[] = [];
+    const names = new Set<string>();
+    for (const entry of raw) {
+      if (isString(entry)) {
+        if (bindingName.test(entry)) out.push(entry);
+        else errors.push(`queues: "${entry}" must be an UPPER_SNAKE binding name`);
+        if (names.has(entry)) errors.push(`queues: two bindings name the queue "${entry}"`);
+        names.add(entry);
+        continue;
+      }
+      if (!isRecord(entry) || !isString(entry.binding) || !bindingName.test(entry.binding)) {
+        errors.push('queues entries must be an UPPER_SNAKE name or { binding: "NAME", ... }');
+        continue;
+      }
+      const ref: QueueBinding = { binding: entry.binding };
+      for (const [key, item] of Object.entries(entry)) {
+        if (key === "binding") continue;
+        if (key === "id") {
+          if (isString(item) && idPattern.test(item)) ref.id = item;
+          else errors.push(`queues.${entry.binding}.id must be "queue_" and 24 hex digits`);
+        } else if (key === "queue" || key === "dead_letter_queue") {
+          if (isString(item) && queueName.test(item)) ref[key] = item;
+          else
+            errors.push(
+              `queues.${entry.binding}.${key} must be a queue name (lowercase letters, digits and hyphens, at most 63)`,
+            );
+        } else {
+          const setting = settings.find(([field]) => field === key);
+          if (!setting) {
+            errors.push(`queues.${entry.binding}: unsupported field ${key}`);
+            continue;
+          }
+          const [field, min, max, integer] = setting;
+          if (Number(item) === item && item >= min && item <= max && (!integer || Number.isInteger(item)))
+            ref[field] = item;
+          else
+            errors.push(
+              `queues.${entry.binding}.${key} must be ${integer ? "an integer" : "a number"} from ${min} to ${max}`,
+            );
+        }
+      }
+      const name = ref.queue ?? ref.binding;
+      if (names.has(name)) errors.push(`queues: two bindings name the queue "${name}"`);
+      names.add(name);
+      if (ref.dead_letter_queue !== undefined && ref.dead_letter_queue === name)
+        errors.push(`queues.${entry.binding}.dead_letter_queue must be another queue`);
+      // A plain { binding, id } stays the same shape it always had.
+      out.push(ref);
+    }
+    return out;
+  };
+
   const version_metadata =
     value.version_metadata === undefined
       ? undefined
@@ -240,7 +375,7 @@ function validateConfig(value: ConfigInput): ConfigValidation {
   const kv_namespaces = resourceArray("kv_namespaces", "kv");
   const d1_databases = resourceArray("d1_databases", "d1");
   const r2_buckets = resourceArray("r2_buckets", "r2");
-  const queues = resourceArray("queues", "queue");
+  const queues = queueArray();
 
   let durable_objects: Record<string, string> | undefined;
   if (value.durable_objects !== undefined) {
@@ -364,7 +499,7 @@ function validateConfig(value: ConfigInput): ConfigValidation {
     }
   }
 
-  const resourceNames = (refs: ResourceRef[] | undefined): string[] => resourceRefs(refs).map((ref) => ref.binding);
+  const resourceNames = (refs: QueueRef[] | undefined): string[] => resourceRefs(refs).map((ref) => ref.binding);
   const bindingSlots = [
     ...resourceNames(kv_namespaces),
     ...(secrets ?? []),

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { OUTBOUND_IGNORED, parseConfig, pinBindingId } from "./config";
+import { OUTBOUND_IGNORED, parseConfig, pinBindingId, queueSettings } from "./config";
 
 const base = `{ "name": "app", "main": "src/index.js", "compatibility_date": "2026-08-26"`;
 
@@ -166,4 +166,53 @@ test("services: valid entries parse; bad shapes and collisions are rejected", ()
     JSON.stringify({ ...base, vars: { AUTH: "x" }, services: [{ binding: "AUTH", service: "auth-api" }] }),
   );
   expect(collide.ok).toBe(false);
+});
+
+// Queues: a queue name and consumer settings on the binding, named as in wrangler.
+test("queues: accepts a name and consumer settings, and normalizes them", () => {
+  const r = parseConfig(
+    `${base}, "queues": [{ "binding": "QUEUE", "queue": "q", "max_batch_size": 5, "max_batch_timeout": 1.5, "max_retries": 3, "retry_delay": 2, "dead_letter_queue": "dlq" }, { "binding": "DLQ", "queue": "dlq" }, "PLAIN"] }`,
+  );
+  expect(r.ok).toBe(true);
+  if (!r.ok) return;
+  expect(queueSettings(r.value.queues)).toEqual([
+    {
+      binding: "QUEUE",
+      queue: "q",
+      maxBatchSize: 5,
+      maxBatchTimeout: 1.5,
+      maxRetries: 3,
+      retryDelay: 2,
+      deadLetterQueue: "dlq",
+    },
+    { binding: "DLQ", queue: "dlq" },
+    { binding: "PLAIN", queue: "PLAIN" },
+  ]);
+});
+
+test("queues: an object needs no id, and keeps a valid one", () => {
+  const r = parseConfig(
+    `${base}, "queues": [{ "binding": "Q" }, { "binding": "R", "id": "queue_${id24}", "queue": "r" }] }`,
+  );
+  expect(r.ok && r.value.queues).toEqual([{ binding: "Q" }, { binding: "R", id: `queue_${id24}`, queue: "r" }]);
+});
+
+test("queues: rejects bad settings, duplicate names and a self dead letter queue", () => {
+  const bad = (entry: string) => parseConfig(`${base}, "queues": [${entry}] }`).ok;
+  expect(bad(`{ "binding": "Q", "max_batch_size": 101 }`)).toBe(false);
+  expect(bad(`{ "binding": "Q", "max_batch_size": 1.5 }`)).toBe(false);
+  expect(bad(`{ "binding": "Q", "max_batch_timeout": 61 }`)).toBe(false);
+  expect(bad(`{ "binding": "Q", "max_retries": -1 }`)).toBe(false);
+  expect(bad(`{ "binding": "Q", "retry_delay": "5" }`)).toBe(false);
+  expect(bad(`{ "binding": "Q", "queue": "Not_A_Name" }`)).toBe(false);
+  expect(bad(`{ "binding": "Q", "queue": "q", "dead_letter_queue": "q" }`)).toBe(false);
+  expect(bad(`{ "binding": "Q", "queue": "q" }, { "binding": "R", "queue": "q" }`)).toBe(false);
+  expect(bad(`{ "binding": "Q", "max_concurrency": 1 }`)).toBe(false);
+});
+
+test("pinBindingId adds the id to a queue object that has none", () => {
+  const source = `{\n  "queues": [\n    { "binding": "JOBS", "queue": "jobs", "max_retries": 2 }, // jobs\n    "OTHER"\n  ]\n}`;
+  const out = pinBindingId(source, "queues", "JOBS", `queue_${id24}`);
+  expect(out).toContain(`{ "id": "queue_${id24}", "binding": "JOBS", "queue": "jobs", "max_retries": 2 }, // jobs`);
+  expect(pinBindingId(out, "queues", "JOBS", "queue_other")).toBe(out);
 });

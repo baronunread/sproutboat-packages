@@ -5751,8 +5751,181 @@ function __sbAssetResponse(path, r) {
 // object from compile.ts (a `const`, but mutable); we add the binding accessors
 // to it in place. compile.ts emits `__sbInstallBindings(env, {...})` right after
 // the `const env = {...}` line.
+// Queues from compatibility date 2026-10-31, as Cloudflare documents them:
+// - send() and sendBatch() return Promises of { metadata: { metrics } } (the queue's backlog
+//   after the send) and check their arguments with workerd's errors: a body over 128 KiB, an
+//   empty batch, more than 100 messages or 256 KiB, a batch that isn't iterable;
+// - bodies keep their content type: "json" (the default), "text", "bytes" or "v8" (structured
+//   clone, with the Durable Object storage codec), so a string that looks like JSON arrives as
+//   the same string;
+// - a message is { id, timestamp (a Date: when it was sent), body, attempts } with ack() and
+//   retry({ delaySeconds }) on its prototype; the first of ack() and retry() wins, as a
+//   message's own call wins over ackAll() and retryAll(); a batch has queue (the queue's name),
+//   messages and metadata;
+// - by default a message is retried at once, 3 times, then dropped (or moved to the dead
+//   letter queue); earlier dates wait 5 s and try 5 times.
+// The queue name and consumer settings (bindings.queueConfig, from `queues` in
+// sproutboat.jsonc) apply at every date: they are opt-in.
+function __sbQueuesStrict() {
+  return globalThis.__sbCompat >= "2026-10-31";
+}
+
+// binding -> { binding, queue, maxBatchSize?, maxBatchTimeout?, maxRetries?, retryDelay?, deadLetterQueue? }
+var __sbQueueConf = {};
+// queue name -> the binding that stores it
+var __sbQueueByName = {};
+function __sbQueueSetup(bindings) {
+  const queues = bindings.queues || [];
+  const config = bindings.queueConfig || [];
+  for (let i = 0; i < queues.length; i++) __sbQueueConf[queues[i]] = { binding: queues[i], queue: queues[i] };
+  for (let i = 0; i < config.length; i++)
+    if (config[i] && __sbQueueConf[config[i].binding]) __sbQueueConf[config[i].binding] = config[i];
+  for (let i = 0; i < queues.length; i++) __sbQueueByName[__sbQueueConf[queues[i]].queue] = queues[i];
+}
+function __sbQueueSettings(binding) {
+  return __sbQueueConf[binding] || { binding, queue: binding };
+}
+// Where the queue named `name` is stored: its binding, or "#name" for a dead letter queue
+// this worker doesn't bind (its messages wait there; "#" can't begin a binding name).
+function __sbQueuePart(name) {
+  return __sbQueueByName[name] || "#" + name;
+}
+
+const __sbQueueTag = "#sbq1:";
+const __sbQueueMaxMessage = 128 * 1024;
+const __sbQueueMaxBatch = 256 * 1024;
+
+function __sbQueueBytesOf(value) {
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  return null;
+}
+function __sbQueueTypeName(value) {
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- workerd's error names the received type
+  return value === null ? "null" : typeof value;
+}
+
+// A body as the stored text "#sbq1:TYPE:PAYLOAD", and its size as Queues counts it.
+function __sbQueueEncode(body, contentType) {
+  const type = contentType === undefined ? "json" : contentType;
+  let payload;
+  let size;
+  if (type === "json") {
+    if (body === undefined) throw new TypeError("Message body cannot be undefined");
+    try {
+      payload = JSON.stringify(body);
+    } catch (error) {
+      if (error instanceof TypeError && /BigInt/i.test(String(error.message)))
+        throw new TypeError("Do not know how to serialize a BigInt");
+      throw error;
+    }
+    if (payload === undefined) throw new TypeError("Message body cannot be undefined");
+    size = new TextEncoder().encode(payload).length;
+  } else if (type === "text") {
+    if (!__sbIsStr(body))
+      throw new TypeError('Content Type "text" requires a value of type string, but received: ' + __sbQueueTypeName(body));
+    payload = body;
+    size = new TextEncoder().encode(body).length;
+  } else if (type === "bytes") {
+    const bytes = __sbQueueBytesOf(body);
+    if (bytes === null)
+      throw new TypeError('Content Type "bytes" requires a value of type ArrayBuffer, but received: ' + __sbQueueTypeName(body));
+    payload = __sbDOHex(bytes);
+    size = bytes.length;
+  } else if (type === "v8") {
+    payload = JSON.stringify(__sbDOPack(body, []));
+    size = new TextEncoder().encode(payload).length;
+  } else throw new TypeError("Unsupported queue message content type: " + type);
+  if (size > __sbQueueMaxMessage)
+    throw new Error("Queue send failed: message is " + size + " bytes, over the limit of " + __sbQueueMaxMessage);
+  return { text: __sbQueueTag + type + ":" + payload, size };
+}
+
+// Reads both formats at every date: tagged (2026-10-31 sends) and the earlier text.
+function __sbQueueDecode(raw) {
+  if (__sbIsStr(raw) && raw.indexOf(__sbQueueTag) === 0) {
+    const rest = raw.slice(__sbQueueTag.length);
+    const colon = rest.indexOf(":");
+    const type = rest.slice(0, colon);
+    const payload = rest.slice(colon + 1);
+    if (type === "text") return payload;
+    if (type === "json") return JSON.parse(payload);
+    if (type === "bytes") return __sbDOUnhex(payload).buffer;
+    if (type === "v8") return __sbDOUnpack(JSON.parse(payload));
+  }
+  return __sbTryParse(raw);
+}
+
+function __sbQueueMetrics(metrics) {
+  const m = metrics || {};
+  const oldest = Number(m.oldestMessageTimestamp) || 0;
+  return {
+    backlogCount: Number(m.backlogCount) || 0,
+    backlogBytes: Number(m.backlogBytes) || 0,
+    // Milliseconds since the epoch, as Cloudflare documents it; none for an empty queue.
+    oldestMessageTimestamp: oldest > 0 ? oldest : undefined,
+  };
+}
+
+function __sbQueueDelay(value) {
+  return value == null ? 0 : Math.max(0, Number(value) || 0);
+}
+
+function __sbMakeQueue(binding) {
+  return {
+    send(body, options) {
+      try {
+        const o = options || {};
+        const encoded = __sbQueueEncode(body, o.contentType);
+        const reply = __sbRpc("queue.send", {
+          queue: binding,
+          body: encoded.text,
+          delaySeconds: __sbQueueDelay(o.delaySeconds),
+          metrics: true,
+        });
+        return Promise.resolve({ metadata: { metrics: __sbQueueMetrics(reply.metrics) } });
+      } catch (error) {
+        return Promise.reject(error);
+      }
+    },
+    sendBatch(messages, options) {
+      try {
+        if (messages == null || !__sbIsFn(messages[Symbol.iterator]))
+          throw new TypeError("Failed to execute 'sendBatch' on 'WorkerQueue': parameter 1 is not of type 'Sequence'.");
+        const batchDelay = __sbQueueDelay(options && options.delaySeconds);
+        const list = [];
+        let total = 0;
+        for (const m of messages) {
+          const item = m || {};
+          const encoded = __sbQueueEncode(item.body, item.contentType);
+          total += encoded.size;
+          // A message delay of 0 (or none) takes the batch delay, as miniflare does.
+          list.push({ body: encoded.text, delaySeconds: __sbQueueDelay(item.delaySeconds) || batchDelay });
+        }
+        if (list.length === 0) throw new TypeError("sendBatch() requires at least one message");
+        if (list.length > 100) throw new Error("Queue sendBatch failed: " + list.length + " messages, over the limit of 100");
+        if (total > __sbQueueMaxBatch)
+          throw new Error("Queue sendBatch failed: " + total + " bytes, over the limit of " + __sbQueueMaxBatch);
+        const reply = __sbRpc("queue.send_batch", { queue: binding, messages: list, metrics: true });
+        return Promise.resolve({ metadata: { metrics: __sbQueueMetrics(reply.metrics) } });
+      } catch (error) {
+        return Promise.reject(error);
+      }
+    },
+    metrics() {
+      try {
+        return Promise.resolve(__sbQueueMetrics(__sbRpc("queue.metrics", { queue: binding }).metrics));
+      } catch (error) {
+        return Promise.reject(error);
+      }
+    },
+  };
+}
+
 globalThis.__sbInstallBindings = function (target, bindings) {
   if (!target) return;
+
+  __sbQueueSetup(bindings);
 
   for (let i = 0; i < (bindings.kv || []).length; i++) {
     const ns = bindings.kv[i];
@@ -5898,7 +6071,7 @@ globalThis.__sbInstallBindings = function (target, bindings) {
 
   for (let i = 0; i < (bindings.queues || []).length; i++) {
     const name = bindings.queues[i];
-    target[name] = {
+    target[name] = __sbQueuesStrict() ? __sbMakeQueue(name) : {
       send(body, options) {
         const o = options || {};
         __sbRpc("queue.send", {
@@ -8226,37 +8399,64 @@ globalThis.__sbEntry = function (handlers, request) {
  * timer in an embedded binary that has no broker to be delivered from.
  */
 async function __sbRunQueueBatch(handlers, body, ctx) {
+  const strict = __sbQueuesStrict();
+  const binding = String(body.queue || "");
+  const settings = __sbQueueSettings(binding);
   const acked = [];
   const retried = [];
+  // id -> seconds, from retry({ delaySeconds }) (2026-10-31)
+  const delays = {};
   let threw = false;
   const raw = body.messages || [];
   const messages = [];
-  for (let i = 0; i < raw.length; i++) {
-    const m = raw[i];
-    const msg = {
-      id: m.id,
-      timestamp: m.timestamp,
-      attempts: m.attempts || 1,
-      body: __sbTryParse(m.body),
-      ack() {
-        if (acked.indexOf(m.id) === -1) acked.push(m.id);
+  let batch;
+  if (strict) {
+    // The first of ack() and retry() on a message wins; ackAll() and retryAll() decide the
+    // messages nothing has decided yet.
+    const decided = {};
+    const ack = (id) => {
+      if (decided[id] !== true) {
+        decided[id] = true;
+        acked.push(id);
+      }
+    };
+    const retry = (id, options) => {
+      if (decided[id] !== true) {
+        decided[id] = true;
+        retried.push(id);
+        if (options && options.delaySeconds != null) delays[id] = __sbQueueDelay(options.delaySeconds);
+      }
+    };
+    for (let i = 0; i < raw.length; i++) messages.push(new __SbQueueMessage(raw[i], ack, retry));
+    batch = new __SbQueueBatch(settings.queue, messages, body.metadata, ack, retry);
+  } else {
+    for (let i = 0; i < raw.length; i++) {
+      const m = raw[i];
+      const msg = {
+        id: m.id,
+        timestamp: m.timestamp,
+        attempts: m.attempts || 1,
+        body: __sbQueueDecode(m.body),
+        ack() {
+          if (acked.indexOf(m.id) === -1) acked.push(m.id);
+        },
+        retry() {
+          if (retried.indexOf(m.id) === -1) retried.push(m.id);
+        },
+      };
+      messages.push(msg);
+    }
+    batch = {
+      queue: settings.queue,
+      messages,
+      ackAll() {
+        for (let i = 0; i < messages.length; i++) messages[i].ack();
       },
-      retry() {
-        if (retried.indexOf(m.id) === -1) retried.push(m.id);
+      retryAll() {
+        for (let i = 0; i < messages.length; i++) messages[i].retry();
       },
     };
-    messages.push(msg);
   }
-  const batch = {
-    queue: body.queue || "",
-    messages,
-    ackAll() {
-      for (let i = 0; i < messages.length; i++) messages[i].ack();
-    },
-    retryAll() {
-      for (let i = 0; i < messages.length; i++) messages[i].retry();
-    },
-  };
   try {
     const __qres = globalThis.__sbCompat >= "2026-09-28"
       ? handlers.queue(batch, globalThis.env, ctx)
@@ -8274,12 +8474,65 @@ async function __sbRunQueueBatch(handlers, body, ctx) {
   // A message neither acked nor retried is acked when the handler returns, and retried
   // when it throws, as on Workers. A throw used to ack the whole batch on the embedded
   // transport (standalone, sproutd), so a failing consumer lost its messages.
-  for (let i = 0; i < messages.length; i++) {
-    if (acked.indexOf(messages[i].id) === -1 && retried.indexOf(messages[i].id) === -1)
-      (threw ? retried : acked).push(messages[i].id);
+  for (let i = 0; i < raw.length; i++) {
+    if (acked.indexOf(raw[i].id) === -1 && retried.indexOf(raw[i].id) === -1)
+      (threw ? retried : acked).push(raw[i].id);
   }
-  return { ack: acked, retry: retried };
+  const out = { ack: acked, retry: retried };
+  // Retry delays and what happens past the last retry. Sent only where they differ from
+  // what a store does by itself (5 s, 5 attempts, then marked dead), so earlier dates
+  // without settings answer as before. A store that predates these fields (an older
+  // broker) ignores them and retries the messages listed in `retry`.
+  if (strict || settings.maxRetries !== undefined || settings.retryDelay !== undefined || settings.deadLetterQueue !== undefined) {
+    const maxRetries = settings.maxRetries !== undefined ? settings.maxRetries : strict ? 3 : 4;
+    const retryDelay = settings.retryDelay !== undefined ? settings.retryDelay : strict ? 0 : 5;
+    const attempts = {};
+    for (let i = 0; i < raw.length; i++) attempts[raw[i].id] = Number(raw[i].attempts) || 1;
+    out.delays = {};
+    out.dead = [];
+    for (let i = 0; i < retried.length; i++) {
+      const id = retried[i];
+      if (attempts[id] > maxRetries) out.dead.push(id);
+      else out.delays[id] = delays[id] !== undefined ? delays[id] : retryDelay;
+    }
+    if (out.dead.length && settings.deadLetterQueue !== undefined) out.deadLetter = __sbQueuePart(settings.deadLetterQueue);
+  }
+  return out;
 }
+
+// A delivered message and batch from 2026-10-31: their data are own properties, as in
+// workerd, and ack/retry live on the prototype, out of Object.keys().
+function __SbQueueMessage(m, ack, retry) {
+  this.id = String(m.id);
+  this.timestamp = new Date(Number(m.timestamp) || Date.now());
+  let decoded;
+  try {
+    decoded = __sbQueueDecode(m.body);
+  } catch {
+    decoded = m.body;
+  }
+  this.body = decoded;
+  this.attempts = Number(m.attempts) || 1;
+  Object.defineProperty(this, "__sbDecide", { value: { ack, retry }, enumerable: false });
+}
+__SbQueueMessage.prototype.ack = function () {
+  this.__sbDecide.ack(this.id);
+};
+__SbQueueMessage.prototype.retry = function (options) {
+  this.__sbDecide.retry(this.id, options);
+};
+function __SbQueueBatch(queue, messages, metadata, ack, retry) {
+  this.queue = queue;
+  this.messages = messages;
+  this.metadata = { metrics: __sbQueueMetrics(metadata && metadata.metrics) };
+  Object.defineProperty(this, "__sbDecide", { value: { ack, retry }, enumerable: false });
+}
+__SbQueueBatch.prototype.ackAll = function () {
+  for (let i = 0; i < this.messages.length; i++) this.__sbDecide.ack(this.messages[i].id);
+};
+__SbQueueBatch.prototype.retryAll = function (options) {
+  for (let i = 0; i < this.messages.length; i++) this.__sbDecide.retry(this.messages[i].id, options);
+};
 
 function __sbReadJson(request) {
   try {

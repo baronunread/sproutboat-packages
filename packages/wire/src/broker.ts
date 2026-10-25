@@ -48,6 +48,15 @@ export type Bindings = {
   d1: string[];
   r2: string[];
   queues: string[];
+  /** Each queue binding's name and consumer settings (`queueSettings` in @sproutboat/config).
+   *  The broker reads the batch settings; the sprout applies the retry settings. */
+  queueConfig?: Array<{
+    binding: string;
+    queue: string;
+    maxBatchSize?: number;
+    maxBatchTimeout?: number;
+    maxRetries?: number;
+  }>;
   analytics: string[];
   do: Array<{ binding: string; className: string }>;
   /** #48 — worker-to-worker: binding name -> the project it calls. */
@@ -369,6 +378,14 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         .some((c) => c.name === "claim_token")
     )
       conn.exec("ALTER TABLE mq ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''");
+    // When the message was sent (message.timestamp); 0 for messages queued before the column.
+    if (
+      !conn
+        .query<{ name: string }, []>("PRAGMA table_info(mq)")
+        .all()
+        .some((c) => c.name === "sent_at")
+    )
+      conn.exec("ALTER TABLE mq ADD COLUMN sent_at INTEGER NOT NULL DEFAULT 0");
     return conn;
   };
 
@@ -647,6 +664,20 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   const requireD1 = bound(bindings.d1, "D1 database");
   const requireR2 = bound(bindings.r2, "R2 bucket");
   const requireQueue = bound(bindings.queues, "queue");
+  /** A queue's backlog as Queues reports it: live messages, their bytes, the oldest send time. */
+  const queueBacklog = (store: Database, part: string): JsonObject => {
+    const r = store
+      .query<{ n: number; bytes: number; oldest: number | null }, [string]>(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(LENGTH(CAST(body AS BLOB))), 0) AS bytes, MIN(NULLIF(sent_at, 0)) AS oldest FROM mq WHERE queue = ? AND dead = 0",
+      )
+      .get(part);
+    return { backlogCount: r?.n ?? 0, backlogBytes: r?.bytes ?? 0, oldestMessageTimestamp: r?.oldest ?? 0 };
+  };
+  /** Where a queue partition named by the sprout lives: a bound queue, or "#name" (a dead
+   *  letter queue the sprout does not bind) in the per-broker db. */
+  const queueStore = (part: string): { store: Database; part: string } =>
+    part.startsWith("#") ? { store: db, part } : storeFor("queue", requireQueue(part));
+  const queueSettingsOf = (binding: string) => bindings.queueConfig?.find((q) => q.binding === binding);
   const requireAe = bound(bindings.analytics, "analytics dataset");
   const rateLimiterNames = bindings.ratelimiters.map((r) => r.binding);
   const requireRateLimiter = bound(rateLimiterNames, "rate limiter");
@@ -1750,21 +1781,29 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
 
       case "queue.send": {
         const { store, part: q } = storeFor("queue", requireQueue(msg.queue));
-        const at = Date.now() + Math.max(0, Number(msg.delaySeconds) || 0) * 1000;
+        const now = Date.now();
+        const at = now + Math.max(0, Number(msg.delaySeconds) || 0) * 1000;
         store
-          .query("INSERT INTO mq (queue, id, body, visible_at) VALUES (?, ?, ?, ?)")
-          .run(q, newId(), str(msg.body), at);
-        return { ok: true };
+          .query("INSERT INTO mq (queue, id, body, visible_at, sent_at) VALUES (?, ?, ?, ?, ?)")
+          .run(q, newId(), str(msg.body), at, now);
+        return msg.metrics === true ? { ok: true, metrics: queueBacklog(store, q) } : { ok: true };
       }
       case "queue.send_batch": {
         const { store, part: q } = storeFor("queue", requireQueue(msg.queue));
         const msgs = Array.isArray(msg.messages) ? msg.messages.map((m) => jsonObject(m) ?? {}) : [];
-        const ins = store.query("INSERT INTO mq (queue, id, body, visible_at) VALUES (?, ?, ?, ?)");
+        const ins = store.query("INSERT INTO mq (queue, id, body, visible_at, sent_at) VALUES (?, ?, ?, ?, ?)");
+        const now = Date.now();
         store.transaction(() => {
           for (const m of msgs)
-            ins.run(q, newId(), str(m.body), Date.now() + Math.max(0, Number(m.delaySeconds) || 0) * 1000);
+            ins.run(q, newId(), str(m.body), now + Math.max(0, Number(m.delaySeconds) || 0) * 1000, now);
         })();
-        return { ok: true, count: msgs.length };
+        return msg.metrics === true
+          ? { ok: true, count: msgs.length, metrics: queueBacklog(store, q) }
+          : { ok: true, count: msgs.length };
+      }
+      case "queue.metrics": {
+        const { store, part: q } = storeFor("queue", requireQueue(msg.queue));
+        return { ok: true, metrics: queueBacklog(store, q) };
       }
 
       case "ae.write": {
@@ -2212,18 +2251,30 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     if (!opts.sproutUrl || !dispatchEnabled() || closed) return;
     for (const binding of bindings.queues) {
       const { store, part } = storeFor("queue", binding);
+      const settings = queueSettingsOf(binding);
+      const size = Math.min(100, Math.max(1, Number(settings?.maxBatchSize) || QUEUE_BATCH));
+      const wait = Math.max(0, Number(settings?.maxBatchTimeout) || 0) * 1000;
+      // Deliveries that never came back (the sprout died or timed out each time) stop after
+      // 5 attempts, or max_retries + 1 when that is more.
+      const cap = Math.max(QUEUE_MAX_ATTEMPTS, (settings?.maxRetries ?? 3) + 1);
       const now = Date.now();
       const claim = randomBytes(24).toString("hex");
       const rows = store
         .transaction(() => {
           store
             .query("UPDATE mq SET dead = 1 WHERE queue = ? AND visible_at <= ? AND attempts >= ?")
-            .run(part, now, QUEUE_MAX_ATTEMPTS);
+            .run(part, now, cap);
           const due = store
-            .query<{ id: string; body: string; attempts: number }, [string, number, number]>(
-              "SELECT id, body, attempts FROM mq WHERE queue = ? AND dead = 0 AND visible_at <= ? ORDER BY visible_at LIMIT ?",
+            .query<
+              { id: string; body: string; attempts: number; sent_at: number; visible_at: number },
+              [string, number, number]
+            >(
+              "SELECT id, body, attempts, sent_at, visible_at FROM mq WHERE queue = ? AND dead = 0 AND visible_at <= ? ORDER BY visible_at LIMIT ?",
             )
-            .all(part, now, QUEUE_BATCH);
+            .all(part, now, size);
+          // max_batch_timeout: a batch short of max_batch_size waits until its oldest
+          // message has been due that long.
+          if (wait > 0 && due.length > 0 && due.length < size && due[0].visible_at + wait > now) return [];
           for (const row of due)
             store
               .query(
@@ -2239,14 +2290,18 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         messages: rows.map((r) => ({
           id: r.id,
           body: r.body,
-          timestamp: now,
+          timestamp: r.sent_at || now,
           attempts: r.attempts + 1,
         })),
+        metadata: { metrics: queueBacklog(store, part) },
       }).then(async (res) => {
         if (closed || !dispatchEnabled()) return;
         const claimed = new Set(rows.map((r) => r.id));
         let ack = rows.map((r) => r.id);
         let retry: string[] = [];
+        let dead: string[] = [];
+        let deadLetter = "";
+        let delays: JsonObject | null = null;
         if (res?.ok) {
           try {
             const parsed = jsonObject(parseJsonValue(await res.text()));
@@ -2254,6 +2309,11 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
               Array.isArray(v) ? v.filter(isString).filter((id) => claimed.has(id)) : null;
             ack = (parsed && ids(parsed.ack)) ?? ack;
             retry = (parsed && ids(parsed.retry)) ?? [];
+            // From runtime 0.32: retry delays, and messages past max_retries (to the dead
+            // letter queue when one is named). An older sprout sends neither.
+            dead = (parsed && ids(parsed.dead)) ?? [];
+            deadLetter = parsed && isString(parsed.deadLetter) ? parsed.deadLetter : "";
+            delays = (parsed && jsonObject(parsed.delays ?? null)) ?? null;
           } catch {
             ack = [];
             retry = rows.map((r) => r.id);
@@ -2264,19 +2324,68 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         }
         if (closed || !dispatchEnabled()) return;
         const retrySet = new Set(retry);
+        const deadSet = new Set(dead);
+        let target: { store: Database; part: string } | null = null;
+        if (dead.length && deadLetter) {
+          try {
+            target = queueStore(deadLetter);
+          } catch {
+            target = null; // not a queue this broker serves: mark them dead instead
+          }
+        }
+        // Into the dead letter queue first, then out of this one: a crash between the two
+        // leaves a copy in each rather than none.
+        if (target && target.store !== store) {
+          const moved = store.query<{ id: string; body: string; sent_at: number }, [string, string, string, number]>(
+            "SELECT id, body, sent_at FROM mq WHERE queue = ? AND id = ? AND claim_token = ? AND visible_at > ?",
+          );
+          const found = dead.flatMap((id) => moved.all(part, id, claim, Date.now()));
+          const ins = target.store.query(
+            "INSERT OR IGNORE INTO mq (queue, id, body, visible_at, sent_at) VALUES (?, ?, ?, ?, ?)",
+          );
+          const at = Date.now();
+          const into = target;
+          into.store.transaction(() => {
+            for (const r of found) ins.run(into.part, r.id, r.body, at, r.sent_at);
+          })();
+        }
         store
           .transaction(() => {
-            for (const id of ack)
-              if (!retrySet.has(id))
+            const at = Date.now();
+            for (const id of dead) {
+              if (target && target.store === store)
+                store
+                  .query(
+                    "UPDATE mq SET queue = ?, visible_at = ?, attempts = 0, claim_token = '', dead = 0 WHERE queue = ? AND id = ? AND claim_token = ? AND visible_at > ?",
+                  )
+                  .run(target.part, at, part, id, claim, at);
+              else if (target)
                 store
                   .query("DELETE FROM mq WHERE queue = ? AND id = ? AND claim_token = ? AND visible_at > ?")
-                  .run(part, id, claim, Date.now());
-            for (const id of retry)
+                  .run(part, id, claim, at);
+              else
+                store
+                  .query(
+                    "UPDATE mq SET dead = 1, claim_token = '' WHERE queue = ? AND id = ? AND claim_token = ? AND visible_at > ?",
+                  )
+                  .run(part, id, claim, at);
+            }
+            for (const id of ack)
+              if (!retrySet.has(id) && !deadSet.has(id))
+                store
+                  .query("DELETE FROM mq WHERE queue = ? AND id = ? AND claim_token = ? AND visible_at > ?")
+                  .run(part, id, claim, at);
+            for (const id of retry) {
+              if (deadSet.has(id)) continue;
+              const seconds = delays ? Number(delays[id]) : NaN;
+              const delay = Number.isFinite(seconds) ? Math.max(0, seconds) * 1000 : 5_000;
+              // With runtime delays, max_retries is the sprout's: only the delivery cap applies.
               store
                 .query(
                   "UPDATE mq SET visible_at = ?, claim_token = '', dead = CASE WHEN attempts >= ? THEN 1 ELSE 0 END WHERE queue = ? AND id = ? AND claim_token = ? AND visible_at > ?",
                 )
-                .run(Date.now() + 5_000, QUEUE_MAX_ATTEMPTS, part, id, claim, Date.now());
+                .run(at + delay, delays ? cap : QUEUE_MAX_ATTEMPTS, part, id, claim, at);
+            }
           })
           .immediate();
       });

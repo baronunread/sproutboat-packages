@@ -1025,6 +1025,67 @@ test("Queues: send enqueues; the consumer delivers a batch and acked messages ar
   await expect(b.dispatch({ op: "queue.send", queue: "NOPE", body: "x" })).rejects.toThrow("not bound");
 });
 
+test("Queues: send reports the backlog; batches carry send times, metrics and the batch settings", async () => {
+  const delivered: JsonObject[] = [];
+  const fetchImpl: FetchLike = async (_url, init) => {
+    const body = obj(parseJsonValue(String(init?.body)));
+    delivered.push(body);
+    return new Response(JSON.stringify({ ack: arr(body.messages).map((m) => obj(m).id), retry: [] }), { status: 200 });
+  };
+  const b = make({
+    bindings: {
+      queues: ["JOBS"],
+      queueConfig: [{ binding: "JOBS", queue: "jobs", maxBatchSize: 2, maxBatchTimeout: 1 }],
+    },
+    sproutUrl: "http://127.0.0.1:1/",
+    fetchImpl,
+  });
+  const before = Date.now();
+  const sent = await b.dispatch({ op: "queue.send", queue: "JOBS", body: "one", metrics: true });
+  expect(obj(sent.metrics)).toMatchObject({ backlogCount: 1, backlogBytes: 3 });
+  expect(Number(obj(sent.metrics).oldestMessageTimestamp)).toBeGreaterThanOrEqual(before);
+  expect(await b.dispatch({ op: "queue.metrics", queue: "JOBS" })).toMatchObject({ metrics: { backlogCount: 1 } });
+  // One message waits for max_batch_timeout (1 s); three fill a batch of two at once.
+  await Bun.sleep(700);
+  expect(delivered.length).toBe(0);
+  await Bun.sleep(900);
+  expect(delivered.length).toBe(1);
+  const batch = obj(delivered[0]);
+  expect(Number(obj(arr(batch.messages)[0]).timestamp)).toBeGreaterThanOrEqual(before);
+  expect(obj(obj(batch.metadata).metrics).backlogCount).toBe(1);
+  await b.dispatch({ op: "queue.send_batch", queue: "JOBS", messages: [{ body: "a" }, { body: "b" }, { body: "c" }] });
+  await Bun.sleep(600);
+  expect(arr(obj(delivered[1]).messages).length).toBe(2);
+});
+
+test("Queues: retry delays from the sprout, and messages past max_retries move to the dead letter queue", async () => {
+  const delivered: JsonObject[] = [];
+  const fetchImpl: FetchLike = async (_url, init) => {
+    const body = obj(parseJsonValue(String(init?.body)));
+    delivered.push(body);
+    const ids = arr(body.messages).map((m) => String(obj(m).id));
+    if (body.queue === "DLQ") return new Response(JSON.stringify({ ack: ids, retry: [] }), { status: 200 });
+    // The first delivery retries at once; the second sends the message to the dead letter queue.
+    const second = Number(obj(arr(body.messages)[0]).attempts) > 1;
+    return new Response(
+      JSON.stringify(
+        second
+          ? { ack: [], retry: ids, delays: {}, dead: ids, deadLetter: "DLQ" }
+          : { ack: [], retry: ids, delays: Object.fromEntries(ids.map((id) => [id, 0])), dead: [] },
+      ),
+      { status: 200 },
+    );
+  };
+  const b = make({ bindings: { queues: ["JOBS", "DLQ"] }, sproutUrl: "http://127.0.0.1:1/", fetchImpl });
+  await b.dispatch({ op: "queue.send", queue: "JOBS", body: "work" });
+  await Bun.sleep(1800);
+  expect(delivered.map((d) => [d.queue, obj(arr(d.messages)[0]).attempts, obj(arr(d.messages)[0]).body])).toEqual([
+    ["JOBS", 1, "work"],
+    ["JOBS", 2, "work"],
+    ["DLQ", 1, "work"],
+  ]);
+});
+
 test("assets.get: serves a bound file, falls back per not_found_handling", async () => {
   const dir = mkdtempSync(join(tmpdir(), "sb-assets-"));
   const assetsDir = join(dir, "assets");
