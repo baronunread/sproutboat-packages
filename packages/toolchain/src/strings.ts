@@ -277,7 +277,13 @@ export const __Porffor_strAppend = (a: any, b: any, owned: boolean): any => {
   let cap: i32 = 0;
   if (owned) Porffor.c${"`"}
 #if PORF_GC_ENABLED
-  cap = porf_gc_in_heap(aPtr) && porf_gc_is_block_start(aPtr) ? (i32)porf_gc_block_size(aPtr) : 0;
+  // by page kind: a slot bumped since the last collection has no allocation bit yet
+  if (porf_gc_in_heap(aPtr)) {
+    const u32 pg = (u32)aPtr >> PORF_GC_SPAGE_SHIFT;
+    if (porf_gc_page_kind[pg] == PORF_GC_PK_SMALL) {
+      if (((u32)aPtr - porf_gc_chunk_start(pg)) % porf_gc_pages[pg].cls == 0u) cap = (i32)porf_gc_pages[pg].cls;
+    } else if (porf_gc_page_kind[pg] == PORF_GC_PK_SPAN && ((u32)aPtr & PORF_GC_SPAGE_MASK) == 0u) cap = (i32)(porf_gc_pages[pg].aux << PORF_GC_SPAGE_SHIFT);
+  }
 #endif
   ${"`"};
   if (6 + n * unit > cap) {
@@ -304,16 +310,17 @@ export const __Porffor_strSettle = (s: any): any => {
   let smaller: i32 = 0;
   Porffor.c${"`"}
 #if PORF_GC_ENABLED
-  if (porf_gc_in_heap(ptr) && porf_gc_is_block_start(ptr)) {
+  if (porf_gc_in_heap(ptr)) {
     const u32 pg = (u32)ptr >> PORF_GC_SPAGE_SHIFT;
-    if (porf_gc_page_kind[pg] == PORF_GC_PK_SPAN) {
+    if (porf_gc_page_kind[pg] == PORF_GC_PK_SPAN && ((u32)ptr & PORF_GC_SPAGE_MASK) == 0u) {
       const u32 npg = porf_gc_pages[pg].aux;
       const u32 keep = ((u32)bytes + PORF_GC_SPAGE_MASK) >> PORF_GC_SPAGE_SHIFT;
       if (keep < npg) {
         porf_gc_release_run(pg + keep, npg - keep);
         porf_gc_pages[pg].aux = keep;
       }
-    } else if (porf_gc_page_kind[pg] == PORF_GC_PK_SMALL && (u32)bytes <= PORF_GC_MAX_SMALL) {
+    } else if (porf_gc_page_kind[pg] == PORF_GC_PK_SMALL && (u32)bytes <= PORF_GC_MAX_SMALL &&
+               ((u32)ptr - porf_gc_chunk_start(pg)) % porf_gc_pages[pg].cls == 0u) {
       smaller = porf_gc_cls_size[porf_gc_cls_lut[((u32)bytes + 7u) >> 3]] < porf_gc_pages[pg].cls;
     }
   }
