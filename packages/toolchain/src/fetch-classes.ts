@@ -280,7 +280,13 @@ export const RESPONSE_CLASS_SOURCE = String.raw`class Response {
   constructor(body = null, init = undefined) {
     const status = init?.status ?? 200;
     this.status = Number(status);
-    if (!(this.status >= 200 && this.status <= 599) || this.status != Math.floor(this.status))
+    // A WebSocket handshake answer (from compatibility date 2026-10-30, where the prelude
+    // defines WebSocketPair): status 101 and the client end of a pair, as in workerd.
+    const webSocket = globalThis.WebSocketPair != null ? init?.webSocket : null;
+    if (webSocket != null) {
+      if (this.status != 101) throw new RangeError('Responses with a WebSocket must have status code 101.');
+      this._webSocket = webSocket;
+    } else if (!(this.status >= 200 && this.status <= 599) || this.status != Math.floor(this.status))
       throw new RangeError('Response status must be between 200 and 599, got ' + status);
     if (body != null && (this.status == 101 || this.status == 204 || this.status == 205 || this.status == 304))
       throw new TypeError('Response with null body status cannot have body');
@@ -299,6 +305,8 @@ export const RESPONSE_CLASS_SOURCE = String.raw`class Response {
   get statusText() { return this._statusText ?? ''; }
   get type() { return this._type ?? 'default'; }
   get ok() { return this.status >= 200 && this.status < 300; }
+  // null when there is none, as in workerd; before 2026-10-30 (no WebSocketPair) undefined.
+  get webSocket() { return this._webSocket != null ? this._webSocket : globalThis.WebSocketPair != null ? null : undefined; }
   get body() { return Request._bodyAsStream(this); }
   set body(value) { this._bodyInit = value; this._bodyStream = null; }
   get bodyUsed() { return Request._used(this); }
