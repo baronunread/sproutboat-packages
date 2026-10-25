@@ -18,12 +18,18 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
   const source = join(root, `porffor-${PORFFOR_COMMIT_FULL}`);
   const files = {
     "runtime/index.js": "fixture:runtime/index.js\n",
-    "compiler/render.js": NATIVE_BYTES_RENDER_ANCHOR + "// sb_native_utf8_scalar_v1\n" +
+    "compiler/render.js":
+      NATIVE_BYTES_RENDER_ANCHOR +
+      "// sb_native_utf8_scalar_v1\n" +
       "static void porf_gc_cons_candidate(u32 c);\n" +
+      // patchIdleTrim's anchor.
+      "  const u32 keep_slack = ${prefs.nativeFetch ? '0u' : '16u * 1024u * 1024u'};\n" +
       // Both conservative scanners consume raw f64 values.
-      ("    if (d > 0.0 && d < 4294967296.0) {\n" +
+      (
+        "    if (d > 0.0 && d < 4294967296.0) {\n" +
         "      const i64 iv = (i64)d;\n" +
-        "      if ((f64)iv == d) porf_gc_cons_candidate((u32)(u64)iv);\n    }\n").repeat(2) +
+        "      if ((f64)iv == d) porf_gc_cons_candidate((u32)(u64)iv);\n    }\n"
+      ).repeat(2) +
       "static i32 porf_gc_mark_queue_cap = 0;\n    porf_gc_discard_free_runs();\n" +
       // patchGcFootprint's anchors.
       "#define PORF_GC_PF_TAIL 8u\nstatic int porf_gc_install_run(i32 ci, u32 pg) {\n" +
@@ -76,7 +82,9 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
     "compiler/builtins_precompiled.js": "fixture:precompiled\n",
     "compiler/builtins/date.ts": "export const __ecma262_ParseDTSF = (string: string) => {\n};\n",
     "compiler/builtins/arraybuffer.ts": "// maxByteLength -1 for fixed length, -2 for immutable\n",
-    "compiler/builtins/typedarray.js": NATIVE_BYTES_LAYOUT + "\n" +
+    "compiler/builtins/typedarray.js":
+      NATIVE_BYTES_LAYOUT +
+      "\n" +
       "${typedArrayFuncs.reduce((acc, x) => acc + x.replace('// @porf-typed-array\\n', '').replaceAll('Array', name).replaceAll('any[]', name) + '\\n\\n', '')}`;\n" +
       "  offset = Math.trunc(offset);\n  if (Porffor.fastOr(offset < 0, offset > len)) throw new RangeError('Offset out of bounds');\n" +
       "export const __${name}_from = (arg: any, mapFn: any): ${name} => {\n" +
@@ -180,7 +188,8 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "}\nfunction setTimeout() {}\nclass TextDecoder {\n}\n" +
       "class URL {\n  constructor(input) {\n    this.href = '';\n  }\n}\n\nclass Request {\n}\n" +
       "class Response {\n  constructor(body = null, init = undefined) {\n    this.body = body;\n    this.status = Number(init?.status ?? 200);\n    this.headers = new Headers(init?.headers);\n  }\n}\n",
-    "compiler/builtins/console.ts": "export const __Porffor_consolePrint = (arg: any): void => {\n  __Porffor_print(arg);\n};\n",
+    "compiler/builtins/console.ts":
+      "export const __Porffor_consolePrint = (arg: any): void => {\n  __Porffor_print(arg);\n};\n",
     "compiler/codegen.js":
       "if (!hoistRead && directCallOnlyFunctionBinding(scope, kind, name, pattern, func)) {\n        return valUndefined();\n}\nconst func = resolveNamedFunction(scope, name) ?? funcByName(name);\n" +
       "    // only names that are nothing but this declaration and its direct calls\n    if (find(program, n => n.name === x.id.name).length !== 1) continue;\n" +
@@ -296,9 +305,13 @@ test("the default call (no url/expectedSha256 override) never touches the networ
   // #238/#241 (out-of-range typed-array reads and writes) are upstream's own
   // integer-indexed element access since alpha-18; no codegen patch remains.
   // Request, Response, Blob and File to the Fetch spec; byte bodies sent as bytes.
-  expect(await readFile(join(dir, "runtime/native-fetch.js"), "utf8")).toContain("sproutboat: byte bodies go out as their bytes");
+  expect(await readFile(join(dir, "runtime/native-fetch.js"), "utf8")).toContain(
+    "sproutboat: byte bodies go out as their bytes",
+  );
   // Unicode case mapping, the WHATWG TextDecoder and Fetch-spec Headers.
-  expect(await readFile(join(dir, "compiler/builtins/string.ts"), "utf8")).toContain("sproutboat: Unicode case mapping");
+  expect(await readFile(join(dir, "compiler/builtins/string.ts"), "utf8")).toContain(
+    "sproutboat: Unicode case mapping",
+  );
   const globals = await readFile(join(dir, "runtime/fetch-globals.js"), "utf8");
   expect(globals).toContain("sproutboat: WHATWG UTF-8 decoder");
   expect(globals).toContain("sproutboat: Fetch-spec Headers");
@@ -310,11 +323,15 @@ test("the default call (no url/expectedSha256 override) never touches the networ
   // base64 options, Map.groupBy and non-enumerable private fields (#286) are upstream's
   // own since alpha-19; json-cycles, groupby-private, date and base64 native tests cover them.
   // Alpha 19 new Function specialization checks a function body before walking the program.
-  expect(await readFile(join(dir, "compiler/codegen.js"), "utf8")).toContain("sproutboat: body check before the whole-program walks");
+  expect(await readFile(join(dir, "compiler/codegen.js"), "utf8")).toContain(
+    "sproutboat: body check before the whole-program walks",
+  );
   // B16: String.prototype.repeat doubles its copies.
   expect(await readFile(join(dir, "compiler/builtins/string.ts"), "utf8")).toContain("sproutboat B16: doubling repeat");
   // #287: full collections under load keep their free pages; the idle collection returns them.
-  expect(await readFile(join(dir, "compiler/render.js"), "utf8")).toContain("if (porf_gc_discard_now) porf_gc_discard_free_runs(); else porf_gc_discard_pending = 1;");
+  expect(await readFile(join(dir, "compiler/render.js"), "utf8")).toContain(
+    "if (porf_gc_discard_now) porf_gc_discard_free_runs(); else porf_gc_discard_pending = 1;",
+  );
   // #256: named class expressions inside functions are rewritten at parse time.
   expect(await readFile(join(dir, "compiler/parse.js"), "utf8")).toContain("sbClassSelf(ast); // sproutboat #256");
   expect(await readFile(join(dir, "compiler/sb-class-self.js"), "utf8")).toContain("sproutboat #256");
