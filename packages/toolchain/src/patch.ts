@@ -35,6 +35,7 @@ import {
   NATIVE_BYTES_SOURCE,
 } from "./native-bytes";
 import * as streaming from "./streaming";
+import { patchCharCodeAt, patchJsonParseChars, patchRegexReplace, patchStringAppend } from "./strings";
 import { PORFFOR_COMMIT_FULL } from "./pin";
 import { PATCH_FINGERPRINT } from "./fingerprint";
 import { version as TOOLCHAIN_VERSION } from "../package.json" with { type: "json" };
@@ -2002,6 +2003,10 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchSplitGlobals(root);
   await patchStreamingRequests(root);
   await patchNativeBytes(root);
+  await patchStringAppend(root);
+  await patchRegexReplace(root);
+  await patchCharCodeAt(root);
+  await patchJsonParseChars(root);
   // Last of the builtin edits: its precompile picks up the promise, replaceAll,
   // local function and repeat patches above too.
   await precompileBuiltins(root);

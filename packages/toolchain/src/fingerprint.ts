@@ -12,6 +12,7 @@ export const PATCH_SOURCES = [
   "pin.ts",
   "request-streaming.ts",
   "streaming.ts",
+  "strings.ts",
   "text-decoder.ts",
   "unicode.ts",
   "url-class.ts",
