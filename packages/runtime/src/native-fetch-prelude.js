@@ -7042,13 +7042,17 @@ function __sbGetDOInstance(cls, idText, idObj) {
       },
     };
     // The hibernation API, from 2026-10-30 (where WebSocketPair exists).
-    const holder = { inst: null, auto: null };
+    const holder = { inst: null, auto: null, cls, id, restored: [] };
     if (__sbWsEnabled()) __sbDOWebSocketState(state, holder);
     inst = new Ctor(state, globalThis.env);
     holder.inst = inst;
     inst.__sbTasks = __sbTasks;
     inst.__sbGate = gate;
     __sbDOInstances[cacheKey] = inst;
+    // Sockets restored from hibernation start delivering now that the object exists.
+    const restored = holder.restored;
+    holder.restored = [];
+    for (let i = 0; i < restored.length; i++) __sbWsPump(restored[i]);
   }
   return inst;
 }
@@ -8103,7 +8107,7 @@ function __sbWsOp(op, id, data, n) {
         const char* __d = 0; size_t __dl = 0;
         if (porf_native_fetch_read_raw_bytes(data, &__d, &__dl) == 0) __w = sb_ws_hook('b', __id, __d, __dl, 0, 0);
         snprintf(__r, sizeof(__r), "%lld", __w);
-      } else if (__op == 't' || __op == 'c' || __op == 'o') {
+      } else if (__op == 't' || __op == 'c' || __op == 'o' || __op == 'a') {
         const char* __d; size_t __dl; char* __do = 0;
         porf_native_fetch_read_value(data, &__d, &__dl, &__do);
         __w = sb_ws_hook(__op, __id, __d, __dl, 0, __n);
@@ -8217,6 +8221,7 @@ class __SbWebSocket {
   }
   serializeAttachment(value) {
     this._attachment = value === undefined ? undefined : structuredClone(value);
+    if (this._hib !== null && this._hib.hostId > 0) __sbWsHibUpdate(this);
   }
   deserializeAttachment() {
     return this._attachment === undefined ? null : structuredClone(this._attachment);
@@ -8317,6 +8322,7 @@ function __sbWsDispatch(ws, event) {
       if (ws._peer !== null) __sbWsDeliver(ws._peer, { kind: 2, code: event.code, reason: event.reason, clean: event.clean });
     }
     ws._state = __SB_WS_CLOSED;
+    if (ws._hib !== null && ws._hib.hostId > 0) __sbWsHibForget(ws);
     if (ws._hib !== null) return __sbWsHibernated(ws, "webSocketClose", [ws, event.code, event.reason, event.clean]);
     return __sbWsFire(ws, { type: "close", code: event.code, reason: event.reason, wasClean: event.clean, target: ws });
   }
@@ -8358,13 +8364,14 @@ function __sbDOWebSocketState(state, holder) {
     for (let i = sockets.length - 1; i >= 0; i--) if (sockets[i]._state === __SB_WS_CLOSED) sockets.splice(i, 1);
     return sockets;
   };
+  __sbWsHibRestore(holder, sockets);
   state.acceptWebSocket = function (ws, tags) {
     if (!(ws instanceof __SbWebSocket)) throw new TypeError("acceptWebSocket needs a WebSocket");
     if (ws._accepted || ws._hib !== null || ws._host !== 0) throw new TypeError("This WebSocket was already accepted.");
     const list = [];
     if (tags != null) for (const t of tags) list.push(String(t));
     if (list.length > 10) throw new TypeError("A WebSocket can have at most 10 tags.");
-    ws._hib = { holder, tags: list };
+    ws._hib = { holder, tags: list, hostId: 0 };
     live().push(ws);
     __sbWsSchedule(ws);
   };
@@ -8382,6 +8389,7 @@ function __sbDOWebSocketState(state, holder) {
     if (pair != null && !(pair instanceof __SbWebSocketRequestResponsePair))
       throw new TypeError("setWebSocketAutoResponse needs a WebSocketRequestResponsePair");
     holder.auto = pair == null ? null : pair;
+    if (__sbWsHibOn()) __sbWsHibAuto(holder, live());
   };
   state.getWebSocketAutoResponse = function () {
     return holder.auto;
@@ -8415,6 +8423,7 @@ function __sbWsHostResponse(r) {
   const id = Number(__sbWsOp("o", 0, globalThis.__sbCompat, 0));
   if (!(id > 0)) return new Response("WebSockets are not supported by this host yet", { status: 501 });
   ws._host = id;
+  if (ws._peer !== null && ws._peer._hib !== null && __sbWsHibOn()) __sbWsHibRegister(ws._peer, id);
   r.headers._immutable = false;
   r.headers.set("x-sb-websocket", String(id));
   const held = ws._inbox;
@@ -8432,7 +8441,8 @@ function __sbWsPump(ws) {
     const head = __sbWsOp("p", id, "", 0);
     if (head === "") {
       const timer = setTimeout(() => __sbWsPump(ws), 2147483647);
-      __sbWsOp("w", id, "", timer);
+      // From 2026-11-01 a parked socket is not background work (z): its app may be reaped.
+      __sbWsOp(__sbWsHibOn() ? "z" : "w", id, "", timer);
       return;
     }
     const parts = head.split(" ");
@@ -8743,6 +8753,149 @@ function __sbWsProxy(r, upstream) {
   });
   r._webSocket = client;
   return r;
+}
+
+// ---------------------------------------------------------------------------
+// Hibernation, from compatibility date 2026-11-01 on a host that keeps client sockets open while
+// the worker is gone (sproutd; ops "H" "h" "a" "l" "R" "N" of sb_ws_hook). A Durable Object's
+// hibernatable socket (ctx.acceptWebSocket) whose other end is a host socket is recorded in
+// storage scoped to the object: its host id, tags, attachment, and the object's auto-response.
+// The host answers the auto-response itself and may stop the worker while the socket is idle.
+// When a message or close arrives for a socket the worker no longer knows, the host starts a
+// worker, tells it which sockets are still open ("l"), and wakes the restore loop ("R", "N"):
+// the object is constructed again (ctx.getWebSockets() lists its sockets from the start, with
+// their tags and attachments) and the event is dispatched as webSocketMessage/webSocketClose.
+let __sbWsHibHost = -1;
+function __sbWsHibOn() {
+  if (globalThis.__sbCompat < "2026-11-01" || !__sbDOGated()) return false;
+  if (__sbWsHibHost < 0 && __sbWsOp("H", 0, "", 0) === "1") __sbWsHibHost = 1;
+  return __sbWsHibHost === 1;
+}
+function __sbWsHibScope(holder) {
+  return "do:" + holder.cls + ":" + holder.id;
+}
+function __sbWsHibLoad(holder) {
+  const r = __sbRpc("do.storage.get", { cls: "__sbws", id: __sbWsHibScope(holder), key: "rec" });
+  if (r.found) {
+    try {
+      const rec = JSON.parse(r.value);
+      if (rec && rec.s) return rec;
+    } catch {
+      // A record this runtime cannot read is dropped.
+    }
+  }
+  return { s: {}, auto: null };
+}
+function __sbWsHibSave(holder, rec) {
+  __sbRpc("do.storage.put", { cls: "__sbws", id: __sbWsHibScope(holder), key: "rec", value: JSON.stringify(rec) });
+}
+function __sbWsHibIndex(id, holder) {
+  if (holder === null) __sbRpc("do.storage.delete", { cls: "__sbws", id: "index", key: "s" + id });
+  else __sbRpc("do.storage.put", { cls: "__sbws", id: "index", key: "s" + id, value: JSON.stringify([holder.cls, holder.id]) });
+}
+function __sbWsHibEntry(server) {
+  return { tags: server._hib.tags.slice(), att: server._attachment === undefined ? null : __sbDOEncode(server._attachment) };
+}
+
+// The 101 response that carries a hibernatable socket to the host went out: record it.
+function __sbWsHibRegister(server, id) {
+  const holder = server._hib.holder;
+  server._hib.hostId = id;
+  __sbWsOp("h", id, "", 0);
+  const rec = __sbWsHibLoad(holder);
+  rec.s[String(id)] = __sbWsHibEntry(server);
+  if (holder.auto !== null) {
+    rec.auto = [holder.auto.request, holder.auto.response];
+    __sbWsOp("a", id, holder.auto.request + String.fromCharCode(0) + holder.auto.response, 0);
+  }
+  __sbWsHibSave(holder, rec);
+  __sbWsHibIndex(id, holder);
+}
+function __sbWsHibUpdate(server) {
+  const holder = server._hib.holder;
+  const rec = __sbWsHibLoad(holder);
+  rec.s[String(server._hib.hostId)] = __sbWsHibEntry(server);
+  __sbWsHibSave(holder, rec);
+}
+function __sbWsHibForget(server) {
+  const id = server._hib.hostId;
+  server._hib.hostId = 0;
+  const holder = server._hib.holder;
+  const rec = __sbWsHibLoad(holder);
+  delete rec.s[String(id)];
+  __sbWsHibSave(holder, rec);
+  __sbWsHibIndex(id, null);
+}
+// setWebSocketAutoResponse: the host answers it for every socket of the object.
+function __sbWsHibAuto(holder, sockets) {
+  const rec = __sbWsHibLoad(holder);
+  rec.auto = holder.auto === null ? null : [holder.auto.request, holder.auto.response];
+  __sbWsHibSave(holder, rec);
+  const text = holder.auto === null ? "" : holder.auto.request + String.fromCharCode(0) + holder.auto.response;
+  for (let i = 0; i < sockets.length; i++) if (sockets[i]._hib.hostId > 0) __sbWsOp("a", sockets[i]._hib.hostId, text, 0);
+}
+
+// A new instance of an object: its recorded sockets that the host still holds come back as
+// hibernatable sockets, before the constructor runs. Their pumps start once the object exists
+// (holder.restored), so the first events reach webSocketMessage.
+function __sbWsHibRestore(holder, sockets) {
+  holder.restored = [];
+  if (!__sbWsHibOn()) return;
+  const rec = __sbWsHibLoad(holder);
+  let dirty = false;
+  for (const key in rec.s) {
+    const id = Number(key);
+    if (__sbWsOp("l", id, "", 0) !== "1") {
+      delete rec.s[key];
+      __sbWsHibIndex(id, null);
+      dirty = true;
+      continue;
+    }
+    const pair = new __SbWebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+    client._host = id;
+    server._hib = { holder, tags: rec.s[key].tags.slice(), hostId: id };
+    server._attachment = rec.s[key].att == null ? undefined : __sbDODecode(rec.s[key].att);
+    sockets.push(server);
+    holder.restored.push(client);
+  }
+  if (rec.auto) holder.auto = new __SbWebSocketRequestResponsePair(rec.auto[0], rec.auto[1]);
+  if (dirty) __sbWsHibSave(holder, rec);
+}
+
+// Woken by the host when an event arrives for a socket this worker has not restored.
+function __sbWsRestoreLoop() {
+  for (;;) {
+    const id = Number(__sbWsOp("N", 0, "", 0));
+    if (!(id > 0)) break;
+    try {
+      __sbWsRestoreSocket(id);
+    } catch (error) {
+      __sbLogUncaught("websocket", error);
+    }
+  }
+  const timer = setTimeout(__sbWsRestoreLoop, 2147483647);
+  __sbWsOp("R", 0, "", timer);
+}
+function __sbWsRestoreSocket(id) {
+  const r = __sbRpc("do.storage.get", { cls: "__sbws", id: "index", key: "s" + id });
+  let target = null;
+  if (r.found) {
+    try {
+      target = JSON.parse(r.value);
+    } catch {
+      target = null;
+    }
+  }
+  if (target === null) {
+    // Nothing remembers this socket (another deployment's): close it.
+    __sbWsOp("c", id, "", 1011);
+    __sbWsOp("r", id, "", 0);
+    return;
+  }
+  // Constructing the object restores its sockets (__sbWsHibRestore) and starts their pumps.
+  __sbGetDOInstance(target[0], target[1]);
 }
 
 function __sbInstallWebSockets() {
@@ -9127,6 +9280,12 @@ globalThis.__sbEntry = function (handlers, request) {
 
   // B22: a host that delivers this worker's triggers (sproutd) asks it to deliver the queue
   // messages and alarms that are due; the embedded transport answers.
+  // Hibernated WebSockets (2026-11-01): the host woke this worker for one; park the restore timer.
+  if (trigger === "websocket") {
+    if (__sbWsHibOn()) __sbWsRestoreLoop();
+    return new Response(null, { status: 204 });
+  }
+
   if (trigger === "due") return __sbRunLocalDue();
 
   return new Response("unknown trigger", { status: 400 });
