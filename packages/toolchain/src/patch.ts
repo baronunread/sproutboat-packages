@@ -367,6 +367,26 @@ const PROMISE_NULL_INJECT =
   "  if (Porffor.type(value) == Porffor.TYPES.object && value != null) {\n    // cheap prototype-chain probe for 'then'";
 const PROMISE_NULL_MARKER = "sproutboat #168: null is object-typed";
 
+// An unhandled rejection must not end the process. __Porffor_promise_runJobs throws the
+// reason of a rejected promise nobody handled, and that throw unwinds out of the event loop
+// into the host's "Uncaught ..." exit(1). On Workers it is a report (a log line and an
+// "unhandledrejection" event) and everything else keeps running, so a D1 or KV call that
+// failed and was never awaited kills every in-flight request here and nothing there. Call the
+// prelude's globalThis.__sbOnUnhandledRejection(reason, promise) when it exists; a program
+// without it (plain Porffor) keeps the throw.
+const UNHANDLED_ANCHOR =
+  "    if (Porffor.fastAnd(!__Porffor_promise_isHandled(p), __Porffor_promise_state(p) == 2)) {\n";
+const UNHANDLED_INJECT =
+  UNHANDLED_ANCHOR +
+  "      // sproutboat: report an unhandled rejection instead of throwing it out of the loop.\n" +
+  "      const sbHook: any = globalThis.__sbOnUnhandledRejection;\n" +
+  "      if (Porffor.type(sbHook) == Porffor.TYPES.function) {\n" +
+  "        __Porffor_promise_setHandled(p);\n" +
+  "        sbHook(__Porffor_promise_result(p), p);\n" +
+  "        continue;\n" +
+  "      }\n";
+const UNHANDLED_MARKER = "sproutboat: report an unhandled rejection";
+
 // baronunread/sproutboat#237: String.prototype.replaceAll grew its result with
 // one __Porffor_strcat per match, and each strcat copies everything so far, so
 // a 2.7 MB string with many matches took ~22 s (Node: 17 ms). Collect the
@@ -1135,6 +1155,16 @@ export async function patchPromiseResolveNull(root: string): Promise<void> {
   if (!src.includes(PROMISE_NULL_ANCHOR))
     throw new Error(`could not patch Porffor's promise resolve for null: anchor not found in ${file}`);
   await writeFile(file, src.replace(PROMISE_NULL_ANCHOR, PROMISE_NULL_INJECT));
+}
+
+/** Report an unhandled rejection through the prelude's hook instead of exiting. Before precompileBuiltins. */
+export async function patchUnhandledRejections(root: string): Promise<void> {
+  const file = resolve(root, "compiler/builtins/promise.ts");
+  const src = await readFile(file, "utf8");
+  if (src.includes(UNHANDLED_MARKER)) return;
+  if (!src.includes(UNHANDLED_ANCHOR))
+    throw new Error(`could not patch Porffor's unhandled rejections: anchor not found in ${file}`);
+  await writeFile(file, src.replace(UNHANDLED_ANCHOR, UNHANDLED_INJECT));
 }
 
 /** #237: linear String.prototype.replaceAll. Precompiled by precompileBuiltins. */
@@ -1998,6 +2028,7 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchDeferredDiscard(root);
   await patchGcFootprint(root);
   await patchPromiseResolveNull(root);
+  await patchUnhandledRejections(root);
   await patchReplaceAll(root);
   await patchLocalFunctionTypes(root);
   await patchFunctionSourcesScan(root);
