@@ -19,10 +19,7 @@ test("native ISO dates honor signed offsets, zero fields, and fractional seconds
     const porffor = await ensurePorffor({ cacheRoot: resolve(root, "cache") });
     const source = resolve(root, "date.js");
     const binary = resolve(root, "date-native");
-    await writeFile(
-      source,
-      `for (const value of ${JSON.stringify(samples)}) console.log(new Date(value).toISOString());\n`,
-    );
+    await writeFile(source, `for (const value of ${JSON.stringify(samples)}) console.log(new Date(value).toISOString());\n`);
     const compile = Bun.spawnSync(["bun", resolve(porffor, "runtime/index.js"), "native", source, "-o", binary, "-s"], {
       cwd: root,
       stdout: "pipe",

@@ -70,7 +70,8 @@ async function complete(dir: string, expectedArchive = PORFFOR_ARCHIVE_SHA256): 
     )
       return false;
     for (const file of required)
-      if (!manifest.files?.[file] || (await digest(resolve(dir, file))) !== manifest.files[file]) return false;
+      if (!manifest.files?.[file] || (await digest(resolve(dir, file))) !== manifest.files[file])
+        return false;
     return true;
   } catch {
     return false;
@@ -107,10 +108,16 @@ async function extract(archive: string, stage: string): Promise<void> {
   });
   const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
   if (code !== 0)
-    throw new PorfforToolchainError("archive", `could not extract pinned Porffor archive: ${stderr.trim()}`);
+    throw new PorfforToolchainError(
+      "archive",
+      `could not extract pinned Porffor archive: ${stderr.trim()}`,
+    );
   for (const file of required)
     if (!existsSync(resolve(stage, file)))
-      throw new PorfforToolchainError("archive", `Porffor archive is missing required file ${file}`);
+      throw new PorfforToolchainError(
+        "archive",
+        `Porffor archive is missing required file ${file}`,
+      );
 }
 
 async function waitForPublisher(dir: string, lock: string): Promise<string | null> {
@@ -139,7 +146,9 @@ export async function ensurePorffor(options: AcquireOptions = {}): Promise<strin
     return dir;
   }
   const root = resolve(
-    options.cacheRoot ?? process.env.SPROUTBOAT_TOOLCHAIN_CACHE ?? resolve(homedir(), ".cache/sproutboat"),
+    options.cacheRoot ??
+      process.env.SPROUTBOAT_TOOLCHAIN_CACHE ??
+      resolve(homedir(), ".cache/sproutboat"),
   );
   const dir = resolve(root, `porffor-${PORFFOR_COMMIT_FULL}-${PATCH_FINGERPRINT}`);
   const expected = options.expectedSha256 ?? PORFFOR_ARCHIVE_SHA256;
@@ -169,7 +178,9 @@ export async function ensurePorffor(options: AcquireOptions = {}): Promise<strin
     // rather than silently accepting it).
     const noOverride = options.url === undefined && options.expectedSha256 === undefined;
     const vendored =
-      noOverride && existsSync(vendoredPorfforArchive) && (await digest(vendoredPorfforArchive)) === expected;
+      noOverride &&
+      existsSync(vendoredPorfforArchive) &&
+      (await digest(vendoredPorfforArchive)) === expected;
     if (vendored) await writeFile(archive, await readFile(vendoredPorfforArchive));
     else
       await download(
@@ -188,17 +199,13 @@ export async function ensurePorffor(options: AcquireOptions = {}): Promise<strin
     await rm(archive, { force: true });
     await ensurePorfforPatched(stage);
     const files = Object.fromEntries(
-      await Promise.all(required.map(async (file) => [file, await digest(resolve(stage, file))] as const)),
+      await Promise.all(
+        required.map(async (file) => [file, await digest(resolve(stage, file))] as const),
+      ),
     );
     await writeFile(
       resolve(stage, ".sproutboat-complete"),
-      JSON.stringify({
-        commit: PORFFOR_COMMIT_FULL,
-        archiveSha256: actual,
-        toolchainVersion: TOOLCHAIN_VERSION,
-        patchFingerprint: PATCH_FINGERPRINT,
-        files,
-      }),
+      JSON.stringify({ commit: PORFFOR_COMMIT_FULL, archiveSha256: actual, toolchainVersion: TOOLCHAIN_VERSION, patchFingerprint: PATCH_FINGERPRINT, files }),
       { mode: 0o444 },
     );
     await rename(stage, dir);

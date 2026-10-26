@@ -4,7 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ensurePorffor } from "./acquire";
 import { ensurePorfforPatched } from "./patch";
-import { preludePath, TRANSPORT_MARKER, transportPath, wrapNativeFetchHandler } from "../../runtime/src/wrap";
+import {
+  preludePath,
+  TRANSPORT_MARKER,
+  transportPath,
+  wrapNativeFetchHandler,
+} from "../../runtime/src/wrap";
 
 // Bun tests alone cannot expose Porffor's string representations or native
 // wire encoding. Compile a real HTTP handler and compare it with Bun vectors.
@@ -56,12 +61,14 @@ test("native Unicode JSON and UTF-8 encoding preserve code points and buffer bou
       readFile(preludePath, "utf8"),
       readFile(transportPath("broker"), "utf8"),
     ]);
-    await writeFile(source, wrapNativeFetchHandler(code, prelude.replace(TRANSPORT_MARKER, transport)));
-    const compile = Bun.spawnSync(["bun", join(isolated, "runtime/index.js"), "native", source, "-o", binary, "-s"], {
-      cwd: work,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
+    await writeFile(
+      source,
+      wrapNativeFetchHandler(code, prelude.replace(TRANSPORT_MARKER, transport)),
+    );
+    const compile = Bun.spawnSync(
+      ["bun", join(isolated, "runtime/index.js"), "native", source, "-o", binary, "-s"],
+      { cwd: work, stdout: "pipe", stderr: "pipe" },
+    );
     expect(compile.exitCode, compile.stderr.toString()).toBe(0);
     const listener = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
     const port = listener.port;
@@ -82,7 +89,9 @@ test("native Unicode JSON and UTF-8 encoding preserve code points and buffer bou
     }
     expect(response).toBeDefined();
     const actual = await response!.json();
-    expect(actual.encoded).toEqual(inputs.map((input) => Array.from(new TextEncoder().encode(input))));
+    expect(actual.encoded).toEqual(
+      inputs.map((input) => Array.from(new TextEncoder().encode(input))),
+    );
     expect(actual.into).toEqual(
       inputs.map((input) =>
         Array.from({ length: 7 }, (_, size) => {
@@ -97,15 +106,7 @@ test("native Unicode JSON and UTF-8 encoding preserve code points and buffer bou
     expect(actual.lone).toEqual({ value: "\ud800" });
     expect(actual.quotedKey).toEqual({ 'quote"key': "🚤" });
     expect(actual.negatives).toEqual([true, true, true, true]);
-    expect(actual.sources).toEqual([
-      ["id", '"🚤"'],
-      ["n", "1.25"],
-      ["東京", null],
-      ["0", "-3e2"],
-      ["1", '"é"'],
-      ["l", null],
-      ["", null],
-    ]);
+    expect(actual.sources).toEqual([["id", '"🚤"'], ["n", "1.25"], ["東京", null], ["0", "-3e2"], ["1", '"é"'], ["l", null], ["", null]]);
   } finally {
     if (child) {
       child.kill(9);

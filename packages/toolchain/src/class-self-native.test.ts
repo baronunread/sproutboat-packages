@@ -35,11 +35,7 @@ test("#256: a named class expression inside a function sees itself", async () =>
     });
     expect(compile.exitCode, Buffer.from(compile.stderr).toString()).toBe(0);
     const run = Bun.spawnSync([binary], { stdout: "pipe", stderr: "pipe" });
-    const lines = Buffer.from(run.stdout)
-      .toString()
-      .replace(/\u001b\[[0-9;]*m/g, "")
-      .trim()
-      .split("\n");
+    const lines = Buffer.from(run.stdout).toString().replace(/\u001b\[[0-9;]*m/g, "").trim().split("\n");
     expect(lines).toEqual(["true 1 3 3 k 7", "ok"]);
   } finally {
     await rm(root, { recursive: true, force: true });
