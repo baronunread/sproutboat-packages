@@ -240,6 +240,14 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "      return;\n" +
       "    }\n" +
       "  }\n" +
+      "};\n" +
+      "export const __Porffor_promise_runJobs = (): void => {\n" +
+      "  while (pendingRejections.length > 0) {\n" +
+      "    const p: any = pendingRejections.pop();\n" +
+      "    if (Porffor.fastAnd(!__Porffor_promise_isHandled(p), __Porffor_promise_state(p) == 2)) {\n" +
+      "      throw __Porffor_promise_result(p);\n" +
+      "    }\n" +
+      "  }\n" +
       "};\n",
   };
   for (const [file, contents] of Object.entries(files)) {
@@ -375,6 +383,10 @@ test("the default call (no url/expectedSha256 override) never touches the networ
   // #168: the real vendored source takes the null guard on the `then` probe.
   expect(await readFile(join(dir, "compiler/builtins/promise.ts"), "utf8")).toContain(
     "if (Porffor.type(value) == Porffor.TYPES.object && value != null) {",
+  );
+  // An unhandled rejection is reported through the prelude hook, not thrown out of the loop.
+  expect(await readFile(join(dir, "compiler/builtins/promise.ts"), "utf8")).toContain(
+    "globalThis.__sbOnUnhandledRejection",
   );
 }, 60_000);
 
