@@ -66,6 +66,10 @@ export const WS_CORK_INJECT =
 export const WS_REGISTRY_ANCHOR =
   "static void write_response_value(uWS::HttpResponse<false>* res, struct jsval response, bool* aborted) {\n";
 export const WS_REGISTRY = String.raw`// sproutboat: WebSockets
+#include <deque>
+#include <vector>
+#include <string>
+#include <unordered_map>
 #include "internal/internal.h"
 static const size_t SB_WS_MAX_MESSAGE = 32u << 20;
 static const size_t SB_WS_WINDOW = 1u << 20;
