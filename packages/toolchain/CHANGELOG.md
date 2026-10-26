@@ -1,5 +1,16 @@
 # @sproutboat/toolchain
 
+## 0.19.0
+
+### Minor Changes
+
+- 85ec3fe: WebSockets on every host, and outbound WebSockets, from compatibility date `2026-11-01`:
+  
+  - **Client sockets on standalone and platform sprouts.** The native server (toolchain) carries the client end of a 101 response: it upgrades the connection, passes text and binary messages both ways, applies the 1 MiB read window, caps messages at 32 MiB (1009), and answers a close with the code and reason. A message the app sent before the 101 goes out right after it, and the app's `Sec-WebSocket-Protocol` is the one the client gets. Before 2026-11-01 these sprouts still answer a 101 with 501 (sproutd, which sets `sb_ws_hook` itself, carries them from 2026-10-30). The toolchain needs `@sproutboat/runtime` 0.33 or later.
+  - **Outbound WebSockets.** `new WebSocket(url, protocols)` (CONNECTING, then `open`, as in a browser) and `fetch(url, { headers: { Upgrade: "websocket" } })`, whose Response carries the connected socket as `response.webSocket` (call `accept()`); a server that answers the upgrade with another status is the Response. `ws`, `wss`, `http` and `https` URLs. Returning that Response from a handler relays the client's socket to the upstream. One I/O thread per socket (up to 64) connects through the egress policy, does TLS with BearSSL, and wakes the loop through the async pipe (sproutd) or the server's waker (standalone). On the embedded transport (standalone, sproutd); the broker transport (platform, `sproutboat dev`) answers `fetch` upgrades with a rejection for now.
+  - `validateHttpSyncSource(source, compatibilityDate)` accepts `WebSocket(` from 2026-11-01 and keeps refusing it before.
+  - **Hibernation, on a host that keeps client sockets open while the worker is gone (sproutd).** A Durable Object's hibernatable socket (`ctx.acceptWebSocket`) is recorded in storage scoped to the object (its id, tags, attachment, and the object's auto-response, kept current by `serializeAttachment` and `setWebSocketAutoResponse`), so the host may stop the worker while the socket is idle. When a message or close arrives, a new worker constructs the object again with `ctx.getWebSockets()` listing its sockets (tags and attachments intact) from the start of the constructor, and the event runs as `webSocketMessage` or `webSocketClose`. Socket ids are random. A host without this (standalone, platform) keeps every socket resident, as before.
+
 ## 0.18.0
 
 ### Minor Changes
