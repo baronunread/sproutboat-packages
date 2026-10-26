@@ -27,6 +27,7 @@ import {
   RESPONSE_CLASS_SOURCE,
 } from "./fetch-classes";
 import * as requestStreaming from "./request-streaming";
+import * as websockets from "./websockets";
 import {
   NATIVE_BYTES_LAYOUT,
   NATIVE_BYTES_MARKER,
@@ -1910,6 +1911,19 @@ export async function patchStreamingRequests(root: string): Promise<void> {
   await writeFile(file, src);
 }
 
+/** Client sockets in the uWebSockets shim (websockets.ts). After patchStreamingRequests. */
+export async function patchWebSockets(root: string): Promise<void> {
+  const file = resolve(root, "compiler/uwebsockets.js");
+  let src = await readFile(file, "utf8");
+  if (src.includes(websockets.WS_MARKER)) return;
+  for (const [anchor, inject] of websockets.WS_EDITS) {
+    if (src.split(anchor).length !== 2)
+      throw new Error(`could not patch Porffor's WebSockets: anchor not found in ${file}`);
+    src = src.replace(anchor, inject);
+  }
+  await writeFile(file, src);
+}
+
 /**
  * True when root is a finished cache entry that this toolchain version and patch
  * chain patched (ensurePorffor patches before it writes the manifest). The CLI calls
@@ -2002,6 +2016,7 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchZeroDelayTimers(root);
   await patchSplitGlobals(root);
   await patchStreamingRequests(root);
+  await patchWebSockets(root);
   await patchNativeBytes(root);
   await patchStringAppend(root);
   await patchRegexReplace(root);

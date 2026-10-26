@@ -4298,6 +4298,10 @@ void (*sb_host_note_hook)(const char* text, size_t length) = 0;
 // WebSockets (from 2026-10-30): set only by a host that carries client sockets (sproutd's
 // native-host-bridge.c, at init); null everywhere else. See __sbWsOp for the ops.
 long long (*sb_ws_hook)(int op, unsigned int id, const char* data, size_t length, char* out, size_t cap) = 0;
+// Outbound WebSockets (from 2026-11-01): set by the embedded transport (a constructor there);
+// null with the broker transport. Ids with the top bit set belong to it. See __sbWsOp.
+long long (*sb_wsc_hook)(int op, unsigned int id, const char* data, size_t length, size_t n, char* out, size_t cap) = 0;
+int (*sb_wsc_wakeable_hook)(void) = 0;
 
 // --- #133: SHA-2 + HMAC ---------------------------------------------------
 // Standalone links BearSSL, but a deployed sprout does not, and this inline C
@@ -6684,6 +6688,7 @@ globalThis.__sbInstallFetch = function () {
       if (globalThis.__sbCompat >= "2026-10-23") return Promise.reject(error);
       throw error;
     }
+    if (__sbWsOutboundOn() && __sbWsIsUpgrade(parts)) return __sbWsFetchUpgrade(parts);
     const send = (body) => {
       const msg = { url: parts.url, method: parts.method, headers: parts.headers, ...body };
       return __sbFetchFollowing("fetch", msg, "sproutboat fetch", parts.redirect, parts.signal);
@@ -7037,13 +7042,17 @@ function __sbGetDOInstance(cls, idText, idObj) {
       },
     };
     // The hibernation API, from 2026-10-30 (where WebSocketPair exists).
-    const holder = { inst: null, auto: null };
+    const holder = { inst: null, auto: null, cls, id, restored: [] };
     if (__sbWsEnabled()) __sbDOWebSocketState(state, holder);
     inst = new Ctor(state, globalThis.env);
     holder.inst = inst;
     inst.__sbTasks = __sbTasks;
     inst.__sbGate = gate;
     __sbDOInstances[cacheKey] = inst;
+    // Sockets restored from hibernation start delivering now that the object exists.
+    const restored = holder.restored;
+    holder.restored = [];
+    for (let i = 0; i < restored.length; i++) __sbWsPump(restored[i]);
   }
   return inst;
 }
@@ -8034,7 +8043,8 @@ function __sbStreamResponse(response) {
 // client sends arrives as if that end had sent it.
 //
 // __sbWsOp(op, id, data, n), on the host socket `id`:
-//   "o" open one (returns its id, "0" without a host), "t" send text data, "b" send the
+//   "o" open one for the app at compatibility date data (returns its id, "0" without a host or
+//   when the host does not carry sockets at that date), "t" send text data, "b" send the
 //   bytes in data, "c" close with code n and reason data, "p" poll the next event ("" for
 //   none, else "KIND LENGTH CODE": 0 text, 1 binary, 2 close, 3 connection lost), "i" take
 //   that event's payload into the Uint8Array data, "k" acknowledge n bytes dispatched,
@@ -8051,7 +8061,36 @@ function __sbWsOp(op, id, data, n) {
     const unsigned int __id = id.type == 1 && id.val > 0 ? (unsigned int)id.val : 0;
     const size_t __n = n.type == 1 && n.val > 0 ? (size_t)n.val : 0;
     char __r[64]; __r[0] = 0;
-    if (sb_ws_hook) {
+    if (__op == 'u' || __op == 'W' || (__id & 0x80000000u)) {
+      long long __w = -1;
+      if (!sb_wsc_hook) snprintf(__r, sizeof(__r), "0");
+      else if (__op == 'W') snprintf(__r, sizeof(__r), "%d", sb_wsc_wakeable_hook && sb_wsc_wakeable_hook() ? 1 : 0);
+      else if (__op == 'p') {
+        sb_wsc_hook('p', __id, 0, 0, 0, __r, sizeof(__r));
+      } else if (__op == 'i') {
+        char* __at = 0; size_t __cap = 0;
+        if (data.type == 81) {
+          const u32 __ta = (u32)data.val;
+          const int32_t __len = *(int32_t*)(MEM + __ta);
+          if (__len > 0) { __at = (char*)(MEM + *(u32*)(MEM + __ta + 4) + 4); __cap = (size_t)__len; }
+        }
+        __w = sb_wsc_hook('i', __id, 0, 0, 0, __at, __cap);
+        snprintf(__r, sizeof(__r), "%lld", __w);
+      } else if (__op == 'b') {
+        const char* __d = 0; size_t __dl = 0;
+        if (porf_native_fetch_read_raw_bytes(data, &__d, &__dl) == 0) __w = sb_wsc_hook('b', __id, __d, __dl, 0, 0, 0);
+        snprintf(__r, sizeof(__r), "%lld", __w);
+      } else if (__op == 't' || __op == 'c' || __op == 'u') {
+        const char* __d; size_t __dl; char* __do = 0;
+        porf_native_fetch_read_value(data, &__d, &__dl, &__do);
+        __w = sb_wsc_hook(__op, __id, __d, __dl, __n, 0, 0);
+        if (__do) free(__do);
+        snprintf(__r, sizeof(__r), "%lld", __w);
+      } else {
+        __w = sb_wsc_hook(__op, __id, 0, 0, __n, 0, 0);
+        snprintf(__r, sizeof(__r), "%lld", __w);
+      }
+    } else if (sb_ws_hook) {
       long long __w = -1;
       if (__op == 'p') {
         sb_ws_hook('p', __id, 0, 0, __r, sizeof(__r));
@@ -8068,7 +8107,7 @@ function __sbWsOp(op, id, data, n) {
         const char* __d = 0; size_t __dl = 0;
         if (porf_native_fetch_read_raw_bytes(data, &__d, &__dl) == 0) __w = sb_ws_hook('b', __id, __d, __dl, 0, 0);
         snprintf(__r, sizeof(__r), "%lld", __w);
-      } else if (__op == 't' || __op == 'c') {
+      } else if (__op == 't' || __op == 'c' || __op == 'o' || __op == 'a') {
         const char* __d; size_t __dl; char* __do = 0;
         porf_native_fetch_read_value(data, &__d, &__dl, &__do);
         __w = sb_ws_hook(__op, __id, __d, __dl, 0, __n);
@@ -8094,9 +8133,12 @@ const __sbWsKey = {};
 // addEventListener listeners, as workerd does. Binary messages arrive as a Blob unless
 // binaryType is "arraybuffer" (workerd's standard binary type).
 class __SbWebSocket {
-  constructor(key) {
-    // Outbound WebSockets (new WebSocket(url)) are not supported; the CLI refuses them too.
-    if (key !== __sbWsKey) throw new TypeError("WebSocket: only WebSocketPair can make a WebSocket here");
+  constructor(key, protocols) {
+    // new WebSocket(url) connects out from compatibility date 2026-11-01; before it only a
+    // WebSocketPair makes a WebSocket.
+    if (key !== __sbWsKey && !__sbWsOutboundOn()) throw new TypeError("WebSocket: only WebSocketPair can make a WebSocket here");
+    this._outbound = false;
+    this._pending = null;
     this._peer = null;
     this._accepted = false;
     this._inbox = [];
@@ -8114,6 +8156,7 @@ class __SbWebSocket {
     this.url = null;
     this.protocol = "";
     this.extensions = "";
+    if (key !== __sbWsKey) __sbWsConnectOutbound(this, key, protocols);
   }
   get readyState() {
     return this._state;
@@ -8122,13 +8165,14 @@ class __SbWebSocket {
     return 0;
   }
   accept() {
-    if (this._host !== 0) throw new TypeError("Can't accept() a WebSocket that was already used in a response.");
+    if (this._host !== 0 && !this._outbound) throw new TypeError("Can't accept() a WebSocket that was already used in a response.");
     if (this._hib !== null) throw new TypeError("Can't accept() a WebSocket that was accepted with acceptWebSocket().");
     if (this._accepted) return;
     this._accepted = true;
     __sbWsSchedule(this);
   }
   send(message) {
+    if (this._outbound) return __sbWsOutSend(this, message);
     if (!this._accepted && this._hib === null)
       throw new TypeError("You must call one of accept() or state.acceptWebSocket() on this WebSocket before sending messages.");
     if (this._closeSent) throw new TypeError("Can't call WebSocket send() after close().");
@@ -8149,6 +8193,7 @@ class __SbWebSocket {
     const text = reason === undefined ? "" : String(reason);
     if (__sbToBytes(text).length > 123)
       throw __sbCryptoError("SyntaxError", "WebSocket close reason must not be longer than 123 bytes when UTF-8 encoded.");
+    if (this._outbound) return __sbWsOutClose(this, code, text);
     if (this._closeSent) return;
     this._closeSent = true;
     this._state = this._closeSeen ? __SB_WS_CLOSED : __SB_WS_CLOSING;
@@ -8176,6 +8221,7 @@ class __SbWebSocket {
   }
   serializeAttachment(value) {
     this._attachment = value === undefined ? undefined : structuredClone(value);
+    if (this._hib !== null && this._hib.hostId > 0) __sbWsHibUpdate(this);
   }
   deserializeAttachment() {
     return this._attachment === undefined ? null : structuredClone(this._attachment);
@@ -8276,6 +8322,7 @@ function __sbWsDispatch(ws, event) {
       if (ws._peer !== null) __sbWsDeliver(ws._peer, { kind: 2, code: event.code, reason: event.reason, clean: event.clean });
     }
     ws._state = __SB_WS_CLOSED;
+    if (ws._hib !== null && ws._hib.hostId > 0) __sbWsHibForget(ws);
     if (ws._hib !== null) return __sbWsHibernated(ws, "webSocketClose", [ws, event.code, event.reason, event.clean]);
     return __sbWsFire(ws, { type: "close", code: event.code, reason: event.reason, wasClean: event.clean, target: ws });
   }
@@ -8317,13 +8364,14 @@ function __sbDOWebSocketState(state, holder) {
     for (let i = sockets.length - 1; i >= 0; i--) if (sockets[i]._state === __SB_WS_CLOSED) sockets.splice(i, 1);
     return sockets;
   };
+  __sbWsHibRestore(holder, sockets);
   state.acceptWebSocket = function (ws, tags) {
     if (!(ws instanceof __SbWebSocket)) throw new TypeError("acceptWebSocket needs a WebSocket");
     if (ws._accepted || ws._hib !== null || ws._host !== 0) throw new TypeError("This WebSocket was already accepted.");
     const list = [];
     if (tags != null) for (const t of tags) list.push(String(t));
     if (list.length > 10) throw new TypeError("A WebSocket can have at most 10 tags.");
-    ws._hib = { holder, tags: list };
+    ws._hib = { holder, tags: list, hostId: 0 };
     live().push(ws);
     __sbWsSchedule(ws);
   };
@@ -8341,6 +8389,7 @@ function __sbDOWebSocketState(state, holder) {
     if (pair != null && !(pair instanceof __SbWebSocketRequestResponsePair))
       throw new TypeError("setWebSocketAutoResponse needs a WebSocketRequestResponsePair");
     holder.auto = pair == null ? null : pair;
+    if (__sbWsHibOn()) __sbWsHibAuto(holder, live());
   };
   state.getWebSocketAutoResponse = function () {
     return holder.auto;
@@ -8364,13 +8413,17 @@ function __sbHasWebSocket(r) {
 // The client end of a 101 response becomes a host socket: marked x-sb-websocket for the
 // host (which upgrades the connection), with what the app already sent going out after it.
 function __sbWsHostResponse(r) {
+  if (r._webSocket instanceof __SbWebSocket && r._webSocket._outbound && !r._webSocket._accepted) __sbWsProxy(r, r._webSocket);
   const ws = r._webSocket;
   if (!(ws instanceof __SbWebSocket) || ws._host !== 0 || ws._accepted || ws._hib !== null) {
     return __sbErrorResponse(new TypeError("A 101 response needs the unaccepted client end of a WebSocketPair."), false);
   }
-  const id = Number(__sbWsOp("o", 0, "", 0));
+  // The compatibility date goes along: a standalone or platform server carries client sockets
+  // from 2026-11-01 only (sproutd, whose bridge ignores it, from 2026-10-30).
+  const id = Number(__sbWsOp("o", 0, globalThis.__sbCompat, 0));
   if (!(id > 0)) return new Response("WebSockets are not supported by this host yet", { status: 501 });
   ws._host = id;
+  if (ws._peer !== null && ws._peer._hib !== null && __sbWsHibOn()) __sbWsHibRegister(ws._peer, id);
   r.headers._immutable = false;
   r.headers.set("x-sb-websocket", String(id));
   const held = ws._inbox;
@@ -8388,7 +8441,8 @@ function __sbWsPump(ws) {
     const head = __sbWsOp("p", id, "", 0);
     if (head === "") {
       const timer = setTimeout(() => __sbWsPump(ws), 2147483647);
-      __sbWsOp("w", id, "", timer);
+      // From 2026-11-01 a parked socket is not background work (z): its app may be reaped.
+      __sbWsOp(__sbWsHibOn() ? "z" : "w", id, "", timer);
       return;
     }
     const parts = head.split(" ");
@@ -8416,6 +8470,432 @@ function __sbWsPump(ws) {
       return;
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Outbound WebSockets, from compatibility date 2026-11-01: new WebSocket(url, protocols) and
+// fetch(url, { headers: { Upgrade: "websocket" } }), whose Response carries the connected
+// socket as response.webSocket (call accept() on it). The transport's C code owns the
+// connection (sb_wsc_hook, the embedded transport); this end is a host socket with the ops
+// described at __sbWsOp, ids with the top bit set. Returning that Response from a handler
+// relays the socket to the client through a pair.
+function __sbWsOutboundOn() {
+  return globalThis.__sbCompat >= "2026-11-01";
+}
+let __sbWsWakeable = -1;
+function __sbWsCanWake() {
+  if (__sbWsWakeable < 0) __sbWsWakeable = __sbWsOp("W", 0, "", 0) === "1" ? 1 : 0;
+  return __sbWsWakeable === 1;
+}
+
+// ws:, wss:, http: and https: URLs, as workerd takes them.
+function __sbWsTarget(input, what) {
+  let u;
+  try {
+    u = new URL(String(input));
+  } catch {
+    throw new SyntaxError("Failed to construct '" + what + "': The URL '" + String(input) + "' is invalid.");
+  }
+  const scheme = u.protocol;
+  if (scheme !== "ws:" && scheme !== "wss:" && scheme !== "http:" && scheme !== "https:")
+    throw new SyntaxError("Failed to construct '" + what + "': The URL's scheme must be either 'http', 'https', 'ws', or 'wss'. '" + scheme.slice(0, scheme.length - 1) + "' is not allowed.");
+  if (u.hash !== "" && u.hash !== "#") throw new SyntaxError("Failed to construct '" + what + "': The URL contains a fragment identifier ('" + u.hash.slice(1) + "'). Fragment identifiers are not allowed in WebSocket URLs.");
+  const tls = scheme === "wss:" || scheme === "https:";
+  const port = u.port === "" ? (tls ? 443 : 80) : Number(u.port);
+  const path = (u.pathname === "" ? "/" : u.pathname) + u.search;
+  const hostPart = u.hostname + (u.port === "" ? "" : ":" + u.port);
+  return { tls, host: u.hostname, port, path, url: (tls ? "wss://" : "ws://") + hostPart + path };
+}
+
+// Opens the connection: the host socket's id, or 0 (outbound sockets not available here, or
+// too many open).
+function __sbWsOpen(target, protocols, headers) {
+  let lines = "";
+  if (headers != null) {
+    for (let i = 0; i < headers.length; i++) {
+      const name = String(headers[i][0]).toLowerCase();
+      const value = String(headers[i][1]);
+      if (name === "host" || name === "upgrade" || name === "connection" || name === "content-length" || name === "transfer-encoding") continue;
+      if (name.indexOf("sec-websocket-") === 0) continue;
+      if (name.indexOf("\r") >= 0 || name.indexOf("\n") >= 0 || value.indexOf("\r") >= 0 || value.indexOf("\n") >= 0) continue;
+      lines += name + ": " + value + "\r\n";
+    }
+  }
+  const spec = target.host + "\n" + target.port + "\n" + (target.tls ? "1" : "0") + "\n" + target.path + "\n" + protocols.join(",") + "\n" + lines;
+  return Number(__sbWsOp("u", 0, spec, 0));
+}
+
+function __sbWsProtocols(protocols) {
+  if (protocols === undefined) return [];
+  const list = __sbIsStr(protocols) ? [protocols] : Array.from(protocols).map(String);
+  for (let i = 0; i < list.length; i++) {
+    if (list[i] === "" || list[i].indexOf(" ") >= 0 || list[i].indexOf(",") >= 0) throw new SyntaxError("Failed to construct 'WebSocket': The subprotocol '" + list[i] + "' is invalid.");
+    if (list.indexOf(list[i]) !== i) throw new SyntaxError("Failed to construct 'WebSocket': The subprotocol '" + list[i] + "' is duplicated.");
+  }
+  return list;
+}
+
+// new WebSocket(url, protocols): CONNECTING until the handshake, then open, as in a browser.
+function __sbWsConnectOutbound(ws, input, protocols) {
+  const target = __sbWsTarget(input, "WebSocket");
+  const list = __sbWsProtocols(protocols);
+  ws._outbound = true;
+  ws._accepted = true;
+  ws._state = 0;
+  ws.url = target.url;
+  const id = __sbWsOpen(target, list, null);
+  if (!(id > 0)) {
+    ws._state = __SB_WS_CLOSED;
+    setTimeout(() => {
+      __sbWsFire(ws, { type: "error", target: ws });
+      __sbWsFire(ws, { type: "close", code: 1006, reason: "", wasClean: false, target: ws });
+    }, 0);
+    return;
+  }
+  ws._host = id;
+  __sbWsPumpOut(ws);
+}
+
+// Takes what the connection received and applies it to ws itself, then waits (a parked timer
+// the transport fires, or a short poll where nothing can wake the loop) for more.
+function __sbWsPumpOut(ws) {
+  const id = ws._host;
+  if (id === 0) return;
+  for (;;) {
+    const head = __sbWsOp("p", id, "", 0);
+    if (head === "") {
+      if (__sbWsCanWake()) {
+        const timer = setTimeout(() => __sbWsPumpOut(ws), 2147483647);
+        __sbWsOp("w", id, "", timer);
+      } else setTimeout(() => __sbWsPumpOut(ws), 15);
+      return;
+    }
+    const parts = head.split(" ");
+    const kind = Number(parts[0]);
+    const length = Number(parts[1]);
+    const bytes = new Uint8Array(length);
+    __sbWsOp("i", id, bytes, 0);
+    __sbWsOutEvent(ws, kind, Number(parts[2]), bytes, length);
+    if (ws._host === 0) return;
+  }
+}
+
+function __sbWsText(bytes, length) {
+  if (length === 0) return "";
+  let text = __sbFromUtf8Native(bytes);
+  if (text === "") text = new TextDecoder().decode(bytes);
+  return text;
+}
+
+// One event from the connection: 0 text, 1 binary, 2 close, 3 lost or never connected,
+// 4 opened, 5 the server answered the upgrade with something else (its raw head and body).
+function __sbWsOutEvent(ws, kind, code, bytes, length) {
+  const id = ws._host;
+  const pending = ws._pending;
+  if (kind === 4) {
+    ws._state = __SB_WS_OPEN;
+    ws.protocol = __sbWsText(bytes, length);
+    if (pending) {
+      ws._pending = null;
+      const headers = new Headers();
+      headers.set("upgrade", "websocket");
+      headers.set("connection", "Upgrade");
+      if (ws.protocol !== "") headers.set("sec-websocket-protocol", ws.protocol);
+      pending.resolve(new Response(null, { status: 101, webSocket: ws, headers }));
+    } else __sbWsFire(ws, { type: "open", target: ws });
+    return;
+  }
+  if (kind === 0 || kind === 1) {
+    ws._inbox.push(kind === 1 ? { kind: 1, data: bytes.buffer } : { kind: 0, data: __sbWsText(bytes, length) });
+    if (!ws._flushing) __sbWsFlush(ws);
+    __sbWsOp("k", id, "", length);
+    return;
+  }
+  ws._host = 0;
+  __sbWsOp("r", id, "", 0);
+  if (pending && (kind === 3 || kind === 5)) {
+    ws._pending = null;
+    ws._state = __SB_WS_CLOSED;
+    if (kind === 5) pending.resolve(__sbWsRefusal(code, bytes, length));
+    else pending.reject(new TypeError(__sbWsText(bytes, length) || "WebSocket connection failed"));
+    return;
+  }
+  if (kind === 3) {
+    if (ws._state === 0) __sbWsFire(ws, { type: "error", target: ws });
+    ws._inbox.push({ kind: 2, code: 1006, reason: "", clean: false });
+  } else {
+    ws._inbox.push({ kind: 2, code, reason: __sbWsText(bytes, length), clean: true });
+  }
+  ws._closeSent = true;
+  if (!ws._flushing) __sbWsFlush(ws);
+  if (ws._state !== __SB_WS_CLOSED) ws._state = __SB_WS_CLOSED;
+}
+
+// An upgrade the server refused: its answer is the Response.
+function __sbWsRefusal(status, bytes, length) {
+  let at = 0;
+  while (at + 3 < length && !(bytes[at] === 13 && bytes[at + 1] === 10 && bytes[at + 2] === 13 && bytes[at + 3] === 10)) at++;
+  const head = __sbWsText(bytes.subarray(0, at), at);
+  const headers = new Headers();
+  const lines = head.split("\r\n");
+  for (let i = 1; i < lines.length; i++) {
+    const colon = lines[i].indexOf(":");
+    if (colon > 0) headers.append(lines[i].slice(0, colon).trim(), lines[i].slice(colon + 1).trim());
+  }
+  headers.delete("content-length");
+  headers.delete("transfer-encoding");
+  headers.delete("connection");
+  const body = at + 4 < length ? bytes.slice(at + 4, length) : null;
+  return new Response(status === 204 || status === 304 ? null : body, { status, headers });
+}
+
+function __sbWsOutSend(ws, message) {
+  if (ws._state === 0) throw __sbCryptoError("InvalidStateError", "WebSocket is still in CONNECTING state.");
+  if (!ws._accepted) throw new TypeError("You must call accept() on this WebSocket before sending messages.");
+  if (ws._closeSent) throw new TypeError("Can't call WebSocket send() after close().");
+  if (ws._state === __SB_WS_CLOSED || ws._host === 0) return;
+  if (__sbIsStr(message)) __sbWsOp("t", ws._host, message, 0);
+  else if (message instanceof ArrayBuffer) __sbWsOp("b", ws._host, __sbToBytes(new Uint8Array(message)), 0);
+  else if (ArrayBuffer.isView(message)) __sbWsOp("b", ws._host, __sbToBytes(new Uint8Array(message.buffer, message.byteOffset, message.byteLength)), 0);
+  else __sbWsOp("t", ws._host, String(message), 0);
+}
+
+function __sbWsOutClose(ws, code, text) {
+  if (ws._closeSent) return;
+  ws._closeSent = true;
+  const id = ws._host;
+  if (id === 0) return;
+  if (ws._state === 0) {
+    // Still connecting: the attempt fails.
+    ws._host = 0;
+    ws._state = __SB_WS_CLOSED;
+    __sbWsOp("r", id, "", 0);
+    const pending = ws._pending;
+    ws._pending = null;
+    if (pending) pending.reject(new TypeError("WebSocket connection was closed before it opened"));
+    else setTimeout(() => {
+      __sbWsFire(ws, { type: "error", target: ws });
+      __sbWsFire(ws, { type: "close", code: 1006, reason: "", wasClean: false, target: ws });
+    }, 0);
+    return;
+  }
+  ws._state = __SB_WS_CLOSING;
+  __sbWsOp("c", id, text, code === undefined ? 1000 : code);
+  // A peer that never answers the close is dropped after a while.
+  setTimeout(() => {
+    if (ws._host !== id) return;
+    ws._host = 0;
+    __sbWsOp("r", id, "", 0);
+    ws._inbox.push({ kind: 2, code: 1006, reason: "", clean: false });
+    if (!ws._flushing) __sbWsFlush(ws);
+    ws._state = __SB_WS_CLOSED;
+  }, 10000);
+}
+
+// fetch(url, { headers: { Upgrade: "websocket" } }).
+function __sbWsIsUpgrade(parts) {
+  if (parts.method !== "GET") return false;
+  for (let i = 0; i < parts.headers.length; i++)
+    if (String(parts.headers[i][0]).toLowerCase() === "upgrade" && String(parts.headers[i][1]).toLowerCase() === "websocket") return true;
+  return false;
+}
+function __sbWsFetchUpgrade(parts) {
+  return new Promise((resolve, reject) => {
+    let target;
+    try {
+      target = __sbWsTarget(parts.url, "fetch");
+    } catch (error) {
+      reject(new TypeError(error.message));
+      return;
+    }
+    const protocols = [];
+    for (let i = 0; i < parts.headers.length; i++) {
+      if (String(parts.headers[i][0]).toLowerCase() !== "sec-websocket-protocol") continue;
+      const items = String(parts.headers[i][1]).split(",");
+      for (let j = 0; j < items.length; j++) if (items[j].trim() !== "") protocols.push(items[j].trim());
+    }
+    const ws = new __SbWebSocket(__sbWsKey);
+    ws._outbound = true;
+    ws._state = 0;
+    ws.url = target.url;
+    ws._pending = { resolve, reject };
+    const id = __sbWsOpen(target, protocols, parts.headers);
+    if (!(id > 0)) {
+      reject(new TypeError("Outbound WebSockets are not available here (too many are open, or this transport does not carry them)."));
+      return;
+    }
+    ws._host = id;
+    __sbWsPumpOut(ws);
+  });
+}
+
+// A handler returned a fetch() upgrade's Response: the client's socket and the upstream's are
+// joined through a pair, message for message and close for close.
+function __sbWsProxy(r, upstream) {
+  const pair = new __SbWebSocketPair();
+  const client = pair[0];
+  const server = pair[1];
+  server.accept();
+  upstream.accept();
+  server.binaryType = "arraybuffer";
+  upstream.binaryType = "arraybuffer";
+  server.addEventListener("message", (e) => {
+    if (upstream._state === __SB_WS_OPEN) upstream.send(e.data);
+  });
+  upstream.addEventListener("message", (e) => {
+    if (server._state === __SB_WS_OPEN) server.send(e.data);
+  });
+  server.addEventListener("close", (e) => {
+    if (upstream._state === __SB_WS_OPEN) upstream.close(e.code === 1005 || e.code === 1006 ? 1000 : e.code, e.reason);
+  });
+  upstream.addEventListener("close", (e) => {
+    if (server._state === __SB_WS_OPEN) server.close(e.code === 1005 || e.code === 1006 ? 1000 : e.code, e.reason);
+  });
+  r._webSocket = client;
+  return r;
+}
+
+// ---------------------------------------------------------------------------
+// Hibernation, from compatibility date 2026-11-01 on a host that keeps client sockets open while
+// the worker is gone (sproutd; ops "H" "h" "a" "l" "R" "N" of sb_ws_hook). A Durable Object's
+// hibernatable socket (ctx.acceptWebSocket) whose other end is a host socket is recorded in
+// storage scoped to the object: its host id, tags, attachment, and the object's auto-response.
+// The host answers the auto-response itself and may stop the worker while the socket is idle.
+// When a message or close arrives for a socket the worker no longer knows, the host starts a
+// worker, tells it which sockets are still open ("l"), and wakes the restore loop ("R", "N"):
+// the object is constructed again (ctx.getWebSockets() lists its sockets from the start, with
+// their tags and attachments) and the event is dispatched as webSocketMessage/webSocketClose.
+let __sbWsHibHost = -1;
+function __sbWsHibOn() {
+  if (globalThis.__sbCompat < "2026-11-01" || !__sbDOGated()) return false;
+  if (__sbWsHibHost < 0 && __sbWsOp("H", 0, "", 0) === "1") __sbWsHibHost = 1;
+  return __sbWsHibHost === 1;
+}
+function __sbWsHibScope(holder) {
+  return "do:" + holder.cls + ":" + holder.id;
+}
+function __sbWsHibLoad(holder) {
+  const r = __sbRpc("do.storage.get", { cls: "__sbws", id: __sbWsHibScope(holder), key: "rec" });
+  if (r.found) {
+    try {
+      const rec = JSON.parse(r.value);
+      if (rec && rec.s) return rec;
+    } catch {
+      // A record this runtime cannot read is dropped.
+    }
+  }
+  return { s: {}, auto: null };
+}
+function __sbWsHibSave(holder, rec) {
+  __sbRpc("do.storage.put", { cls: "__sbws", id: __sbWsHibScope(holder), key: "rec", value: JSON.stringify(rec) });
+}
+function __sbWsHibIndex(id, holder) {
+  if (holder === null) __sbRpc("do.storage.delete", { cls: "__sbws", id: "index", key: "s" + id });
+  else __sbRpc("do.storage.put", { cls: "__sbws", id: "index", key: "s" + id, value: JSON.stringify([holder.cls, holder.id]) });
+}
+function __sbWsHibEntry(server) {
+  return { tags: server._hib.tags.slice(), att: server._attachment === undefined ? null : __sbDOEncode(server._attachment) };
+}
+
+// The 101 response that carries a hibernatable socket to the host went out: record it.
+function __sbWsHibRegister(server, id) {
+  const holder = server._hib.holder;
+  server._hib.hostId = id;
+  __sbWsOp("h", id, "", 0);
+  const rec = __sbWsHibLoad(holder);
+  rec.s[String(id)] = __sbWsHibEntry(server);
+  if (holder.auto !== null) {
+    rec.auto = [holder.auto.request, holder.auto.response];
+    __sbWsOp("a", id, holder.auto.request + String.fromCharCode(0) + holder.auto.response, 0);
+  }
+  __sbWsHibSave(holder, rec);
+  __sbWsHibIndex(id, holder);
+}
+function __sbWsHibUpdate(server) {
+  const holder = server._hib.holder;
+  const rec = __sbWsHibLoad(holder);
+  rec.s[String(server._hib.hostId)] = __sbWsHibEntry(server);
+  __sbWsHibSave(holder, rec);
+}
+function __sbWsHibForget(server) {
+  const id = server._hib.hostId;
+  server._hib.hostId = 0;
+  const holder = server._hib.holder;
+  const rec = __sbWsHibLoad(holder);
+  delete rec.s[String(id)];
+  __sbWsHibSave(holder, rec);
+  __sbWsHibIndex(id, null);
+}
+// setWebSocketAutoResponse: the host answers it for every socket of the object.
+function __sbWsHibAuto(holder, sockets) {
+  const rec = __sbWsHibLoad(holder);
+  rec.auto = holder.auto === null ? null : [holder.auto.request, holder.auto.response];
+  __sbWsHibSave(holder, rec);
+  const text = holder.auto === null ? "" : holder.auto.request + String.fromCharCode(0) + holder.auto.response;
+  for (let i = 0; i < sockets.length; i++) if (sockets[i]._hib.hostId > 0) __sbWsOp("a", sockets[i]._hib.hostId, text, 0);
+}
+
+// A new instance of an object: its recorded sockets that the host still holds come back as
+// hibernatable sockets, before the constructor runs. Their pumps start once the object exists
+// (holder.restored), so the first events reach webSocketMessage.
+function __sbWsHibRestore(holder, sockets) {
+  holder.restored = [];
+  if (!__sbWsHibOn()) return;
+  const rec = __sbWsHibLoad(holder);
+  let dirty = false;
+  for (const key in rec.s) {
+    const id = Number(key);
+    if (__sbWsOp("l", id, "", 0) !== "1") {
+      delete rec.s[key];
+      __sbWsHibIndex(id, null);
+      dirty = true;
+      continue;
+    }
+    const pair = new __SbWebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+    client._host = id;
+    server._hib = { holder, tags: rec.s[key].tags.slice(), hostId: id };
+    server._attachment = rec.s[key].att == null ? undefined : __sbDODecode(rec.s[key].att);
+    sockets.push(server);
+    holder.restored.push(client);
+  }
+  if (rec.auto) holder.auto = new __SbWebSocketRequestResponsePair(rec.auto[0], rec.auto[1]);
+  if (dirty) __sbWsHibSave(holder, rec);
+}
+
+// Woken by the host when an event arrives for a socket this worker has not restored.
+function __sbWsRestoreLoop() {
+  for (;;) {
+    const id = Number(__sbWsOp("N", 0, "", 0));
+    if (!(id > 0)) break;
+    try {
+      __sbWsRestoreSocket(id);
+    } catch (error) {
+      __sbLogUncaught("websocket", error);
+    }
+  }
+  const timer = setTimeout(__sbWsRestoreLoop, 2147483647);
+  __sbWsOp("R", 0, "", timer);
+}
+function __sbWsRestoreSocket(id) {
+  const r = __sbRpc("do.storage.get", { cls: "__sbws", id: "index", key: "s" + id });
+  let target = null;
+  if (r.found) {
+    try {
+      target = JSON.parse(r.value);
+    } catch {
+      target = null;
+    }
+  }
+  if (target === null) {
+    // Nothing remembers this socket (another deployment's): close it.
+    __sbWsOp("c", id, "", 1011);
+    __sbWsOp("r", id, "", 0);
+    return;
+  }
+  // Constructing the object restores its sockets (__sbWsHibRestore) and starts their pumps.
+  __sbGetDOInstance(target[0], target[1]);
 }
 
 function __sbInstallWebSockets() {
@@ -8800,6 +9280,12 @@ globalThis.__sbEntry = function (handlers, request) {
 
   // B22: a host that delivers this worker's triggers (sproutd) asks it to deliver the queue
   // messages and alarms that are due; the embedded transport answers.
+  // Hibernated WebSockets (2026-11-01): the host woke this worker for one; park the restore timer.
+  if (trigger === "websocket") {
+    if (__sbWsHibOn()) __sbWsRestoreLoop();
+    return new Response(null, { status: 204 });
+  }
+
   if (trigger === "due") return __sbRunLocalDue();
 
   return new Response("unknown trigger", { status: 400 });

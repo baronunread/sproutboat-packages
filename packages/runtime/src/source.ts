@@ -10,7 +10,7 @@ const alwaysForbidden: Array<[RegExp, string]> = [
   [/^\s*import\s/m, "an import survived bundling — only static imports can be resolved at build time"],
   [/\bimport\s*\(/, "dynamic import() is not supported: nothing can resolve it at build time"],
   [/\brequire\s*\(/, "CommonJS require is not supported"],
-  [/\b(WebSocket|XMLHttpRequest)\s*\(/, "WebSocket / XMLHttpRequest are not supported"],
+  [/\bXMLHttpRequest\s*\(/, "XMLHttpRequest is not supported"],
   // baronunread/sproutboat#132 — a bare identifier match flags a *local*
   // `function process()` as readily as the global: zod v4 declares exactly
   // that (its internal `process(schema, ctx)`), so importing zod alone used
@@ -27,7 +27,10 @@ const alwaysForbidden: Array<[RegExp, string]> = [
   [/['"`]node:/, "Node, Bun, and Deno APIs are not supported"],
 ];
 
-export function validateHttpSyncSource(module: string): SourceValidation {
+/** `new WebSocket(url)` connects out from this compatibility date (earlier, only WebSocketPair makes one). */
+export const OUTBOUND_WEBSOCKET_DATE = "2026-11-01";
+
+export function validateHttpSyncSource(module: string, compatibilityDate?: string): SourceValidation {
   // `cloudflare:workers` is the one import allowed past bundling: the compiler turns it
   // into globals the same way (see inlineWorkersImports).
   const source = inlineWorkersImports(module);
@@ -46,5 +49,12 @@ export function validateHttpSyncSource(module: string): SourceValidation {
     );
   }
   for (const [pattern, message] of alwaysForbidden) if (pattern.test(source)) errors.push(message);
+  if (
+    /\bWebSocket\s*\(/.test(source) &&
+    !(compatibilityDate !== undefined && compatibilityDate >= OUTBOUND_WEBSOCKET_DATE)
+  )
+    errors.push(
+      `WebSocket() needs compatibility_date ${OUTBOUND_WEBSOCKET_DATE} or later (earlier dates have WebSocketPair only)`,
+    );
   return errors.length ? { ok: false, errors } : { ok: true };
 }

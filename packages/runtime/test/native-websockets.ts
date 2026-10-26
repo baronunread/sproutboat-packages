@@ -9,7 +9,8 @@ import { preludePath, TRANSPORT_MARKER, transportPath, wrapNativeFetchHandler } 
 // the worker is plain JavaScript and works on every host; a 101 response needs a host that
 // carries client sockets (sproutd), so a standalone sprout answers it with a 501. Before the
 // date nothing is defined. The answers below are workerd's (1.20260730.1) for the same code.
-const handler = `export default {async fetch(request) {
+const handler = `const closes = [];
+export default {async fetch(request) {
   const path = new URL(request.url).pathname;
   const tick = () => new Promise((r) => setTimeout(r, 10));
   if (path === "/shape") return Response.json([typeof WebSocketPair, typeof WebSocket, typeof WebSocketRequestResponsePair, new Response("x").webSocket]);
@@ -69,6 +70,20 @@ const handler = `export default {async fetch(request) {
     const pair = new WebSocketPair();
     try { pair[0].send("x"); return new Response("sent"); } catch (e) { return new Response(e.name + ": " + e.message); }
   }
+  if (path === "/echo" || path === "/hello" || path === "/proto" || path === "/serverclose") {
+    if (request.headers.get("Upgrade") !== "websocket") return new Response("expected websocket", { status: 426 });
+    const [client, server] = Object.values(new WebSocketPair());
+    server.accept();
+    if (path === "/hello") server.send("hello");
+    if (path === "/serverclose") server.close(4002, "server says bye");
+    if (path === "/echo") {
+      server.binaryType = "arraybuffer";
+      server.addEventListener("message", (e) => server.send(typeof e.data === "string" ? "echo:" + e.data : e.data));
+      server.addEventListener("close", (e) => closes.push([e.code, e.reason, e.wasClean]));
+    }
+    return new Response(null, { status: 101, webSocket: client, headers: path === "/proto" ? { "Sec-WebSocket-Protocol": "chat" } : {} });
+  }
+  if (path === "/closes") return Response.json(closes);
   if (path === "/upgrade") {
     const [client, server] = Object.values(new WebSocketPair());
     server.accept();
@@ -136,7 +151,7 @@ try {
     }
     throw new Error("compiled handler did not start");
   };
-  const [now, before] = await Promise.all([start("2026-10-30"), start("2026-10-29")]);
+  const [now, before, hosted] = await Promise.all([start("2026-10-30"), start("2026-10-29"), start("2026-11-01")]);
 
   assert.deepEqual(await (await fetch(`${now}/shape`)).json(), ["function", "function", "function", null]);
   assert.deepEqual(await (await fetch(`${before}/shape`)).json(), ["undefined", "undefined", "undefined", null]);
@@ -168,7 +183,75 @@ try {
   assert.equal(await upgrade.text(), "WebSockets are not supported by this host yet");
   assert.equal(await (await fetch(`${now}/bad101`)).text(), "RangeError");
   assert.equal(await (await fetch(`${before}/bad101`)).text(), "RangeError");
-  console.log("a standalone sprout answers a 101 response with 501; status 101 needs a WebSocket");
+  console.log("a standalone sprout answers a 101 response with 501 before 2026-11-01; status 101 needs a WebSocket");
+
+  // From 2026-11-01 the server carries the client end: a real WebSocket.
+  const wsBase = hosted.replace("http:", "ws:");
+  const open = (url: string, protocols?: string | string[]) =>
+    new Promise<WebSocket>((ok, fail) => {
+      const ws = protocols ? new WebSocket(url, protocols) : new WebSocket(url);
+      ws.binaryType = "arraybuffer";
+      ws.addEventListener("open", () => ok(ws), { once: true });
+      ws.addEventListener("error", () => fail(new Error("WebSocket error for " + url)), { once: true });
+    });
+  const nextMessage = (ws: WebSocket) =>
+    new Promise<MessageEvent["data"]>((ok, fail) => {
+      const t = setTimeout(() => fail(new Error("timed out waiting for a message")), 5000);
+      ws.addEventListener(
+        "message",
+        (e) => {
+          clearTimeout(t);
+          ok(e.data);
+        },
+        { once: true },
+      );
+    });
+  const closedWith = (ws: WebSocket) =>
+    new Promise<[number, string]>((ok) => ws.addEventListener("close", (e) => ok([e.code, e.reason]), { once: true }));
+
+  const echo = await open(`${wsBase}/echo`);
+  echo.send("hi");
+  assert.equal(await nextMessage(echo), "echo:hi");
+  echo.send(new Uint8Array([0, 1, 2, 255]));
+  assert.deepEqual(Array.from(new Uint8Array(await nextMessage(echo))), [0, 1, 2, 255]);
+  for (let i = 0; i < 200; i++) echo.send(String(i));
+  const many: string[] = [];
+  await new Promise<void>((done) =>
+    echo.addEventListener("message", (e) => {
+      many.push(String(e.data));
+      if (many.length === 200) done();
+    }),
+  );
+  assert.deepEqual(
+    many,
+    Array.from({ length: 200 }, (_, i) => "echo:" + i),
+  );
+  const big = "x".repeat(3 * 1024 * 1024);
+  echo.send(big);
+  const bigEcho = await nextMessage(echo);
+  assert.equal(bigEcho.length, big.length + 5);
+  const gone = closedWith(echo);
+  echo.close(4001, "bye");
+  assert.deepEqual(await gone, [4001, "bye"]);
+  await Bun.sleep(100);
+  assert.deepEqual(await (await fetch(`${hosted}/closes`)).json(), [[4001, "bye", true]]);
+  console.log("a client socket echoes text, bytes, 200 queued messages and a 3 MiB message, and closes with its code");
+
+  const hello = await open(`${wsBase}/hello`);
+  assert.equal(await nextMessage(hello), "hello");
+  hello.close();
+  const proto = await open(`${wsBase}/proto`, ["other", "chat"]);
+  assert.equal(proto.protocol, "chat");
+  proto.close();
+  const bye = await open(`${wsBase}/serverclose`);
+  assert.deepEqual(await closedWith(bye), [4002, "server says bye"]);
+  console.log("a message sent before the 101 arrives first, the app picks the protocol, and the app can close");
+
+  assert.equal((await fetch(`${hosted}/echo`)).status, 426);
+  const plain = await fetch(`${hosted}/upgrade`);
+  assert.equal(plain.status, 500);
+  assert.equal(await plain.text(), "WebSocket response to a request that is not an upgrade");
+  console.log("a plain request is not upgraded, and a 101 to one is a 500");
 } finally {
   for (const server of servers) {
     server.kill(9);

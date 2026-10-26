@@ -171,7 +171,7 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "\n" +
       "  if (body_owned) free(body_owned);\n" +
       "}\n" +
-      "int main(void) {\n  porf_native_fetch_runtime_init();\n  porf_native_fetch_static_init();\n\n  return 0;\n}\n",
+      'int main(void) {\n  porf_native_fetch_runtime_init();\n  porf_native_fetch_static_init();\n\n  uWS::App().any("/*", [](auto* res, auto* req) {\n    on_request(res, req);\n  }).run();\n  return 0;\n}\n',
     "compiler/builtins/json.ts":
       "// sb_json_utf16_v1\n" +
       "export const __Porffor_json_serialize = (_buffer: i32, value: any): i32 => {\n" +
