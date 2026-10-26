@@ -2997,10 +2997,13 @@ void sb_async_submit(u32 id, int port, int tls, char* host, char* path, char* me
 const char* sb_async_reply(u32 id) {
   return sb_async_current && sb_async_current->id == id ? sb_async_current->out : 0;
 }
+// Set by the outbound WebSocket code below (a constructor there), which this block stands without.
+static void (*sb_wsc_drain_hook)(void) = 0;
 // Host: the fd became readable. Fires each finished request's callback.
 void sb_async_drain(void) {
   char buf[64];
   while (read(sb_async_pipe[0], buf, sizeof(buf)) > 0) {}
+  if (sb_wsc_drain_hook) sb_wsc_drain_hook();
   pthread_mutex_lock(&sb_async_lock);
   sb_async_job* done = sb_async_done;
   sb_async_done = 0;
@@ -3016,6 +3019,642 @@ void sb_async_drain(void) {
   }
 }
 // ASYNC:END
+
+// WSC:BEGIN
+// Outbound WebSockets (compatibility date 2026-11-01): new WebSocket(url) and fetch() with
+// Upgrade: websocket. One I/O thread per socket connects (through sb_tcp_connect, so the
+// egress policy and a sandboxed host's egress socket apply), does the TLS handshake for wss,
+// sends the upgrade request, then multiplexes the socket with a wake pipe: frames the JS side
+// queued (already masked) go out, frames that arrive are parsed into events. The JS side polls
+// the events through the same ops as a host socket (sb_ws_hook; ids here have the top bit set):
+// 'u' connect, 't' 'b' send, 'c' close, 'p' 'i' take an event, 'k' acknowledge bytes dispatched,
+// 'w' park a timer for the next event, 'r' release. Threads touch only their own malloc'd
+// state, never the JS heap; the loop is woken through the async pipe (sproutd) or the host's
+// waker (the standalone server), then sb_async_drain() fires the parked timers.
+// Event kinds: 0 text, 1 binary, 2 close (code, reason), 3 connection lost (no close frame, or
+// it never opened: data holds the reason), 4 opened (data holds the chosen subprotocol), 5 the
+// server answered the upgrade with another status (code; data holds its head and what followed).
+#include <poll.h>
+#include <fcntl.h>
+#include <unistd.h>
+#define SB_WSC_BIT 0x80000000u
+#define SB_WSC_MAX 64
+#define SB_WSC_MAXMSG (32u << 20)
+#define SB_WSC_WINDOW (4u << 20)
+typedef struct sb_wsc_ev { struct sb_wsc_ev* next; int kind; unsigned code; char* data; size_t len; } sb_wsc_ev;
+typedef struct sb_wsc {
+  struct sb_wsc* next;
+  unsigned id;
+  pthread_mutex_t lock;
+  int wake[2];
+  sb_wsc_ev *evh, *evt;
+  unsigned waiter;
+  int wake_pending;
+  size_t unacked;
+  unsigned char* outq; size_t outq_len, outq_cap;
+  int released, finished, close_queued;
+  uint64_t rng;
+  char *host, *path, *headers, *protocols;
+  int port, tls;
+} sb_wsc;
+static pthread_mutex_t sb_wsc_lock = PTHREAD_MUTEX_INITIALIZER;
+static sb_wsc* sb_wscs = 0;
+static unsigned sb_wsc_next = 0;
+static void (*sb_wsc_waker)(void) = 0;
+void sb_async_set_waker(void (*wake)(void)) { sb_wsc_waker = wake; }
+static int sb_wsc_pipe_enabled(void) { return sb_async_pipe[0] >= 0; }
+static void sb_async_poke(void) {
+  char one = 1;
+  while (write(sb_async_pipe[1], &one, 1) < 0 && errno == EINTR) {}
+}
+
+static uint64_t sb_wsc_rand(uint64_t* s) {
+  uint64_t x = *s;
+  x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+  *s = x;
+  return x * 0x2545F4914F6CDD1DULL;
+}
+static void sb_wsc_seed(sb_wsc* c) {
+  uint64_t seed = 0;
+  int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+  if (fd >= 0) { if (read(fd, &seed, sizeof(seed)) != (ssize_t)sizeof(seed)) seed = 0; close(fd); }
+  if (!seed) { struct timeval tv; gettimeofday(&tv, 0); seed = (uint64_t)tv.tv_usec * 1000003ULL ^ (uint64_t)tv.tv_sec ^ (uint64_t)(uintptr_t)c; }
+  c->rng = seed ? seed : 88172645463325252ULL;
+}
+
+// Wakes the loop: the async pipe where the host watches it, and the host's waker.
+static void sb_wsc_signal(void) {
+  if (sb_wsc_pipe_enabled()) sb_async_poke();
+  if (sb_wsc_waker) sb_wsc_waker();
+}
+static void sb_wsc_push(sb_wsc* c, int kind, unsigned code, const char* data, size_t len) {
+  sb_wsc_ev* e = (sb_wsc_ev*)calloc(1, sizeof(sb_wsc_ev));
+  if (!e) return;
+  e->kind = kind; e->code = code; e->len = len;
+  if (len) {
+    e->data = (char*)malloc(len);
+    if (!e->data) { free(e); return; }
+    memcpy(e->data, data, len);
+  }
+  pthread_mutex_lock(&c->lock);
+  if (c->evt) c->evt->next = e; else c->evh = e;
+  c->evt = e;
+  if (kind <= 1) c->unacked += len;
+  if (c->waiter) c->wake_pending = 1;
+  pthread_mutex_unlock(&c->lock);
+  sb_wsc_signal();
+}
+static void sb_wsc_wake_thread(sb_wsc* c) {
+  char one = 1;
+  while (write(c->wake[1], &one, 1) < 0 && errno == EINTR) {}
+}
+
+// One masked client frame, appended to the socket's queue for the I/O thread.
+static int sb_wsc_frame(sb_wsc* c, int opcode, const char* data, size_t len, unsigned code, int with_code) {
+  size_t payload = len + (with_code ? 2 : 0);
+  unsigned char head[14];
+  size_t h = 0;
+  head[h++] = (unsigned char)(0x80 | opcode);
+  if (payload < 126) head[h++] = (unsigned char)(0x80 | payload);
+  else if (payload < 65536) { head[h++] = 0x80 | 126; head[h++] = (unsigned char)(payload >> 8); head[h++] = (unsigned char)payload; }
+  else { head[h++] = 0x80 | 127; for (int i = 7; i >= 0; i--) head[h++] = (unsigned char)((uint64_t)payload >> (8 * i)); }
+  pthread_mutex_lock(&c->lock);
+  uint32_t m = (uint32_t)sb_wsc_rand(&c->rng);
+  unsigned char mask[4] = { (unsigned char)m, (unsigned char)(m >> 8), (unsigned char)(m >> 16), (unsigned char)(m >> 24) };
+  memcpy(head + h, mask, 4); h += 4;
+  size_t need = c->outq_len + h + payload;
+  if (need > c->outq_cap) {
+    size_t cap = c->outq_cap ? c->outq_cap : 4096;
+    while (cap < need) cap *= 2;
+    unsigned char* grown = (unsigned char*)realloc(c->outq, cap);
+    if (!grown) { pthread_mutex_unlock(&c->lock); return -1; }
+    c->outq = grown; c->outq_cap = cap;
+  }
+  memcpy(c->outq + c->outq_len, head, h);
+  unsigned char* at = c->outq + c->outq_len + h;
+  size_t i = 0;
+  if (with_code) { at[0] = (unsigned char)(code >> 8) ^ mask[0]; at[1] = (unsigned char)code ^ mask[1]; i = 2; }
+  for (size_t k = 0; k < len; k++, i++) at[i] = (unsigned char)data[k] ^ mask[i & 3];
+  c->outq_len += h + payload;
+  pthread_mutex_unlock(&c->lock);
+  sb_wsc_wake_thread(c);
+  return 0;
+}
+
+// --- the socket the I/O thread owns: plain, or TLS through BearSSL's engine ---
+typedef struct {
+  int fd, tls;
+  br_ssl_client_context* sc;
+  br_x509_minimal_context* xc;
+  unsigned char* iobuf;
+} sb_wsio;
+
+static int sb_wsio_wait(int fd, int wakefd, short events, int ms) {
+  struct pollfd p[2];
+  p[0].fd = fd; p[0].events = fd >= 0 ? events : 0; p[0].revents = 0;
+  p[1].fd = wakefd; p[1].events = POLLIN; p[1].revents = 0;
+  int rc;
+  do { rc = poll(p, 2, ms); } while (rc < 0 && errno == EINTR);
+  if (rc < 0) return -1;
+  int out = 0;
+  if (p[0].revents & (events | POLLERR | POLLHUP)) out |= 1;
+  if (p[1].revents & POLLIN) out |= 2;
+  return out;
+}
+static void sb_wsc_drain_wake(sb_wsc* c) {
+  char buf[64];
+  while (read(c->wake[0], buf, sizeof(buf)) > 0) {}
+}
+// Writes everything in buf (the socket is non-blocking), waiting for it to drain.
+static int sb_wsio_raw_write(sb_wsio* io, const unsigned char* buf, size_t len) {
+  size_t at = 0;
+  while (at < len) {
+    ssize_t n = write(io->fd, buf + at, len - at);
+    if (n > 0) { at += (size_t)n; continue; }
+    if (n < 0 && errno == EINTR) continue;
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      struct pollfd p; p.fd = io->fd; p.events = POLLOUT; p.revents = 0;
+      int rc = poll(&p, 1, 30000);
+      if (rc <= 0) return -1;
+      continue;
+    }
+    return -1;
+  }
+  return 0;
+}
+
+// Moves bytes both ways until there is application data to hand over (returned in buf, up to
+// cap), the wake pipe fires or the timeout passes (0, or -2 for the timeout when ms >= 0), or the
+// connection ends (-1). out/outlen is application data to send first. With may_read false (the
+// reader is far behind) it only sends, and waits for the wake pipe.
+static long sb_wsio_pump(sb_wsc* c, sb_wsio* io, unsigned char* buf, size_t cap, unsigned char* out, size_t* outlen, int may_read, int ms) {
+  if (!io->tls) {
+    if (*outlen) {
+      if (sb_wsio_raw_write(io, out, *outlen) != 0) return -1;
+      *outlen = 0;
+    }
+    for (;;) {
+      if (may_read) {
+        ssize_t n = read(io->fd, buf, cap);
+        if (n > 0) return (long)n;
+        if (n == 0) return -1;
+        if (errno == EINTR) continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) return -1;
+      }
+      int w = may_read ? sb_wsio_wait(io->fd, c->wake[0], POLLIN, ms) : sb_wsio_wait(-1, c->wake[0], POLLIN, ms);
+      if (w < 0) return -1;
+      if (w & 2) return 0;
+      if (w == 0 && ms >= 0) return -2;
+    }
+  }
+  br_ssl_engine_context* eng = &io->sc->eng;
+  for (;;) {
+    unsigned st = br_ssl_engine_current_state(eng);
+    if (st & BR_SSL_CLOSED) return -1;
+    if (st & BR_SSL_SENDREC) {
+      size_t n; unsigned char* b = br_ssl_engine_sendrec_buf(eng, &n);
+      if (sb_wsio_raw_write(io, b, n) != 0) return -1;
+      br_ssl_engine_sendrec_ack(eng, n);
+      continue;
+    }
+    if ((st & BR_SSL_RECVAPP) && may_read) {
+      size_t n; unsigned char* b = br_ssl_engine_recvapp_buf(eng, &n);
+      if (n > cap) n = cap;
+      memcpy(buf, b, n);
+      br_ssl_engine_recvapp_ack(eng, n);
+      return (long)n;
+    }
+    if ((st & BR_SSL_SENDAPP) && *outlen) {
+      size_t n; unsigned char* b = br_ssl_engine_sendapp_buf(eng, &n);
+      if (n > *outlen) n = *outlen;
+      memcpy(b, out, n);
+      br_ssl_engine_sendapp_ack(eng, n);
+      memmove(out, out + n, *outlen - n);
+      *outlen -= n;
+      if (*outlen == 0) br_ssl_engine_flush(eng, 0);
+      continue;
+    }
+    // Handshaking, or waiting for the peer: read records while the reader may; else only wake.
+    int reading = (st & BR_SSL_RECVREC) && (may_read || !(st & BR_SSL_SENDAPP));
+    if (reading) {
+      size_t n; unsigned char* b = br_ssl_engine_recvrec_buf(eng, &n);
+      ssize_t got = read(io->fd, b, n);
+      if (got > 0) { br_ssl_engine_recvrec_ack(eng, (size_t)got); continue; }
+      if (got == 0) return -1;
+      if (errno == EINTR) continue;
+      if (errno != EAGAIN && errno != EWOULDBLOCK) return -1;
+    }
+    int w = sb_wsio_wait(reading ? io->fd : -1, c->wake[0], POLLIN, ms);
+    if (w < 0) return -1;
+    if (w & 2) return 0;
+    if (w == 0 && ms >= 0) return -2;
+  }
+}
+
+static int sb_wsio_open(sb_wsio* io, const char* host, int port, int tls, char* why, size_t whylen) {
+  memset(io, 0, sizeof(*io));
+  io->fd = sb_tcp_connect(host, port, why, whylen);
+  if (io->fd < 0) { if (!why[0]) snprintf(why, whylen, "could not connect to %s", host); return -1; }
+  struct timeval none; none.tv_sec = 0; none.tv_usec = 0;
+  setsockopt(io->fd, SOL_SOCKET, SO_RCVTIMEO, &none, sizeof(none));
+  setsockopt(io->fd, SOL_SOCKET, SO_SNDTIMEO, &none, sizeof(none));
+  fcntl(io->fd, F_SETFL, fcntl(io->fd, F_GETFL) | O_NONBLOCK);
+  io->tls = tls;
+  if (!tls) return 0;
+  io->sc = (br_ssl_client_context*)malloc(sizeof(br_ssl_client_context));
+  io->xc = (br_x509_minimal_context*)malloc(sizeof(br_x509_minimal_context));
+  io->iobuf = (unsigned char*)malloc(BR_SSL_BUFSIZE_BIDI);
+  if (!io->sc || !io->xc || !io->iobuf) { snprintf(why, whylen, "out of memory setting up TLS for %s", host); return -1; }
+  sb_init_anchors();
+  br_ssl_client_init_full(io->sc, io->xc, sb_all_anchors, sb_all_anchor_count);
+  br_ssl_engine_set_buffer(&io->sc->eng, io->iobuf, BR_SSL_BUFSIZE_BIDI, 1);
+  char bare[256];
+  size_t hl = strlen(host);
+  if (hl > 2 && hl < sizeof(bare) && host[0] == '[' && host[hl - 1] == ']') { memcpy(bare, host + 1, hl - 2); bare[hl - 2] = 0; }
+  else snprintf(bare, sizeof(bare), "%s", host);
+  br_ssl_client_reset(io->sc, bare, 0);
+  return 0;
+}
+static void sb_wsio_close(sb_wsio* io) {
+  if (io->fd >= 0) close(io->fd);
+  free(io->sc); free(io->xc); free(io->iobuf);
+  memset(io, 0, sizeof(*io));
+  io->fd = -1;
+}
+
+static const char sb_wsc_b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static void sb_wsc_base64(const unsigned char* in, size_t n, char* out) {
+  size_t o = 0;
+  for (size_t i = 0; i < n; i += 3) {
+    unsigned v = (unsigned)in[i] << 16 | (i + 1 < n ? (unsigned)in[i + 1] << 8 : 0) | (i + 2 < n ? in[i + 2] : 0);
+    out[o++] = sb_wsc_b64[(v >> 18) & 63];
+    out[o++] = sb_wsc_b64[(v >> 12) & 63];
+    out[o++] = i + 1 < n ? sb_wsc_b64[(v >> 6) & 63] : '=';
+    out[o++] = i + 2 < n ? sb_wsc_b64[v & 63] : '=';
+  }
+  out[o] = 0;
+}
+
+// Messages being assembled and the parser's place in a frame.
+typedef struct {
+  unsigned char* msg; size_t msg_len, msg_cap; int msg_kind, in_msg;
+  unsigned char head[14]; size_t head_got; int in_payload;
+  int opcode, fin, masked; uint64_t need, got; unsigned char mask[4];
+  unsigned char ctl[125]; size_t ctl_len;
+} sb_wsc_parser;
+
+// The connection ends with a close frame of ours and the reason for the app.
+static int sb_wsc_fail(sb_wsc* c, unsigned code) {
+  sb_wsc_frame(c, 8, 0, 0, code, 1);
+  sb_wsc_push(c, 2, code, "", 0);
+  return 1;
+}
+
+// A control frame is complete. Returns 1 when the connection is over.
+static int sb_wsc_control(sb_wsc* c, sb_wsc_parser* p) {
+  if (p->opcode == 8) {
+    unsigned code = p->ctl_len >= 2 ? ((unsigned)p->ctl[0] << 8 | p->ctl[1]) : 1005;
+    pthread_mutex_lock(&c->lock);
+    int ours = c->close_queued;
+    c->close_queued = 1;
+    pthread_mutex_unlock(&c->lock);
+    // Echo the close (unless ours went first), then report it.
+    if (!ours) sb_wsc_frame(c, 8, (const char*)p->ctl, p->ctl_len >= 2 ? 2 : 0, 0, 0);
+    sb_wsc_push(c, 2, code, p->ctl_len > 2 ? (const char*)p->ctl + 2 : "", p->ctl_len > 2 ? p->ctl_len - 2 : 0);
+    return 1;
+  }
+  if (p->opcode == 9) sb_wsc_frame(c, 10, (const char*)p->ctl, p->ctl_len, 0, 0);
+  return 0;
+}
+
+// Feeds received bytes to the parser. Returns 1 when the socket is over (a close frame, or a
+// protocol error already reported), else 0.
+static int sb_wsc_feed(sb_wsc* c, sb_wsc_parser* p, const unsigned char* in, size_t n) {
+  size_t at = 0;
+  for (;;) {
+    if (!p->in_payload) {
+      if (at >= n) break;
+      p->head[p->head_got++] = in[at++];
+      if (p->head_got < 2) continue;
+      size_t len7 = p->head[1] & 0x7f;
+      size_t hdr = 2 + (len7 == 126 ? 2 : len7 == 127 ? 8 : 0) + ((p->head[1] & 0x80) ? 4 : 0);
+      if (p->head_got < hdr) continue;
+      p->fin = p->head[0] >> 7; p->opcode = p->head[0] & 0xf; p->masked = (p->head[1] & 0x80) != 0;
+      uint64_t l = len7;
+      if (len7 == 126) l = (uint64_t)p->head[2] << 8 | p->head[3];
+      else if (len7 == 127) { l = 0; for (int i = 0; i < 8; i++) l = l << 8 | p->head[2 + i]; }
+      if (p->masked) memcpy(p->mask, p->head + hdr - 4, 4);
+      p->need = l; p->got = 0; p->ctl_len = 0; p->in_payload = 1;
+      if ((p->head[0] & 0x70) || (p->opcode > 2 && p->opcode < 8) || p->opcode > 10) return sb_wsc_fail(c, 1002);
+      if (p->opcode >= 8) { if (l > 125 || !p->fin) return sb_wsc_fail(c, 1002); }
+      else {
+        if (p->opcode == 0 ? !p->in_msg : p->in_msg) return sb_wsc_fail(c, 1002);
+        if (p->msg_len + l > SB_WSC_MAXMSG) return sb_wsc_fail(c, 1009);
+        if (p->opcode != 0) { p->msg_kind = p->opcode == 1 ? 0 : 1; p->in_msg = 1; }
+      }
+    }
+    size_t take = n - at;
+    if ((uint64_t)take > p->need - p->got) take = (size_t)(p->need - p->got);
+    if (take) {
+      const unsigned char* src = in + at;
+      if (p->opcode >= 8) {
+        memcpy(p->ctl + p->ctl_len, src, take);
+        if (p->masked) for (size_t i = 0; i < take; i++) p->ctl[p->ctl_len + i] ^= p->mask[(p->got + i) & 3];
+        p->ctl_len += take;
+      } else {
+        if (p->msg_len + take > p->msg_cap) {
+          size_t cap = p->msg_cap ? p->msg_cap : 4096;
+          while (cap < p->msg_len + take) cap *= 2;
+          unsigned char* grown = (unsigned char*)realloc(p->msg, cap);
+          if (!grown) return sb_wsc_fail(c, 1011);
+          p->msg = grown; p->msg_cap = cap;
+        }
+        memcpy(p->msg + p->msg_len, src, take);
+        if (p->masked) for (size_t i = 0; i < take; i++) p->msg[p->msg_len + i] ^= p->mask[(p->got + i) & 3];
+        p->msg_len += take;
+      }
+      p->got += take; at += take;
+    }
+    if (p->got < p->need) break;
+    if (p->opcode >= 8) { if (sb_wsc_control(c, p)) return 1; }
+    else if (p->fin) { sb_wsc_push(c, p->msg_kind, 0, (const char*)p->msg, p->msg_len); p->msg_len = 0; p->in_msg = 0; }
+    p->in_payload = 0; p->head_got = 0;
+  }
+  return 0;
+}
+
+static void sb_wsc_free(sb_wsc* c) {
+  while (c->evh) { sb_wsc_ev* e = c->evh; c->evh = e->next; free(e->data); free(e); }
+  close(c->wake[0]); close(c->wake[1]);
+  free(c->outq); free(c->host); free(c->path); free(c->headers); free(c->protocols);
+  pthread_mutex_destroy(&c->lock);
+  free(c);
+}
+
+static void* sb_wsc_thread(void* arg) {
+  sb_wsc* c = (sb_wsc*)arg;
+  sb_wsio io;
+  memset(&io, 0, sizeof(io));
+  io.fd = -1;
+  sb_wsc_parser* p = (sb_wsc_parser*)calloc(1, sizeof(sb_wsc_parser));
+  char why[512] = "";
+  unsigned char buf[16384];
+  unsigned char* wq = 0; size_t wq_len = 0, wq_cap = 0;
+  int opened = 0;
+  if (!p) goto finish;
+  if (sb_wsio_open(&io, c->host, c->port, c->tls, why, sizeof(why)) != 0) goto failed;
+  {
+    // The upgrade request.
+    unsigned char keybytes[16];
+    for (int i = 0; i < 16; i += 4) { uint32_t r = (uint32_t)sb_wsc_rand(&c->rng); memcpy(keybytes + i, &r, 4); }
+    char key[32];
+    sb_wsc_base64(keybytes, 16, key);
+    sb_buf req = { 0, 0, 0 };
+    sb_puts(&req, "GET "); sb_puts(&req, c->path); sb_puts(&req, " HTTP/1.1\r\nHost: "); sb_puts(&req, c->host);
+    if (c->port != (c->tls ? 443 : 80)) { char pt[16]; snprintf(pt, sizeof(pt), ":%d", c->port); sb_puts(&req, pt); }
+    sb_puts(&req, "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ");
+    sb_puts(&req, key);
+    sb_puts(&req, "\r\n");
+    if (c->protocols && *c->protocols) { sb_puts(&req, "Sec-WebSocket-Protocol: "); sb_puts(&req, c->protocols); sb_puts(&req, "\r\n"); }
+    if (c->headers && *c->headers) sb_puts(&req, c->headers);
+    sb_puts(&req, "\r\n");
+    size_t reqlen = req.len;
+    if (reqlen > wq_cap) { wq = (unsigned char*)malloc(reqlen); wq_cap = reqlen; }
+    if (!wq) { free(req.p); snprintf(why, sizeof(why), "out of memory"); goto failed; }
+    memcpy(wq, req.p, reqlen); wq_len = reqlen; free(req.p);
+    // The answer's head: up to the blank line; what follows it is already frame data.
+    char head[8192]; size_t head_len = 0; size_t body_at = 0; int have_head = 0;
+    unsigned char acceptwant[32];
+    {
+      br_sha1_context sh; br_sha1_init(&sh);
+      br_sha1_update(&sh, key, strlen(key));
+      br_sha1_update(&sh, "258EAFA5-E914-47DA-95CA-C5AB0DC85B11", 36);
+      unsigned char dig[20]; br_sha1_out(&sh, dig);
+      sb_wsc_base64(dig, 20, (char*)acceptwant);
+    }
+    while (!have_head) {
+      long n = sb_wsio_pump(c, &io, buf, sizeof(buf), wq, &wq_len, 1, 30000);
+      if (n == -2) { snprintf(why, sizeof(why), "timed out in the WebSocket handshake with %s", c->host); goto failed; }
+      if (n < 0) { snprintf(why, sizeof(why), "connection closed during the WebSocket handshake with %s", c->host); goto failed; }
+      if (n == 0) { pthread_mutex_lock(&c->lock); int rel = c->released; pthread_mutex_unlock(&c->lock); sb_wsc_drain_wake(c); if (rel) goto finish; continue; }
+      if (head_len + (size_t)n > sizeof(head) - 1) { snprintf(why, sizeof(why), "WebSocket handshake response too large"); goto failed; }
+      memcpy(head + head_len, buf, (size_t)n); head_len += (size_t)n;
+      for (size_t i = 3; i < head_len; i++) if (head[i - 3] == '\r' && head[i - 2] == '\n' && head[i - 1] == '\r' && head[i] == '\n') { have_head = 1; body_at = i + 1; break; }
+    }
+    head[head_len] = 0;
+    int status = 0;
+    if (sscanf(head, "HTTP/1.%*d %d", &status) != 1) {
+      snprintf(why, sizeof(why), "WebSocket handshake with %s failed: not an HTTP response", c->host);
+      goto failed;
+    }
+    // Another answer (a 401, a redirect, a 404): the app gets it as the response.
+    if (status != 101) { sb_wsc_push(c, 5, (unsigned)status, head, head_len); goto finish; }
+    head[body_at - 1] = 0;
+    char accept_got[64] = ""; char proto[256] = ""; int upgrade_ok = 0;
+    for (char* line = strstr(head, "\r\n"); line; line = strstr(line + 2, "\r\n")) {
+      char* l = line + 2;
+      if (!strncasecmp(l, "sec-websocket-accept:", 21)) { char* v = l + 21; while (*v == ' ') v++; size_t k = strcspn(v, "\r\n"); if (k < sizeof(accept_got)) { memcpy(accept_got, v, k); accept_got[k] = 0; } }
+      else if (!strncasecmp(l, "sec-websocket-protocol:", 23)) { char* v = l + 23; while (*v == ' ') v++; size_t k = strcspn(v, "\r\n"); if (k < sizeof(proto)) { memcpy(proto, v, k); proto[k] = 0; } }
+      else if (!strncasecmp(l, "upgrade:", 8)) { char* v = l + 8; while (*v == ' ') v++; if (!strncasecmp(v, "websocket", 9)) upgrade_ok = 1; }
+    }
+    if (!upgrade_ok || strcmp(accept_got, (const char*)acceptwant)) { snprintf(why, sizeof(why), "WebSocket handshake with %s failed: bad Sec-WebSocket-Accept", c->host); goto failed; }
+    opened = 1;
+    sb_wsc_push(c, 4, 0, proto, strlen(proto));
+    if (head_len > body_at && sb_wsc_feed(c, p, (const unsigned char*)head + body_at, head_len - body_at)) goto closing;
+  }
+  for (;;) {
+    pthread_mutex_lock(&c->lock);
+    int rel = c->released;
+    size_t window = c->unacked;
+    if (c->outq_len) {
+      if (wq_len + c->outq_len > wq_cap) {
+        size_t cap = wq_cap ? wq_cap : 4096;
+        while (cap < wq_len + c->outq_len) cap *= 2;
+        unsigned char* grown = (unsigned char*)realloc(wq, cap);
+        if (grown) { wq = grown; wq_cap = cap; }
+      }
+      if (wq_len + c->outq_len <= wq_cap) { memcpy(wq + wq_len, c->outq, c->outq_len); wq_len += c->outq_len; c->outq_len = 0; }
+    }
+    pthread_mutex_unlock(&c->lock);
+    if (rel) goto finish;
+    long n = sb_wsio_pump(c, &io, buf, sizeof(buf), wq, &wq_len, window < SB_WSC_WINDOW, -1);
+    if (n < 0) break;
+    if (n == 0) { sb_wsc_drain_wake(c); continue; }
+    if (sb_wsc_feed(c, p, buf, (size_t)n)) goto closing;
+  }
+  // The peer went without a close frame.
+  sb_wsc_push(c, 3, 1006, "", 0);
+  goto finish;
+closing:
+  // Our echo of the close frame is queued: let it go out, then end.
+  {
+    pthread_mutex_lock(&c->lock);
+    if (c->outq_len && wq_len + c->outq_len <= wq_cap) { memcpy(wq + wq_len, c->outq, c->outq_len); wq_len += c->outq_len; c->outq_len = 0; }
+    pthread_mutex_unlock(&c->lock);
+    if (wq_len) sb_wsio_pump(c, &io, buf, sizeof(buf), wq, &wq_len, 0, 0);
+  }
+  goto finish;
+failed:
+  if (!opened) sb_wsc_push(c, 3, 1006, why, strlen(why));
+  else sb_wsc_push(c, 3, 1006, "", 0);
+finish:
+  sb_wsio_close(&io);
+  if (p) { free(p->msg); free(p); }
+  free(wq);
+  pthread_mutex_lock(&c->lock);
+  c->finished = 1;
+  int rel = c->released;
+  pthread_mutex_unlock(&c->lock);
+  if (rel) {
+    pthread_mutex_lock(&sb_wsc_lock);
+    for (sb_wsc** at = &sb_wscs; *at; at = &(*at)->next) if (*at == c) { *at = c->next; break; }
+    pthread_mutex_unlock(&sb_wsc_lock);
+    sb_wsc_free(c);
+  }
+  return 0;
+}
+
+static sb_wsc* sb_wsc_find(unsigned id) {
+  pthread_mutex_lock(&sb_wsc_lock);
+  sb_wsc* c = sb_wscs;
+  while (c && c->id != id) c = c->next;
+  pthread_mutex_unlock(&sb_wsc_lock);
+  return c;
+}
+
+// Host: fires the timers parked for sockets that have events.
+static void sb_wsc_drain(void) {
+  for (;;) {
+    unsigned timer = 0;
+    pthread_mutex_lock(&sb_wsc_lock);
+    for (sb_wsc* c = sb_wscs; c; c = c->next) {
+      pthread_mutex_lock(&c->lock);
+      if (c->waiter && (c->wake_pending || c->evh)) { timer = c->waiter; c->waiter = 0; c->wake_pending = 0; }
+      pthread_mutex_unlock(&c->lock);
+      if (timer) break;
+    }
+    pthread_mutex_unlock(&sb_wsc_lock);
+    if (!timer) return;
+    porf_native_fetch_timer_clear(timer);
+    porf_native_fetch_fire_timer(timer);
+  }
+}
+
+// The JS side's ops. data is borrowed for the call.
+static long long sb_wsc_op(int op, unsigned id, const char* data, size_t len, size_t n, char* out, size_t cap) {
+  if (op == 'u') {
+    // data: host \n port \n tls(0|1) \n path \n protocols \n header lines (to the end)
+    sb_wsc* c = (sb_wsc*)calloc(1, sizeof(sb_wsc));
+    if (!c) return 0;
+    char* copy = (char*)malloc(len + 1);
+    if (!copy) { free(c); return 0; }
+    memcpy(copy, data, len); copy[len] = 0;
+    char* parts[5]; char* cur = copy; int i;
+    for (i = 0; i < 5; i++) {
+      parts[i] = cur;
+      char* nl = strchr(cur, '\n');
+      if (!nl) { if (i < 4) { free(copy); free(c); return 0; } cur = cur + strlen(cur); break; }
+      *nl = 0; cur = nl + 1;
+    }
+    c->host = strdup(parts[0]); c->port = atoi(parts[1]); c->tls = atoi(parts[2]);
+    c->path = strdup(parts[3]); c->protocols = strdup(parts[4]); c->headers = strdup(cur);
+    free(copy);
+    if (!c->host || !c->path || !c->protocols || !c->headers || pipe(c->wake) != 0) { free(c->host); free(c->path); free(c->protocols); free(c->headers); free(c); return 0; }
+    for (int k = 0; k < 2; k++) { fcntl(c->wake[k], F_SETFD, FD_CLOEXEC); fcntl(c->wake[k], F_SETFL, fcntl(c->wake[k], F_GETFL) | O_NONBLOCK); }
+    pthread_mutex_init(&c->lock, 0);
+    sb_wsc_seed(c);
+    pthread_mutex_lock(&sb_wsc_lock);
+    int live = 0;
+    for (sb_wsc* k = sb_wscs; k; k = k->next) live++;
+    if (live >= SB_WSC_MAX) { pthread_mutex_unlock(&sb_wsc_lock); sb_wsc_free(c); return 0; }
+    sb_wsc_next = (sb_wsc_next + 1) & 0x7fffffffu;
+    if (!sb_wsc_next) sb_wsc_next = 1;
+    c->id = sb_wsc_next | SB_WSC_BIT;
+    c->next = sb_wscs; sb_wscs = c;
+    pthread_mutex_unlock(&sb_wsc_lock);
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&attr, 512 * 1024);
+    pthread_t thread;
+    int failed = pthread_create(&thread, &attr, sb_wsc_thread, c);
+    pthread_attr_destroy(&attr);
+    if (failed) {
+      pthread_mutex_lock(&sb_wsc_lock);
+      for (sb_wsc** at = &sb_wscs; *at; at = &(*at)->next) if (*at == c) { *at = c->next; break; }
+      pthread_mutex_unlock(&sb_wsc_lock);
+      sb_wsc_free(c);
+      return 0;
+    }
+    return (long long)c->id;
+  }
+  sb_wsc* c = sb_wsc_find(id);
+  if (!c) return op == 'p' || op == 'k' || op == 'w' || op == 'r' ? 0 : -1;
+  switch (op) {
+    case 't': case 'b': return sb_wsc_frame(c, op == 't' ? 1 : 2, data, len, 0, 0);
+    case 'c': {
+      pthread_mutex_lock(&c->lock);
+      int already = c->close_queued;
+      c->close_queued = 1;
+      pthread_mutex_unlock(&c->lock);
+      if (already) return 0;
+      return sb_wsc_frame(c, 8, data, len, (unsigned)n, 1);
+    }
+    case 'p': {
+      if (!out || !cap) return -1;
+      out[0] = 0;
+      pthread_mutex_lock(&c->lock);
+      if (c->evh) snprintf(out, cap, "%d %zu %u", c->evh->kind, c->evh->len, c->evh->code);
+      pthread_mutex_unlock(&c->lock);
+      return 0;
+    }
+    case 'i': {
+      pthread_mutex_lock(&c->lock);
+      sb_wsc_ev* e = c->evh;
+      if (!e) { pthread_mutex_unlock(&c->lock); return -1; }
+      c->evh = e->next; if (!c->evh) c->evt = 0;
+      pthread_mutex_unlock(&c->lock);
+      size_t got = e->len < cap ? e->len : cap;
+      if (got) memcpy(out, e->data, got);
+      free(e->data); free(e);
+      return (long long)got;
+    }
+    case 'k':
+      pthread_mutex_lock(&c->lock);
+      c->unacked -= n < c->unacked ? n : c->unacked;
+      pthread_mutex_unlock(&c->lock);
+      sb_wsc_wake_thread(c);
+      return 0;
+    case 'w':
+      pthread_mutex_lock(&c->lock);
+      c->waiter = (unsigned)n;
+      if (c->evh) c->wake_pending = 1;
+      pthread_mutex_unlock(&c->lock);
+      if (c->evh) sb_wsc_signal();
+      return 0;
+    case 'r': {
+      pthread_mutex_lock(&c->lock);
+      c->released = 1;
+      int done = c->finished;
+      pthread_mutex_unlock(&c->lock);
+      if (done) {
+        pthread_mutex_lock(&sb_wsc_lock);
+        for (sb_wsc** at = &sb_wscs; *at; at = &(*at)->next) if (*at == c) { *at = c->next; break; }
+        pthread_mutex_unlock(&sb_wsc_lock);
+        sb_wsc_free(c);
+      } else sb_wsc_wake_thread(c);
+      return 0;
+    }
+  }
+  return -1;
+}
+// 1 when something will run the loop when an event arrives (the async pipe or a waker).
+static int sb_wsc_wakeable(void) { return sb_wsc_pipe_enabled() || sb_wsc_waker != 0; }
+extern long long (*sb_wsc_hook)(int op, unsigned int id, const char* data, size_t length, size_t n, char* out, size_t cap);
+extern int (*sb_wsc_wakeable_hook)(void);
+static void sb_wsc_install(void) __attribute__((constructor));
+static void sb_wsc_install(void) { sb_wsc_drain_hook = sb_wsc_drain; sb_wsc_hook = sb_wsc_op; sb_wsc_wakeable_hook = sb_wsc_wakeable; }
+// WSC:END
 `;
 
 // R2 put: the body is its own parameter, so it never gets escaped.

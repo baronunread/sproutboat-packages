@@ -50,7 +50,8 @@
     "test:native-byte-text": "bun packages/runtime/test/native-byte-text.ts",
     "test:native-request-streaming": "bun packages/runtime/test/native-request-streaming.ts",
     "test:native-websockets": "bun packages/runtime/test/native-websockets.ts",
-    "test:native-bytes": "bun packages/toolchain/test/native-bytes.ts"
+    "test:native-bytes": "bun packages/toolchain/test/native-bytes.ts",
+    "test:native-websockets-outbound": "bun packages/runtime/test/native-websockets-outbound.ts"
   },
   "devDependencies": {
     "@changesets/cli": "^3.0.2",
