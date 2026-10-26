@@ -19,6 +19,11 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
   const files = {
     "runtime/index.js": "fixture:runtime/index.js\n",
     "compiler/render.js":
+      // patchUnhandledRejections' anchors: the async-result helper, the rejected-promise helper and
+      // the settle calls of a coroutine that threw.
+      "  const settleAsyncResult = promiseResolveFunc\n" +
+      "${st}jsval porf_promise_rejected(jsval value) {\n  return porf_promise_settled(value, 2);\n}" +
+      "  porf_promise_settle_direct(out_promise, porf_exception, 2);\n" +
       NATIVE_BYTES_RENDER_ANCHOR +
       "// sb_native_utf8_scalar_v1\n" +
       "static void porf_gc_cons_candidate(u32 c);\n" +
@@ -204,6 +209,7 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
     "compiler/builtins/console.ts":
       "export const __Porffor_consolePrint = (arg: any): void => {\n  __Porffor_print(arg);\n};\n",
     "compiler/codegen.js":
+      "    includeBuiltin(topLevelFunc, '__Porffor_promise_resolve');\n" +
       "if (!hoistRead && directCallOnlyFunctionBinding(scope, kind, name, pattern, func)) {\n        return valUndefined();\n}\nconst func = resolveNamedFunction(scope, name) ?? funcByName(name);\n" +
       "    // only names that are nothing but this declaration and its direct calls\n    if (find(program, n => n.name === x.id.name).length !== 1) continue;\n" +
       "      stmt(scope, Store(ctype, addr, 4, ctype === 'f64' || ctype === 'f32' ? f : toUint32(scope, f)));\n" +
@@ -238,6 +244,14 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "    if (Porffor.type(probe) != Porffor.TYPES.object) {\n" +
       "      __ecma262_FulfillPromise(promise, value);\n" +
       "      return;\n" +
+      "    }\n" +
+      "  }\n" +
+      "};\n" +
+      "export const __Porffor_promise_runJobs = (): void => {\n" +
+      "  while (pendingRejections.length > 0) {\n" +
+      "    const p: any = pendingRejections.pop();\n" +
+      "    if (Porffor.fastAnd(!__Porffor_promise_isHandled(p), __Porffor_promise_state(p) == 2)) {\n" +
+      "      throw __Porffor_promise_result(p);\n" +
       "    }\n" +
       "  }\n" +
       "};\n",
@@ -375,6 +389,10 @@ test("the default call (no url/expectedSha256 override) never touches the networ
   // #168: the real vendored source takes the null guard on the `then` probe.
   expect(await readFile(join(dir, "compiler/builtins/promise.ts"), "utf8")).toContain(
     "if (Porffor.type(value) == Porffor.TYPES.object && value != null) {",
+  );
+  // An unhandled rejection is reported through the prelude hook, not thrown out of the loop.
+  expect(await readFile(join(dir, "compiler/builtins/promise.ts"), "utf8")).toContain(
+    "globalThis.__sbOnUnhandledRejection",
   );
 }, 60_000);
 

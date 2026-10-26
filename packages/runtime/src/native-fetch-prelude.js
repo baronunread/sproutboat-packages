@@ -3789,6 +3789,22 @@ if (typeof globalThis.EventTarget !== "function") {
   globalThis.EventTarget = EventTarget;
   globalThis.AbortSignal = AbortSignal;
   globalThis.AbortController = AbortController;
+  // Workers' global event target: `addEventListener("unhandledrejection", fn)` hears every
+  // promise that rejected with nobody waiting on it (see __sbOnUnhandledRejection).
+  class PromiseRejectionEvent extends Event {
+    constructor(type, init) {
+      super(type, init);
+      this.promise = init ? init.promise : undefined;
+      this.reason = init ? init.reason : undefined;
+    }
+  }
+  const globalTarget = new EventTarget();
+  globalThis.PromiseRejectionEvent = PromiseRejectionEvent;
+  if (typeof globalThis.addEventListener !== "function") {
+    globalThis.addEventListener = (type, listener, options) => globalTarget.addEventListener(type, listener, options);
+    globalThis.removeEventListener = (type, listener, options) => globalTarget.removeEventListener(type, listener, options);
+    globalThis.dispatchEvent = (event) => globalTarget.dispatchEvent(event);
+  }
 }
 
 // TextEncoderStream and TextDecoderStream over the Web Streams ponyfill (W2 conformance).
@@ -8982,6 +8998,21 @@ function __sbLogUncaught(where, error) {
     /* logging must never turn a handled error into a crash */
   }
 }
+
+// A promise rejected and nothing was waiting on it (an un-awaited `db.prepare(...).run()`
+// that failed, say). As on Workers the request, the process and every other request go on:
+// the rejection is logged, and an "unhandledrejection" event fires on the global scope when
+// something listens. Porffor's promise job loop calls this hook (patchUnhandledRejections);
+// without it, it throws the reason out of the event loop and the process exits.
+globalThis.__sbOnUnhandledRejection = function (reason, promise) {
+  __sbLogUncaught("promise", reason);
+  try {
+    if (__sbIsFn(globalThis.PromiseRejectionEvent) && __sbIsFn(globalThis.dispatchEvent))
+      globalThis.dispatchEvent(new globalThis.PromiseRejectionEvent("unhandledrejection", { promise, reason, cancelable: true }));
+  } catch (error) {
+    __sbLogUncaught("unhandledrejection listener", error);
+  }
+};
 
 // Shared by alarm and scheduled: both reply with an empty 204 once their
 // handler (and anything it queued via `waitUntil`) has settled.

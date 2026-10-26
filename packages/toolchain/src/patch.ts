@@ -367,6 +367,47 @@ const PROMISE_NULL_INJECT =
   "  if (Porffor.type(value) == Porffor.TYPES.object && value != null) {\n    // cheap prototype-chain probe for 'then'";
 const PROMISE_NULL_MARKER = "sproutboat #168: null is object-typed";
 
+// An unhandled rejection must not end the process. __Porffor_promise_runJobs throws the
+// reason of a rejected promise nobody handled, and that throw unwinds out of the event loop
+// into the host's "Uncaught ..." exit(1). On Workers it is a report (a log line and an
+// "unhandledrejection" event) and everything else keeps running, so a D1 or KV call that
+// failed and was never awaited kills every in-flight request here and nothing there. Call the
+// prelude's globalThis.__sbOnUnhandledRejection(reason, promise) when it exists; a program
+// without it (plain Porffor) keeps the throw.
+const UNHANDLED_ANCHOR =
+  "    if (Porffor.fastAnd(!__Porffor_promise_isHandled(p), __Porffor_promise_state(p) == 2)) {\n";
+const UNHANDLED_INJECT =
+  UNHANDLED_ANCHOR +
+  "      // sproutboat: report an unhandled rejection instead of throwing it out of the loop.\n" +
+  "      const sbHook: any = globalThis.__sbOnUnhandledRejection;\n" +
+  "      if (Porffor.type(sbHook) == Porffor.TYPES.function) {\n" +
+  "        __Porffor_promise_setHandled(p);\n" +
+  "        sbHook(__Porffor_promise_result(p), p);\n" +
+  "        continue;\n" +
+  "      }\n";
+const UNHANDLED_TRACK_ANCHOR = "export const __Porffor_promise_runJobs = (): void => {\n";
+const UNHANDLED_TRACK_INJECT =
+  "// sproutboat: a promise the C runtime rejected (an async function that threw) is checked like the rest.\n" +
+  "export const __Porffor_promise_trackRejected = (promise: any): void => {\n" +
+  "  if (!__Porffor_promise_isHandled(promise)) Porffor.array.fastPush(pendingRejections, promise);\n" +
+  "};\n\n" +
+  UNHANDLED_TRACK_ANCHOR;
+const UNHANDLED_RENDER_DEFS = "  const settleAsyncResult = promiseResolveFunc\n";
+const UNHANDLED_RENDER_DEFS_INJECT =
+  "  const promiseTrackFunc = funcByName.get('__Porffor_promise_trackRejected');\n" +
+  "  const trackRejected = promise => promiseTrackFunc ? `(void)${fnSym(promiseTrackFunc)}(${promise});` : '';\n" +
+  UNHANDLED_RENDER_DEFS;
+const UNHANDLED_RENDER_REJECTED =
+  "${st}jsval porf_promise_rejected(jsval value) {\n  return porf_promise_settled(value, 2);\n}";
+const UNHANDLED_RENDER_REJECTED_INJECT =
+  "${st}jsval porf_promise_rejected(jsval value) {\n  const jsval rejected = porf_promise_settled(value, 2);\n  ${trackRejected('rejected')}\n  return rejected;\n}";
+const UNHANDLED_RENDER_SETTLE = "  porf_promise_settle_direct(out_promise, porf_exception, 2);\n";
+const UNHANDLED_RENDER_SETTLE_INJECT = UNHANDLED_RENDER_SETTLE + "  ${trackRejected('out_promise')}\n";
+const UNHANDLED_CODEGEN_ANCHOR = "    includeBuiltin(topLevelFunc, '__Porffor_promise_resolve');\n";
+const UNHANDLED_CODEGEN_INJECT =
+  "    { includeBuiltin(topLevelFunc, '__Porffor_promise_resolve'); includeBuiltin(topLevelFunc, '__Porffor_promise_trackRejected'); }\n";
+const UNHANDLED_MARKER = "sproutboat: report an unhandled rejection";
+
 // baronunread/sproutboat#237: String.prototype.replaceAll grew its result with
 // one __Porffor_strcat per match, and each strcat copies everything so far, so
 // a 2.7 MB string with many matches took ~22 s (Node: 17 ms). Collect the
@@ -1135,6 +1176,39 @@ export async function patchPromiseResolveNull(root: string): Promise<void> {
   if (!src.includes(PROMISE_NULL_ANCHOR))
     throw new Error(`could not patch Porffor's promise resolve for null: anchor not found in ${file}`);
   await writeFile(file, src.replace(PROMISE_NULL_ANCHOR, PROMISE_NULL_INJECT));
+}
+
+/**
+ * Report an unhandled rejection through the prelude's hook instead of exiting. Before
+ * precompileBuiltins. An async function that throws is rejected by the C runtime (render.js),
+ * not by __ecma262_RejectPromise, so the C paths also hand the promise to
+ * __Porffor_promise_trackRejected, which queues it for the same check in the job loop.
+ */
+export async function patchUnhandledRejections(root: string): Promise<void> {
+  const promiseFile = resolve(root, "compiler/builtins/promise.ts");
+  const renderFile = resolve(root, "compiler/render.js");
+  const codegenFile = resolve(root, "compiler/codegen.js");
+  let promise = await readFile(promiseFile, "utf8");
+  let render = await readFile(renderFile, "utf8");
+  let codegen = await readFile(codegenFile, "utf8");
+  if (promise.includes(UNHANDLED_MARKER)) return;
+  const once = (text: string, anchor: string, file: string) => {
+    if (text.split(anchor).length !== 2)
+      throw new Error(`could not patch Porffor's unhandled rejections: anchor not found in ${file}`);
+  };
+  once(promise, UNHANDLED_ANCHOR, promiseFile);
+  once(promise, UNHANDLED_TRACK_ANCHOR, promiseFile);
+  once(render, UNHANDLED_RENDER_DEFS, renderFile);
+  once(render, UNHANDLED_RENDER_REJECTED, renderFile);
+  once(codegen, UNHANDLED_CODEGEN_ANCHOR, codegenFile);
+  promise = promise.replace(UNHANDLED_ANCHOR, UNHANDLED_INJECT).replace(UNHANDLED_TRACK_ANCHOR, UNHANDLED_TRACK_INJECT);
+  render = render
+    .replace(UNHANDLED_RENDER_DEFS, UNHANDLED_RENDER_DEFS_INJECT)
+    .replace(UNHANDLED_RENDER_REJECTED, UNHANDLED_RENDER_REJECTED_INJECT)
+    .split(UNHANDLED_RENDER_SETTLE)
+    .join(UNHANDLED_RENDER_SETTLE_INJECT);
+  codegen = codegen.replace(UNHANDLED_CODEGEN_ANCHOR, UNHANDLED_CODEGEN_INJECT);
+  await Promise.all([writeFile(promiseFile, promise), writeFile(renderFile, render), writeFile(codegenFile, codegen)]);
 }
 
 /** #237: linear String.prototype.replaceAll. Precompiled by precompileBuiltins. */
@@ -1998,6 +2072,7 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchDeferredDiscard(root);
   await patchGcFootprint(root);
   await patchPromiseResolveNull(root);
+  await patchUnhandledRejections(root);
   await patchReplaceAll(root);
   await patchLocalFunctionTypes(root);
   await patchFunctionSourcesScan(root);

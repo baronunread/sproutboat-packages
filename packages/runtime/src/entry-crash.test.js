@@ -18,10 +18,7 @@ const load = new Function(
 // Every Porffor.c`...` block in the prelude only runs inside a function body
 // (never at load time), so a no-op tag covers all of them: __sbCpuMs and
 // __sbEnv just see an empty result, same as "native op returned nothing."
-const H = load(
-  { c: () => "" },
-  new Proxy({}, { get: () => undefined }),
-);
+const H = load({ c: () => "" }, new Proxy({}, { get: () => undefined }));
 
 const req = (overrides = {}) => ({
   headers: { get: (k) => (overrides.headers && overrides.headers[k.toLowerCase()]) ?? null },
@@ -60,4 +57,56 @@ test("a throwing fetch handler doesn't stop the next request from being served",
   expect(first.status).toBe(500);
   const second = await H.__sbEntry(handlers, req({ boom: false }));
   expect(await second.text()).toBe("ok");
+});
+
+// A promise that rejects with nobody waiting on it (an un-awaited D1 run() that broke a
+// foreign key) must be reported, not end the process: Porffor's promise job loop calls
+// globalThis.__sbOnUnhandledRejection (toolchain patchUnhandledRejections).
+test("an unhandled rejection is logged and fires an unhandledrejection event", () => {
+  const logged = [];
+  const consoleError = console.error;
+  const dispatch = globalThis.dispatchEvent;
+  const Ctor = globalThis.PromiseRejectionEvent;
+  const events = [];
+  console.error = (line) => logged.push(String(line));
+  globalThis.PromiseRejectionEvent = class {
+    constructor(type, init) {
+      this.type = type;
+      this.reason = init.reason;
+      this.promise = init.promise;
+    }
+  };
+  globalThis.dispatchEvent = (event) => events.push(event);
+  try {
+    const promise = Promise.reject(new Error("D1_ERROR: FOREIGN KEY constraint failed"));
+    promise.catch(() => {});
+    globalThis.__sbOnUnhandledRejection(new Error("D1_ERROR: FOREIGN KEY constraint failed"), promise);
+  } finally {
+    console.error = consoleError;
+    globalThis.dispatchEvent = dispatch;
+    globalThis.PromiseRejectionEvent = Ctor;
+  }
+  expect(logged.join("\n")).toContain("Uncaught (in promise)");
+  expect(logged.join("\n")).toContain("FOREIGN KEY");
+  expect(events).toHaveLength(1);
+  expect(events[0].type).toBe("unhandledrejection");
+  expect(events[0].reason.message).toContain("FOREIGN KEY");
+});
+
+test("a throwing unhandledrejection listener does not escape the hook", () => {
+  const consoleError = console.error;
+  const dispatch = globalThis.dispatchEvent;
+  const Ctor = globalThis.PromiseRejectionEvent;
+  console.error = () => {};
+  globalThis.PromiseRejectionEvent = class {};
+  globalThis.dispatchEvent = () => {
+    throw new Error("listener broke");
+  };
+  try {
+    expect(() => globalThis.__sbOnUnhandledRejection(new Error("x"), undefined)).not.toThrow();
+  } finally {
+    console.error = consoleError;
+    globalThis.dispatchEvent = dispatch;
+    globalThis.PromiseRejectionEvent = Ctor;
+  }
 });

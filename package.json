@@ -51,7 +51,8 @@
     "test:native-request-streaming": "bun packages/runtime/test/native-request-streaming.ts",
     "test:native-websockets": "bun packages/runtime/test/native-websockets.ts",
     "test:native-bytes": "bun packages/toolchain/test/native-bytes.ts",
-    "test:native-websockets-outbound": "bun packages/runtime/test/native-websockets-outbound.ts"
+    "test:native-websockets-outbound": "bun packages/runtime/test/native-websockets-outbound.ts",
+    "test:native-unhandled-rejection": "bun packages/runtime/test/native-unhandled-rejection.ts"
   },
   "devDependencies": {
     "@changesets/cli": "^3.0.2",
