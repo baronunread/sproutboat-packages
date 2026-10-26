@@ -45,6 +45,13 @@ test("with the prelude hook, an unhandled rejection is reported and the program 
     };
     Promise.reject(new Error("boom"));
     new Promise(function (resolve, reject) { reject(new Error("second")); });
+    async function failNow() { throw new Error("async sync throw"); }
+    async function failLater() { await null; throw new Error("async after await"); }
+    async function awaited() { await null; throw new Error("awaited failure"); }
+    async function caller() { try { await awaited(); } catch (e) { console.log("caller caught " + e.message); } }
+    failNow();
+    failLater();
+    caller();
     const late = Promise.reject(new Error("handled later"));
     late.catch(function () { console.log("caught"); });
     Promise.resolve().then(function () { console.log("still running"); });
@@ -52,6 +59,10 @@ test("with the prelude hook, an unhandled rejection is reported and the program 
   expect(result.code, result.stderr).toBe(0);
   expect(result.stdout).toContain("reported boom");
   expect(result.stdout).toContain("reported second");
+  expect(result.stdout).toContain("reported async sync throw");
+  expect(result.stdout).toContain("reported async after await");
+  expect(result.stdout).toContain("caller caught awaited failure");
+  expect(result.stdout).not.toContain("reported awaited failure");
   expect(result.stdout).toContain("still running");
   expect(result.stdout).not.toContain("reported handled later");
 }, 180_000);

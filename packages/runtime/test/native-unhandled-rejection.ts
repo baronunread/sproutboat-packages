@@ -30,6 +30,11 @@ export default {async fetch(request) {
     }
     return new Response("fired");
   }
+  if (path === "/async") {
+    async function failNow() { throw new Error("async function failed"); }
+    failNow();
+    return new Response("fired");
+  }
   if (path === "/heard") return new Response(JSON.stringify(globalThis.__heard || []));
   return new Response("pong");
 }};`;
@@ -98,13 +103,19 @@ for (const date of ["2026-09-28", "2026-10-24"]) {
     assert.equal(await get("/reject"), "fired");
     assert.equal(await get("/pong"), "pong", `the request after an unhandled rejection failed (${date})`);
     assert.equal(await get("/promise"), "fired");
+    assert.equal(await get("/async"), "fired");
     await Bun.sleep(300);
     assert.equal(await get("/pong"), "pong", `the request after a rejected promise failed (${date})`);
     assert.equal(server.exitCode, null, `the server exited on an unhandled rejection (${date})`);
+    assert.equal(await get("/pong"), "pong", `the request after an unawaited async function threw failed (${date})`);
     const heard = JSON.parse(await get("/heard"));
     assert(
       heard.some((message: string) => message.includes("FOREIGN KEY")),
       `no unhandledrejection event for the rejected promise (${date}): ${JSON.stringify(heard)}`,
+    );
+    assert(
+      heard.some((message: string) => message.includes("async function failed")),
+      `no unhandledrejection event for the async function (${date}): ${JSON.stringify(heard)}`,
     );
     server.kill(9);
     await server.exited;

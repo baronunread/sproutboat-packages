@@ -69,7 +69,9 @@ test("alpha-16: native Proxy, iterators and upstream fixes match Bun", async () 
     expect(reference.exitCode).toBe(0);
     await rm(binary, { force: true });
     const compile = Bun.spawnSync(["bun", resolve(porffor, "runtime/index.js"), "native", source, "-o", binary, "-s"], {
-      cwd: root, stdout: "pipe", stderr: "pipe",
+      cwd: root,
+      stdout: "pipe",
+      stderr: "pipe",
     });
     expect(compile.exitCode, Buffer.from(compile.stderr).toString()).toBe(0);
     const run = Bun.spawnSync([binary], { stdout: "pipe", stderr: "pipe", timeout: 10_000 });

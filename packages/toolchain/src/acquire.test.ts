@@ -19,6 +19,11 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
   const files = {
     "runtime/index.js": "fixture:runtime/index.js\n",
     "compiler/render.js":
+      // patchUnhandledRejections' anchors: the async-result helper, the rejected-promise helper and
+      // the settle calls of a coroutine that threw.
+      "  const settleAsyncResult = promiseResolveFunc\n" +
+      "${st}jsval porf_promise_rejected(jsval value) {\n  return porf_promise_settled(value, 2);\n}" +
+      "  porf_promise_settle_direct(out_promise, porf_exception, 2);\n" +
       NATIVE_BYTES_RENDER_ANCHOR +
       "// sb_native_utf8_scalar_v1\n" +
       "static void porf_gc_cons_candidate(u32 c);\n" +
@@ -204,6 +209,7 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
     "compiler/builtins/console.ts":
       "export const __Porffor_consolePrint = (arg: any): void => {\n  __Porffor_print(arg);\n};\n",
     "compiler/codegen.js":
+      "    includeBuiltin(topLevelFunc, '__Porffor_promise_resolve');\n" +
       "if (!hoistRead && directCallOnlyFunctionBinding(scope, kind, name, pattern, func)) {\n        return valUndefined();\n}\nconst func = resolveNamedFunction(scope, name) ?? funcByName(name);\n" +
       "    // only names that are nothing but this declaration and its direct calls\n    if (find(program, n => n.name === x.id.name).length !== 1) continue;\n" +
       "      stmt(scope, Store(ctype, addr, 4, ctype === 'f64' || ctype === 'f32' ? f : toUint32(scope, f)));\n" +

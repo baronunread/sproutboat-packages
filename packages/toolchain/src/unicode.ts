@@ -57,16 +57,8 @@ export const __Porffor_json_appendChar = (out: string, char: i32): void => {
     "let buffer: bytestring = Porffor.malloc(6 + cap);",
     "let buffer: string = Porffor.malloc(4 + cap);",
   );
-  source = replace(
-    source,
-    "buffer = Porffor.malloc(6 + cap);",
-    "buffer = Porffor.malloc(4 + cap);",
-  );
-  source = replace(
-    source,
-    "buffer.length = out - (buffer as i32);",
-    "buffer.length = (out - (buffer as i32)) / 2;",
-  );
+  source = replace(source, "buffer = Porffor.malloc(6 + cap);", "buffer = Porffor.malloc(4 + cap);");
+  source = replace(source, "buffer.length = out - (buffer as i32);", "buffer.length = (out - (buffer as i32)) / 2;");
   source = replace(source, "(buffer - _buffer) > 1", "(buffer - _buffer) > 2");
   source = replace(source, "Porffor.IR.storeU8(buffer, 3,", "Porffor.IR.storeU16(buffer, 2,");
   source = replace(source, "for (const key: bytestring in", "for (const key: any in");
