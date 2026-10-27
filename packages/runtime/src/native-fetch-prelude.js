@@ -5173,11 +5173,30 @@ function __sbD1Param(value, strict) {
   // oxlint-disable-next-line anti-slop/no-runtime-typeof -- workerd's D1_TYPE_ERROR names the value's typeof
   throw new Error("D1_TYPE_ERROR: Type '" + typeof value + "' not supported for value '" + String(value) + "'");
 }
+// An embedded (standalone) build sets this to hand the request object straight to its
+// dispatcher. D1 replies are the biggest ones a handler sees (20 rows is 100 cells), and
+// the JSON.stringify and JSON.parse around the in-process call cost more than SQLite did.
+// The broker transport leaves it unset and keeps the string hop. (No initializer: the transport is placed ahead of the prelude, and `= null` would run after its assignment.)
+// oxlint-disable-next-line no-unassigned-vars -- the embedded transport assigns it; the broker transport does not.
+var __sbCallDirect;
+function __sbRpcDirect(op, extra) {
+  if (!__sbCallDirect) return __sbRpc(op, extra);
+  const req = { v: 1, id: ++__sbReqId, op };
+  if (extra) for (const k in extra) req[k] = extra[k];
+  let reply;
+  try {
+    reply = __sbCallDirect(req);
+  } catch (err) {
+    throw new Error(`sproutboat ${op}: ${String((err && err.message) || err) || "failed"}`);
+  }
+  if (reply && reply.ok === false) throw new Error(`sproutboat ${op}: ${reply.error || "failed"}`);
+  return reply;
+}
 function __sbD1Rpc(op, extra, strict) {
-  if (!strict) return __sbRpc(op, extra);
+  if (!strict) return __sbRpcDirect(op, extra);
   extra.strict = true;
   try {
-    return __sbRpc(op, extra);
+    return __sbRpcDirect(op, extra);
   } catch (err) {
     // "sproutboat d1.query: D1_ERROR: ..." -> "D1_ERROR: ...", as workerd words it.
     const message = String((err && err.message) || err);
