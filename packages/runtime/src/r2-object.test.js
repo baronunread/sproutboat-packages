@@ -31,7 +31,7 @@ const load = new Function(
   "__sbRpc",
   "__sbR2MultipartPut",
   // __sbIsStr and __sbToBytes (for uploadPart's values), with the C fast paths stubbed out.
-  `function __sbFromUtf8Native() { return ""; }\nfunction __sbToBytesNative() { return ""; }\n${src.slice(isStrStart, isStrEnd)}\n${src.slice(bytesStart, utf8Start)}\n${src.slice(utf8Start, utf8End)}\n${src.slice(rawStart, rawEnd)}\n${src.slice(r2Start, r2End)}\nreturn { __sbR2Object, __sbR2Multipart };`,
+  `function __sbFromUtf8Native() { return ""; }\nfunction __sbToBytesNative() { return ""; }\nfunction __sbFillBytes() { return false; }\n${src.slice(isStrStart, isStrEnd)}\n${src.slice(bytesStart, utf8Start)}\n${src.slice(utf8Start, utf8End)}\n${src.slice(rawStart, rawEnd)}\n${src.slice(r2Start, r2End)}\nreturn { __sbR2Object, __sbR2Multipart };`,
 );
 const calls = [];
 const rpc = (op, value) => {
