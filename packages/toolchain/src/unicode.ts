@@ -57,16 +57,8 @@ export const __Porffor_json_appendChar = (out: string, char: i32): void => {
     "let buffer: bytestring = Porffor.malloc(6 + cap);",
     "let buffer: string = Porffor.malloc(4 + cap);",
   );
-  source = replace(
-    source,
-    "buffer = Porffor.malloc(6 + cap);",
-    "buffer = Porffor.malloc(4 + cap);",
-  );
-  source = replace(
-    source,
-    "buffer.length = out - (buffer as i32);",
-    "buffer.length = (out - (buffer as i32)) / 2;",
-  );
+  source = replace(source, "buffer = Porffor.malloc(6 + cap);", "buffer = Porffor.malloc(4 + cap);");
+  source = replace(source, "buffer.length = out - (buffer as i32);", "buffer.length = (out - (buffer as i32)) / 2;");
   source = replace(source, "(buffer - _buffer) > 1", "(buffer - _buffer) > 2");
   source = replace(source, "Porffor.IR.storeU8(buffer, 3,", "Porffor.IR.storeU16(buffer, 2,");
   source = replace(source, "for (const key: bytestring in", "for (const key: any in");
@@ -93,6 +85,30 @@ export const __Porffor_json_appendChar = (out: string, char: i32): void => {
         continue;
       }
       buffer = __Porffor_bytestring_bufferChar(buffer, c);`,
+  );
+  // sproutboat: read each character straight from the string and store the ones that need no
+  // escape, instead of a charCodeAt call (and the checks behind it) per character, which was a
+  // quarter of a 20-row feed response. Everything that needs escaping, and every surrogate,
+  // still takes the branches below, so the output is unchanged.
+  source = replace(
+    source,
+    `    const len: i32 = value.length;
+    for (let i: i32 = 0; i < len; i++) {
+      const c: i32 = value.charCodeAt(i);
+      if (c < 0x20) {`,
+    `    const len: i32 = value.length;
+    const base: i32 = Porffor.IR.ptr(value);
+    const narrow: boolean = Porffor.type(value) == Porffor.TYPES.bytestring;
+    for (let i: i32 = 0; i < len; i++) {
+      let c: i32 = 0;
+      if (narrow) c = Porffor.IR.loadU8(base + i, 4);
+        else c = Porffor.IR.loadU16(base + i * 2, 4);
+      if (c >= 0x20) if (c != 0x22) if (c != 0x5c) if (c < 0xd800 || c > 0xdfff) {
+        if (buffer + 6 <= __Porffor_json_bufLimit) Porffor.IR.storeU16(buffer, 4, c);
+        buffer += 2;
+        continue;
+      }
+      if (c < 0x20) {`,
   );
   return source;
 }
