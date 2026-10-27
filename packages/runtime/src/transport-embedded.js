@@ -5331,6 +5331,12 @@ function __sbCall(reqJson) {
   }
 }
 
+// The same dispatch without the JSON text either side: D1 calls take this (see __sbRpcDirect).
+__sbCallDirect = function (req) {
+  if (__sbCompatDate() >= "2026-10-22") __sbLtxConfigure();
+  return __sbEmbeddedDispatch(req);
+};
+
 // --- local triggers ---------------------------------------------------------
 // A deployed sprout is driven by the broker: it POSTs x-sb-trigger for cron
 // ticks, queue batches and DO alarms. An embedded binary has no broker, so the
