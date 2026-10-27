@@ -2005,6 +2005,49 @@ export async function patchWebSockets(root: string): Promise<void> {
  * ~1.3 s per build, and its precompile rewrote builtins_precompiled.js in place,
  * so parallel builds sharing the cache could import a half-written table.
  */
+// Porffor's `globalThis` is an object built once, but its getter re-syncs every top-level
+// function and `var` of the module into it on EVERY access (add-or-update writes), so each read
+// of `globalThis` costs one hashed write per top-level binding: ~20 us with the prelude's ~270.
+// Function bindings never change (they are compile-time references), so they are written once,
+// when the object is built; only `var` bindings, whose values can change, are re-synced per access.
+const GLOBALTHIS_SYNC_MARKER = "sproutboat: function bindings are written to globalThis once";
+const GLOBALTHIS_SYNC_EDITS: [string, string][] = [
+  [
+    "  globalThisUserSync: (objJv, sync) => {\n    const finalizer = () => {\n      sync.length = 0;\n      const seen = new Set();\n      const push = (key, value) => {\n        seen.add(key);\n        sync.push(builtinCall(scope, '__Porffor_object_set', [ objJv, makeString(scope, key), value ]));\n      };\n",
+    "  // " +
+      GLOBALTHIS_SYNC_MARKER +
+      " (`once`), `var` bindings on every access (`sync`)\n  globalThisUserSync: (objJv, sync, once) => {\n    const finalizer = () => {\n      sync.length = 0;\n      once.length = 0;\n      const seen = new Set();\n      const push = (key, value, into = sync) => {\n        seen.add(key);\n        into.push(builtinCall(scope, '__Porffor_object_set', [ objJv, makeString(scope, key), value ]));\n      };\n",
+  ],
+  ["        push(name, funcRef(func));\n", "        push(name, funcRef(func), once);\n"],
+];
+const GLOBALTHIS_BUILTINS_EDITS: [string, string][] = [
+  [
+    "        const sync = [];\n        if (name === 'globalThis') globalThisUserSync(Box(getPtr, Const(T.i32, TYPES.object)), sync);\n",
+    "        const sync = [];\n        const once = [];\n        if (name === 'globalThis') globalThisUserSync(Box(getPtr, Const(T.i32, TYPES.object)), sync, once);\n",
+  ],
+  ["        out.push(BlockStmt(sync));\n", "        out.push(BlockStmt(once));\n        out.push(BlockStmt(sync));\n"],
+];
+
+/** `globalThis` reads no longer rewrite every function binding each time. */
+export async function patchGlobalThisSync(root: string): Promise<void> {
+  const codegenFile = resolve(root, "compiler/codegen.js");
+  const builtinsFile = resolve(root, "compiler/builtins.js");
+  let codegen = await readFile(codegenFile, "utf8");
+  let builtins = await readFile(builtinsFile, "utf8");
+  if (codegen.includes(GLOBALTHIS_SYNC_MARKER)) return;
+  for (const [anchor, inject] of GLOBALTHIS_SYNC_EDITS) {
+    if (codegen.split(anchor).length !== 2)
+      throw new Error(`could not patch Porffor's globalThis sync: anchor not found in ${codegenFile}`);
+    codegen = codegen.replace(anchor, inject);
+  }
+  for (const [anchor, inject] of GLOBALTHIS_BUILTINS_EDITS) {
+    if (builtins.split(anchor).length !== 2)
+      throw new Error(`could not patch Porffor's globalThis sync: anchor not found in ${builtinsFile}`);
+    builtins = builtins.replace(anchor, inject);
+  }
+  await Promise.all([writeFile(codegenFile, codegen), writeFile(builtinsFile, builtins)]);
+}
+
 async function patchedByThisVersion(root: string): Promise<boolean> {
   try {
     // SAFETY: private manifest written by ensurePorffor; only three fields are read.
@@ -2085,6 +2128,7 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchResponseBytes(root);
   await patchURLClass(root);
   await patchTextDecoder(root);
+  await patchGlobalThisSync(root);
   await patchRepeatDoubling(root);
   await patchConsoleColors(root);
   await patchCaseMapping(root);

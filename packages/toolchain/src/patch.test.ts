@@ -17,6 +17,7 @@ import {
   patchStreamingResponses,
   patchAsyncWaker,
   patchSplitGlobals,
+  patchGlobalThisSync,
   patchBlobClass,
   patchFetchClasses,
   patchResponseBytes,
@@ -813,6 +814,57 @@ test("GC footprint patch returns every free run at idle and adds porf_gc_seal_he
     await expect(patchGcFootprint(root)).rejects.toThrow("deferred discard missing");
     await writeFile(file, "static i32 porf_gc_discard_pending = 0;\n");
     await expect(patchGcFootprint(root)).rejects.toThrow("anchor not found");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("globalThis patch writes function bindings once and re-syncs only vars, idempotently", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sb-globalthis-sync-"));
+  try {
+    await mkdir(join(root, "compiler"), { recursive: true });
+    const codegen = join(root, "compiler/codegen.js");
+    const builtins = join(root, "compiler/builtins.js");
+    await writeFile(
+      codegen,
+      [
+        "  globalThisUserSync: (objJv, sync) => {",
+        "    const finalizer = () => {",
+        "      sync.length = 0;",
+        "      const seen = new Set();",
+        "      const push = (key, value) => {",
+        "        seen.add(key);",
+        "        sync.push(builtinCall(scope, '__Porffor_object_set', [ objJv, makeString(scope, key), value ]));",
+        "      };",
+        "",
+        "      for (const name in topLevelFunc?.namedFuncBindings ?? {}) {",
+        "        push(name, funcRef(func));",
+        "      }",
+        "",
+      ].join("\n"),
+    );
+    await writeFile(
+      builtins,
+      [
+        "        const sync = [];",
+        "        if (name === 'globalThis') globalThisUserSync(Box(getPtr, Const(T.i32, TYPES.object)), sync);",
+        "        out.push(BlockStmt(sync));",
+        "",
+      ].join("\n"),
+    );
+    await patchGlobalThisSync(root);
+    const patchedCodegen = await readFile(codegen, "utf8");
+    const patchedBuiltins = await readFile(builtins, "utf8");
+    expect(patchedCodegen).toContain("globalThisUserSync: (objJv, sync, once) => {");
+    expect(patchedCodegen).toContain("once.length = 0;");
+    expect(patchedCodegen).toContain("push(name, funcRef(func), once);");
+    expect(patchedBuiltins).toContain("globalThisUserSync(Box(getPtr, Const(T.i32, TYPES.object)), sync, once);");
+    expect(patchedBuiltins).toContain("out.push(BlockStmt(once));\n        out.push(BlockStmt(sync));");
+    await patchGlobalThisSync(root);
+    expect(await readFile(codegen, "utf8")).toBe(patchedCodegen);
+    expect(await readFile(builtins, "utf8")).toBe(patchedBuiltins);
+    await writeFile(codegen, "export const x = 1;\n");
+    await expect(patchGlobalThisSync(root)).rejects.toThrow("anchor not found");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

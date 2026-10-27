@@ -3116,17 +3116,25 @@ function __sbCpuMs() {
 function __sbTagCpu(res, t0) {
   const cpu = __sbCpuMs() - t0;
   try {
-    const body = __sbRawBody(res);
-    if (__sbIsStr(body) && !res.headers.has("set-cookie")) {
-      const headers = {};
-      res.headers.forEach(function (value, name) {
-        headers[name] = value;
-      });
-      headers["x-sb-cpu-ms"] = (cpu >= 0 ? cpu : 0).toFixed(3);
-      return new Response(body, { status: res.status, headers: headers });
+    // A string body and no Set-Cookie, as before. The native writer reads Headers' flat `_entries`,
+    // so the stamp is appended to the handler's own Response instead of building a second one (a
+    // Headers, a body extraction and a status check, plus a copy of every header); an x-sb-cpu-ms
+    // the handler set itself is replaced by the measured one, as before.
+    const headers = res && res.headers;
+    if (headers && __sbIsStr(__sbRawBody(res)) && !headers.has("set-cookie")) {
+      const stamp = (cpu >= 0 ? cpu : 0).toFixed(3);
+      const entries = headers._entries;
+      let set = false;
+      for (let i = 0; i < entries.length; i += 2) {
+        if (entries[i] === "x-sb-cpu-ms") {
+          entries[i + 1] = stamp;
+          set = true;
+        }
+      }
+      if (!set) headers._push("x-sb-cpu-ms", stamp);
     }
   } catch {
-    /* fall through to the original response */
+    /* the handler's Response goes out unstamped */
   }
   return res;
 }
@@ -9204,6 +9212,14 @@ function __sbDecodeIngress(request) {
   };
 }
 
+// SB_TRUSTED_PROXIES is fixed for the life of a process (a sproutd worker gets its own after the fork,
+// and this runs per request, never before it), so it is read and split once, not four times a request.
+let __sbTrustedCache;
+function __sbTrustedProxiesOnce() {
+  if (__sbTrustedCache === undefined) __sbTrustedCache = __sbSplitList(__sbEnv("SB_TRUSTED_PROXIES"));
+  return __sbTrustedCache;
+}
+
 globalThis.__sbEntry = function (handlers, request) {
   __sbDecodeIngress(request);
   const trigger = request.headers.get("x-sb-trigger");
@@ -9214,13 +9230,18 @@ globalThis.__sbEntry = function (handlers, request) {
     // are only set when a trusted front proxy forwarded them; colo, ASN and
     // geo fields stay absent everywhere (#128 explicitly rejects faking them).
     const __cf = request.cf || {};
-    __cf.clientIp = __sbClientIp(request);
-    const __httpProtocol = __sbTrustedProxyHeader(request, "x-sb-http-protocol");
-    if (__httpProtocol) __cf.httpProtocol = __httpProtocol;
-    const __tlsVersion = __sbTrustedProxyHeader(request, "x-sb-tls-version");
-    if (__tlsVersion) __cf.tlsVersion = __tlsVersion;
-    const __tlsCipher = __sbTrustedProxyHeader(request, "x-sb-tls-cipher");
-    if (__tlsCipher) __cf.tlsCipher = __tlsCipher;
+    if (__sbTrustedProxiesOnce().length === 0) {
+      // No trusted proxy (the usual case): the peer is the client and no forwarded header counts.
+      __cf.clientIp = __sbNormalizeIp(request.headers.get("x-sb-remote-addr") || "");
+    } else {
+      __cf.clientIp = __sbClientIp(request);
+      const __httpProtocol = __sbTrustedProxyHeader(request, "x-sb-http-protocol");
+      if (__httpProtocol) __cf.httpProtocol = __httpProtocol;
+      const __tlsVersion = __sbTrustedProxyHeader(request, "x-sb-tls-version");
+      if (__tlsVersion) __cf.tlsVersion = __tlsVersion;
+      const __tlsCipher = __sbTrustedProxyHeader(request, "x-sb-tls-cipher");
+      if (__tlsCipher) __cf.tlsCipher = __tlsCipher;
+    }
     request.cf = __cf;
     // The edge's headers are gone: from 2026-10-23 the handler cannot change the rest.
     __sbFreezeHeaders(request);
