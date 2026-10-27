@@ -1401,6 +1401,70 @@ static void sb_collect_quiet(struct us_timer_t*) {
   await Promise.all([writeFile(renderFile, render), writeFile(shimFile, shim)]);
 }
 
+/** Requests between collections in a standalone binary (SB_GC_EVERY overrides it). */
+const REQUEST_GC_EVERY_DEFAULT = 8;
+const REQUEST_GC_MARKER = "// sproutboat: collect every N requests";
+const REQUEST_GC_HEAD = "static void collect_after_request(void) {\n";
+const REQUEST_GC_BLOCK = `${REQUEST_GC_MARKER}
+// The standalone binary used to collect after every response. A collection costs about the same
+// whatever the request made (it marks the live heap), so a cheap request paid it in full: 13 to 15%
+// of the CPU of a small API request. It now collects every SB_GC_EVERY requests (default
+// ${REQUEST_GC_EVERY_DEFAULT}), and once the server has been quiet for about 50 ms, so a burst's garbage is not held
+// past it. A request that needs more heap than is free still collects at allocation time, as before.
+// SB_GC_EVERY=1 restores a collection after every request. sproutd has its own host and does not run this.
+static u32 sb_gc_every(void) {
+  static u32 cached = 0;
+  if (cached == 0) {
+    const char* raw = getenv("SB_GC_EVERY");
+    long parsed = raw && *raw ? atol(raw) : 0;
+    cached = parsed > 0 ? (u32)parsed : ${REQUEST_GC_EVERY_DEFAULT}u;
+  }
+  return cached;
+}
+static u32 sb_gc_since = 0;
+static u32 sb_gc_idle_seen = 0;
+static us_timer_t* sb_gc_idle_timer = nullptr;
+static void collect_after_request_now(void);
+static void sb_gc_idle_tick(struct us_timer_t* timer) {
+  if (sb_gc_since == 0) return;
+  if (sb_gc_since != sb_gc_idle_seen) {
+    sb_gc_idle_seen = sb_gc_since;
+    us_timer_set(timer, sb_gc_idle_tick, 50, 0);
+    return;
+  }
+  collect_after_request_now();
+}
+static void collect_after_request(void) {
+  if (++sb_gc_since < sb_gc_every()) {
+    if (sb_gc_since == 1) {
+      if (!sb_gc_idle_timer) sb_gc_idle_timer = us_create_timer((struct us_loop_t*)uWS::Loop::get(), 0, 0);
+      if (sb_gc_idle_timer) {
+        sb_gc_idle_seen = 0;
+        us_timer_set(sb_gc_idle_timer, sb_gc_idle_tick, 50, 0);
+      }
+    }
+    return;
+  }
+  collect_after_request_now();
+}
+static void collect_after_request_now(void) {
+  sb_gc_since = 0;
+`;
+
+/**
+ * Standalone only: collect every SB_GC_EVERY requests and when idle, not after each one. It edits the native
+ * shim (compiler/uwebsockets.js), never render.js, so sproutd's collector is untouched. Runs after
+ * patchQuietCollection, whose collect_after_request it renames.
+ */
+export async function patchRequestCollectionInterval(root: string): Promise<void> {
+  const file = resolve(root, "compiler/uwebsockets.js");
+  const src = await readFile(file, "utf8");
+  if (src.includes(REQUEST_GC_MARKER)) return;
+  if (src.split(REQUEST_GC_HEAD).length !== 2 || !src.includes("sb_collect_quiet"))
+    throw new Error(`could not patch Porffor's request collection: anchor not found in ${file}`);
+  await writeFile(file, src.replace(REQUEST_GC_HEAD, REQUEST_GC_BLOCK));
+}
+
 /**
  * Apply every patch to a Porffor checkout at `root` (the directory that holds
  * `compiler/` and `runtime/`). Idempotent per process and per marker, so it is
@@ -2112,6 +2176,7 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchBigIntRoots(root);
   await patchStreamingResponses(root);
   await patchQuietCollection(root);
+  await patchRequestCollectionInterval(root);
   await patchAsyncWaker(root);
   await patchDeferredDiscard(root);
   await patchGcFootprint(root);
