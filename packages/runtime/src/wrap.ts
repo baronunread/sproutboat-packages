@@ -234,7 +234,7 @@ export function wrapNativeFetchHandler(
     );
   }
 
-  const env = `const env = ${JSON.stringify(vars)};\nglobalThis.env = env;\n`;
+  const env = `const env = ${JSON.stringify(vars)};\nglobalThis.env = env;\n__sbSetEnv(env);\n`;
   const versionMetadataLine = versionMetadata
     ? `env[${JSON.stringify(versionMetadata.binding)}] = ${JSON.stringify({
         id: versionMetadata.id,
@@ -246,6 +246,7 @@ export function wrapNativeFetchHandler(
   // not be able to change the semantics it was compiled against at runtime.
   const compat =
     `globalThis.__sbCompat = ${JSON.stringify(compatibilityDate)};\n` +
+    `__sbSetCompat(${JSON.stringify(compatibilityDate)});\n` +
     // #15 — the embedded transport derives its default data directory from this.
     `globalThis.__sbAppName = ${JSON.stringify(appName)};\n` +
     (assets ? `globalThis.__sbAssets = ${JSON.stringify(assets)};\n` : "");

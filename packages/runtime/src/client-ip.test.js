@@ -17,7 +17,7 @@ const load = new Function(
   "__envMap",
   `${src.slice(start, end)}
    const __sbEnv = (k) => __envMap[k];
-   return { __sbNormalizeIp, __sbIpInCidr, __sbIpTrusted, __sbClientIp, __sbSplitList, __sbTrustedProxyHeader };`,
+   return { __sbNormalizeIp, __sbIpInCidr, __sbIpTrusted, __sbClientIp, __sbSplitList, __sbTrustedProxyHeader, __sbTrustedProxiesOnce };`,
 );
 const H = load(new Proxy({}, { get: (_, k) => env[k] }));
 
@@ -62,7 +62,9 @@ test("__sbClientIp: a trusted peer resolves the rightmost untrusted XFF hop", ()
 
 test("__sbClientIp: an untrusted peer cannot use XFF even if it sends one", () => {
   env = { SB_TRUSTED_PROXIES: "10.0.0.0/8" };
-  expect(H.__sbClientIp(req({ "x-sb-remote-addr": "198.51.100.9", "x-forwarded-for": "1.1.1.1" }))).toBe("198.51.100.9");
+  expect(H.__sbClientIp(req({ "x-sb-remote-addr": "198.51.100.9", "x-forwarded-for": "1.1.1.1" }))).toBe(
+    "198.51.100.9",
+  );
 });
 
 test("__sbTrustedProxyHeader: no trusted proxies configured means the header is ignored", () => {
@@ -82,4 +84,11 @@ test("__sbTrustedProxyHeader: a trusted peer's value passes through, absent stay
   const r = req({ "x-sb-remote-addr": "127.0.0.1", "x-sb-http-protocol": "HTTP/2" });
   expect(H.__sbTrustedProxyHeader(r, "x-sb-http-protocol")).toBe("HTTP/2");
   expect(H.__sbTrustedProxyHeader(r, "x-sb-tls-cipher")).toBeUndefined();
+});
+
+test("__sbTrustedProxiesOnce reads SB_TRUSTED_PROXIES once and keeps the list", () => {
+  env = { SB_TRUSTED_PROXIES: "10.0.0.0/8, 192.0.2.1" };
+  expect(H.__sbTrustedProxiesOnce()).toEqual(["10.0.0.0/8", "192.0.2.1"]);
+  env = { SB_TRUSTED_PROXIES: "198.51.100.0/24" };
+  expect(H.__sbTrustedProxiesOnce()).toEqual(["10.0.0.0/8", "192.0.2.1"]); // fixed for the process
 });

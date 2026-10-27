@@ -208,7 +208,12 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "class Response {\n  constructor(body = null, init = undefined) {\n    this.body = body;\n    this.status = Number(init?.status ?? 200);\n    this.headers = new Headers(init?.headers);\n  }\n}\n",
     "compiler/builtins/console.ts":
       "export const __Porffor_consolePrint = (arg: any): void => {\n  __Porffor_print(arg);\n};\n",
+    "compiler/builtins.js":
+      "        const sync = [];\n        if (name === 'globalThis') globalThisUserSync(Box(getPtr, Const(T.i32, TYPES.object)), sync);\n" +
+      "        out.push(BlockStmt(sync));\n",
     "compiler/codegen.js":
+      "  Reinterpret, Box, JvType, JvNum, JvPtr, JvIsNum,\n" +
+      "  globalThisUserSync: (objJv, sync) => {\n    const finalizer = () => {\n      sync.length = 0;\n      const seen = new Set();\n      const push = (key, value) => {\n        seen.add(key);\n        sync.push(builtinCall(scope, '__Porffor_object_set', [ objJv, makeString(scope, key), value ]));\n      };\n" +
       "    includeBuiltin(topLevelFunc, '__Porffor_promise_resolve');\n" +
       "if (!hoistRead && directCallOnlyFunctionBinding(scope, kind, name, pattern, func)) {\n        return valUndefined();\n}\nconst func = resolveNamedFunction(scope, name) ?? funcByName(name);\n" +
       "    // only names that are nothing but this declaration and its direct calls\n    if (find(program, n => n.name === x.id.name).length !== 1) continue;\n" +

@@ -5,21 +5,8 @@ const source = unicodeEncoderSource("class TextEncoder { }\nclass TextDecoder { 
 const Encoder = new Function(`${source}\nreturn TextEncoder;`)();
 
 test("UTF-8 encoding matches WebCrypto inputs for BMP, astral and lone surrogates", () => {
-  for (const input of [
-    "",
-    "ASCII",
-    "caffè",
-    "東京",
-    "🚤",
-    "x🚤y",
-    "\ud800",
-    "\udc00",
-    "\ud800x",
-    "🚤".repeat(1000),
-  ]) {
-    expect(Array.from(new Encoder().encode(input))).toEqual(
-      Array.from(new TextEncoder().encode(input)),
-    );
+  for (const input of ["", "ASCII", "caffè", "東京", "🚤", "x🚤y", "\ud800", "\udc00", "\ud800x", "🚤".repeat(1000)]) {
+    expect(Array.from(new Encoder().encode(input))).toEqual(Array.from(new TextEncoder().encode(input)));
   }
 });
 
@@ -28,9 +15,7 @@ test("encodeInto stops before a split UTF-8 character and counts UTF-16 units", 
     for (let size = 0; size <= 10; size++) {
       const actual = new Uint8Array(size);
       const expected = new Uint8Array(size);
-      expect(new Encoder().encodeInto(input, actual)).toEqual(
-        new TextEncoder().encodeInto(input, expected),
-      );
+      expect(new Encoder().encodeInto(input, actual)).toEqual(new TextEncoder().encodeInto(input, expected));
       expect(actual).toEqual(expected);
     }
   }

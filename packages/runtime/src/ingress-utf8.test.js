@@ -7,7 +7,7 @@ const rawBody = src.slice(src.indexOf("function __sbRawBody("), src.indexOf("fun
 if (!decoder || !ingress || !rawBody) throw new Error("Ingress decoder source not found");
 // oxlint-disable-next-line no-function-constructor -- Exercise the text-only runtime prelude.
 const load = new Function(
-  `// The C fast paths (Porffor.c) cannot run here: the stubs make the JS fallback run.\nfunction __sbFromUtf8Native() { return ""; }\nfunction __sbToBytesNative() { return ""; }\n${decoder}\n${rawBody}\n${ingress}\nreturn __sbDecodeIngress;`,
+  `// The C fast paths (Porffor.c) cannot run here: the stubs make the JS fallback run.\nfunction __sbFromUtf8Native() { return ""; }\nfunction __sbToBytesNative() { return ""; }\nfunction __sbCompatDate() { return undefined; }\n${decoder}\n${rawBody}\n${ingress}\nreturn __sbDecodeIngress;`,
 );
 const decode = load();
 const raw = (text) => Array.from(new TextEncoder().encode(text), (byte) => String.fromCharCode(byte)).join("");

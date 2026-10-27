@@ -25,7 +25,7 @@ export const REQUEST_CLASS_SOURCE = String.raw`class Request {
     }
     // FormData as multipart/form-data. The prelude defines FormData and URLSearchParams on
     // globalThis after this file is compiled.
-    const Form = globalThis.FormData;
+    const Form = Request._form ?? (Request._form = globalThis.FormData);
     if (Form != null && body instanceof Form) {
       const boundary = '----sproutboat' + Math.random().toString(16).slice(2) + Math.random().toString(16).slice(2);
       const encoder = new TextEncoder();
@@ -44,7 +44,7 @@ export const REQUEST_CLASS_SOURCE = String.raw`class Request {
       if (!headers.has('content-type')) headers.set('content-type', 'multipart/form-data; boundary=' + boundary);
       return new Blob(parts)._bytes;
     }
-    const Params = globalThis.URLSearchParams;
+    const Params = Request._params ?? (Request._params = globalThis.URLSearchParams);
     if (Params != null && body instanceof Params) {
       if (!headers.has('content-type')) headers.set('content-type', 'application/x-www-form-urlencoded;charset=UTF-8');
       return body.toString();
@@ -61,11 +61,19 @@ export const REQUEST_CLASS_SOURCE = String.raw`class Request {
     return new TextEncoder().encode(text);
   }
 
+  // The compatibility date, from the static the app tail sets once (__sbSetCompat). Every read of
+  // globalThis costs a rebuild of the whole global object (#get_globalThis), ~20 us each, so the
+  // per-request paths here avoid it; until the tail has run (the shared template, unit tests) it
+  // reads globalThis as before.
+  static _compat() { const d = Request._cd; return d === undefined ? globalThis.__sbCompat : d; }
+  // Whether the prelude defined WebSocketPair: set by __sbInstallWebSockets once the date is known.
+  static _hasWebSocketPair() { const h = Request._hasWsp; return h === undefined ? globalThis.WebSocketPair != null : h; }
+
   // Fetch as workerd implements it, from compatibility date 2026-10-23: a Request made from
   // another takes its body (the source becomes used, and a used one cannot be copied),
   // GET and HEAD refuse any body, methods and redirect modes are workerd's, and errors
   // carry workerd's messages. Before it, a copy shared the body, as it always did here.
-  static _strict() { return globalThis.__sbCompat >= '2026-10-23'; }
+  static _strict() { return Request._compat() >= '2026-10-23'; }
   static _usedError() {
     return new TypeError(Request._strict() ? 'Body has already been used. It can only be used once. Use tee() first if you need to read it twice.' : 'Body has already been used');
   }
@@ -110,7 +118,7 @@ export const REQUEST_CLASS_SOURCE = String.raw`class Request {
   // was here (apps read request.body as a string); a deployed handler keeps its behaviour.
   static _bodyAsStream(message) {
     const init = message._bodyInit;
-    if (!(globalThis.__sbCompat >= '2026-10-21')) return init;
+    if (!(Request._compat() >= '2026-10-21')) return init;
     if (init == null) return null;
     if (Request._isStream(init)) return init;
     if (message._bodyStream == null) {
@@ -140,7 +148,7 @@ export const REQUEST_CLASS_SOURCE = String.raw`class Request {
   // once, since the prelude reads them synchronously. The prelude defines ReadableStream on
   // globalThis after this file is compiled.
   static _isStream(body) {
-    const Stream = globalThis.ReadableStream;
+    const Stream = Request._stream ?? (Request._stream = globalThis.ReadableStream);
     return Stream != null && body instanceof Stream;
   }
   static async _streamBytes(stream) {
@@ -282,7 +290,7 @@ export const RESPONSE_CLASS_SOURCE = String.raw`class Response {
     this.status = Number(status);
     // A WebSocket handshake answer (from compatibility date 2026-10-30, where the prelude
     // defines WebSocketPair): status 101 and the client end of a pair, as in workerd.
-    const webSocket = globalThis.WebSocketPair != null ? init?.webSocket : null;
+    const webSocket = Request._hasWebSocketPair() ? init?.webSocket : null;
     if (webSocket != null) {
       if (this.status != 101) throw new RangeError('Responses with a WebSocket must have status code 101.');
       this._webSocket = webSocket;
@@ -306,7 +314,7 @@ export const RESPONSE_CLASS_SOURCE = String.raw`class Response {
   get type() { return this._type ?? 'default'; }
   get ok() { return this.status >= 200 && this.status < 300; }
   // null when there is none, as in workerd; before 2026-10-30 (no WebSocketPair) undefined.
-  get webSocket() { return this._webSocket != null ? this._webSocket : globalThis.WebSocketPair != null ? null : undefined; }
+  get webSocket() { return this._webSocket != null ? this._webSocket : Request._hasWebSocketPair() ? null : undefined; }
   get body() { return Request._bodyAsStream(this); }
   set body(value) { this._bodyInit = value; this._bodyStream = null; }
   get bodyUsed() { return Request._used(this); }
