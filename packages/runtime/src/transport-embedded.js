@@ -5323,7 +5323,7 @@ function __sbLtxConfigure() {
 }
 
 function __sbCall(reqJson) {
-  if (globalThis.__sbCompat >= "2026-10-22") __sbLtxConfigure();
+  if (__sbCompatDate() >= "2026-10-22") __sbLtxConfigure();
   try {
     return JSON.stringify(__sbEmbeddedDispatch(JSON.parse(reqJson)));
   } catch (err) {
@@ -5710,8 +5710,8 @@ globalThis.__sbStartLocalTriggers = function (handlers, bindings) {
           try {
             const receiver = __sbReceiver(handlers, ctx);
             const event = { cron: crons[i], scheduledTime: now.getTime(), noRetry() {} };
-            const res = globalThis.__sbCompat >= "2026-09-28"
-              ? receiver.scheduled(event, globalThis.env, ctx)
+            const res = __sbCompatDate() >= "2026-09-28"
+              ? receiver.scheduled(event, __sbEnvValue(), ctx)
               : receiver.scheduled(event, ctx);
             if (res && __sbIsFn(res.then)) await res;
           } catch (error) {
