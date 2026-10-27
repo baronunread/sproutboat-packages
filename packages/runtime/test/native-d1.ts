@@ -51,6 +51,33 @@ int main(void) {
     char* params = strchr(sql, '\\t'); if (!params) return 2; *params++ = 0;
     if (!strncmp(line, ":db ", 4)) { int r = sql[0] == 'p' ? sb_db_page_size(line + 4) : sb_db_quota_freeze(line + 4, sql[0] == 'c' ? -1 : sql[0] == 'f'); printf("{\\"n\\":%d}\\n", r); fflush(stdout); continue; }
     if (!strncmp(line, ":bytes ", 7)) { line[strcspn(line, "\\t")] = 0; printf("{\\"n\\":%lld}\\n", sb_dir_bytes(line + 7, 0)); fflush(stdout); continue; }
+    // ":cells PATH": the same statement through sb_sql_run_x with cells, printed as JSON the test
+    // can compare with sb_sql_run's rows: TEXT as \\uXXXX units (sb_text_units), BLOB as {"$blob":hex}.
+    if (!strncmp(line, ":cells ", 7)) {
+      sb_cells cs = { 0, 0, 0, 0, 0 };
+      char* head = sb_sql_run_x(line + 7, sql, params, &cs);
+      printf("{\\"head\\":%s,\\"rows\\":[", head);
+      size_t nrow = cs.ncol ? cs.n / (size_t)cs.ncol : 0;
+      for (size_t r = 0; r < nrow; r++) {
+        printf(r ? ",[" : "[");
+        for (int c = 0; c < cs.ncol; c++) {
+          sb_cell* x = &cs.c[r * (size_t)cs.ncol + (size_t)c];
+          if (c) printf(",");
+          if (x->t == 0) printf("null");
+          else if (x->t == 1) printf("%.17g", x->d);
+          else if (x->t == 2) {
+            uint16_t* u = (uint16_t*)malloc((size_t)x->n * 2 + 2); int wide = 0;
+            size_t k = sb_text_units((const unsigned char*)x->p, (size_t)x->n, u, &wide);
+            printf("\\"");
+            for (size_t i = 0; i < k; i++) printf("\\\\u%04x", u[i]);
+            printf("\\"");
+            free(u);
+          } else { printf("{\\"$blob\\":\\""); for (int i = 0; i < x->n; i++) printf("%02x", (unsigned char)x->p[i]); printf("\\"}"); }
+        }
+        printf("]");
+      }
+      printf("]}\\n"); fflush(stdout); sb_cells_free(&cs); free(head); continue;
+    }
     // ":script PATH" runs SQL as a script (sb_sql_script, what exec() uses).
     char* out = !strncmp(line, ":script ", 8) ? sb_sql_script(line + 8, sql) : sb_sql_run(line, sql, params); puts(out); fflush(stdout); free(out);
   }
@@ -90,6 +117,59 @@ int main(void) {
     "blob stored as a BLOB, later parameters kept",
   );
   assert.equal(other.rows[0][0], String(other.rows[0][0]), "outside D1 a BLOB is still one char per byte, not hex");
+
+  // Strict rows handed over as cells (the JS arrays are built from them in C) hold exactly what
+  // the JSON rows hold: NULL, integers, floats, ASCII, Latin-1, BMP and astral text, every kind
+  // of invalid UTF-8, a BLOB, and no rows at all.
+  const cellRun = (sql: string, params: unknown[] = []) => {
+    const input = `:cells ${d1}\t/*sb-d1-strict*/${sql}\t${JSON.stringify(params)}\n${d1}\t/*sb-d1-strict*/${sql}\t${JSON.stringify(params)}\n`;
+    const out = Bun.spawnSync([binary], { stdin: Buffer.from(input) });
+    assert.equal(out.exitCode, 0, out.stderr.toString());
+    const [cells, json] = out.stdout
+      .toString()
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l));
+    return { cells, json };
+  };
+  const bad = [
+    "x'80'",
+    "x'c0af'",
+    "x'c3'",
+    "x'e282'",
+    "x'f09f9880'",
+    "x'f0'",
+    "x'eda080'",
+    "x'f4908080'",
+    "x'e0809a'",
+    "x'41c342'",
+    "x'ffff'",
+    "x'c3a9e282'",
+  ];
+  const texts = [
+    "''",
+    "'plain ascii'",
+    "'caf\u00e9'",
+    "'\u4e1c\u4eac'",
+    "'x\u{1F680}y'",
+    "'\u00ff\u0100'",
+    "char(113, 34, 92, 10, 9, 1, 127)",
+    ...bad.map((b) => `CAST(${b} AS TEXT)`),
+  ];
+  for (const t of texts) {
+    const { cells, json } = cellRun(`SELECT ${t} AS t, 7 AS i, 2.5 AS f, NULL AS n, x'00ff7f' AS b, ${t} || 'z' AS u`);
+    assert.equal(cells.head.ok, true);
+    assert.deepEqual(cells.rows, json.rows, `cells equal the JSON rows for ${t}`);
+    assert.deepEqual(cells.head.cols, json.cols);
+    assert.equal(cells.head.changes, json.changes);
+  }
+  const empty = cellRun("SELECT a FROM t WHERE 0");
+  assert.deepEqual(empty.cells.rows, []);
+  assert.deepEqual(empty.json.rows, []);
+  const wide = cellRun("SELECT * FROM t");
+  assert.deepEqual(wide.cells.rows, wide.json.rows, "a table with a BLOB and NULLs");
+  const failed = cellRun("SELECT nope FROM nowhere");
+  assert.equal(failed.cells.head.ok, false);
 
   // An object that is not a blob binds NULL and the parse carries on (a "}" in a string included).
   const [, kept] = run([
@@ -172,12 +252,23 @@ int main(void) {
   };
   // oxlint-disable-next-line no-function-constructor -- lifting a block out of the text-only transport
   const scriptRaw = (path: string, text: string) => sqlRaw(":script " + path, text, "[]");
+  // __sbSqlRowsRaw as the transport's C block gives it: [header JSON, rows], BLOBs as byte arrays.
+  const rowsOf =
+    (raw: (path: string, text: string, params: string) => string) => (path: string, text: string, params: string) => {
+      const r = JSON.parse(raw(":cells " + path, text, params));
+      if (r.head.ok === false) return [JSON.stringify(r.head), undefined];
+      const rows = r.rows.map((row: unknown[]) =>
+        row.map((c) => (c instanceof Object && "$blob" in c ? [...Buffer.from(String(c.$blob), "hex")] : c)),
+      );
+      return [JSON.stringify(r.head), rows];
+    };
   const ops = new Function(
     "__sbSqlRaw",
     "__sbSql",
     "__sbSqlScriptRaw",
+    "__sbSqlRowsRaw",
     `${transport.slice(opsStart, opsEnd)}\nreturn { __sbD1Run, __sbD1Batch, __sbD1Open, __sbD1ExecLines };`,
-  )(sqlRaw, sql, scriptRaw);
+  )(sqlRaw, sql, scriptRaw, rowsOf(sqlRaw));
   // The storage quota, lifted from "The storage quota" to __sbStore, for DIR and LIMIT.
   const quotaStart = transport.indexOf("// The storage quota: an app's data directory");
   const quotaEnd = transport.indexOf("function __sbStore() {");
@@ -233,8 +324,9 @@ int main(void) {
       "__sbSqlRaw",
       "__sbSql",
       "__sbSqlScriptRaw",
+      "__sbSqlRowsRaw",
       `${transport.slice(opsStart, opsEnd)}\nreturn { __sbD1Run, __sbD1Batch, __sbD1Open, __sbD1ExecLines };`,
-    )(raw, run, (path: string, text: string) => raw(":script " + path, text, "[]"));
+    )(raw, run, (path: string, text: string) => raw(":script " + path, text, "[]"), rowsOf(raw));
     const lift = (dir: string, limit: number) =>
       // oxlint-disable-next-line no-function-constructor -- lifting a block out of the text-only transport
       new Function(
@@ -312,7 +404,7 @@ int main(void) {
       "D1_ERROR: FOREIGN KEY constraint failed: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_FOREIGNKEY)",
   );
   const strictRow = ops.__sbD1Run(db2, "SELECT 1 AS a, ?1 AS a", [{ $blob: "0a" }], true);
-  assert.deepEqual([strictRow.columns, strictRow.rows], [["a", "a"], [[1, { $blob: "0a" }]]]);
+  assert.deepEqual([strictRow.columns, strictRow.rows], [["a", "a"], [[1, [10]]]]);
   assert.throws(
     () => ops.__sbD1Run(db2, "SELEC 1", [], true),
     (e: Error) => e.message === 'D1_ERROR: near "SELEC": syntax error at offset 0: SQLITE_ERROR',
@@ -413,6 +505,7 @@ int main(void) {
     "__sbSqlRaw",
     "__sbSql",
     "__sbSqlScriptRaw",
+    "__sbSqlRowsRaw",
     `${transport.slice(opsStart, opsEnd)}\nreturn { __sbD1Run, __sbD1Batch };`,
   )(
     (path: string, text: string, params: string) => {
@@ -421,6 +514,7 @@ int main(void) {
     },
     sql,
     scriptRaw,
+    rowsOf(sqlRaw),
   );
   const LTX_FAILED =
     "D1_ERROR: LTX capture failed: the transaction may be committed locally but is not durable in the replication log; writes are refused until restart: SQLITE_IOERR";

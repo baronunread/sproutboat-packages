@@ -5267,7 +5267,8 @@ function __sbD1Meta(meta, started) {
 }
 // Columns and rows of a strict reply (an older broker answers with objects only).
 function __sbD1Table(r) {
-  if (r.columns) return { columns: r.columns, rows: __sbD1Rows(r) };
+  // rows built in C (r.native) already hold BLOBs as byte arrays
+  if (r.columns) return { columns: r.columns, rows: r.native === true ? r.rows : __sbD1Rows(r) };
   const objects = r.results || [];
   const columns = objects.length ? Object.keys(objects[0]) : [];
   const rows = [];
