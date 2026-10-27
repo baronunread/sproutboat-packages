@@ -3645,7 +3645,12 @@ if (globalThis.crypto.getRandomValues == null) {
   for (let i = 0; i < 128; i++) sextet.push(255);
   for (let i = 0; i < alphabet.length; i++) sextet[alphabet.charCodeAt(i)] = i;
   globalThis.atob = function (data) {
-    let text = String(data).replace(/[\t\n\f\r ]/g, "");
+    // One C pass for the usual input (no whitespace, valid characters); the JS below
+    // takes everything else, so it alone decides what throws.
+    const input = String(data);
+    const fast = __sbAtobNative(input);
+    if (fast !== "") return fast;
+    let text = input.replace(/[\t\n\f\r ]/g, "");
     if (text.length % 4 === 0) text = text.replace(/==?$/, "");
     if (text.length % 4 === 1) throw invalidCharacter("atob: the string is not valid base64");
     const parts = [];
@@ -4058,6 +4063,7 @@ function __sbToBytes(input) {
 }
 function __sbBufFrom(latin1) {
   const b = new Uint8Array(latin1.length);
+  if (__sbFillBytes(latin1, b)) return b.buffer;
   for (let i = 0; i < latin1.length; i++) b[i] = latin1.charCodeAt(i) & 0xff;
   return b.buffer;
 }
@@ -4190,6 +4196,8 @@ function __sbRawBodyResponse(body, init) {
 // Constant-time compare of two latin1 byte strings.
 function __sbEqCt(a, b) {
   if (a.length !== b.length) return false;
+  const native = __sbEqCtNative(a, b);
+  if (native >= 0) return native === 1;
   let diff = 0;
   for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return diff === 0;
@@ -4805,6 +4813,21 @@ static size_t sb_utf8_encode_units(const uint16_t* s, size_t len, unsigned char*
   return k;
 }
 
+// Unit I of a string held as UTF-16 (WIDE) or one unit per byte.
+static unsigned sb_unit(const unsigned char* s, int wide, size_t i) {
+  return wide ? (unsigned)((const uint16_t*)s)[i] : (unsigned)s[i];
+}
+
+// Base64 sextet of a character, or -1.
+static int sb_b64_val(unsigned c) {
+  if (c >= 'A' && c <= 'Z') return (int)(c - 'A');
+  if (c >= 'a' && c <= 'z') return (int)(c - 'a') + 26;
+  if (c >= '0' && c <= '9') return (int)(c - '0') + 52;
+  if (c == '+') return 62;
+  if (c == '/') return 63;
+  return -1;
+}
+
 `;
 
 // sproutd #22: __sbFromUtf8 for a string of bytes (one byte per unit) or a Uint8Array, in C.
@@ -4898,6 +4921,91 @@ function __sbToBytesNative(input) {
           memcpy(__o, MEM + __data, (size_t)__len);
           out = porf_box((f64)porf_native_fetch_alloc_bytestring((const char*)__o, (size_t)__len), 195);
           free(__o);
+        }
+      }
+    }
+  `;
+  return out;
+}
+
+// Constant-time equality of two equal-length bytestrings in C: 1 equal, 0 different, -1 when
+// either is not a bytestring (the caller then compares in JS).
+// oxlint-disable-next-line no-unused-vars -- `a` and `b` are read inside the RawC block below, not by JS.
+function __sbEqCtNative(a, b) {
+  let result = -1;
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    if (a.type == 195 && b.type == 195) {
+      const size_t __n = (size_t)*(u32*)(MEM + (u32)a.val);
+      if (__n == (size_t)*(u32*)(MEM + (u32)b.val)) {
+        const unsigned char* __x = (const unsigned char*)(MEM + (u32)a.val + 4);
+        const unsigned char* __y = (const unsigned char*)(MEM + (u32)b.val + 4);
+        unsigned char __diff = 0;
+        for (size_t __i = 0; __i < __n; __i++) __diff |= __x[__i] ^ __y[__i];
+        result = (f64)(__diff == 0 ? 1 : 0);
+      }
+    }
+  `;
+  return result;
+}
+
+// Copies a bytestring (one unit per byte) into the front of a Uint8Array.
+// Returns false (writing nothing) when it cannot.
+// oxlint-disable-next-line no-unused-vars -- `bytes` and `view` are read inside the RawC block below, not by JS.
+function __sbFillBytes(bytes, view) {
+  let ok = 0;
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    if (bytes.type == 195 && view.type == 81 && *(int32_t*)(MEM + (u32)view.val) >= 0) {
+      const u32 __p = (u32)bytes.val;
+      const u32 __v = (u32)view.val;
+      const size_t __n = (size_t)*(u32*)(MEM + __p);
+      if (__n <= (size_t)*(int32_t*)(MEM + __v)) {
+        memcpy(MEM + *(u32*)(MEM + __v + 4) + 4, MEM + __p + 4, __n);
+        ok = (f64)1;
+      }
+    }
+  `;
+  return ok === 1;
+}
+
+// atob for the common case: no whitespace, only base64 characters, `=` padding
+// only where the spec allows it. Returns the decoded bytestring, or "" for
+// anything else (including an empty result), so the caller's JS path decides
+// and throws.
+// oxlint-disable-next-line no-unused-vars -- `text` is read inside the RawC block below, not by JS.
+function __sbAtobNative(text) {
+  let out = "";
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    if (text.type == 195 || text.type == 67) {
+      const u32 __p = (u32)text.val;
+      const int __wide = text.type == 67;
+      size_t __n = (size_t)*(u32*)(MEM + __p);
+      const unsigned char* __s = (const unsigned char*)(MEM + __p + 4);
+      if (__n % 4 == 0) {
+        if (__n > 0 && sb_unit(__s, __wide, __n - 1) == '=') __n--;
+        if (__n > 0 && sb_unit(__s, __wide, __n - 1) == '=' && __n % 4 != 0) __n--;
+      }
+      if (__n > 0 && __n % 4 != 1) {
+        const size_t __cap = __n / 4 * 3 + 3;
+        unsigned char __stack[768];
+        unsigned char* __o = __cap <= sizeof(__stack) ? __stack : (unsigned char*)malloc(__cap);
+        if (__o) {
+          size_t __k = 0, __i = 0;
+          int __bad = 0;
+          uint32_t __acc = 0;
+          int __bits = 0;
+          for (; __i < __n; __i++) {
+            const unsigned __c = sb_unit(__s, __wide, __i);
+            const int __v = __c < 128 ? sb_b64_val(__c) : -1;
+            if (__v < 0) { __bad = 1; break; }
+            __acc = (__acc << 6) | (uint32_t)__v;
+            __bits += 6;
+            if (__bits >= 8) { __bits -= 8; __o[__k++] = (unsigned char)((__acc >> __bits) & 0xff); }
+          }
+          if (!__bad) out = porf_box((f64)porf_native_fetch_alloc_bytestring((const char*)__o, __k), 195);
+          if (__o != __stack) free(__o);
         }
       }
     }

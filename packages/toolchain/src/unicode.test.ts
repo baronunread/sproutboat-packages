@@ -2,7 +2,8 @@ import { expect, test } from "bun:test";
 import { unicodeEncoderSource } from "./unicode";
 const source = unicodeEncoderSource("class TextEncoder { }\nclass TextDecoder { }");
 // oxlint-disable-next-line no-function-constructor -- Test the replacement source inserted into Porffor's fetch globals.
-const Encoder = new Function(`${source}\nreturn TextEncoder;`)();
+// Outside Porffor the C blocks do nothing, so this runs the JavaScript loops; the native test covers the C.
+const Encoder = new Function("Porffor", `${source}\nreturn TextEncoder;`)({ c: () => undefined });
 
 test("UTF-8 encoding matches WebCrypto inputs for BMP, astral and lone surrogates", () => {
   for (const input of ["", "ASCII", "caffè", "東京", "🚤", "x🚤y", "\ud800", "\udc00", "\ud800x", "🚤".repeat(1000)]) {

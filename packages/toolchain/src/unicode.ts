@@ -113,11 +113,72 @@ export const __Porffor_json_appendChar = (out: string, char: i32): void => {
   return source;
 }
 
+// The UTF-8 loop of TextEncoder.encode in C, run once to count (__o is null) and once to
+// fill. A valid surrogate pair is four bytes, a lone surrogate U+FFFD; __wide says the string is
+// UTF-16, otherwise it holds one unit per byte. No backtick or dollar-brace in here: it is
+// spliced into a template literal in the generated JavaScript.
+const ENCODE_LOOP = `
+        size_t __k = 0;
+        for (size_t __i = 0; __i < __len; __i++) {
+          uint32_t __c = __wide ? (uint32_t)((const uint16_t*)__s)[__i] : (uint32_t)__s[__i];
+          if (__c < 0x80) { if (__o) __o[__k] = (unsigned char)__c; __k += 1; continue; }
+          if (__c < 0x800) {
+            if (__o) { __o[__k] = (unsigned char)(0xc0 | (__c >> 6)); __o[__k + 1] = (unsigned char)(0x80 | (__c & 0x3f)); }
+            __k += 2; continue;
+          }
+          if (__c >= 0xd800 && __c <= 0xdbff && __i + 1 < __len) {
+            const uint32_t __d = (uint32_t)((const uint16_t*)__s)[__i + 1];
+            if (__d >= 0xdc00 && __d <= 0xdfff) {
+              const uint32_t __cp = 0x10000 + ((__c - 0xd800) << 10) + (__d - 0xdc00);
+              if (__o) {
+                __o[__k] = (unsigned char)(0xf0 | (__cp >> 18)); __o[__k + 1] = (unsigned char)(0x80 | ((__cp >> 12) & 0x3f));
+                __o[__k + 2] = (unsigned char)(0x80 | ((__cp >> 6) & 0x3f)); __o[__k + 3] = (unsigned char)(0x80 | (__cp & 0x3f));
+              }
+              __k += 4; __i++; continue;
+            }
+          }
+          if (__c >= 0xd800 && __c <= 0xdfff) __c = 0xfffd;
+          if (__o) {
+            __o[__k] = (unsigned char)(0xe0 | (__c >> 12)); __o[__k + 1] = (unsigned char)(0x80 | ((__c >> 6) & 0x3f));
+            __o[__k + 2] = (unsigned char)(0x80 | (__c & 0x3f));
+          }
+          __k += 3;
+        }`;
+const BT = "`";
 const ENCODER = `class TextEncoder {
   // ${ENCODER_MARKER}
   get encoding() { return 'utf-8'; }
   encode(input = '') {
     const text = String(input);
+    // Two C passes (size, then fill) for a string; the JS loops below stay for anything else.
+    let size = -1;
+    let bytes = null;
+    let filled = 0;
+    Porffor.c${BT}
+      if (text.type == 195 || text.type == 67) {
+        const int __wide = text.type == 67;
+        const size_t __len = (size_t)*(u32*)(MEM + (u32)text.val);
+        const unsigned char* __s = (const unsigned char*)(MEM + (u32)text.val + 4);
+        unsigned char* __o = 0;
+        ${ENCODE_LOOP}
+        size = (f64)__k;
+      }
+    ${BT};
+    if (size === 0) return new Uint8Array(0);
+    if (size > 0) {
+      bytes = new Uint8Array(size);
+      Porffor.c${BT}
+        if (bytes.type == 81 && *(int32_t*)(MEM + (u32)bytes.val) == (int32_t)size) {
+          const int __wide = text.type == 67;
+          const size_t __len = (size_t)*(u32*)(MEM + (u32)text.val);
+          const unsigned char* __s = (const unsigned char*)(MEM + (u32)text.val + 4);
+          unsigned char* __o = MEM + *(u32*)(MEM + (u32)bytes.val + 4) + 4;
+          ${ENCODE_LOOP}
+          filled = (f64)1;
+        }
+      ${BT};
+      if (filled === 1) return bytes;
+    }
     let length = 0;
     for (let i = 0; i < text.length; i++) {
       const c = text.charCodeAt(i);
