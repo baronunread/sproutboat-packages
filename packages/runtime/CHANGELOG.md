@@ -1,5 +1,19 @@
 # @sproutboat/runtime
 
+## 0.34.3
+
+### Patch Changes
+
+- 49ac7df: Faster `atob`: each character is looked up in a 128-entry table instead of `indexOf` over the alphabet, and the same pass validates, so the regex test over the whole input is gone. Same output and same `InvalidCharacterError` cases (checked against the platform `atob` on 9,000 random inputs and edge cases).
+  
+  A JWT check decodes three base64url parts. On one pinned x86 core at a fixed rate, CPU per request: like 854 to 761 us, create 922 to 866 us; feed and post reads do not call `atob`.
+- 745f94c: Faster D1 in standalone builds: a D1 call no longer goes through `JSON.stringify` and `JSON.parse` on both sides of the in-process dispatch. The request object is handed straight to the dispatcher and the reply object comes straight back (the C layer still returns its own JSON, parsed once). Same results, same error messages, no change under the broker transport.
+  
+  On one pinned x86 core at a fixed rate, CPU per request against a 500,000-row feed API: feed (20 rows) 1,418 to 1,133 us, post read 394 to 332 us, like 854 to 728 us, create 922 to 857 us, the realistic mix 670 to 580 us.
+- 88c7bff: Faster strict D1 queries in standalone builds (compatibility date 2026-10-24 and later): the rows of a result are built as JS arrays in C, straight from the SQLite cells, instead of being written as JSON text in C and parsed again in JS. NULL, numbers, text (UTF-8 decoded exactly as the JSON path decoded it, including invalid sequences), BLOBs (byte arrays) and empty results are unchanged. Only a small header (columns, changes, last row id) still goes through JSON. Older compatibility dates and non-D1 operations keep the JSON path.
+  
+  On one pinned x86 core at a fixed rate, CPU per request against a 500,000-row feed API, see the PR for numbers.
+
 ## 0.34.2
 
 ### Patch Changes
