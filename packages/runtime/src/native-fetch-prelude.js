@@ -3639,16 +3639,24 @@ if (globalThis.crypto.getRandomValues == null) {
   // so a string held as UTF-16 (one from JSON.parse or TextDecoder, say) decoded to the
   // wrong bytes, and btoa encoded its UTF-16 units.
   const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  // Sextet per character code (255 = not base64): a table read rather than an indexOf over the
+  // alphabet, and one pass that also validates, so no regex test over the whole input.
+  const sextet = [];
+  for (let i = 0; i < 128; i++) sextet.push(255);
+  for (let i = 0; i < alphabet.length; i++) sextet[alphabet.charCodeAt(i)] = i;
   globalThis.atob = function (data) {
     let text = String(data).replace(/[\t\n\f\r ]/g, "");
     if (text.length % 4 === 0) text = text.replace(/==?$/, "");
-    if (text.length % 4 === 1 || !/^[A-Za-z0-9+/]*$/.test(text)) throw invalidCharacter("atob: the string is not valid base64");
+    if (text.length % 4 === 1) throw invalidCharacter("atob: the string is not valid base64");
     const parts = [];
     let chunk = "";
     let bits = 0;
     let count = 0;
     for (let i = 0; i < text.length; i++) {
-      bits = (bits << 6) | alphabet.indexOf(text[i]);
+      const code = text.charCodeAt(i);
+      const value = code < 128 ? sextet[code] : 255;
+      if (value === 255) throw invalidCharacter("atob: the string is not valid base64");
+      bits = (bits << 6) | value;
       count += 6;
       if (count >= 8) {
         count -= 8;
