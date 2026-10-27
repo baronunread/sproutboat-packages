@@ -4032,6 +4032,23 @@ function __sbD1DbRaw(path, what) {
   return res;
 }
 
+// The capture status of a database as a number (sb_db_quota_freeze(path, -1)), for the call every
+// D1 statement makes: no snprintf, no result string, no Number() on the way back.
+// oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
+function __sbD1Status(path) {
+  let res = 0;
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    const char* __p; size_t __pl; char* __po = 0;
+    porf_native_fetch_read_value(path, &__p, &__pl, &__po);
+    char* __path = (char*)malloc(__pl + 1); memcpy(__path, __p, __pl); __path[__pl] = 0;
+    if (__po) free(__po);
+    res = (f64)sb_db_quota_freeze(__path, -1);
+    free(__path);
+  `;
+  return res;
+}
+
 // #164 — VACUUM INTO a fresh file. Two strings in, JSON out. Same pattern as
 // __sbSqlScriptRaw.
 // oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
@@ -4231,9 +4248,10 @@ function __sbSqlRowsRaw(path, sql, paramsJson) {
     char* __path = (char*)malloc(__pl + 1); memcpy(__path, __p, __pl); __path[__pl] = 0;
     if (__po) free(__po);
 
+    // The strict marker is put on here, so JS does not build a second copy of the SQL.
     const char* __s; size_t __sl; char* __so = 0;
     porf_native_fetch_read_value(sql, &__s, &__sl, &__so);
-    char* __sql = (char*)malloc(__sl + 1); memcpy(__sql, __s, __sl); __sql[__sl] = 0;
+    char* __sql = (char*)malloc(__sl + 17); memcpy(__sql, "/*sb-d1-strict*/", 16); memcpy(__sql + 16, __s, __sl); __sql[__sl + 16] = 0;
     if (__so) free(__so);
 
     const char* __a; size_t __al; char* __ao = 0;
@@ -4366,7 +4384,7 @@ function __sbD1Quota(path) {
   // Whether capture owns this database, from the private helper (no SQL), before anything
   // below depends on it. A database that cannot open (or whose capture failed) is left to
   // the call itself, which reports why.
-  const status = Number(__sbD1DbRaw(path, "captured"));
+  const status = __sbD1Status(path);
   if (status < 0) return;
   __sbD1Captured[path] = status === 1;
   let full = __sbQuotaFull();
@@ -5335,7 +5353,7 @@ function __sbD1Bytes(cell) {
 function __sbD1Run(path, sql, params, strict) {
   if (strict) {
     // Rows come back as arrays, built in C (see __sbSqlRowsRaw); the header is small JSON.
-    const pair = __sbSqlRowsRaw(path, "/*sb-d1-strict*/" + String(sql), JSON.stringify(params || []));
+    const pair = __sbSqlRowsRaw(path, String(sql), params && params.length ? JSON.stringify(params) : "[]");
     const head = JSON.parse(pair[0]);
     if (head.ok === false) throw __sbD1Error(head);
     const rows = pair[1];

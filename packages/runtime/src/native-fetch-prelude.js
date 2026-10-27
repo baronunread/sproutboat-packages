@@ -5171,6 +5171,8 @@ function __sbD1Strict() {
   return __sbCompatDate() >= "2026-10-24";
 }
 function __sbD1Param(value, strict) {
+  // The common values first: none of them is a buffer, so the buffer test below is skipped.
+  if (value === null || value === true || value === false || __sbIsStr(value) || Object(value) instanceof Number) return value;
   if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
     const bytes = value instanceof ArrayBuffer ? new Uint8Array(value) : new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
     let hex = "";
@@ -5248,7 +5250,15 @@ function __sbD1Fail(message) {
 var __sbD1NoTransactions =
   "D1_ERROR: To execute a transaction, please use the state.storage.transaction() or state.storage.transactionSync() APIs instead of the SQL BEGIN TRANSACTION or SAVEPOINT statements. The JavaScript API is safer because it will automatically roll back on exceptions, and because it interacts correctly with Durable Objects' automatic atomic write coalescing.";
 function __sbD1Check(sql) {
-  const text = String(sql).trim();
+  // Only a statement that starts like a transaction keyword (BEGIN, COMMIT, END, ROLLBACK,
+  // SAVEPOINT, RELEASE) or with no letter needs the trim and the regex.
+  const first = String(sql);
+  const c = first.charCodeAt(0) | 32;
+  if (c >= 97 && c <= 122) {
+    const d = first.charCodeAt(1) | 32;
+    if (!((c === 98 && d === 101) || (c === 99 && d === 111) || (c === 101 && d === 110) || (c === 114 && (d === 111 || d === 101)) || (c === 115 && d === 97))) return;
+  }
+  const text = first.trim();
   if (!text) throw __sbD1Fail("D1_ERROR: No SQL statements detected.");
   if (/^(BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b/i.test(text)) throw __sbD1Fail(__sbD1NoTransactions);
 }
@@ -5288,13 +5298,14 @@ function __sbD1Promise(run) {
 }
 function __sbMakeD1(dbName) {
   // The synchronous core: the answer to one statement as columns, rows and meta.
-  function query(sql, params, strict) {
+  // wantMeta is false for raw() and first(), which drop the meta object: no clock read, no object.
+  function query(sql, params, strict, wantMeta) {
     if (strict) __sbD1Check(sql);
-    const started = Date.now();
+    const started = wantMeta ? Date.now() : 0;
     const r = __sbD1Rpc("d1.query", { db: dbName, sql, params }, strict);
     if (!strict) return { results: r.results || [], success: true, meta: r.meta || {} };
     const table = __sbD1Table(r);
-    return { columns: table.columns, rows: table.rows, meta: __sbD1Meta(r.meta || {}, started) };
+    return { columns: table.columns, rows: table.rows, meta: wantMeta ? __sbD1Meta(r.meta || {}, started) : null };
   }
   function stmt(sql, params) {
     const s = {
@@ -5307,9 +5318,10 @@ function __sbMakeD1(dbName) {
         return stmt(sql, list);
       },
       all() {
-        if (!__sbD1Strict()) return query(sql, params, false);
+        const strict = __sbD1Strict();
+        if (!strict) return query(sql, params, false, true);
         return __sbD1Promise(() => {
-          const t = query(sql, params, true);
+          const t = query(sql, params, true, true);
           return { success: true, meta: t.meta, results: __sbD1Objects(t.columns, t.rows) };
         });
       },
@@ -5317,8 +5329,9 @@ function __sbMakeD1(dbName) {
         return s.all();
       },
       raw(options) {
-        if (!__sbD1Strict()) {
-          const rows = query(sql, params, false).results;
+        const strict = __sbD1Strict();
+        if (!strict) {
+          const rows = query(sql, params, false, false).results;
           const out = [];
           for (let i = 0; i < rows.length; i++) {
             const cols = [];
@@ -5328,18 +5341,19 @@ function __sbMakeD1(dbName) {
           return out;
         }
         return __sbD1Promise(() => {
-          const t = query(sql, params, true);
+          const t = query(sql, params, true, false);
           return options && options.columnNames ? [t.columns].concat(t.rows) : t.rows;
         });
       },
       first(column) {
-        if (!__sbD1Strict()) {
-          const rows = query(sql, params, false).results;
+        const strict = __sbD1Strict();
+        if (!strict) {
+          const rows = query(sql, params, false, false).results;
           if (rows.length === 0) return null;
           return column == null ? rows[0] : rows[0][column];
         }
         return __sbD1Promise(() => {
-          const t = query(sql, params, true);
+          const t = query(sql, params, true, false);
           if (column == null) return t.rows.length ? __sbD1Objects(t.columns, [t.rows[0]])[0] : null;
           const at = t.columns.indexOf(String(column));
           if (!t.rows.length) return null;

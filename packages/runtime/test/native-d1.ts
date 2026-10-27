@@ -255,7 +255,8 @@ int main(void) {
   // __sbSqlRowsRaw as the transport's C block gives it: [header JSON, rows], BLOBs as byte arrays.
   const rowsOf =
     (raw: (path: string, text: string, params: string) => string) => (path: string, text: string, params: string) => {
-      const r = JSON.parse(raw(":cells " + path, text, params));
+      // The C block puts the strict marker on the SQL itself.
+      const r = JSON.parse(raw(":cells " + path, "/*sb-d1-strict*/" + text, params));
       if (r.head.ok === false) return [JSON.stringify(r.head), undefined];
       const rows = r.rows.map((row: unknown[]) =>
         row.map((c) => (c instanceof Object && "$blob" in c ? [...Buffer.from(String(c.$blob), "hex")] : c)),
@@ -279,6 +280,7 @@ int main(void) {
       "__sbDir",
       "__sbDirBytesRaw",
       "__sbD1DbRaw",
+      "__sbD1Status",
       "__sbSql",
       "__sbSqlRaw",
       `${transport.slice(quotaStart, quotaEnd)}\nreturn { __sbQuotaCheck, __sbD1Quota, __sbQuotaFull, expire() { __sbQuotaAt = -1; } };`,
@@ -287,6 +289,7 @@ int main(void) {
       () => dir,
       (d: string) => String(JSON.parse(sqlRaw(":bytes " + d, "", "")).n),
       (path: string, what: string) => String(JSON.parse(sqlRaw(":db " + path, what, "")).n),
+      (path: string) => JSON.parse(sqlRaw(":db " + path, "captured", "")).n,
       sql,
       sqlRaw,
     );
@@ -334,6 +337,7 @@ int main(void) {
         "__sbDir",
         "__sbDirBytesRaw",
         "__sbD1DbRaw",
+        "__sbD1Status",
         "__sbSql",
         "__sbSqlRaw",
         `${transport.slice(quotaStart, quotaEnd)}\nreturn { __sbQuotaCheck, __sbD1Quota, __sbQuotaFull };`,
@@ -342,6 +346,7 @@ int main(void) {
         () => dir,
         (d: string) => String(JSON.parse(raw(":bytes " + d, "", "")).n),
         (path: string, what: string) => String(JSON.parse(raw(":db " + path, what, "")).n),
+        (path: string) => JSON.parse(raw(":db " + path, "captured", "")).n,
         run,
         raw,
       );

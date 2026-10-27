@@ -152,3 +152,83 @@ test("from 2026-10-24: empty SQL, transactions, exec() and sessions as in worker
   expect(session.getBookmark()).toBeNull();
   expect(await session.batch([session.prepare("SELECT 1 AS a")]).then((r) => r[0].results)).toEqual([{ a: 1 }]);
 });
+
+test("from 2026-10-24: only transaction statements are refused, whatever their case or leading space", async () => {
+  const DB = fresh("2026-10-24");
+  const TRANSACTION = /^D1_ERROR: To execute a transaction/;
+  for (const sql of [
+    "BEGIN",
+    "begin immediate",
+    "  \n Commit",
+    "END",
+    "end transaction",
+    "ROLLBACK TO x",
+    "rollback",
+    "SAVEPOINT a",
+    "Release a",
+    "RELEASE SAVEPOINT a",
+  ]) {
+    expect(await failure(() => DB.prepare(sql).run())).toMatch(TRANSACTION);
+  }
+  for (const sql of ["", "  ", "\n\t"]) expect(await failure(() => DB.prepare(sql).run())).toBe(NO_STATEMENTS);
+  await DB.exec("CREATE TABLE t (id INTEGER, s TEXT)");
+  // Statements that begin with the same first letter as a keyword, and the second letters that tell them apart.
+  for (const sql of [
+    "SELECT 1",
+    "select 1",
+    "  SELECT 1",
+    "REPLACE INTO t VALUES (1, 'a')",
+    "replace into t values (2, 'b')",
+    "CREATE INDEX i ON t (id)",
+    "EXPLAIN SELECT 1",
+    "RETURNING",
+    "SAVE",
+    "BE",
+    "ENDX",
+    "WITH x AS (SELECT 1) SELECT * FROM x",
+  ]) {
+    const message = await failure(() => DB.prepare(sql).run());
+    expect(message).not.toMatch(TRANSACTION);
+    expect(message).not.toBe(NO_STATEMENTS);
+  }
+  expect(await DB.prepare("SELECT count(*) AS n FROM t").first("n")).toBe(2);
+  // batch() checks every statement.
+  expect(await failure(() => DB.batch([DB.prepare("SELECT 1"), DB.prepare("commit")]))).toMatch(TRANSACTION);
+});
+
+test("from 2026-10-24: raw() and first() answer the same as all(), and all() still has its meta", async () => {
+  const DB = fresh("2026-10-24");
+  await DB.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT, n REAL, b BLOB)");
+  const insert = await DB.prepare("INSERT INTO t (s, n, b) VALUES (?, ?, ?)")
+    .bind("x", 1.5, new Uint8Array([1, 2]))
+    .run();
+  expect(insert.meta).toMatchObject({
+    served_by: "sproutboat",
+    changes: 1,
+    last_row_id: 1,
+    changed_db: true,
+    rows_written: 1,
+  });
+  const select = DB.prepare("SELECT id, s, n, b FROM t WHERE id = ?").bind(1);
+  const all = await select.all();
+  expect(all.results).toEqual([{ id: 1, s: "x", n: 1.5, b: [1, 2] }]);
+  expect(all.meta.rows_read).toBe(1);
+  expect(await select.raw()).toEqual([[1, "x", 1.5, [1, 2]]]);
+  expect(await select.raw({ columnNames: true })).toEqual([
+    ["id", "s", "n", "b"],
+    [1, "x", 1.5, [1, 2]],
+  ]);
+  expect(await select.first()).toEqual(all.results[0]);
+  expect(await select.first("s")).toBe("x");
+  expect(await failure(() => select.first("nope"))).toMatch(/^D1_COLUMN_NOTFOUND/);
+  // Parameter types that skip the buffer test, and the ones that do not.
+  const types = DB.prepare("SELECT ? AS a, ? AS b, ? AS c, ? AS d, ? AS e");
+  expect(await types.bind(null, true, 7, "s", new Uint8Array([9])).first()).toEqual({
+    a: null,
+    b: 1,
+    c: 7,
+    d: "s",
+    e: [9],
+  });
+  expect(await failure(() => types.bind(undefined, 1, 1, 1, 1).first())).toMatch(/^D1_TYPE_ERROR: Type 'undefined'/);
+});
