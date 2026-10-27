@@ -2006,29 +2006,30 @@ export async function patchWebSockets(root: string): Promise<void> {
  * so parallel builds sharing the cache could import a half-written table.
  */
 // Porffor's `globalThis` is an object built once, but its getter re-syncs every top-level
-// function and `var` of the module into it on EVERY access (add-or-update writes), so each read
-// of `globalThis` costs one hashed write per top-level binding: ~20 us with the prelude's ~270.
-// Function bindings never change (they are compile-time references), so they are written once,
-// when the object is built; only `var` bindings, whose values can change, are re-synced per access.
-const GLOBALTHIS_SYNC_MARKER = "sproutboat: function bindings are written to globalThis once";
+// function and `var` of the module into it on EVERY access (one hashed add-or-update write per
+// binding), so each read of `globalThis` costs ~20 us with the prelude's ~120 bindings and every
+// `globalThis.x` in user code pays it too. Every binding is now written when the object is built
+// (`once`), and a later access rewrites only the bindings whose value changed: a packed copy of the
+// last value written is kept per binding, so an unchanged binding costs one compare.
+const GLOBALTHIS_SYNC_MARKER = "sproutboat: globalThis rewrites only bindings that changed";
 const GLOBALTHIS_SYNC_EDITS: [string, string][] = [
+  ["  Reinterpret, Box, JvType, JvNum, JvPtr, JvIsNum,", "  Reinterpret, Box, JvType, JvNum, JvPtr, JvBits, JvIsNum,"],
   [
     "  globalThisUserSync: (objJv, sync) => {\n    const finalizer = () => {\n      sync.length = 0;\n      const seen = new Set();\n      const push = (key, value) => {\n        seen.add(key);\n        sync.push(builtinCall(scope, '__Porffor_object_set', [ objJv, makeString(scope, key), value ]));\n      };\n",
     "  // " +
       GLOBALTHIS_SYNC_MARKER +
-      " (`once`), `var` bindings on every access (`sync`)\n  globalThisUserSync: (objJv, sync, once) => {\n    const finalizer = () => {\n      sync.length = 0;\n      once.length = 0;\n      const seen = new Set();\n      const push = (key, value, into = sync) => {\n        seen.add(key);\n        into.push(builtinCall(scope, '__Porffor_object_set', [ objJv, makeString(scope, key), value ]));\n      };\n",
+      ": `once` writes every binding when the object is built, `sync` (every later access) only the changed ones\n  globalThisUserSync: (objJv, sync, once) => {\n    const finalizer = () => {\n      sync.length = 0;\n      once.length = 0;\n      const seen = new Set();\n      const push = (key, value) => {\n        seen.add(key);\n        const shadowName = '#gtsync_' + key;\n        if (!(shadowName in globals)) globals[shadowName] = { idx: globals['#ind']++, type: T.u64 };\n        const shadow = Global(shadowName, T.u64);\n        const write = () => [ builtinCall(scope, '__Porffor_object_set', [ objJv, makeString(scope, key), value ]), Assign(shadow, JvBits(value)) ];\n        once.push(...write());\n        sync.push(If(Bin('!=', T.u64, JvBits(value), shadow), write()));\n      };\n",
   ],
-  ["        push(name, funcRef(func));\n", "        push(name, funcRef(func), once);\n"],
 ];
 const GLOBALTHIS_BUILTINS_EDITS: [string, string][] = [
   [
     "        const sync = [];\n        if (name === 'globalThis') globalThisUserSync(Box(getPtr, Const(T.i32, TYPES.object)), sync);\n",
     "        const sync = [];\n        const once = [];\n        if (name === 'globalThis') globalThisUserSync(Box(getPtr, Const(T.i32, TYPES.object)), sync, once);\n",
   ],
-  ["        out.push(BlockStmt(sync));\n", "        out.push(BlockStmt(once));\n        out.push(BlockStmt(sync));\n"],
+  ["        out.push(BlockStmt(sync));\n", "        out.push(BlockStmt(once));\n"],
 ];
 
-/** `globalThis` reads no longer rewrite every function binding each time. */
+/** A `globalThis` read rewrites only the top-level bindings that changed. */
 export async function patchGlobalThisSync(root: string): Promise<void> {
   const codegenFile = resolve(root, "compiler/codegen.js");
   const builtinsFile = resolve(root, "compiler/builtins.js");

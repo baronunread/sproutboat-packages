@@ -819,7 +819,7 @@ test("GC footprint patch returns every free run at idle and adds porf_gc_seal_he
   }
 });
 
-test("globalThis patch writes function bindings once and re-syncs only vars, idempotently", async () => {
+test("globalThis patch rewrites only changed bindings on access, idempotently", async () => {
   const root = await mkdtemp(join(tmpdir(), "sb-globalthis-sync-"));
   try {
     await mkdir(join(root, "compiler"), { recursive: true });
@@ -828,6 +828,7 @@ test("globalThis patch writes function bindings once and re-syncs only vars, ide
     await writeFile(
       codegen,
       [
+        "  Reinterpret, Box, JvType, JvNum, JvPtr, JvIsNum,",
         "  globalThisUserSync: (objJv, sync) => {",
         "    const finalizer = () => {",
         "      sync.length = 0;",
@@ -836,10 +837,6 @@ test("globalThis patch writes function bindings once and re-syncs only vars, ide
         "        seen.add(key);",
         "        sync.push(builtinCall(scope, '__Porffor_object_set', [ objJv, makeString(scope, key), value ]));",
         "      };",
-        "",
-        "      for (const name in topLevelFunc?.namedFuncBindings ?? {}) {",
-        "        push(name, funcRef(func));",
-        "      }",
         "",
       ].join("\n"),
     );
@@ -855,11 +852,14 @@ test("globalThis patch writes function bindings once and re-syncs only vars, ide
     await patchGlobalThisSync(root);
     const patchedCodegen = await readFile(codegen, "utf8");
     const patchedBuiltins = await readFile(builtins, "utf8");
+    expect(patchedCodegen).toContain("JvPtr, JvBits, JvIsNum,");
     expect(patchedCodegen).toContain("globalThisUserSync: (objJv, sync, once) => {");
     expect(patchedCodegen).toContain("once.length = 0;");
-    expect(patchedCodegen).toContain("push(name, funcRef(func), once);");
+    expect(patchedCodegen).toContain("sync.push(If(Bin('!=', T.u64, JvBits(value), shadow), write()));");
+    expect(patchedCodegen).toContain("once.push(...write());");
     expect(patchedBuiltins).toContain("globalThisUserSync(Box(getPtr, Const(T.i32, TYPES.object)), sync, once);");
-    expect(patchedBuiltins).toContain("out.push(BlockStmt(once));\n        out.push(BlockStmt(sync));");
+    expect(patchedBuiltins).toContain("out.push(BlockStmt(once));");
+    expect(patchedBuiltins).not.toContain("out.push(BlockStmt(sync));");
     await patchGlobalThisSync(root);
     expect(await readFile(codegen, "utf8")).toBe(patchedCodegen);
     expect(await readFile(builtins, "utf8")).toBe(patchedBuiltins);

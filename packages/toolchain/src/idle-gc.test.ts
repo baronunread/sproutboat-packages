@@ -21,9 +21,7 @@ test("idle reclamation preserves unconditional request GC and is idempotent on t
     const start = shim.indexOf("static void collect_after_request(void) {");
     const end = shim.indexOf("\n}\n", start);
     const body = shim.slice(start, end);
-    const normal = body.indexOf(
-      "porf_native_fetch_collect_normal_from((void*)&porf_stack_anchor);",
-    );
+    const normal = body.indexOf("porf_native_fetch_collect_normal_from((void*)&porf_stack_anchor);");
     const guard = body.indexOf("if (porf_native_fetch_needs_quiet_collect()) {");
     expect(normal).toBeGreaterThan(-1);
     expect(guard).toBeGreaterThan(normal);

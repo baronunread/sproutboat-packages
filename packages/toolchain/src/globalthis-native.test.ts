@@ -5,8 +5,8 @@ import { resolve } from "node:path";
 import { ensurePorffor } from "./acquire";
 
 // Porffor's globalThis getter re-synced every top-level function and var into the global
-// object on every access, so a read cost one hashed write per binding. Function bindings are
-// now written once; vars, which can change, still follow their binding on every read.
+// object on every access, so a read cost one hashed write per binding. Bindings are now written when
+// the object is built and rewritten on a read only if their value changed.
 async function run(source: string): Promise<string> {
   const workdir = await mkdtemp(resolve(tmpdir(), "sb-globalthis-"));
   try {
@@ -63,6 +63,6 @@ test("reading globalThis does not rewrite every top-level function", async () =>
   `);
   expect(out.startsWith("20000 ")).toBe(true);
   // 600 functions took 9,300 ms for these 20,000 reads before the patch (one hashed write per
-  // function per read) and take about 50 ms after it, at -O0.
+  // function per read) and take a few ms after it, at -O0.
   expect(Number(out.trim().split(" ")[1])).toBeLessThan(1000);
 }, 120_000);

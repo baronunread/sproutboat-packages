@@ -28,14 +28,19 @@ test("alpha-18: local function types, typed-array bounds, toJSON and iterator he
   const dir = await mkdtemp(resolve(tmpdir(), "sb-alpha18-"));
   try {
     const porffor = await ensurePorffor();
-    const input = resolve(dir, "alpha18.js"), binary = resolve(dir, "alpha18");
+    const input = resolve(dir, "alpha18.js"),
+      binary = resolve(dir, "alpha18");
     await writeFile(input, source);
-    const compile = Bun.spawnSync(["bun", resolve(porffor, "runtime/index.js"), "native", input, "-o", binary, "-s", "-O0"], { stdout: "pipe", stderr: "pipe" });
+    const compile = Bun.spawnSync(
+      ["bun", resolve(porffor, "runtime/index.js"), "native", input, "-o", binary, "-s", "-O0"],
+      { stdout: "pipe", stderr: "pipe" },
+    );
     expect(compile.exitCode, new TextDecoder().decode(compile.stderr)).toBe(0);
     const run = Bun.spawnSync([binary], { stdout: "pipe", stderr: "pipe", timeout: 10_000 });
     expect(run.exitCode, new TextDecoder().decode(run.stderr)).toBe(0);
     const reference = Bun.spawnSync(["bun", input], { stdout: "pipe" });
-    const strip = (bytes: Uint8Array) => new TextDecoder().decode(bytes).replaceAll("\x1b[33m", "").replaceAll("\x1b[0m", "").trim();
+    const strip = (bytes: Uint8Array) =>
+      new TextDecoder().decode(bytes).replaceAll("\x1b[33m", "").replaceAll("\x1b[0m", "").trim();
     expect(JSON.parse(strip(run.stdout))).toEqual(JSON.parse(strip(reference.stdout)));
   } finally {
     await rm(dir, { recursive: true, force: true });
