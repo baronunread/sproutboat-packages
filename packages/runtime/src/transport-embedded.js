@@ -1352,6 +1352,43 @@ static void sb_putjson(sb_buf* b, const char* s, size_t n) {
 // doesn't start a valid sequence passes through as \u00XX, the same rule as
 // the prelude's __sbFromUtf8. Raw byte producers (the HTTP client's body,
 // BLOB columns) keep sb_putjson.
+// The UTF-16 units sb_putjson_text would write as u-escapes, for a TEXT cell handed over as
+// a JS string: same validity rules (an invalid lead byte is its own unit, an overlong form, a
+// surrogate or a value above U+10FFFF is not decoded). OUT has room for n units. *wide is set
+// when a unit is above 0xff.
+static size_t sb_text_units(const unsigned char* s, size_t n, uint16_t* out, int* wide) {
+  size_t k = 0;
+  *wide = 0;
+  for (size_t i = 0; i < n; i++) {
+    unsigned char c = s[i];
+    if (c < 0x80) { out[k++] = c; continue; }
+    unsigned int cp = 0, min = 0;
+    size_t len = 0;
+    if ((c & 0xe0) == 0xc0) { cp = c & 0x1f; len = 2; min = 0x80; }
+    else if ((c & 0xf0) == 0xe0) { cp = c & 0x0f; len = 3; min = 0x800; }
+    else if ((c & 0xf8) == 0xf0) { cp = c & 0x07; len = 4; min = 0x10000; }
+    int ok = len > 0 && i + len <= n;
+    for (size_t j = 1; ok && j < len; j++) {
+      unsigned char cc = s[i + j];
+      if ((cc & 0xc0) != 0x80) ok = 0;
+      else cp = (cp << 6) | (cc & 0x3f);
+    }
+    if (ok && (cp < min || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff))) ok = 0;
+    if (!ok) { out[k++] = c; if (c > 0xff) *wide = 1; continue; }
+    if (cp >= 0x10000) {
+      cp -= 0x10000;
+      out[k++] = (uint16_t)(0xd800 + (cp >> 10));
+      out[k++] = (uint16_t)(0xdc00 + (cp & 0x3ff));
+      *wide = 1;
+    } else {
+      out[k++] = (uint16_t)cp;
+      if (cp > 0xff) *wide = 1;
+    }
+    i += len - 1;
+  }
+  return k;
+}
+
 static void sb_putjson_text(sb_buf* b, const char* s, size_t n) {
   sb_put(b, "\"", 1);
   for (size_t i = 0; i < n; i++) {
@@ -2122,7 +2159,29 @@ static char* sb_sql_error(sqlite3* db, const char* message, int code, int skip) 
 //   {"ok":true,"cols":[...],"rows":[[...]],"changes":n,"rowid":n}
 // or {"ok":false,"error":"...","code":n,"offset":n}. In a D1 database (a path under
 // /d1/) a BLOB comes back as {"$blob":"HEX"}; elsewhere as one char per byte.
-static char* sb_sql_run(const char* path, const char* sql, const char* params) {
+// A strict D1 query can hand its rows back as cells instead of JSON text: the caller turns
+// them into JS arrays, with no JSON written here and none parsed there. t is 0 NULL,
+// 1 number, 2 TEXT (UTF-8 in p), 3 BLOB (bytes in p).
+typedef struct { unsigned char t; double d; char* p; int n; } sb_cell;
+typedef struct { sb_cell* c; size_t n; size_t cap; int ncol; int used; } sb_cells;
+static void sb_cells_free(sb_cells* cs) {
+  if (!cs) return;
+  for (size_t i = 0; i < cs->n; i++) free(cs->c[i].p);
+  free(cs->c);
+  cs->c = 0; cs->n = cs->cap = 0;
+}
+static sb_cell* sb_cells_add(sb_cells* cs) {
+  if (cs->n == cs->cap) {
+    size_t cap = cs->cap ? cs->cap * 2 : 64;
+    sb_cell* grown = (sb_cell*)realloc(cs->c, cap * sizeof(sb_cell));
+    if (!grown) return 0;
+    cs->c = grown; cs->cap = cap;
+  }
+  sb_cell* cell = &cs->c[cs->n++];
+  cell->t = 0; cell->d = 0; cell->p = 0; cell->n = 0;
+  return cell;
+}
+static char* sb_sql_run_x(const char* path, const char* sql, const char* params, sb_cells* cells) {
   sb_buf b = { 0, 0, 0 };
   int idx = sb_db_for(path);
   if (idx < 0 && sb_db_capture_failed(path)) return sb_sql_error(0, SB_LTX_FAILED, 10, 0);
@@ -2151,8 +2210,30 @@ static char* sb_sql_run(const char* path, const char* sql, const char* params) {
     sb_putjson_text(&b, name ? name : "", name ? strlen(name) : 0);
   }
   sb_puts(&b, "],\"rows\":[");
+  // Cells only for a strict D1 statement: its BLOBs are byte arrays either way.
+  const int native = cells && strict && d1;
+  if (native) { cells->ncol = ncol; cells->used = 1; }
   int rc, first = 1;
   while ((rc = sqlite3_step(st)) == SB_SQLITE_ROW) {
+    if (native) {
+      for (int i = 0; i < ncol; i++) {
+        sb_cell* cell = sb_cells_add(cells);
+        if (!cell) { cells->used = -1; break; }
+        int t = sqlite3_column_type(st, i);
+        if (t == 5) continue;
+        if (t == 1 || t == 2) { cell->t = 1; cell->d = sqlite3_column_double(st, i); continue; }
+        const unsigned char* txt = t == 4 ? (const unsigned char*)sqlite3_column_blob(st, i) : sqlite3_column_text(st, i);
+        int n = sqlite3_column_bytes(st, i);
+        cell->t = t == 4 ? 3 : 2;
+        cell->n = txt ? n : 0;
+        cell->p = (char*)malloc((size_t)cell->n + 1);
+        if (!cell->p) { cells->used = -1; break; }
+        if (cell->n) memcpy(cell->p, txt, (size_t)cell->n);
+        cell->p[cell->n] = 0;
+      }
+      if (cells->used < 0) break;
+      continue;
+    }
     if (!first) sb_puts(&b, ",");
     first = 0;
     sb_puts(&b, "[");
@@ -2188,6 +2269,7 @@ static char* sb_sql_run(const char* path, const char* sql, const char* params) {
   // Reset, don't finalize: the statement stays compiled in sb_stmt_cache. Reset
   // now (not just on next reuse) so a SELECT stops holding its read transaction.
   sqlite3_reset(st);
+  if (cells && cells->used < 0) { free(b.p); sb_cells_free(cells); return sb_sql_error(db, "out of memory", 7, 0); }
   // The statement's own error, kept before LTX capture runs: capture executes statements
   // of its own, after which SQLite reports "not an error".
   char failure[512] = { 0 };
@@ -2200,10 +2282,14 @@ static char* sb_sql_run(const char* path, const char* sql, const char* params) {
   if (capture_failed) rc = 10;
   if (rc != SB_SQLITE_DONE && rc != SB_SQLITE_ROW) {
     free(b.p);
+    if (cells) sb_cells_free(cells);
     if (capture_failed) return sb_sql_error(db, SB_LTX_FAILED, 10, 0);
     return sb_sql_error(db, failure, failure_code, 0);
   }
   return b.p;
+}
+static char* sb_sql_run(const char* path, const char* sql, const char* params) {
+  return sb_sql_run_x(path, sql, params, 0);
 }
 
 // The storage quota (docs: an app's data directory is capped): bytes in regular files under
@@ -4131,6 +4217,85 @@ function __sbSqlRaw(path, sql, paramsJson) {
   return res;
 }
 
+// One strict D1 statement: [header JSON, rows]. The header is {"ok":true,"cols":[...],"changes":n,
+// "rowid":n} (or the error reply) and rows is an array of row arrays built here from the
+// cells, BLOBs as byte arrays, so no JSON for the rows is written or parsed. rows is
+// undefined when the reply is not a result.
+// oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
+function __sbSqlRowsRaw(path, sql, paramsJson) {
+  let res = "";
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    const char* __p; size_t __pl; char* __po = 0;
+    porf_native_fetch_read_value(path, &__p, &__pl, &__po);
+    char* __path = (char*)malloc(__pl + 1); memcpy(__path, __p, __pl); __path[__pl] = 0;
+    if (__po) free(__po);
+
+    const char* __s; size_t __sl; char* __so = 0;
+    porf_native_fetch_read_value(sql, &__s, &__sl, &__so);
+    char* __sql = (char*)malloc(__sl + 1); memcpy(__sql, __s, __sl); __sql[__sl] = 0;
+    if (__so) free(__so);
+
+    const char* __a; size_t __al; char* __ao = 0;
+    porf_native_fetch_read_value(paramsJson, &__a, &__al, &__ao);
+    char* __args = (char*)malloc(__al + 1); memcpy(__args, __a, __al); __args[__al] = 0;
+    if (__ao) free(__ao);
+
+    sb_cells __cells = { 0, 0, 0, 0, 0 };
+    char* __out = sb_sql_run_x(__path, __sql, __args, &__cells);
+    free(__path); free(__sql); free(__args);
+    const u32 __pair = porf_arr_new(2, 2);
+    res = porf_box((f64)__pair, 72);
+    if (!__out) __out = strdup("{\"ok\":false,\"error\":\"no result\"}");
+    porf_arr_set(__pair, 0, porf_box((f64)porf_native_fetch_alloc_bytestring(__out, strlen(__out)), 195));
+    free(__out);
+    if (__cells.used == 1) {
+      const size_t __ncol = (size_t)__cells.ncol;
+      const size_t __nrow = __ncol ? __cells.n / __ncol : 0;
+      const u32 __rows = porf_arr_new(0, (i32)(__nrow ? __nrow : 1));
+      porf_arr_set(__pair, 1, porf_box((f64)__rows, 72));
+      for (size_t __r = 0; __r < __nrow; __r++) {
+        const u32 __row = porf_arr_new((i32)__ncol, (i32)__ncol);
+        porf_arr_set(__rows, (u32)__r, porf_box((f64)__row, 72));
+        for (size_t __c = 0; __c < __ncol; __c++) {
+          const sb_cell* __cell = &__cells.c[__r * __ncol + __c];
+          jsval __v = porf_box(0.0, 7);
+          if (__cell->t == 1) __v = porf_box_num(__cell->d);
+          else if (__cell->t == 2) {
+            const size_t __n = (size_t)__cell->n;
+            uint16_t* __u = (uint16_t*)malloc(__n * 2 + 2);
+            if (__u) {
+              int __wide = 0;
+              const size_t __k = sb_text_units((const unsigned char*)__cell->p, __n, __u, &__wide);
+              if (__wide) {
+                const u32 __str = porf_native_fetch_alloc((u32)(4 + __k * 2), 67);
+                *(u32*)(MEM + __str) = (u32)__k;
+                memcpy(MEM + __str + 4, __u, __k * 2);
+                __v = porf_box((f64)__str, 67);
+              } else {
+                unsigned char* __b = (unsigned char*)malloc(__k + 1);
+                if (__b) {
+                  for (size_t __i = 0; __i < __k; __i++) __b[__i] = (unsigned char)__u[__i];
+                  __v = porf_box((f64)porf_native_fetch_alloc_bytestring((const char*)__b, __k), 195);
+                  free(__b);
+                }
+              }
+              free(__u);
+            }
+          } else if (__cell->t == 3) {
+            const u32 __bytes = porf_arr_new((i32)__cell->n, (i32)__cell->n);
+            for (int __i = 0; __i < __cell->n; __i++) porf_arr_set(__bytes, (u32)__i, porf_box_num((f64)(unsigned char)__cell->p[__i]));
+            __v = porf_box((f64)__bytes, 72);
+          }
+          porf_arr_set(__row, (u32)__c, __v);
+        }
+      }
+    }
+    sb_cells_free(&__cells);
+  `;
+  return res;
+}
+
 // --- the op dispatch, in JS -------------------------------------------------
 // Deliberately the same SQL and the same partition keys as broker.ts. When one
 // changes the other has to, and the conformance suite is what says so.
@@ -4621,7 +4786,7 @@ function __sbEmbeddedDispatch(msg) {
     __sbD1Quota(path);
     if (op === "d1.batch") return { ok: true, results: __sbD1Batch(path, msg.statements || [], strict) };
     const one = __sbD1Run(path, msg.sql, msg.params, strict);
-    return { ok: true, results: one.results, columns: one.columns, rows: one.rows, meta: one.meta, success: true };
+    return { ok: true, results: one.results, columns: one.columns, rows: one.rows, native: one.native, meta: one.meta, success: true };
   }
 
   // Durable Objects storage.sql (compatibility date 2026-10-29): one database per object,
@@ -5168,6 +5333,14 @@ function __sbD1Bytes(cell) {
   return out;
 }
 function __sbD1Run(path, sql, params, strict) {
+  if (strict) {
+    // Rows come back as arrays, built in C (see __sbSqlRowsRaw); the header is small JSON.
+    const pair = __sbSqlRowsRaw(path, "/*sb-d1-strict*/" + String(sql), JSON.stringify(params || []));
+    const head = JSON.parse(pair[0]);
+    if (head.ok === false) throw __sbD1Error(head);
+    const rows = pair[1];
+    return { columns: head.cols, rows, native: true, meta: { changes: head.changes, last_row_id: head.rowid, rows_read: rows.length } };
+  }
   const r = JSON.parse(__sbSqlRaw(path, (strict ? "/*sb-d1-strict*/" : "") + String(sql), JSON.stringify(params || [])));
   if (r.ok === false) throw strict ? __sbD1Error(r) : new Error("sqlite: " + r.error);
   const meta = { changes: r.changes, last_row_id: r.rowid, rows_read: r.rows.length };
