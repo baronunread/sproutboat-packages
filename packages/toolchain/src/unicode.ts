@@ -3,6 +3,7 @@ import { readFile, realpath, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 const JSON_MARKER = "sb_json_utf16_v1";
+const STRINGIFY_MARKER = "sb_json_stringify_narrow_v1";
 const ENCODER_MARKER = "sb_text_encoder_scalar_v1";
 function replace(source: string, anchor: string, replacement: string): string {
   if (!source.includes(anchor)) throw new Error(`Porffor Unicode patch anchor missing: ${anchor}`);
@@ -109,6 +110,70 @@ export const __Porffor_json_appendChar = (out: string, char: i32): void => {
         continue;
       }
       if (c < 0x20) {`,
+  );
+  // sproutboat: JSON.stringify gave back UTF-16 text even for plain ASCII, so a response built
+  // from its pieces was UTF-16 too: every concatenation copied twice the bytes and the server
+  // re-encoded each unit on the way out. Hand back an 8-bit string when every unit fits in one
+  // byte, and skip the 4 KiB zeroed buffer for the commonest call, a plain string that needs no
+  // escape. Neither changes the characters, only how the string is stored. The loops are C.
+  source = replace(
+    source,
+    "export const __JSON_stringify = (value: any, replacer: any, space: any) => {\n",
+    `export const __JSON_stringify = (value: any, replacer: any, space: any) => {
+  // ${STRINGIFY_MARKER}
+  if (Porffor.type(replacer) == Porffor.TYPES.undefined) if (space === undefined) {
+    let quoted: any = undefined;
+    Porffor.c${BT}
+      if (value.type == 195 || value.type == 67) {
+        const int __wide = value.type == 67;
+        const size_t __len = (size_t)*(u32*)(MEM + (u32)value.val);
+        const unsigned char* __s = MEM + (u32)value.val + 4;
+        size_t __i = 0;
+        if (__wide) {
+          const uint16_t* __w = (const uint16_t*)__s;
+          for (; __i < __len; __i++) { const uint32_t __c = __w[__i]; if (__c < 0x20 || __c == 0x22 || __c == 0x5c || __c > 0xff) break; }
+        } else {
+          for (; __i < __len; __i++) { const unsigned char __c = __s[__i]; if (__c < 0x20 || __c == 0x22 || __c == 0x5c) break; }
+        }
+        if (__i == __len) {
+          const u32 __p = porf_bstr_new((u32)__len + 2);
+          unsigned char* __o = MEM + __p + 4;
+          __s = MEM + (u32)value.val + 4;
+          __o[0] = 34;
+          if (__wide) { const uint16_t* __w2 = (const uint16_t*)__s; for (size_t __j = 0; __j < __len; __j++) __o[1 + __j] = (unsigned char)__w2[__j]; }
+          else if (__len) memcpy(__o + 1, __s, __len);
+          __o[__len + 1] = 34;
+          quoted = porf_box((f64)__p, 195);
+        }
+      }
+    ${BT};
+    if (quoted !== undefined) return quoted;
+  }
+`,
+  );
+  source = replace(
+    source,
+    "  buffer.length = (out - (buffer as i32)) / 2;\n  return buffer;\n};",
+    `  const units: i32 = (out - (buffer as i32)) / 2;
+  buffer.length = units;
+  const wbase: i32 = Porffor.IR.ptr(buffer);
+  let narrowed: any = undefined;
+  Porffor.c${BT}
+    const size_t __n = (size_t)units;
+    const uint16_t* __w = (const uint16_t*)(MEM + (u32)wbase + 4);
+    size_t __i = 0;
+    for (; __i < __n; __i++) if (__w[__i] > 0xff) break;
+    if (__i == __n) {
+      const u32 __p = porf_bstr_new((u32)__n);
+      unsigned char* __o = MEM + __p + 4;
+      __w = (const uint16_t*)(MEM + (u32)wbase + 4);
+      for (__i = 0; __i < __n; __i++) __o[__i] = (unsigned char)__w[__i];
+      narrowed = porf_box((f64)__p, 195);
+    }
+  ${BT};
+  if (narrowed !== undefined) return narrowed;
+  return buffer;
+};`,
   );
   return source;
 }
