@@ -1252,9 +1252,25 @@ static int sb_db_for(const char* path) {
   // copies of the binary behind SO_REUSEPORT (#154 scaling recipe): WAL takes
   // concurrent readers plus one writer across processes, and this makes a
   // writer wait for the lock instead of failing SQLITE_BUSY.
+  // SB_SQLITE_EXCLUSIVE=1 holds the database's lock for the life of the process: no fcntl lock
+  // and unlock around each transaction, and the WAL index lives in heap memory instead of a shared
+  // -shm file. Set before journal_mode, because the heap index is only chosen when WAL starts in
+  // exclusive mode. No other process can open the database while the binary runs, which also rules
+  // out the several-copies-behind-SO_REUSEPORT recipe above. Off unless set.
+  // SB_SQLITE_CACHE_MB sizes each database's page cache in MiB (default 2, about -2000 KiB).
+  {
+    const char* excl = getenv("SB_SQLITE_EXCLUSIVE");
+    if (excl && excl[0] == '1' && !excl[1]) sqlite3_exec(db, "PRAGMA locking_mode=EXCLUSIVE", 0, 0, 0);
+    char cache[64];
+    const char* mb = getenv("SB_SQLITE_CACHE_MB");
+    long mib = mb && *mb ? strtol(mb, 0, 10) : 0;
+    if (mib >= 1 && mib <= 4096) snprintf(cache, sizeof(cache), "PRAGMA cache_size=-%ld", mib * 1024);
+    else snprintf(cache, sizeof(cache), "PRAGMA cache_size=-2000");
+    sqlite3_exec(db, cache, 0, 0, 0);
+  }
   sqlite3_exec(db,
     "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;"
-    "PRAGMA cache_size=-2000; PRAGMA journal_size_limit=16777216;",
+    "PRAGMA journal_size_limit=16777216;",
     0, 0, 0);
   // Durable Object SQLite enforces foreign keys, as in workerd.
   if (do_sql) sqlite3_exec(db, "PRAGMA foreign_keys=ON", 0, 0, 0);
