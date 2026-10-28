@@ -1,0 +1,35 @@
+## verify hint
+ad0bb4d066f4e472691095da5d66b25b  /tmp/sbt-verify-feed-turso-hint.txt
+VERIFY-IDENTICAL
+## cmp feed+post
+1 feed-sqlite feed user=3765e-1 sys=1065e-1 total=4831e-1 rss_kb=7560 achieved=999 errors=0.00% p95=4.0ms
+1 feed-sqlite post user=1506e-1 sys=944e-1 total=2450e-1 rss_kb=10952 achieved=1997 errors=0.00% p95=3.6ms
+1 feed-turso-hint feed user=5251e-1 sys=1003e-1 total=6255e-1 rss_kb=26668 achieved=999 errors=0.00% p95=5.0ms
+1 feed-turso-hint post user=2176e-1 sys=1072e-1 total=3249e-1 rss_kb=32476 achieved=1997 errors=0.00% p95=10.5ms
+2 feed-sqlite feed user=3811e-1 sys=1019e-1 total=4831e-1 rss_kb=7564 achieved=996 errors=0.00% p95=4.4ms
+2 feed-sqlite post user=1516e-1 sys=935e-1 total=2452e-1 rss_kb=10940 achieved=1998 errors=0.00% p95=3.5ms
+2 feed-turso-hint feed user=4993e-1 sys=1073e-1 total=6066e-1 rss_kb=26668 achieved=999 errors=0.00% p95=5.9ms
+2 feed-turso-hint post user=1928e-1 sys=947e-1 total=2875e-1 rss_kb=32480 achieved=1997 errors=0.00% p95=3.5ms
+3 feed-sqlite feed user=4040e-1 sys=1045e-1 total=5086e-1 rss_kb=7564 achieved=998 errors=0.00% p95=4.1ms
+3 feed-sqlite post user=1566e-1 sys=917e-1 total=2483e-1 rss_kb=10952 achieved=1998 errors=0.00% p95=3.5ms
+3 feed-turso-hint feed user=4922e-1 sys=962e-1 total=5884e-1 rss_kb=26668 achieved=999 errors=0.00% p95=4.5ms
+3 feed-turso-hint post user=1891e-1 sys=894e-1 total=2785e-1 rss_kb=31100 achieved=1997 errors=0.00% p95=3.8ms
+## held sqlite
+feed-sqlite 2800 rss_kb=11468 offered=2800 achieved=2798 req/s errors=0.00% p50=2.3ms p95=6.3ms p99=24.1ms max=59.2ms loadgen_cpu=38%
+feed-sqlite 3200 rss_kb=11492 offered=3200 achieved=3198 req/s errors=0.00% p50=2.9ms p95=96.6ms p99=176.9ms max=330.5ms loadgen_cpu=42%
+feed-sqlite 3600 rss_kb=11516 offered=3600 achieved=3535 req/s errors=0.00% p50=4.3ms p95=441.1ms p99=540.6ms max=689.8ms loadgen_cpu=44%
+feed-sqlite 4000 rss_kb=11456 offered=4000 achieved=3986 req/s errors=0.00% p50=74.5ms p95=201.9ms p99=214.2ms max=338.6ms loadgen_cpu=44%
+## held turso-hint
+feed-turso-hint 1200 rss_kb=36872 offered=1200 achieved=1199 req/s errors=0.00% p50=2.8ms p95=7.0ms p99=18.7ms max=50.4ms loadgen_cpu=26%
+feed-turso-hint 1600 rss_kb=38416 offered=1600 achieved=1599 req/s errors=0.00% p50=2.6ms p95=6.9ms p99=18.8ms max=44.5ms loadgen_cpu=28%
+feed-turso-hint 2000 rss_kb=42328 offered=2000 achieved=1998 req/s errors=0.00% p50=2.5ms p95=6.0ms p99=22.7ms max=57.6ms loadgen_cpu=29%
+feed-turso-hint 2400 rss_kb=43992 offered=2400 achieved=2399 req/s errors=0.00% p50=3.1ms p95=230.4ms p99=299.5ms max=502.2ms loadgen_cpu=34%
+feed-turso-hint 2800 rss_kb=49748 offered=2800 achieved=2778 req/s errors=0.00% p50=12.1ms p95=550.8ms p99=565.2ms max=748.2ms loadgen_cpu=38%
+## integrity
+total 251996
+drwxrwxr-x   3 baronunread baronunread        80 Oct 28 16:29 .
+drwxrwxrwt 587 root        root            13200 Oct 28 16:29 ..
+drwxrwxr-x   3 baronunread baronunread       100 Oct 28 16:29 data
+-rw-r--r--   1 baronunread baronunread 258043904 Oct 28 16:29 feed.db
+copied
+Failed to stop bench12.service: Unit bench12.service not loaded.

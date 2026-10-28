@@ -1,0 +1,3 @@
+feed-sqlite 4400 rss_kb=11440 offered=4400 achieved=2968 req/s errors=0.00% p50=8389.3ms p95=13706.9ms p99=14248.9ms max=14468.6ms loadgen_cpu=35%
+feed-sqlite 4800 rss_kb=11388 offered=4800 achieved=2857 req/s errors=0.00% p50=11414.2ms p95=19666.0ms p99=20299.5ms max=20398.2ms loadgen_cpu=34%
+feed-sqlite 5200 rss_kb=11348 offered=5200 achieved=2979 req/s errors=0.00% p50=12016.1ms p95=21573.2ms p99=22299.2ms max=22372.9ms loadgen_cpu=34%

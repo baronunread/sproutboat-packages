@@ -1,0 +1,393 @@
+{
+  "reference": "miniflare 4.20260730.0, workerd 1.20260730.1",
+  "cases": 64,
+  "pass": 57,
+  "codeOnly": 1,
+  "fail": 6,
+  "rows": [
+    {
+      "case": "runInsert",
+      "status": "pass",
+      "reference": "[object Object]:{\"keys\":[\"meta\",\"results\",\"success\"],\"success\":true,\"results\":[],\"meta\":{\"keys\":[\"changed_db\",\"changes\",\"last_row_id\",\"rows_read\",\"rows_written\",\"served_by\",\"size_after\"],\"changes\":1,\"last_row_id\":1,\"changed_db\":true,\"rows_read\":0,\"rows_written\":1}}",
+      "sproutd": "[object Object]:{\"keys\":[\"meta\",\"results\",\"success\"],\"success\":true,\"results\":[],\"meta\":{\"keys\":[\"changed_db\",\"changes\",\"last_row_id\",\"rows_read\",\"rows_written\",\"served_by\",\"size_after\"],\"changes\":1,\"last_row_id\":1,\"changed_db\":true,\"rows_read\":0,\"rows_written\":1}}"
+    },
+    {
+      "case": "allSelect",
+      "status": "pass",
+      "reference": "[object Object]:{\"keys\":[\"meta\",\"results\",\"success\"],\"success\":true,\"results\":[{\"id\":1,\"name\":\"one\",\"n\":1.5},{\"id\":2,\"name\":\"two\",\"n\":2}],\"meta\":{\"keys\":[\"changed_db\",\"changes\",\"last_row_id\",\"rows_read\",\"rows_written\",\"served_by\",\"size_after\"],\"changes\":0,\"last_row_id\":2,\"changed_db\":false,\"rows_read\":2,\"rows_written\":0}}",
+      "sproutd": "[object Object]:{\"keys\":[\"meta\",\"results\",\"success\"],\"success\":true,\"results\":[{\"id\":1,\"name\":\"one\",\"n\":1.5},{\"id\":2,\"name\":\"two\",\"n\":2}],\"meta\":{\"keys\":[\"changed_db\",\"changes\",\"last_row_id\",\"rows_read\",\"rows_written\",\"served_by\",\"size_after\"],\"changes\":0,\"last_row_id\":2,\"changed_db\":false,\"rows_read\":2,\"rows_written\":0}}"
+    },
+    {
+      "case": "allEmpty",
+      "status": "fail",
+      "reference": "[object Object]:{\"keys\":[\"meta\",\"results\",\"success\"],\"success\":true,\"results\":[],\"meta\":{\"keys\":[\"changed_db\",\"changes\",\"last_row_id\",\"rows_read\",\"rows_written\",\"served_by\",\"size_after\"],\"changes\":0,\"last_row_id\":2,\"changed_db\":false,\"rows_read\":1,\"rows_written\":0}}",
+      "sproutd": "[object Object]:{\"keys\":[\"meta\",\"results\",\"success\"],\"success\":true,\"results\":[],\"meta\":{\"keys\":[\"changed_db\",\"changes\",\"last_row_id\",\"rows_read\",\"rows_written\",\"served_by\",\"size_after\"],\"changes\":0,\"last_row_id\":2,\"changed_db\":false,\"rows_read\":0,\"rows_written\":0}}"
+    },
+    {
+      "case": "runSelect",
+      "status": "pass",
+      "reference": "[object Object]:{\"keys\":[\"meta\",\"results\",\"success\"],\"success\":true,\"results\":[{\"name\":\"one\"},{\"name\":\"two\"}],\"meta\":{\"keys\":[\"changed_db\",\"changes\",\"last_row_id\",\"rows_read\",\"rows_written\",\"served_by\",\"size_after\"],\"changes\":0,\"last_row_id\":2,\"changed_db\":false,\"rows_read\":2,\"rows_written\":0}}",
+      "sproutd": "[object Object]:{\"keys\":[\"meta\",\"results\",\"success\"],\"success\":true,\"results\":[{\"name\":\"one\"},{\"name\":\"two\"}],\"meta\":{\"keys\":[\"changed_db\",\"changes\",\"last_row_id\",\"rows_read\",\"rows_written\",\"served_by\",\"size_after\"],\"changes\":0,\"last_row_id\":2,\"changed_db\":false,\"rows_read\":2,\"rows_written\":0}}"
+    },
+    {
+      "case": "runUpdate",
+      "status": "fail",
+      "reference": "[object Object]:{\"keys\":[\"meta\",\"results\",\"success\"],\"success\":true,\"results\":[],\"meta\":{\"keys\":[\"changed_db\",\"changes\",\"last_row_id\",\"rows_read\",\"rows_written\",\"served_by\",\"size_after\"],\"changes\":2,\"last_row_id\":2,\"changed_db\":true,\"rows_read\":2,\"rows_written\":2}}",
+      "sproutd": "[object Object]:{\"keys\":[\"meta\",\"results\",\"success\"],\"success\":true,\"results\":[],\"meta\":{\"keys\":[\"changed_db\",\"changes\",\"last_row_id\",\"rows_read\",\"rows_written\",\"served_by\",\"size_after\"],\"changes\":2,\"last_row_id\":2,\"changed_db\":true,\"rows_read\":0,\"rows_written\":2}}"
+    },
+    {
+      "case": "runDelete",
+      "status": "fail",
+      "reference": "[object Object]:{\"keys\":[\"meta\",\"results\",\"success\"],\"success\":true,\"results\":[],\"meta\":{\"keys\":[\"changed_db\",\"changes\",\"last_row_id\",\"rows_read\",\"rows_written\",\"served_by\",\"size_after\"],\"changes\":1,\"last_row_id\":2,\"changed_db\":true,\"rows_read\":1,\"rows_written\":1}}",
+      "sproutd": "[object Object]:{\"keys\":[\"meta\",\"results\",\"success\"],\"success\":true,\"results\":[],\"meta\":{\"keys\":[\"changed_db\",\"changes\",\"last_row_id\",\"rows_read\",\"rows_written\",\"served_by\",\"size_after\"],\"changes\":1,\"last_row_id\":2,\"changed_db\":true,\"rows_read\":0,\"rows_written\":1}}"
+    },
+    {
+      "case": "lastRowId",
+      "status": "pass",
+      "reference": "[object Array]:[3,1]",
+      "sproutd": "[object Array]:[3,1]"
+    },
+    {
+      "case": "firstRow",
+      "status": "pass",
+      "reference": "[object Object]:{\"id\":1,\"name\":\"one\"}",
+      "sproutd": "[object Object]:{\"id\":1,\"name\":\"one\"}"
+    },
+    {
+      "case": "firstColumn",
+      "status": "pass",
+      "reference": "string:one",
+      "sproutd": "string:one"
+    },
+    {
+      "case": "firstNoRows",
+      "status": "pass",
+      "reference": "object:null",
+      "sproutd": "object:null"
+    },
+    {
+      "case": "firstNoRowsColumn",
+      "status": "pass",
+      "reference": "object:null",
+      "sproutd": "object:null"
+    },
+    {
+      "case": "firstMissingColumn",
+      "status": "pass",
+      "reference": "THROWS Error: D1_COLUMN_NOTFOUND: Column not found (nope)",
+      "sproutd": "THROWS Error: D1_COLUMN_NOTFOUND: Column not found (nope)"
+    },
+    {
+      "case": "raw",
+      "status": "pass",
+      "reference": "[object Array]:[[1,\"one\"],[2,\"two\"]]",
+      "sproutd": "[object Array]:[[1,\"one\"],[2,\"two\"]]"
+    },
+    {
+      "case": "rawColumnNames",
+      "status": "pass",
+      "reference": "[object Array]:[[\"id\",\"name\"],[1,\"one\"],[2,\"two\"]]",
+      "sproutd": "[object Array]:[[\"id\",\"name\"],[1,\"one\"],[2,\"two\"]]"
+    },
+    {
+      "case": "rawEmpty",
+      "status": "pass",
+      "reference": "[object Array]:[]",
+      "sproutd": "[object Array]:[]"
+    },
+    {
+      "case": "rawEmptyColumnNames",
+      "status": "pass",
+      "reference": "[object Array]:[[\"id\"]]",
+      "sproutd": "[object Array]:[[\"id\"]]"
+    },
+    {
+      "case": "duplicateColumns",
+      "status": "pass",
+      "reference": "[object Array]:[{\"a\":2}]",
+      "sproutd": "[object Array]:[{\"a\":2}]"
+    },
+    {
+      "case": "duplicateColumnsRaw",
+      "status": "pass",
+      "reference": "[object Array]:[[\"a\",\"a\"],[1,2]]",
+      "sproutd": "[object Array]:[[\"a\",\"a\"],[1,2]]"
+    },
+    {
+      "case": "expressionColumn",
+      "status": "pass",
+      "reference": "[object Object]:{\"1 + 1\":2,\"upper('x')\":\"X\"}",
+      "sproutd": "[object Object]:{\"1 + 1\":2,\"upper('x')\":\"X\"}"
+    },
+    {
+      "case": "bindTypes",
+      "status": "pass",
+      "reference": "[object Array]:[{\"a\":null,\"b\":1,\"c\":1.5,\"d\":\"s\",\"e\":1,\"f\":0},{\"a\":\"null\",\"b\":\"number\",\"c\":\"number\",\"d\":\"string\",\"e\":\"number\",\"f\":\"number\"}]",
+      "sproutd": "[object Array]:[{\"a\":null,\"b\":1,\"c\":1.5,\"d\":\"s\",\"e\":1,\"f\":0},{\"a\":\"null\",\"b\":\"number\",\"c\":\"number\",\"d\":\"string\",\"e\":\"number\",\"f\":\"number\"}]"
+    },
+    {
+      "case": "bindPositional",
+      "status": "pass",
+      "reference": "[object Object]:{\"a\":1,\"b\":2}",
+      "sproutd": "[object Object]:{\"a\":1,\"b\":2}"
+    },
+    {
+      "case": "bindNumberedReuse",
+      "status": "pass",
+      "reference": "[object Object]:{\"a\":\"x\",\"b\":\"x\",\"c\":\"y\"}",
+      "sproutd": "[object Object]:{\"a\":\"x\",\"b\":\"x\",\"c\":\"y\"}"
+    },
+    {
+      "case": "bindUndefined",
+      "status": "pass",
+      "reference": "THROWS Error: D1_TYPE_ERROR: Type 'undefined' not supported for value 'undefined'",
+      "sproutd": "THROWS Error: D1_TYPE_ERROR: Type 'undefined' not supported for value 'undefined'"
+    },
+    {
+      "case": "bindObject",
+      "status": "pass",
+      "reference": "THROWS Error: D1_TYPE_ERROR: Type 'object' not supported for value '[object Object]'",
+      "sproutd": "THROWS Error: D1_TYPE_ERROR: Type 'object' not supported for value '[object Object]'"
+    },
+    {
+      "case": "bindBigInt",
+      "status": "pass",
+      "reference": "THROWS Error: D1_TYPE_ERROR: Type 'bigint' not supported for value '10'",
+      "sproutd": "THROWS Error: D1_TYPE_ERROR: Type 'bigint' not supported for value '10'"
+    },
+    {
+      "case": "bindTooFew",
+      "status": "pass",
+      "reference": "THROWS Error: D1_ERROR: Wrong number of parameter bindings for SQL query.",
+      "sproutd": "THROWS Error: D1_ERROR: Wrong number of parameter bindings for SQL query."
+    },
+    {
+      "case": "bindTooMany",
+      "status": "pass",
+      "reference": "THROWS Error: D1_ERROR: Wrong number of parameter bindings for SQL query.",
+      "sproutd": "THROWS Error: D1_ERROR: Wrong number of parameter bindings for SQL query."
+    },
+    {
+      "case": "bindNone",
+      "status": "pass",
+      "reference": "THROWS Error: D1_ERROR: Wrong number of parameter bindings for SQL query.",
+      "sproutd": "THROWS Error: D1_ERROR: Wrong number of parameter bindings for SQL query."
+    },
+    {
+      "case": "bindTwice",
+      "status": "pass",
+      "reference": "[object Object]:{\"a\":2}",
+      "sproutd": "[object Object]:{\"a\":2}"
+    },
+    {
+      "case": "bindBlob",
+      "status": "pass",
+      "reference": "[object Array]:[\"array\",[0,1,255]]",
+      "sproutd": "[object Array]:[\"array\",[0,1,255]]"
+    },
+    {
+      "case": "bindArrayBuffer",
+      "status": "pass",
+      "reference": "[object Object]:{\"h\":\"0708\",\"t\":\"blob\"}",
+      "sproutd": "[object Object]:{\"h\":\"0708\",\"t\":\"blob\"}"
+    },
+    {
+      "case": "blobLiteral",
+      "status": "pass",
+      "reference": "[object Array]:[\"array\",[0,255]]",
+      "sproutd": "[object Array]:[\"array\",[0,255]]"
+    },
+    {
+      "case": "bindStoredTypes",
+      "status": "pass",
+      "reference": "[object Object]:{\"a\":\"real\",\"b\":\"real\",\"c\":\"text\",\"d\":\"real\"}",
+      "sproutd": "[object Object]:{\"a\":\"real\",\"b\":\"real\",\"c\":\"text\",\"d\":\"real\"}"
+    },
+    {
+      "case": "integers",
+      "status": "pass",
+      "reference": "[object Object]:{\"a\":1,\"b\":-1,\"c\":1,\"d\":\"1\",\"e\":0.30000000000000004}",
+      "sproutd": "[object Object]:{\"a\":1,\"b\":-1,\"c\":1,\"d\":\"1\",\"e\":0.30000000000000004}"
+    },
+    {
+      "case": "bigInteger",
+      "status": "pass",
+      "reference": "[object Object]:{\"a\":9007199254740992,\"b\":-9223372036854776000}",
+      "sproutd": "[object Object]:{\"a\":9007199254740992,\"b\":-9223372036854776000}"
+    },
+    {
+      "case": "nullValue",
+      "status": "pass",
+      "reference": "[object Array]:[{\"a\":null},{\"a\":\"null\"}]",
+      "sproutd": "[object Array]:[{\"a\":null},{\"a\":\"null\"}]"
+    },
+    {
+      "case": "unicode",
+      "status": "pass",
+      "reference": "[object Object]:{\"name\":\"\u00e9\ud83d\ude00\\u0000z\",\"l\":2}",
+      "sproutd": "[object Object]:{\"name\":\"\u00e9\ud83d\ude00\\u0000z\",\"l\":2}"
+    },
+    {
+      "case": "emptyString",
+      "status": "pass",
+      "reference": "[object Object]:{\"a\":\"\",\"l\":0}",
+      "sproutd": "[object Object]:{\"a\":\"\",\"l\":0}"
+    },
+    {
+      "case": "syntaxError",
+      "status": "pass",
+      "reference": "THROWS Error: D1_ERROR: near \"SELEC\": syntax error at offset 0: SQLITE_ERROR",
+      "sproutd": "THROWS Error: D1_ERROR: near \"SELEC\": syntax error at offset 0: SQLITE_ERROR"
+    },
+    {
+      "case": "missingTable",
+      "status": "pass",
+      "reference": "THROWS Error: D1_ERROR: no such table: nope: SQLITE_ERROR",
+      "sproutd": "THROWS Error: D1_ERROR: no such table: nope: SQLITE_ERROR"
+    },
+    {
+      "case": "uniqueViolation",
+      "status": "pass",
+      "reference": "THROWS Error: D1_ERROR: UNIQUE constraint failed: t.id: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_PRIMARYKEY)",
+      "sproutd": "THROWS Error: D1_ERROR: UNIQUE constraint failed: t.id: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_PRIMARYKEY)"
+    },
+    {
+      "case": "notNullViolation",
+      "status": "pass",
+      "reference": "THROWS Error: D1_ERROR: NOT NULL constraint failed: nn.a: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_NOTNULL)",
+      "sproutd": "THROWS Error: D1_ERROR: NOT NULL constraint failed: nn.a: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_NOTNULL)"
+    },
+    {
+      "case": "emptyStatement",
+      "status": "pass",
+      "reference": "THROWS Error: D1_ERROR: No SQL statements detected.",
+      "sproutd": "THROWS Error: D1_ERROR: No SQL statements detected."
+    },
+    {
+      "case": "beginTransaction",
+      "status": "pass",
+      "reference": "THROWS Error: D1_ERROR: To execute a transaction, please use the state.storage.transaction() or state.storage.transactionSync() APIs instead of the SQL BEGIN TRANSACTION or SAVEPOINT statements. The JavaScript API is safer because it will automatically roll back on exceptions, and because it interacts correctly with Durable Objects' automatic atomic write coalescing.",
+      "sproutd": "THROWS Error: D1_ERROR: To execute a transaction, please use the state.storage.transaction() or state.storage.transactionSync() APIs instead of the SQL BEGIN TRANSACTION or SAVEPOINT statements. The JavaScript API is safer because it will automatically roll back on exceptions, and because it interacts correctly with Durable Objects' automatic atomic write coalescing."
+    },
+    {
+      "case": "batch",
+      "status": "fail",
+      "reference": "[object Array]:[{\"keys\":[\"meta\",\"results\",\"success\"],\"success\":true,\"results\":[],\"meta\":{\"keys\":[\"changed_db\",\"changes\",\"last_row_id\",\"rows_read\",\"rows_written\",\"served_by\",\"size_after\"],\"changes\":1,\"last_row_id\":1,\"changed_db\":true,\"rows_read\":1,\"rows_written\":1}},{\"keys\":[\"meta\",\"results\",\"success\"],\"success\":true,\"results\":[],\"meta\":{\"keys\":[\"changed_db\",\"changes\",\"last_row_id\",\"rows_read\",\"rows_written\",\"served_by\",\"size_after\"],\"changes\":1,\"last_row_id\":2,\"changed_db\":true,\"rows_read\":1,\"rows_written\":1}},{\"keys\":[\"meta\",\"results\",\"success\"],\"success\":true,\"results\":[{\"id\":1,\"name\":\"a\"},{\"id\":2,\"name\":\"b\"}],\"meta\":{\"keys\":[\"changed_db\",\"changes\",\"last_row_id\",\"rows_read\",\"rows_written\",\"served_by\",\"size_after\"],\"changes\":0,\"last_row_id\":2,\"changed_db\":false,\"rows_read\":2,\"rows_written\":0}}]",
+      "sproutd": "[object Array]:[{\"keys\":[\"meta\",\"results\",\"success\"],\"success\":true,\"results\":[],\"meta\":{\"keys\":[\"changed_db\",\"changes\",\"last_row_id\",\"rows_read\",\"rows_written\",\"served_by\",\"size_after\"],\"changes\":1,\"last_row_id\":1,\"changed_db\":true,\"rows_read\":0,\"rows_written\":1}},{\"keys\":[\"meta\",\"results\",\"success\"],\"success\":true,\"results\":[],\"meta\":{\"keys\":[\"changed_db\",\"changes\",\"last_row_id\",\"rows_read\",\"rows_written\",\"served_by\",\"size_after\"],\"changes\":1,\"last_row_id\":2,\"changed_db\":true,\"rows_read\":0,\"rows_written\":1}},{\"keys\":[\"meta\",\"results\",\"success\"],\"success\":true,\"results\":[{\"id\":1,\"name\":\"a\"},{\"id\":2,\"name\":\"b\"}],\"meta\":{\"keys\":[\"changed_db\",\"changes\",\"last_row_id\",\"rows_read\",\"rows_written\",\"served_by\",\"size_after\"],\"changes\":0,\"last_row_id\":2,\"changed_db\":false,\"rows_read\":2,\"rows_written\":0}}]"
+    },
+    {
+      "case": "batchBound",
+      "status": "pass",
+      "reference": "[object Array]:[2,2]",
+      "sproutd": "[object Array]:[2,2]"
+    },
+    {
+      "case": "batchRollback",
+      "status": "pass",
+      "reference": "[object Array]:[\"Error: D1_ERROR: UNIQUE constraint failed: t.id: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_PRIMARYKEY)\",0]",
+      "sproutd": "[object Array]:[\"Error: D1_ERROR: UNIQUE constraint failed: t.id: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_PRIMARYKEY)\",0]"
+    },
+    {
+      "case": "batchEmpty",
+      "status": "pass",
+      "reference": "THROWS Error: D1_ERROR: No SQL statements detected.",
+      "sproutd": "THROWS Error: D1_ERROR: No SQL statements detected."
+    },
+    {
+      "case": "exec",
+      "status": "pass",
+      "reference": "[object Array]:[[\"count\",\"duration\"],1,\"number\",2]",
+      "sproutd": "[object Array]:[[\"count\",\"duration\"],1,\"number\",2]"
+    },
+    {
+      "case": "execNewlines",
+      "status": "pass",
+      "reference": "[object Array]:[2,2]",
+      "sproutd": "[object Array]:[2,2]"
+    },
+    {
+      "case": "execError",
+      "status": "code",
+      "reference": "THROWS Error: D1_EXEC_ERROR: Error in line 1: INSERT INTO t (id) VALUES (1); SELEC 2: near \"SELEC\": syntax error at offset 0: SQLITE_ERROR",
+      "sproutd": "THROWS Error: D1_EXEC_ERROR: Error in line 1: INSERT INTO t (id) VALUES (1); SELEC 2: near \"SELEC\": syntax error"
+    },
+    {
+      "case": "execPartial",
+      "status": "fail",
+      "reference": "[object Array]:[\"threw\",\"D1_EXEC_ERROR: Error in line 1: INSERT INTO t (id) VALUES (1);: near \\\"SELEC\\\": syntax error at offset 0: SQLITE_ERROR\",0]",
+      "sproutd": "[object Array]:[\"threw\",\"D1_EXEC_ERROR: Error in line 2: SELEC 2: near \\\"SELEC\\\": syntax error\",0]"
+    },
+    {
+      "case": "execSelect",
+      "status": "pass",
+      "reference": "number:1",
+      "sproutd": "number:1"
+    },
+    {
+      "case": "statementIsThenable",
+      "status": "pass",
+      "reference": "[object Array]:[\"function\",\"function\",\"function\",\"function\",\"function\",\"function\"]",
+      "sproutd": "[object Array]:[\"function\",\"function\",\"function\",\"function\",\"function\",\"function\"]"
+    },
+    {
+      "case": "thenChain",
+      "status": "pass",
+      "reference": "number:42",
+      "sproutd": "number:42"
+    },
+    {
+      "case": "promiseAll",
+      "status": "pass",
+      "reference": "[object Array]:[1,2]",
+      "sproutd": "[object Array]:[1,2]"
+    },
+    {
+      "case": "methods",
+      "status": "pass",
+      "reference": "[object Array]:[\"function\",\"function\",\"function\",\"function\",\"function\",\"function\"]",
+      "sproutd": "[object Array]:[\"function\",\"function\",\"function\",\"function\",\"function\",\"function\"]"
+    },
+    {
+      "case": "prepareReuse",
+      "status": "pass",
+      "reference": "[object Array]:[1,2]",
+      "sproutd": "[object Array]:[1,2]"
+    },
+    {
+      "case": "pragmaTableInfo",
+      "status": "pass",
+      "reference": "[object Array]:[[\"id\",\"INTEGER\",1],[\"name\",\"TEXT\",0],[\"n\",\"REAL\",0],[\"b\",\"BLOB\",0]]",
+      "sproutd": "[object Array]:[[\"id\",\"INTEGER\",1],[\"name\",\"TEXT\",0],[\"n\",\"REAL\",0],[\"b\",\"BLOB\",0]]"
+    },
+    {
+      "case": "pragmaUserVersion",
+      "status": "fail",
+      "reference": "THROWS Error: D1_ERROR: not authorized: SQLITE_AUTH",
+      "sproutd": "[object Object]:{\"user_version\":0}"
+    },
+    {
+      "case": "sqliteMaster",
+      "status": "pass",
+      "reference": "[object Array]:[{\"name\":\"t\"}]",
+      "sproutd": "[object Array]:[{\"name\":\"t\"}]"
+    },
+    {
+      "case": "returning",
+      "status": "pass",
+      "reference": "[object Array]:[{\"id\":9,\"name\":\"r\"}]",
+      "sproutd": "[object Array]:[{\"id\":9,\"name\":\"r\"}]"
+    },
+    {
+      "case": "jsonFunctions",
+      "status": "pass",
+      "reference": "[object Object]:{\"v\":2,\"j\":\"[1,\\\"x\\\"]\"}",
+      "sproutd": "[object Object]:{\"v\":2,\"j\":\"[1,\\\"x\\\"]\"}"
+    },
+    {
+      "case": "foreignKeys",
+      "status": "pass",
+      "reference": "[object Object]:{\"foreign_keys\":1}",
+      "sproutd": "[object Object]:{\"foreign_keys\":1}"
+    }
+  ]
+}

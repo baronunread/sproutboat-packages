@@ -1,0 +1,29 @@
+## verify
+ad0bb4d066f4e472691095da5d66b25b  /tmp/sbt-verify-feed-sqlite.txt
+ad0bb4d066f4e472691095da5d66b25b  /tmp/sbt-verify-feed-turso.txt
+VERIFY-IDENTICAL
+## cmp
+1 feed-sqlite feed user=3578e-1 sys=1084e-1 total=4663e-1 rss_kb=7688 achieved=999 errors=0.00% p95=4.3ms
+1 feed-sqlite post user=1500e-1 sys=899e-1 total=2399e-1 rss_kb=11072 achieved=1997 errors=0.00% p95=3.5ms
+1 feed-sqlite like user=2720e-1 sys=1469e-1 total=4189e-1 rss_kb=11084 achieved=1498 errors=0.00% p95=10.4ms
+1 feed-sqlite create user=3172e-1 sys=2542e-1 total=5715e-1 rss_kb=11116 achieved=999 errors=0.00% p95=5.1ms
+1 feed-turso feed user=72320e-1 sys=26960e-1 total=99281e-1 rss_kb=30124 achieved=0 errors=100.00% p95=0.0ms
+1 feed-turso post user=2197e-1 sys=1135e-1 total=3333e-1 rss_kb=30576 achieved=1997 errors=0.00% p95=14.4ms
+1 feed-turso like user=3568e-1 sys=1313e-1 total=4881e-1 rss_kb=24772 achieved=1498 errors=0.00% p95=59.6ms
+1 feed-turso create user=3807e-1 sys=1323e-1 total=5130e-1 rss_kb=24260 achieved=998 errors=0.00% p95=4.7ms
+2 feed-sqlite feed user=3697e-1 sys=1102e-1 total=4799e-1 rss_kb=7688 achieved=998 errors=0.00% p95=4.4ms
+2 feed-sqlite post user=1564e-1 sys=888e-1 total=2452e-1 rss_kb=11080 achieved=1997 errors=0.00% p95=4.7ms
+2 feed-sqlite like user=3086e-1 sys=1708e-1 total=4794e-1 rss_kb=11096 achieved=1493 errors=0.00% p95=215.2ms
+2 feed-sqlite create user=3131e-1 sys=2672e-1 total=5803e-1 rss_kb=11112 achieved=999 errors=0.00% p95=5.4ms
+2 feed-turso feed user=72274e-1 sys=27094e-1 total=99368e-1 rss_kb=30432 achieved=0 errors=100.00% p95=0.0ms
+2 feed-turso post user=1875e-1 sys=821e-1 total=2697e-1 rss_kb=30764 achieved=1997 errors=0.00% p95=3.8ms
+2 feed-turso like user=3598e-1 sys=1450e-1 total=5048e-1 rss_kb=27664 achieved=1498 errors=0.00% p95=12.6ms
+2 feed-turso create user=3765e-1 sys=1385e-1 total=5151e-1 rss_kb=24520 achieved=998 errors=0.00% p95=5.2ms
+3 feed-sqlite feed user=4059e-1 sys=1185e-1 total=5245e-1 rss_kb=7684 achieved=999 errors=0.00% p95=6.5ms
+3 feed-sqlite post user=1499e-1 sys=959e-1 total=2459e-1 rss_kb=11080 achieved=1997 errors=0.00% p95=3.8ms
+3 feed-sqlite like user=2781e-1 sys=1358e-1 total=4140e-1 rss_kb=11096 achieved=1498 errors=0.00% p95=5.7ms
+3 feed-sqlite create user=3841e-1 sys=3358e-1 total=7199e-1 rss_kb=11152 achieved=999 errors=0.00% p95=24.3ms
+3 feed-turso feed user=72824e-1 sys=26688e-1 total=99512e-1 rss_kb=30732 achieved=0 errors=100.00% p95=0.0ms
+3 feed-turso post user=1813e-1 sys=892e-1 total=2706e-1 rss_kb=32480 achieved=1998 errors=0.00% p95=3.9ms
+3 feed-turso like user=3765e-1 sys=1491e-1 total=5256e-1 rss_kb=25436 achieved=1498 errors=0.00% p95=50.8ms
+3 feed-turso create user=3669e-1 sys=1268e-1 total=4938e-1 rss_kb=23876 achieved=999 errors=0.00% p95=5.9ms
