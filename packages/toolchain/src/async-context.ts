@@ -183,3 +183,7 @@ export async function patchAsyncContext(root: string): Promise<void> {
   }
   await Promise.all([writeFile(renderFile, render), writeFile(promiseFile, promise)]);
 }
+
+/** Text holding every anchor, for tests that stand in for a Porffor checkout. */
+export const ASYNC_CONTEXT_RENDER_ANCHORS = RENDER_EDITS.flatMap((e) => Array<string>(e.count).fill(e.anchor)).join("");
+export const ASYNC_CONTEXT_PROMISE_ANCHORS = PROMISE_EDITS.map((e) => e.anchor).join("");
