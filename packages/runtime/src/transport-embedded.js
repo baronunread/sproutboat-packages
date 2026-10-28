@@ -1256,11 +1256,13 @@ static int sb_db_for(const char* path) {
   // and unlock around each transaction, and the WAL index lives in heap memory instead of a shared
   // -shm file. Set before journal_mode, because the heap index is only chosen when WAL starts in
   // exclusive mode. No other process can open the database while the binary runs, which also rules
-  // out the several-copies-behind-SO_REUSEPORT recipe above. Off unless set.
+  // out the several-copies-behind-SO_REUSEPORT recipe above. Off unless set, and never for a
+  // database under LTX replication: capture reads the WAL through its shared index, and in
+  // exclusive mode (no -shm file) every capture failed (native-d1's LTX database).
   // SB_SQLITE_CACHE_MB sizes each database's page cache in MiB (default 2, about -2000 KiB).
   {
     const char* excl = getenv("SB_SQLITE_EXCLUSIVE");
-    if (excl && excl[0] == '1' && !excl[1]) sqlite3_exec(db, "PRAGMA locking_mode=EXCLUSIVE", 0, 0, 0);
+    if (excl && excl[0] == '1' && !excl[1] && !replicated) sqlite3_exec(db, "PRAGMA locking_mode=EXCLUSIVE", 0, 0, 0);
     char cache[64];
     const char* mb = getenv("SB_SQLITE_CACHE_MB");
     long mib = mb && *mb ? strtol(mb, 0, 10) : 0;
