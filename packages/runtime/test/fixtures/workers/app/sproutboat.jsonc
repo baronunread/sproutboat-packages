@@ -1,0 +1,8 @@
+{
+  "name": "workers-app",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-26",
+  "d1_databases": ["DB"],
+  "kv_namespaces": ["KV"],
+  "triggers": { "crons": ["* * * * *"] },
+}

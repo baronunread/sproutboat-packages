@@ -17,6 +17,7 @@ export const PATCH_SOURCES = [
   "unicode.ts",
   "url-class.ts",
   "websockets.ts",
+  "workers.ts",
 ] as const;
 
 /**
@@ -25,7 +26,7 @@ export const PATCH_SOURCES = [
  * patch.ts as the module patch.ts is everywhere else. Kept current by fingerprint.test.ts
  * (UPDATE_FINGERPRINT=1 bun test packages/toolchain/src/fingerprint.test.ts).
  */
-export const RELEASED_FINGERPRINT = "fa5ce003220c";
+export const RELEASED_FINGERPRINT = "b68717ae4012";
 
 /** The fingerprint of the sources in dir, or null where they are not on disk. */
 export function sourceFingerprint(dir: string): string | null {

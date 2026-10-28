@@ -28,6 +28,7 @@ import {
 } from "./fetch-classes";
 import * as requestStreaming from "./request-streaming";
 import * as websockets from "./websockets";
+import * as workers from "./workers";
 import {
   NATIVE_BYTES_LAYOUT,
   NATIVE_BYTES_MARKER,
@@ -2063,6 +2064,30 @@ export async function patchWebSockets(root: string): Promise<void> {
 }
 
 /**
+ * Standalone only: SB_WORKERS worker processes, each its own listener, heap and event loop, under a
+ * supervisor that restarts a crashed worker and drains on SIGTERM. Edits the shim, never render.js, the
+ * prelude or the transport, so sproutd's apps are unchanged. Runs after every other shim edit, whose
+ * text it anchors on. See workers.ts for what stays single-instance.
+ */
+export async function patchWorkers(root: string): Promise<void> {
+  const file = resolve(root, "compiler/uwebsockets.js");
+  let src = await readFile(file, "utf8");
+  if (src.includes(workers.WORKERS_MARKER)) return;
+  for (const [anchor, inject] of workers.WORKERS_EDITS) {
+    if (src.split(anchor).length !== 2)
+      throw new Error(
+        `could not patch Porffor's worker processes: anchor not found in ${file}: ${anchor.slice(0, 60)}`,
+      );
+    src = src.replace(anchor, () =>
+      inject
+        .replace("WORKERS_BLOCK", () => workers.WORKERS_BLOCK)
+        .replace("WORKERS_SUPERVISOR", () => workers.WORKERS_SUPERVISOR),
+    );
+  }
+  await writeFile(file, src);
+}
+
+/**
  * True when root is a finished cache entry that this toolchain version and patch
  * chain patched (ensurePorffor patches before it writes the manifest). The CLI calls
  * ensurePorfforPatched on every compile: re-running the patch chain there cost
@@ -2203,6 +2228,7 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchStreamingRequests(root);
   await patchWebSockets(root);
   await patchNativeBytes(root);
+  await patchWorkers(root);
   await patchStringAppend(root);
   await patchRegexReplace(root);
   await patchCharCodeAt(root);

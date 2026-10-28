@@ -1,0 +1,6 @@
+{
+  "name": "workers-do",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-26",
+  "durable_objects": { "COUNTER": "Counter" },
+}

@@ -78,6 +78,9 @@ const concurrency = positiveInteger(process.env.NATIVE_TEST_CONCURRENCY, 4, "NAT
 const timeoutMs = positiveInteger(process.env.NATIVE_TEST_TIMEOUT_MS, 600_000, "NATIVE_TEST_TIMEOUT_MS");
 const scripts = nativeScripts(process.argv.slice(2));
 const env = { ...process.env };
+// A standalone binary runs one worker per CPU by default, and these tests keep state in the process
+// (counters, globalThis) and read it back over separate connections. native-workers sets its own.
+env.SB_WORKERS ??= "1";
 
 if (!env.SPROUTBOAT_PORFFOR_DIR && env.NATIVE_TEST_FRESH_PORFFOR !== "1") {
   const started = performance.now();

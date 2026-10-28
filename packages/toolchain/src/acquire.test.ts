@@ -120,7 +120,9 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "  if (method_ptr == 0) return;\n" +
       "  __porffor_js_enter();\n  const i32 url_ptr = alloc_request_url(req);\n" +
       "  const i32 headers_ptr = collect_headers(req);\n" +
-      "  if (declared_content_length > REQUEST_BODY_MAX_BYTES || REQUEST_BODY_MAX_BYTES == 0) {\n  }\n}\n" +
+      "  if (declared_content_length > REQUEST_BODY_MAX_BYTES || REQUEST_BODY_MAX_BYTES == 0) {\n  }\n  auto pending = std::make_shared<PendingRequest>();\n}\n" +
+      "struct PendingRequest {\n  bool finished = false;\n};\nstruct PendingResponse {\n  uWS::HttpResponse<false>* res = nullptr;\n  bool aborted = false;\n};\n" +
+      "static bool finish_pending_request(PendingRequest* pending) {\n  if (pending->finished) return false;\n  pending->finished = true;\n  return true;\n}\n" +
       "static bool handle_request(uWS::HttpResponse<false>* res, i32 method_ptr, i32 url_ptr, i32 headers_ptr, std::string_view request_body, bool* aborted, NativeRequestRoots* roots) {\n" +
       "      res->onAborted([pending]() {\n        pending->aborted = true;\n        pending->res = nullptr;\n      });\n}\n" +
       "static bool is_forbidden_response_header(std::string_view key) {\n" +
@@ -176,7 +178,7 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "\n" +
       "  if (body_owned) free(body_owned);\n" +
       "}\n" +
-      'int main(void) {\n  porf_native_fetch_runtime_init();\n  porf_native_fetch_static_init();\n\n  uWS::App().any("/*", [](auto* res, auto* req) {\n    on_request(res, req);\n  }).run();\n  return 0;\n}\n',
+      'int main(void) {\n  porf_native_fetch_runtime_init();\n  porf_native_fetch_static_init();\n\n  const int port = (int)porf_native_fetch_get_port();\n  bool listened = false;\n  uWS::App().any("/*", [](auto* res, auto* req) {\n    on_request(res, req);\n  }).listen(port, [&listened, port](auto* token) {\n    if (token) {\n      listened = true;\n      std::fprintf(stderr, "Porffor native fetch server listening on http://127.0.0.1:%d\\\\n", port);\n    }\n  }).run();\n\n  if (!listened) {\n    std::fprintf(stderr, "Failed to bind native fetch server\\\\n");\n    return 1;\n  }\n\n  return 0;\n}\n',
     "compiler/builtins/json.ts":
       "// sb_json_utf16_v1\n" +
       "export const __Porffor_json_serialize = (_buffer: i32, value: any): i32 => {\n" +
