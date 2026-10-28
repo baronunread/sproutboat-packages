@@ -7959,8 +7959,19 @@ function __sbParseHex(s) {
 // uWS hands back IPv4-mapped IPv6 for IPv4 clients on a dual-stack socket
 // (`::ffff:1.2.3.4`, or fully expanded `0:0:0:0:0:ffff:0102:0304`). Fold those
 // to the dotted IPv4 so CIDR matching and `clientIp` see a plain address.
+// The last address folded and its result: a client keeps the same address from one request to the
+// next, and folding an IPv6 text costs a lowercase, a split and eight hex parses.
+let __sbIpRaw = "";
+let __sbIpFolded = "";
 function __sbNormalizeIp(ip) {
   const s = String(ip || "");
+  if (s === __sbIpRaw) return __sbIpFolded;
+  const folded = __sbFoldIp(s);
+  __sbIpRaw = s;
+  __sbIpFolded = folded;
+  return folded;
+}
+function __sbFoldIp(s) {
   if (s.indexOf(":") === -1) return s;
   const low = s.toLowerCase();
   const dotted = low.indexOf("::ffff:");
