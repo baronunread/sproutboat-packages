@@ -641,6 +641,24 @@ int main(void) {
   assert.match(failedOver.error, /^LTX capture failed/);
   third.close();
   await third.exited;
+  // Locking mode. This driver is the transport on its own, as sproutd and the broker embed it (no
+  // standalone shim): unset it must stay shared, so those hosts behave as before. SB_SQLITE_EXCLUSIVE=1 is
+  // exclusive for a plain database; anything else, 0 included, is shared. A database under LTX replication
+  // is never exclusive.
+  const lockingMode = (env: Record<string, string>, path: string) => {
+    const e = Object.fromEntries(Object.entries(process.env).filter(([key]) => key !== "SB_SQLITE_EXCLUSIVE"));
+    const p = Bun.spawnSync([binary], {
+      stdin: Buffer.from(`${path}\tPRAGMA locking_mode\t[]\n`),
+      env: { ...e, ...env },
+    });
+    assert.equal(p.exitCode, 0, p.stderr.toString());
+    return JSON.parse(p.stdout.toString().trim()).rows[0][0];
+  };
+  const lockDb = join(work, "data/d1/LOCK.sqlite");
+  assert.equal(lockingMode({}, lockDb), "normal", "the bare transport keeps shared locking unless asked");
+  assert.equal(lockingMode({ SB_SQLITE_EXCLUSIVE: "0" }, lockDb), "normal");
+  assert.equal(lockingMode({ SB_SQLITE_EXCLUSIVE: "1" }, lockDb), "exclusive");
+  assert.equal(lockingMode({ SB_SQLITE_EXCLUSIVE: "1" }, join(work, "data/d1/LOCK2.sqlite")), "exclusive");
   console.log(
     "native d1: sb_sql_run and the D1 ops pass (blob binds, atomic batch, strict counts, foreign keys, error text)",
   );

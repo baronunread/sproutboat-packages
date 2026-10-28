@@ -1421,6 +1421,11 @@ static u32 sb_gc_every(void) {
   }
   return cached;
 }
+// A standalone binary opens its databases in EXCLUSIVE locking mode unless SB_SQLITE_EXCLUSIVE is set
+// (SB_SQLITE_EXCLUSIVE=0 opts out). The transport's C reads only that variable, so sproutd and the broker,
+// which never run this shim, keep shared locking unless an operator sets it. setenv(..., 0) keeps a value
+// already set; it runs before main, so before any database opens.
+static void __attribute__((constructor)) sb_default_sqlite_exclusive(void) { setenv("SB_SQLITE_EXCLUSIVE", "1", 0); }
 static u32 sb_gc_since = 0;
 static u32 sb_gc_idle_seen = 0;
 static us_timer_t* sb_gc_idle_timer = nullptr;
