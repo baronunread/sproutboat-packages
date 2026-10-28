@@ -1491,7 +1491,7 @@ static inline int sb_read_value_fast(struct jsval value, const char** out_buf, s
       memcpy(&word, units + i, 8);
       if (word & 0x8080808080808080ULL) { high = 0x80; break; }
     }
-    for (; !high && i < len; i++) high |= units[i];
+    for (; high < 0x80 && i < len; i++) high |= units[i];
     if (high < 0x80) {
       *out_buf = (const char*)units;
       *out_len = len;

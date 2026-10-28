@@ -26,6 +26,7 @@ test("a response's strings are read in place by the patched shim", async () => {
     const helper = shim.slice(shim.indexOf("static inline int sb_read_value_fast("), start);
     expect(helper).toContain("value.type == 195");
     expect(helper).toContain("0x8080808080808080ULL");
+    expect(helper).toContain("high < 0x80 && i < len");
     expect(helper).toContain("return porf_native_fetch_read_value(value, out_buf, out_len, out_owned);");
     expect(shim).toContain("// sproutboat: a response's ASCII strings are written in place");
   } finally {
