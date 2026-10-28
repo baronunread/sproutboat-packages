@@ -1,5 +1,12 @@
 # @sproutboat/toolchain
 
+## 0.19.4
+
+### Patch Changes
+
+- 5bd4a25: Cheaper JWT verification. `atob` decodes in C for the usual input (no whitespace, valid characters, correct padding) and falls back to the existing JavaScript for everything else, so what throws and what it throws is unchanged. `TextEncoder.encode` sizes and fills the Uint8Array in two C passes instead of two `charCodeAt` loops (a lone surrogate is still U+FFFD). The ArrayBuffer returned by `crypto.subtle.sign` and `digest` is copied in with one `memcpy`, and the constant-time compare behind `verify` runs in C. A typical `authenticate()` (three base64url decodes, two `JSON.parse`, one `TextEncoder.encode`, one HMAC verify) goes from 21.5 to 7 us on an M-series host. New native test `test:native-jwt`: RFC 4231 HMAC vectors, the RFC 7515 and jwt.io tokens, wrong key, tampered header, payload and signature, short, long and missing signatures, bad base64url, typed-array windows and ArrayBuffers as verify input, and seeded random `atob`, `TextEncoder` and HMAC (SHA-256, 384, 512) inputs compared with Bun and node:crypto.
+- 8ac6917: A standalone binary collects garbage every 8 requests, and once it has been quiet for about 50 ms, instead of after every response. A collection costs about the same whatever the request made, so a cheap request paid all of it: on the API-challenge mix at 900 req/s the CPU per request goes from about 550 to about 470 us, and the feed endpoint from 940 to 750 us, for about 2 MiB more resident memory. `SB_GC_EVERY=<n>` sets the interval (`1` restores a collection after each request). A request that needs more heap than is free still collects when it allocates. Only the standalone server's shim changes: sproutd's collector, and its density, are untouched. New native test `test:native-http` covers keep-alive, pipelining, split requests, large bodies, partial writes and many connections at both intervals.
+
 ## 0.19.3
 
 ### Patch Changes
