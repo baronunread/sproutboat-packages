@@ -1195,6 +1195,17 @@ static unsigned long sb_db_tick = 0;
 static int sb_is_do_sql(const char* path) { return strstr(path, "/do-sql/") != 0; }
 static void sb_db_evict(int idx);
 
+// SQLite allocates 20 pages in one block for every page cache it creates, and a statement that
+// builds a temporary table (INSERT ... RETURNING, a sort) creates one: an 88 KiB mmap and munmap
+// per such statement. A page count of 0 turns the bulk allocation off; the cache then takes
+// its pages one at a time, as it always does past the first 20. Must run before SQLite starts.
+extern int sqlite3_config(int, ...);
+static int sb_sqlite_booted = 0;
+static void sb_sqlite_boot(void) {
+  if (sb_sqlite_booted) return;
+  sb_sqlite_booted = 1;
+  sqlite3_config(7 /* SQLITE_CONFIG_PAGECACHE */, (void*)0, 0, 0);
+}
 static int sb_db_for(const char* path) {
   for (int i = 0; i < sb_db_count; i++) {
     if (sb_dbs[i] && strcmp(sb_db_names[i], path) == 0) {
@@ -1202,6 +1213,7 @@ static int sb_db_for(const char* path) {
       return sb_ltx_states[i].failed ? -1 : i;
     }
   }
+  sb_sqlite_boot();
   const int do_sql = sb_is_do_sql(path);
   // A name that would not fit could never be found again.
   if (do_sql && strlen(path) >= sizeof(sb_db_names[0])) return -1;
@@ -2165,7 +2177,9 @@ static char* sb_sql_error(sqlite3* db, const char* message, int code, int skip) 
 // The text and blob bytes of every cell share one arena (a cell holds an offset into it), and a
 // TEXT cell says whether it is all ASCII: that one becomes a JS string with a single copy.
 typedef struct { unsigned char t; unsigned char ascii; double d; size_t off; int n; } sb_cell;
-typedef struct { sb_cell* c; size_t n; size_t cap; int ncol; int used; char* a; size_t alen; size_t acap; } sb_cells;
+// hdr: how many of the first cells are the column names, not row data; changes and rowid are the
+// statement's counts, so a native reply needs no JSON header at all.
+typedef struct { sb_cell* c; size_t n; size_t cap; int ncol; int used; char* a; size_t alen; size_t acap; int hdr; long long changes; long long rowid; } sb_cells;
 static void sb_cells_free(sb_cells* cs) {
   if (!cs) return;
   free(cs->c);
@@ -2222,17 +2236,30 @@ static char* sb_sql_run_x(const char* path, const char* sql, const char* params,
     return sb_sql_error(db, "Wrong number of parameter bindings for SQL query.", 0, 0);
   }
 
-  sb_puts(&b, "{\"ok\":true,\"cols\":[");
   int ncol = sqlite3_column_count(st);
-  for (int i = 0; i < ncol; i++) {
-    if (i) sb_puts(&b, ",");
-    const char* name = sqlite3_column_name(st, i);
-    sb_putjson_text(&b, name ? name : "", name ? strlen(name) : 0);
-  }
-  sb_puts(&b, "],\"rows\":[");
-  // Cells only for a strict D1 statement: its BLOBs are byte arrays either way.
+  // Cells only for a strict D1 statement: its BLOBs are byte arrays either way. The column names
+  // are its first cells and the reply is no JSON text: success returns NULL, with the counts in cells.
   const int native = cells && strict && d1;
-  if (native) { cells->ncol = ncol; cells->used = 1; }
+  if (native) {
+    cells->ncol = ncol; cells->used = 1; cells->hdr = ncol;
+    for (int i = 0; i < ncol && cells->used > 0; i++) {
+      sb_cell* cell = sb_cells_add(cells);
+      if (!cell) { cells->used = -1; break; }
+      const char* name = sqlite3_column_name(st, i);
+      cell->t = 2;
+      cell->n = name ? (int)strlen(name) : 0;
+      cell->off = sb_cells_bytes(cells, (const unsigned char*)(name ? name : ""), (size_t)cell->n, &cell->ascii);
+      if (cell->off == (size_t)-1) { cells->used = -1; break; }
+    }
+  } else {
+    sb_puts(&b, "{\"ok\":true,\"cols\":[");
+    for (int i = 0; i < ncol; i++) {
+      if (i) sb_puts(&b, ",");
+      const char* name = sqlite3_column_name(st, i);
+      sb_putjson_text(&b, name ? name : "", name ? strlen(name) : 0);
+    }
+    sb_puts(&b, "],\"rows\":[");
+  }
   int rc, first = 1;
   while ((rc = sqlite3_step(st)) == SB_SQLITE_ROW) {
     if (native) {
@@ -2280,10 +2307,15 @@ static char* sb_sql_run_x(const char* path, const char* sql, const char* params,
     }
     sb_puts(&b, "]");
   }
-  char tail[96];
   // A read-only statement changed nothing: sqlite3_changes still holds the last write's count.
-  int k = snprintf(tail, 96, "],\"changes\":%d,\"rowid\":%lld}", sqlite3_stmt_readonly(st) ? 0 : sqlite3_changes(db), (long long)sqlite3_last_insert_rowid(db));
-  sb_put(&b, tail, (size_t)k);
+  if (native) {
+    cells->changes = sqlite3_stmt_readonly(st) ? 0 : sqlite3_changes(db);
+    cells->rowid = (long long)sqlite3_last_insert_rowid(db);
+  } else {
+    char tail[96];
+    int k = snprintf(tail, 96, "],\"changes\":%d,\"rowid\":%lld}", sqlite3_stmt_readonly(st) ? 0 : sqlite3_changes(db), (long long)sqlite3_last_insert_rowid(db));
+    sb_put(&b, tail, (size_t)k);
+  }
   // Reset, don't finalize: the statement stays compiled in sb_stmt_cache. Reset
   // now (not just on next reuse) so a SELECT stops holding its read transaction.
   sqlite3_reset(st);
@@ -4029,6 +4061,22 @@ function __sbDirBytesRaw(dir) {
   return res;
 }
 
+// "captured" of __sbD1DbRaw as a number: no text made in C and parsed here, on every D1 query.
+// oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
+function __sbD1Captured_(path) {
+  let status = -1;
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    const char* __p; size_t __pl; char* __po = 0;
+    porf_native_fetch_read_value(path, &__p, &__pl, &__po);
+    char* __path = (char*)malloc(__pl + 1); memcpy(__path, __p, __pl); __path[__pl] = 0;
+    if (__po) free(__po);
+    status = (f64)sb_db_quota_freeze(__path, -1);
+    free(__path);
+  `;
+  return status;
+}
+
 // sb_db_page_size and sb_db_quota_freeze, for the quota (a path and a "0"/"1" in, a number out).
 // oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
 function __sbD1DbRaw(path, what) {
@@ -4235,10 +4283,10 @@ function __sbSqlRaw(path, sql, paramsJson) {
   return res;
 }
 
-// One strict D1 statement: [header JSON, rows]. The header is {"ok":true,"cols":[...],"changes":n,
-// "rowid":n} (or the error reply) and rows is an array of row arrays built here from the
-// cells, BLOBs as byte arrays, so no JSON for the rows is written or parsed. rows is
-// undefined when the reply is not a result.
+// One strict D1 statement: [header, rows, columns, changes, rowid]. A result has the empty string
+// for its header, rows an array of row arrays built here from the cells (BLOBs as byte arrays),
+// columns the array of names, and changes and rowid numbers: no JSON is written or parsed. Any
+// other reply is the error JSON in the header, with nothing after it.
 // oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
 function __sbSqlRowsRaw(path, sql, paramsJson) {
   let res = "";
@@ -4262,21 +4310,28 @@ function __sbSqlRowsRaw(path, sql, paramsJson) {
     sb_cells __cells = { 0, 0, 0, 0, 0 };
     char* __out = sb_sql_run_x(__path, __sql, __args, &__cells);
     free(__path); free(__sql); free(__args);
-    const u32 __pair = porf_arr_new(2, 2);
+    const u32 __pair = porf_arr_new(5, 5);
     res = porf_box((f64)__pair, 72);
-    if (!__out) __out = strdup("{\"ok\":false,\"error\":\"no result\"}");
-    porf_arr_set(__pair, 0, porf_box((f64)porf_native_fetch_alloc_bytestring(__out, strlen(__out)), 195));
+    const int __native = !__out && __cells.used == 1;
+    if (!__out && !__native) __out = strdup("{\"ok\":false,\"error\":\"no result\"}");
+    porf_arr_set(__pair, 0, porf_box((f64)porf_native_fetch_alloc_bytestring(__out ? __out : "", __out ? strlen(__out) : 0), 195));
     free(__out);
-    if (__cells.used == 1) {
+    if (__native) {
       const size_t __ncol = (size_t)__cells.ncol;
-      const size_t __nrow = __ncol ? __cells.n / __ncol : 0;
+      const size_t __hdr = (size_t)__cells.hdr;
+      const size_t __nrow = __ncol ? (__cells.n - __hdr) / __ncol : 0;
       const u32 __rows = porf_arr_new(0, (i32)(__nrow ? __nrow : 1));
       porf_arr_set(__pair, 1, porf_box((f64)__rows, 72));
-      for (size_t __r = 0; __r < __nrow; __r++) {
+      porf_arr_set(__pair, 3, porf_box_num((f64)__cells.changes));
+      porf_arr_set(__pair, 4, porf_box_num((f64)__cells.rowid));
+      if (!__ncol) porf_arr_set(__pair, 2, porf_box((f64)porf_arr_new(0, 1), 72));
+      // Row index -1 is the column names; the data rows follow.
+      for (long long __r = (__ncol ? -1 : 0); __r < (long long)__nrow; __r++) {
         const u32 __row = porf_arr_new((i32)__ncol, (i32)__ncol);
-        porf_arr_set(__rows, (u32)__r, porf_box((f64)__row, 72));
+        if (__r < 0) porf_arr_set(__pair, 2, porf_box((f64)__row, 72));
+        else porf_arr_set(__rows, (u32)__r, porf_box((f64)__row, 72));
         for (size_t __c = 0; __c < __ncol; __c++) {
-          const sb_cell* __cell = &__cells.c[__r * __ncol + __c];
+          const sb_cell* __cell = &__cells.c[(__r < 0 ? 0 : __hdr + (size_t)__r * __ncol) + __c];
           jsval __v = porf_box(0.0, 7);
           if (__cell->t == 1) __v = porf_box_num(__cell->d);
           else if (__cell->t == 2 && __cell->ascii) {
@@ -4386,7 +4441,7 @@ function __sbD1Quota(path) {
   // Whether capture owns this database, from the private helper (no SQL), before anything
   // below depends on it. A database that cannot open (or whose capture failed) is left to
   // the call itself, which reports why.
-  const status = Number(__sbD1DbRaw(path, "captured"));
+  const status = __sbD1Captured_(path);
   if (status < 0) return;
   __sbD1Captured[path] = status === 1;
   let full = __sbQuotaFull();
@@ -4434,8 +4489,16 @@ function __sbDOSqlPath(cls, file) {
   if (!__sbDOSqlName(c, false) || !__sbDOSqlName(f, true)) throw new Error("invalid Durable Object SQL database");
   return __sbDir() + "/do-sql/" + c + "/" + f + ".sqlite";
 }
+// The last database's path: an app has one or two, and every query asks, so three concatenations
+// are done once. The directory cannot change mid-run (see __sbDir).
+var __sbD1PathName = "";
+var __sbD1PathValue = "";
 function __sbD1Path(name) {
-  return __sbDir() + "/d1/" + name + ".sqlite";
+  if (name === __sbD1PathName) return __sbD1PathValue;
+  const path = __sbDir() + "/d1/" + name + ".sqlite";
+  __sbD1PathName = name;
+  __sbD1PathValue = path;
+  return path;
 }
 
 function __sbSql(path, sql, params) {
@@ -5356,10 +5419,12 @@ function __sbD1Run(path, sql, params, strict) {
   if (strict) {
     // Rows come back as arrays, built in C (see __sbSqlRowsRaw); the header is small JSON.
     const pair = __sbSqlRowsRaw(path, "/*sb-d1-strict*/" + String(sql), JSON.stringify(params || []));
-    const head = JSON.parse(pair[0]);
-    if (head.ok === false) throw __sbD1Error(head);
+    if (pair[0] !== "") {
+      const head = JSON.parse(pair[0]);
+      if (head.ok === false) throw __sbD1Error(head);
+    }
     const rows = pair[1];
-    return { columns: head.cols, rows, native: true, meta: { changes: head.changes, last_row_id: head.rowid, rows_read: rows.length } };
+    return { columns: pair[2], rows, native: true, meta: { changes: pair[3], last_row_id: pair[4], rows_read: rows.length } };
   }
   const r = JSON.parse(__sbSqlRaw(path, (strict ? "/*sb-d1-strict*/" : "") + String(sql), JSON.stringify(params || [])));
   if (r.ok === false) throw strict ? __sbD1Error(r) : new Error("sqlite: " + r.error);
@@ -5523,6 +5588,17 @@ function __sbCall(reqJson) {
     return JSON.stringify({ ok: false, error: String((err && err.message) || err) });
   }
 }
+
+// A strict D1 query without the generic dispatch: no request object, no copy of its fields, no walk
+// down the op list and no result object. The same steps __sbEmbeddedDispatch runs for "d1.query".
+__sbD1QueryDirect = function (db, sql, params) {
+  if (__sbCompatDate() >= "2026-10-22") __sbLtxConfigure();
+  __sbEnsureSchema();
+  const path = __sbD1Path(String(db));
+  __sbD1Open(path, true);
+  __sbD1Quota(path);
+  return __sbD1Run(path, sql, params, true);
+};
 
 // The same dispatch without the JSON text either side: D1 calls take this (see __sbRpcDirect).
 __sbCallDirect = function (req) {
