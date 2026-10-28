@@ -1465,6 +1465,57 @@ export async function patchRequestCollectionInterval(root: string): Promise<void
   await writeFile(file, src.replace(REQUEST_GC_HEAD, REQUEST_GC_BLOCK));
 }
 
+const ASCII_WRITE_MARKER = "// sproutboat: a response's ASCII strings are written in place";
+const ASCII_WRITE_HEAD =
+  "static void write_response_value(uWS::HttpResponse<false>* res, struct jsval response, bool* aborted) {\n";
+const ASCII_WRITE_HELPER = `${ASCII_WRITE_MARKER}
+// porf_native_fetch_read_value turns a bytestring into UTF-8 with a malloc and a per-byte loop, and a
+// response runs it for every header name and value (twice) and for the body: 5% of the CPU of a 4 KB
+// reply. A bytestring whose bytes are all below 0x80 already is its UTF-8 text, so it is read where it
+// lies (valid until the next JS allocation: every use below ends before one). Anything else, a
+// UTF-16 string or a byte of 0x80 or more, takes the copying read unchanged.
+static inline int sb_read_value_fast(struct jsval value, const char** out_buf, size_t* out_len, char** out_owned) {
+  if (value.type == 195 && out_buf && out_len && out_owned) {
+    const u32 ptr = (u32)value.val;
+    const size_t len = (size_t)*(u32*)(porf_mem + ptr);
+    const unsigned char* units = (const unsigned char*)(porf_mem + ptr + 4);
+    size_t i = 0;
+    unsigned char high = 0;
+    for (; i + 8 <= len; i += 8) {
+      u64 word;
+      memcpy(&word, units + i, 8);
+      if (word & 0x8080808080808080ULL) { high = 0x80; break; }
+    }
+    for (; !high && i < len; i++) high |= units[i];
+    if (high < 0x80) {
+      *out_buf = (const char*)units;
+      *out_len = len;
+      *out_owned = NULL;
+      return 0;
+    }
+  }
+  return porf_native_fetch_read_value(value, out_buf, out_len, out_owned);
+}
+
+`;
+
+/**
+ * Standalone only: a response's ASCII header names, header values and body are read in place instead
+ * of being copied through malloc. It edits the native shim (compiler/uwebsockets.js), never render.js,
+ * so sproutd's code is untouched.
+ */
+export async function patchResponseWriteInPlace(root: string): Promise<void> {
+  const file = resolve(root, "compiler/uwebsockets.js");
+  const src = await readFile(file, "utf8");
+  if (src.includes(ASCII_WRITE_MARKER)) return;
+  const start = src.indexOf(ASCII_WRITE_HEAD);
+  const end = start < 0 ? -1 : src.indexOf("\n}\n", start);
+  if (start < 0 || src.split(ASCII_WRITE_HEAD).length !== 2 || end < 0)
+    throw new Error(`could not patch Porffor's response write: anchor not found in ${file}`);
+  const body = src.slice(start, end).replaceAll("porf_native_fetch_read_value(", "sb_read_value_fast(");
+  await writeFile(file, src.slice(0, start) + ASCII_WRITE_HELPER + body + src.slice(end));
+}
+
 /**
  * Apply every patch to a Porffor checkout at `root` (the directory that holds
  * `compiler/` and `runtime/`). Idempotent per process and per marker, so it is
@@ -2202,6 +2253,8 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchSplitGlobals(root);
   await patchStreamingRequests(root);
   await patchWebSockets(root);
+  // After every patch that edits write_response_value (streaming, raw bodies, WebSockets).
+  await patchResponseWriteInPlace(root);
   await patchNativeBytes(root);
   await patchStringAppend(root);
   await patchRegexReplace(root);
