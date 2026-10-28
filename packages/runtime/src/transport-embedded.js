@@ -2162,13 +2162,33 @@ static char* sb_sql_error(sqlite3* db, const char* message, int code, int skip) 
 // A strict D1 query can hand its rows back as cells instead of JSON text: the caller turns
 // them into JS arrays, with no JSON written here and none parsed there. t is 0 NULL,
 // 1 number, 2 TEXT (UTF-8 in p), 3 BLOB (bytes in p).
-typedef struct { unsigned char t; double d; char* p; int n; } sb_cell;
-typedef struct { sb_cell* c; size_t n; size_t cap; int ncol; int used; } sb_cells;
+// The text and blob bytes of every cell share one arena (a cell holds an offset into it), and a
+// TEXT cell says whether it is all ASCII: that one becomes a JS string with a single copy.
+typedef struct { unsigned char t; unsigned char ascii; double d; size_t off; int n; } sb_cell;
+typedef struct { sb_cell* c; size_t n; size_t cap; int ncol; int used; char* a; size_t alen; size_t acap; } sb_cells;
 static void sb_cells_free(sb_cells* cs) {
   if (!cs) return;
-  for (size_t i = 0; i < cs->n; i++) free(cs->c[i].p);
   free(cs->c);
-  cs->c = 0; cs->n = cs->cap = 0;
+  free(cs->a);
+  cs->c = 0; cs->a = 0; cs->n = cs->cap = cs->alen = cs->acap = 0;
+}
+// Copies n bytes into the arena and returns their offset, or (size_t)-1 when out of memory.
+static size_t sb_cells_bytes(sb_cells* cs, const unsigned char* src, size_t n, unsigned char* ascii) {
+  if (cs->alen + n + 1 > cs->acap) {
+    size_t cap = cs->acap ? cs->acap * 2 : 1024;
+    while (cap < cs->alen + n + 1) cap *= 2;
+    char* grown = (char*)realloc(cs->a, cap);
+    if (!grown) return (size_t)-1;
+    cs->a = grown; cs->acap = cap;
+  }
+  const size_t off = cs->alen;
+  unsigned char high = 0;
+  for (size_t i = 0; i < n; i++) high |= src[i];
+  if (n) memcpy(cs->a + off, src, n);
+  cs->a[off + n] = 0;
+  cs->alen = off + n + 1;
+  *ascii = high < 0x80;
+  return off;
 }
 static sb_cell* sb_cells_add(sb_cells* cs) {
   if (cs->n == cs->cap) {
@@ -2178,7 +2198,7 @@ static sb_cell* sb_cells_add(sb_cells* cs) {
     cs->c = grown; cs->cap = cap;
   }
   sb_cell* cell = &cs->c[cs->n++];
-  cell->t = 0; cell->d = 0; cell->p = 0; cell->n = 0;
+  cell->t = 0; cell->ascii = 0; cell->d = 0; cell->off = 0; cell->n = 0;
   return cell;
 }
 static char* sb_sql_run_x(const char* path, const char* sql, const char* params, sb_cells* cells) {
@@ -2226,10 +2246,8 @@ static char* sb_sql_run_x(const char* path, const char* sql, const char* params,
         int n = sqlite3_column_bytes(st, i);
         cell->t = t == 4 ? 3 : 2;
         cell->n = txt ? n : 0;
-        cell->p = (char*)malloc((size_t)cell->n + 1);
-        if (!cell->p) { cells->used = -1; break; }
-        if (cell->n) memcpy(cell->p, txt, (size_t)cell->n);
-        cell->p[cell->n] = 0;
+        cell->off = sb_cells_bytes(cells, txt, (size_t)cell->n, &cell->ascii);
+        if (cell->off == (size_t)-1) { cells->used = -1; break; }
       }
       if (cells->used < 0) break;
       continue;
@@ -4261,12 +4279,14 @@ function __sbSqlRowsRaw(path, sql, paramsJson) {
           const sb_cell* __cell = &__cells.c[__r * __ncol + __c];
           jsval __v = porf_box(0.0, 7);
           if (__cell->t == 1) __v = porf_box_num(__cell->d);
-          else if (__cell->t == 2) {
+          else if (__cell->t == 2 && __cell->ascii) {
+            __v = porf_box((f64)porf_native_fetch_alloc_bytestring(__cells.a + __cell->off, (size_t)__cell->n), 195);
+          } else if (__cell->t == 2) {
             const size_t __n = (size_t)__cell->n;
             uint16_t* __u = (uint16_t*)malloc(__n * 2 + 2);
             if (__u) {
               int __wide = 0;
-              const size_t __k = sb_text_units((const unsigned char*)__cell->p, __n, __u, &__wide);
+              const size_t __k = sb_text_units((const unsigned char*)(__cells.a + __cell->off), __n, __u, &__wide);
               if (__wide) {
                 const u32 __str = porf_native_fetch_alloc((u32)(4 + __k * 2), 67);
                 *(u32*)(MEM + __str) = (u32)__k;
@@ -4284,7 +4304,7 @@ function __sbSqlRowsRaw(path, sql, paramsJson) {
             }
           } else if (__cell->t == 3) {
             const u32 __bytes = porf_arr_new((i32)__cell->n, (i32)__cell->n);
-            for (int __i = 0; __i < __cell->n; __i++) porf_arr_set(__bytes, (u32)__i, porf_box_num((f64)(unsigned char)__cell->p[__i]));
+            for (int __i = 0; __i < __cell->n; __i++) porf_arr_set(__bytes, (u32)__i, porf_box_num((f64)(unsigned char)__cells.a[__cell->off + __i]));
             __v = porf_box((f64)__bytes, 72);
           }
           porf_arr_set(__row, (u32)__c, __v);

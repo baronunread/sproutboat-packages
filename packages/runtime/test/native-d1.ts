@@ -67,12 +67,12 @@ int main(void) {
           else if (x->t == 1) printf("%.17g", x->d);
           else if (x->t == 2) {
             uint16_t* u = (uint16_t*)malloc((size_t)x->n * 2 + 2); int wide = 0;
-            size_t k = sb_text_units((const unsigned char*)x->p, (size_t)x->n, u, &wide);
+            size_t k = sb_text_units((const unsigned char*)(cs.a + x->off), (size_t)x->n, u, &wide);
             printf("\\"");
             for (size_t i = 0; i < k; i++) printf("\\\\u%04x", u[i]);
             printf("\\"");
             free(u);
-          } else { printf("{\\"$blob\\":\\""); for (int i = 0; i < x->n; i++) printf("%02x", (unsigned char)x->p[i]); printf("\\"}"); }
+          } else { printf("{\\"$blob\\":\\""); for (int i = 0; i < x->n; i++) printf("%02x", (unsigned char)cs.a[x->off + i]); printf("\\"}"); }
         }
         printf("]");
       }
