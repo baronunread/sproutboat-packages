@@ -59,7 +59,8 @@
     "test:native-websockets-outbound": "bun packages/runtime/test/native-websockets-outbound.ts",
     "test:native-unhandled-rejection": "bun packages/runtime/test/native-unhandled-rejection.ts",
     "test:native-jwt": "bun packages/runtime/test/native-jwt.ts",
-    "test:native-concurrent-requests": "bun packages/runtime/test/native-concurrent-requests.ts"
+    "test:native-concurrent-requests": "bun packages/runtime/test/native-concurrent-requests.ts",
+    "test:native-async-local-storage": "bun packages/runtime/test/native-async-local-storage.ts"
   },
   "devDependencies": {
     "@changesets/cli": "^3.0.2",

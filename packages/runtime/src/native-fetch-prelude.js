@@ -9287,6 +9287,87 @@ globalThis.__sbOnUnhandledRejection = function (reason, promise) {
   }
 };
 
+// AsyncLocalStorage (node:async_hooks, as Workers has it: run, getStore, exit and the static snapshot
+// (no bind, enterWith or disable). The patched Porffor (toolchain async-context.ts) keeps one
+// "current context" value that every promise reaction, await and timer records when it is created and
+// sets when it runs. Here that value is a frame: the stores of the AsyncLocalStorage instances
+// entered so far, in two parallel arrays (a frame is never changed, run() makes a new one).
+function __sbCtxGet() {
+  let frame;
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    frame = porf_unpack(porf_async_ctx_bits);
+  `;
+  return frame;
+}
+// oxlint-disable-next-line no-unused-vars -- `frame` is read inside the RawC block below, not by JS.
+function __sbCtxSet(frame) {
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    porf_async_ctx_bits = porf_pack(frame);
+  `;
+}
+function __sbFrameIndex(frame, als) {
+  if (!frame) return -1;
+  const keys = frame.keys;
+  for (let i = 0; i < keys.length; i++) if (keys[i] === als) return i;
+  return -1;
+}
+function __sbFrameWith(frame, als, store) {
+  const keys = [];
+  const vals = [];
+  if (frame) {
+    for (let i = 0; i < frame.keys.length; i++) {
+      if (frame.keys[i] === als) continue;
+      keys.push(frame.keys[i]);
+      vals.push(frame.vals[i]);
+    }
+  }
+  keys.push(als);
+  vals.push(store);
+  return { keys, vals };
+}
+function __sbRunInFrame(frame, fn, args) {
+  const previous = __sbCtxGet();
+  __sbCtxSet(frame);
+  try {
+    return fn.apply(undefined, args);
+  } finally {
+    __sbCtxSet(previous);
+  }
+}
+// A function constructor, not a class: Porffor refuses `new` on a class reached through an alias
+// (const { AsyncLocalStorage } = globalThis), which is how a bundled import arrives.
+function __SbAsyncLocalStorage() {}
+__SbAsyncLocalStorage.prototype.run = function (store, fn, ...args) {
+  if (!__sbIsFn(fn)) throw new TypeError("The \"callback\" argument must be of type function.");
+  return __sbRunInFrame(__sbFrameWith(__sbCtxGet(), this, store), fn, args);
+};
+__SbAsyncLocalStorage.prototype.exit = function (fn, ...args) {
+  if (!__sbIsFn(fn)) throw new TypeError("The \"callback\" argument must be of type function.");
+  return __sbRunInFrame(__sbFrameWith(__sbCtxGet(), this, undefined), fn, args);
+};
+__SbAsyncLocalStorage.prototype.getStore = function () {
+  const frame = __sbCtxGet();
+  const at = __sbFrameIndex(frame, this);
+  return at === -1 ? undefined : frame.vals[at];
+};
+__SbAsyncLocalStorage.prototype.enterWith = function () {
+  throw new Error("AsyncLocalStorage.enterWith() is not supported");
+};
+__SbAsyncLocalStorage.prototype.disable = function () {
+  throw new Error("AsyncLocalStorage.disable() is not supported");
+};
+// AsyncLocalStorage.bind(fn) is not provided: Porffor compiles a call of .bind on a function value to
+// Function.prototype.bind whatever properties the function has. snapshot() does the same job.
+__SbAsyncLocalStorage.snapshot = function () {
+  const frame = __sbCtxGet();
+  return function (fn, ...args) {
+    return __sbRunInFrame(frame, fn, args);
+  };
+};
+globalThis.AsyncLocalStorage = __SbAsyncLocalStorage;
+
 // Shared by alarm and scheduled: both reply with an empty 204 once their
 // handler (and anything it queued via `waitUntil`) has settled.
 async function __sb204WithDrain(res, tasks) {
