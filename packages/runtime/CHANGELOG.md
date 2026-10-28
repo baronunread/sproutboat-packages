@@ -1,5 +1,12 @@
 # @sproutboat/runtime
 
+## 0.34.5
+
+### Patch Changes
+
+- e62b600: The client address is folded to plain IPv4 once per distinct address instead of on every request: a request read `x-sb-remote-addr` and, for an IPv4-mapped IPv6 peer, lowercased, split and hex-parsed it each time. The last address and its result are kept; a different address takes the same path as before.
+- 0b12b94: A strict D1 query hands its rows to JavaScript with fewer copies: the text of every cell goes into one arena instead of one `malloc` per cell, and a cell that is plain ASCII becomes its JS string in one copy (it used to go through a UTF-16 buffer, an 8-bit buffer and a third copy, three `malloc`s each). Non-ASCII text still takes the old path, so the strings are unchanged.
+
 ## 0.34.4
 
 ### Patch Changes
