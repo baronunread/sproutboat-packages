@@ -1,5 +1,21 @@
 # @sproutboat/runtime
 
+## 0.35.0
+
+### Minor Changes
+
+- 7f5e87b: A standalone binary now opens its SQLite databases in `PRAGMA locking_mode=EXCLUSIVE` by default, with the page cache at 2 MB (`cache_size=-2000`, unchanged). The lock is taken once and held, so a transaction no longer takes and releases file locks around itself, and the WAL index lives in heap memory instead of a shared `-shm` file. The cost: no other process can open the database while the binary runs, so the `sqlite3` shell, `sproutboat kv/d1 --local --data-dir` against a running binary, and the several-copies-behind-`SO_REUSEPORT` recipe do not work on a live binary. Set `SB_SQLITE_EXCLUSIVE=0` to opt out and keep shared locking. A database under LTX replication is never opened exclusive.
+  
+  The default belongs to the standalone binary only: the toolchain's native server shim sets `SB_SQLITE_EXCLUSIVE=1` at startup unless the variable is already set. The embedded transport itself reads only `SB_SQLITE_EXCLUSIVE` (`1` is exclusive, anything else is shared), so sproutd and the broker keep shared locking unless an operator sets it.
+  
+  `SB_SQLITE_CACHE_MB=<n>` (1 to 4096) sets each database's page cache in MiB; unset it stays at 2 MB.
+
+### Patch Changes
+
+- 2c9d885: A strict D1 query in a standalone binary does less around SQLite. It skips the generic dispatch (a request object, a walk down the op list, a result object), a statement is a class instead of an object with five closures, `raw()` and `first()` no longer build the `meta` they throw away (two clock reads), the transaction-keyword check reads character codes instead of compiling a regular expression on every query, and the column names, change count and row id come back as JavaScript values built in C instead of as JSON text that is written, parsed and discarded. Replies, errors and `meta` are unchanged.
+- 004b8e7: A request's fixed cost in a native sprout drops five items. The CPU stamp and the streamed-body probe come back as numbers instead of formatted and parsed text (a `printf` and a `parseFloat` each, per request). The ingress reads of `x-sb-trigger` and `x-sb-remote-addr` scan the stored header names instead of validating and lowercasing a name for each, and the three `x-sb-` names the runtime strips are looked for in one pass. `SB_EDGE_TOKEN` is read once. `Headers` checks a name and a value in C and only falls back to its regular expression for a name it cannot judge there, so `get`, `has`, `set`, `append` and `new Response(body, { headers })` stop compiling that expression on every call. Behavior is unchanged.
+- 4213ed7: A standalone binary stops mapping and unmapping 88 KiB for every statement that builds a temporary table. SQLite allocates 20 pages in one block for each page cache it creates, and `INSERT ... RETURNING` (and any sort that spills to a temporary table) creates one, so each such statement cost an `mmap` and an `munmap`. The runtime now sets the initial page-cache allocation to 0 before SQLite starts, so a cache takes its pages one at a time as it grows. Query results and the main database's cache size are unchanged.
+
 ## 0.34.5
 
 ### Patch Changes
