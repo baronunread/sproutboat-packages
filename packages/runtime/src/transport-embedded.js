@@ -1195,6 +1195,17 @@ static unsigned long sb_db_tick = 0;
 static int sb_is_do_sql(const char* path) { return strstr(path, "/do-sql/") != 0; }
 static void sb_db_evict(int idx);
 
+// SQLite allocates 20 pages in one block for every page cache it creates, and a statement that
+// builds a temporary table (INSERT ... RETURNING, a sort) creates one: an 88 KiB mmap and munmap
+// per such statement. A page count of 0 turns the bulk allocation off; the cache then takes
+// its pages one at a time, as it always does past the first 20. Must run before SQLite starts.
+extern int sqlite3_config(int, ...);
+static int sb_sqlite_booted = 0;
+static void sb_sqlite_boot(void) {
+  if (sb_sqlite_booted) return;
+  sb_sqlite_booted = 1;
+  sqlite3_config(7 /* SQLITE_CONFIG_PAGECACHE */, (void*)0, 0, 0);
+}
 static int sb_db_for(const char* path) {
   for (int i = 0; i < sb_db_count; i++) {
     if (sb_dbs[i] && strcmp(sb_db_names[i], path) == 0) {
@@ -1202,6 +1213,7 @@ static int sb_db_for(const char* path) {
       return sb_ltx_states[i].failed ? -1 : i;
     }
   }
+  sb_sqlite_boot();
   const int do_sql = sb_is_do_sql(path);
   // A name that would not fit could never be found again.
   if (do_sql && strlen(path) >= sizeof(sb_db_names[0])) return -1;
