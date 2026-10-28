@@ -13,7 +13,8 @@ const handler = `export default {async fetch(request) {
   const url = new URL(request.url);
   const ms = Number(url.searchParams.get("ms") || 0);
   const sleep = (n) => new Promise((resolve) => setTimeout(resolve, n));
-  const spin = (n) => { const end = Date.now() + n; while (Date.now() < end) {} };
+  // Work, not wall time: a loaded machine deschedules the process, and CPU time must not follow wall time.
+  const spin = (n) => { let x = 1; for (let i = 0; i < n * 40000; i++) x = (x * 1.0000001 + i) % 1000003; return x; };
   if (url.pathname === "/spin") {
     await sleep(5);
     spin(ms / 2);
@@ -99,11 +100,14 @@ try {
   };
 
   const alone = await cpu("/spin?ms=200");
-  assert(alone >= 170 && alone < 320, `a 200 ms spinner alone reports ${alone} ms`);
-  const sync = await cpu("/sync?ms=100");
-  assert(sync >= 90 && sync < 200, `a 100 ms synchronous spinner reports ${sync} ms`);
+  assert(alone > 10, `a spinner alone reports only ${alone} ms`);
+  const sync = await cpu("/sync?ms=200");
+  assert(
+    sync > alone * 0.5 && sync < alone * 2,
+    `a synchronous spinner of the same work reports ${sync} ms, the async one ${alone}`,
+  );
   const idle = await cpu("/wait?ms=50");
-  assert(idle < 30, `a request that only waits reports ${idle} ms`);
+  assert(idle < alone / 4 && idle < 30, `a request that only waits reports ${idle} ms (a spinner: ${alone})`);
 
   // Together: the spinner next to eight waiters, repeated so the slices interleave differently.
   for (let round = 0; round < 3; round++) {
@@ -112,14 +116,23 @@ try {
       ...Array.from({ length: 8 }, (_, i) => cpu(`/wait?ms=${150 + i * 20}`)),
     ]);
     const [spinner, ...waiters] = results;
-    assert(spinner >= 170 && spinner < 320, `round ${round}: the spinner reports ${spinner} ms`);
+    assert(
+      spinner > alone * 0.5 && spinner < alone * 2,
+      `round ${round}: the spinner reports ${spinner} ms, alone it did ${alone}`,
+    );
     for (const waiter of waiters)
-      assert(waiter < 60, `round ${round}: a waiter was charged ${waiter} ms of the spinner's work`);
+      assert(
+        waiter < alone / 4 && waiter < 60,
+        `round ${round}: a waiter was charged ${waiter} ms (the spinner: ${spinner})`,
+      );
   }
-  // Two spinners at once are each charged their own 100 ms, not 200.
-  const [a, b] = await Promise.all([cpu("/spin?ms=100"), cpu("/spin?ms=100")]);
-  assert(a >= 80 && a < 190 && b >= 80 && b < 190, `two 100 ms spinners report ${a} and ${b} ms`);
-  console.log(`per-request CPU holds under interleaving (spinner ${alone.toFixed(0)} ms, waiters under 60 ms)`);
+  // Two spinners at once are each charged their own work, not both.
+  const [a, b] = await Promise.all([cpu("/spin?ms=200"), cpu("/spin?ms=200")]);
+  assert(
+    a > alone * 0.5 && a < alone * 1.6 && b > alone * 0.5 && b < alone * 1.6,
+    `two spinners report ${a} and ${b} ms, one alone ${alone}`,
+  );
+  console.log(`per-request CPU holds under interleaving (a spinner ${alone.toFixed(0)} ms, waiters a few ms)`);
 
   // Before 2026-11-02 an async handler still reports nothing.
   const oldPort = await build("2026-11-01");
