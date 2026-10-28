@@ -9126,7 +9126,7 @@ async function __sbFetchWithDrain(res, tasks, bindingCall, rethrow, top) {
   } catch (error) {
     // A Durable Object's stub.fetch() from 2026-10-29: the caller gets the exception.
     if (rethrow) {
-      __sbDrainWaitUntil(tasks);
+      if (tasks.length) __sbDrainWaitUntil(tasks);
       throw error;
     }
     // #179 — a rejected handler promise must not take the process down with it.
@@ -9134,8 +9134,8 @@ async function __sbFetchWithDrain(res, tasks, bindingCall, rethrow, top) {
   }
   // The response goes out now and ctx.waitUntil work keeps running after it, as in
   // workerd; it was awaited first, so a 1.5 s background task delayed the response by
-  // 1.5 s. The 25 s cap still bounds it.
-  __sbDrainWaitUntil(tasks);
+  // 1.5 s. The 25 s cap still bounds it. Not called for no tasks: an async call is a coroutine and a promise.
+  if (tasks.length) __sbDrainWaitUntil(tasks);
   return r;
 }
 
