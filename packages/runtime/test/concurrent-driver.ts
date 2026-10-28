@@ -34,6 +34,8 @@ export interface DriverOptions {
   /** Whether the host carries client WebSockets (a standalone binary answers 501). */
   readonly clientSockets: boolean;
   readonly store: boolean;
+  /** Most requests (and sockets) in flight at once; sproutd queues 32 per app and refuses the rest. Default: all. */
+  readonly limit?: number;
 }
 
 const randomId = (round: number, i: number) => `r${round}-${i}-${rand(1e9).toString(36)}`;
@@ -252,9 +254,9 @@ export async function drive(options: DriverOptions): Promise<{ requests: number;
   };
 
   for (let round = 0; round < rounds; round++) {
-    const work: Promise<void>[] = [];
+    const work: (() => Promise<void>)[] = [];
     for (let i = 0; i < requests; i++) {
-      work.push(
+      work.push(() =>
         one(round, i).catch((error) => {
           fail(`request ${round}-${i} threw ${String(error)}`);
         }),
@@ -262,9 +264,17 @@ export async function drive(options: DriverOptions): Promise<{ requests: number;
     }
     if (options.clientSockets) {
       for (let i = 0; i < 6; i++)
-        work.push(socket(round, i).catch((error) => fail(`socket ${round}-${i} threw ${String(error)}`)));
+        work.push(() => socket(round, i).catch((error) => fail(`socket ${round}-${i} threw ${String(error)}`)));
     }
-    await Promise.all(work);
+    // At most `limit` at a time, started in order.
+    let next = 0;
+    const runner = async () => {
+      while (next < work.length) {
+        const job = work[next++];
+        if (job) await job();
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(options.limit ?? work.length, work.length) }, runner));
   }
   // Nothing shared between requests: no two saw the same cf, headers or ctx object.
   const report: {
