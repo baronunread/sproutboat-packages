@@ -56,12 +56,18 @@ int main(void) {
     if (!strncmp(line, ":cells ", 7)) {
       sb_cells cs = { 0, 0, 0, 0, 0 };
       char* head = sb_sql_run_x(line + 7, sql, params, &cs);
-      printf("{\\"head\\":%s,\\"rows\\":[", head);
-      size_t nrow = cs.ncol ? cs.n / (size_t)cs.ncol : 0;
+      // A result has no JSON header: its column names are the first cells and its counts are in cs.
+      if (head) printf("{\\"head\\":%s,\\"rows\\":[", head);
+      else {
+        printf("{\\"head\\":{\\"ok\\":true,\\"cols\\":[");
+        for (int c = 0; c < cs.hdr; c++) printf(c ? ",\\"%.*s\\"" : "\\"%.*s\\"", cs.c[c].n, cs.a + cs.c[c].off);
+        printf("],\\"changes\\":%lld,\\"rowid\\":%lld},\\"rows\\":[", cs.changes, cs.rowid);
+      }
+      size_t nrow = cs.ncol ? (cs.n - (size_t)cs.hdr) / (size_t)cs.ncol : 0;
       for (size_t r = 0; r < nrow; r++) {
         printf(r ? ",[" : "[");
         for (int c = 0; c < cs.ncol; c++) {
-          sb_cell* x = &cs.c[r * (size_t)cs.ncol + (size_t)c];
+          sb_cell* x = &cs.c[(size_t)cs.hdr + r * (size_t)cs.ncol + (size_t)c];
           if (c) printf(",");
           if (x->t == 0) printf("null");
           else if (x->t == 1) printf("%.17g", x->d);
@@ -162,6 +168,7 @@ int main(void) {
     assert.deepEqual(cells.rows, json.rows, `cells equal the JSON rows for ${t}`);
     assert.deepEqual(cells.head.cols, json.cols);
     assert.equal(cells.head.changes, json.changes);
+    assert.equal(cells.head.rowid, json.rowid);
   }
   const empty = cellRun("SELECT a FROM t WHERE 0");
   assert.deepEqual(empty.cells.rows, []);
@@ -252,15 +259,16 @@ int main(void) {
   };
   // oxlint-disable-next-line no-function-constructor -- lifting a block out of the text-only transport
   const scriptRaw = (path: string, text: string) => sqlRaw(":script " + path, text, "[]");
-  // __sbSqlRowsRaw as the transport's C block gives it: [header JSON, rows], BLOBs as byte arrays.
+  // __sbSqlRowsRaw as the transport's C block gives it: an error is [header JSON], a result is
+  // ["", rows, columns, changes, rowid], BLOBs as byte arrays.
   const rowsOf =
     (raw: (path: string, text: string, params: string) => string) => (path: string, text: string, params: string) => {
       const r = JSON.parse(raw(":cells " + path, text, params));
-      if (r.head.ok === false) return [JSON.stringify(r.head), undefined];
+      if (r.head.ok === false) return [JSON.stringify(r.head)];
       const rows = r.rows.map((row: unknown[]) =>
         row.map((c) => (c instanceof Object && "$blob" in c ? [...Buffer.from(String(c.$blob), "hex")] : c)),
       );
-      return [JSON.stringify(r.head), rows];
+      return ["", rows, r.head.cols, r.head.changes, r.head.rowid];
     };
   const ops = new Function(
     "__sbSqlRaw",
@@ -279,6 +287,7 @@ int main(void) {
       "__sbDir",
       "__sbDirBytesRaw",
       "__sbD1DbRaw",
+      "__sbD1Captured_",
       "__sbSql",
       "__sbSqlRaw",
       `${transport.slice(quotaStart, quotaEnd)}\nreturn { __sbQuotaCheck, __sbD1Quota, __sbQuotaFull, expire() { __sbQuotaAt = -1; } };`,
@@ -287,6 +296,7 @@ int main(void) {
       () => dir,
       (d: string) => String(JSON.parse(sqlRaw(":bytes " + d, "", "")).n),
       (path: string, what: string) => String(JSON.parse(sqlRaw(":db " + path, what, "")).n),
+      (path: string) => JSON.parse(sqlRaw(":db " + path, "c", "")).n,
       sql,
       sqlRaw,
     );
@@ -334,6 +344,7 @@ int main(void) {
         "__sbDir",
         "__sbDirBytesRaw",
         "__sbD1DbRaw",
+        "__sbD1Captured_",
         "__sbSql",
         "__sbSqlRaw",
         `${transport.slice(quotaStart, quotaEnd)}\nreturn { __sbQuotaCheck, __sbD1Quota, __sbQuotaFull };`,
@@ -342,6 +353,7 @@ int main(void) {
         () => dir,
         (d: string) => String(JSON.parse(raw(":bytes " + d, "", "")).n),
         (path: string, what: string) => String(JSON.parse(raw(":db " + path, what, "")).n),
+        (path: string) => JSON.parse(raw(":db " + path, "c", "")).n,
         run,
         raw,
       );

@@ -64,7 +64,9 @@ for (const date of ["2026-09-28", "2026-10-24"]) {
   test(`${date}: batch() is one transaction`, async () => {
     const DB = fresh(date);
     await DB.exec("CREATE TABLE t (id INTEGER PRIMARY KEY)");
-    expect(await failure(() => DB.batch([DB.prepare("INSERT INTO t VALUES (1)"), DB.prepare("INSERT INTO t VALUES (1)")]))).toMatch(/UNIQUE/);
+    expect(
+      await failure(() => DB.batch([DB.prepare("INSERT INTO t VALUES (1)"), DB.prepare("INSERT INTO t VALUES (1)")])),
+    ).toMatch(/UNIQUE/);
     expect(await DB.prepare("SELECT count(*) AS n FROM t").first("n")).toBe(0);
   });
 }
@@ -85,13 +87,23 @@ test("before 2026-10-24: synchronous, lenient, no foreign keys, BLOBs as one cha
 
 test("from 2026-10-24: D1's parameter rules", async () => {
   const DB = fresh("2026-10-24");
-  expect(caught(() => DB.prepare("SELECT ?1").bind(undefined))).toBe("D1_TYPE_ERROR: Type 'undefined' not supported for value 'undefined'");
-  expect(caught(() => DB.prepare("SELECT ?1").bind({ a: 1 }))).toBe("D1_TYPE_ERROR: Type 'object' not supported for value '[object Object]'");
-  expect(caught(() => DB.prepare("SELECT ?1").bind(10n))).toBe("D1_TYPE_ERROR: Type 'bigint' not supported for value '10'");
+  expect(caught(() => DB.prepare("SELECT ?1").bind(undefined))).toBe(
+    "D1_TYPE_ERROR: Type 'undefined' not supported for value 'undefined'",
+  );
+  expect(caught(() => DB.prepare("SELECT ?1").bind({ a: 1 }))).toBe(
+    "D1_TYPE_ERROR: Type 'object' not supported for value '[object Object]'",
+  );
+  expect(caught(() => DB.prepare("SELECT ?1").bind(10n))).toBe(
+    "D1_TYPE_ERROR: Type 'bigint' not supported for value '10'",
+  );
   expect(await failure(() => DB.prepare("SELECT ?1, ?2").bind(1).all())).toBe(WRONG_COUNT);
   expect(await failure(() => DB.prepare("SELECT ?1").bind(1, 2).all())).toBe(WRONG_COUNT);
   expect(await failure(() => DB.prepare("SELECT ?1").all())).toBe(WRONG_COUNT);
-  expect(await DB.prepare("SELECT ?1 AS a, ?1 AS b, ?2 AS c").bind("x", true).first()).toEqual({ a: "x", b: "x", c: 1 });
+  expect(await DB.prepare("SELECT ?1 AS a, ?1 AS b, ?2 AS c").bind("x", true).first()).toEqual({
+    a: "x",
+    b: "x",
+    c: 1,
+  });
 });
 
 test("from 2026-10-24: foreign keys, BLOBs as byte arrays, D1's error text", async () => {
@@ -104,18 +116,25 @@ test("from 2026-10-24: foreign keys, BLOBs as byte arrays, D1's error text", asy
   expect(await failure(() => DB.prepare("INSERT INTO p VALUES (1)").run())).toBe(
     "D1_ERROR: UNIQUE constraint failed: p.id: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_PRIMARYKEY)",
   );
-  expect(await failure(() => DB.prepare("SELECT * FROM nope").all())).toBe("D1_ERROR: no such table: nope: SQLITE_ERROR");
+  expect(await failure(() => DB.prepare("SELECT * FROM nope").all())).toBe(
+    "D1_ERROR: no such table: nope: SQLITE_ERROR",
+  );
   expect(await DB.prepare("SELECT x'00ff' AS b").first("b")).toEqual([0, 255]);
 });
 
 test("from 2026-10-24: every query method returns a Promise", async () => {
   const DB = fresh("2026-10-24");
   const s = DB.prepare("SELECT 41 AS a");
-  for (const p of [s.all(), s.run(), s.first(), s.raw(), DB.batch([s]), DB.exec("SELECT 1"), DB.dump().catch(() => 0)]) expect(p).toBeInstanceOf(Promise);
+  for (const p of [s.all(), s.run(), s.first(), s.raw(), DB.batch([s]), DB.exec("SELECT 1"), DB.dump().catch(() => 0)])
+    expect(p).toBeInstanceOf(Promise);
   expect(await s.first("a").then((a) => a + 1)).toBe(42);
   expect(await Promise.all([s.first("a"), DB.prepare("SELECT 2 AS a").first("a")])).toEqual([41, 2]);
   // Errors reject rather than throw: .catch() sees them.
-  expect(await DB.prepare("SELEC 1").all().catch((e) => e.message)).toMatch(/^D1_ERROR: near "SELEC": syntax error/);
+  expect(
+    await DB.prepare("SELEC 1")
+      .all()
+      .catch((e) => e.message),
+  ).toMatch(/^D1_ERROR: near "SELEC": syntax error/);
 });
 
 test("from 2026-10-24: results, meta, raw() and first() as in workerd", async () => {
@@ -123,16 +142,42 @@ test("from 2026-10-24: results, meta, raw() and first() as in workerd", async ()
   await DB.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)");
   const inserted = await DB.prepare("INSERT INTO t (name) VALUES (?), (?)").bind("one", "two").run();
   expect(Object.keys(inserted).sort()).toEqual(["meta", "results", "success"]);
-  expect(Object.keys(inserted.meta).sort()).toEqual(["changed_db", "changes", "duration", "last_row_id", "rows_read", "rows_written", "served_by", "size_after"]);
-  expect([inserted.meta.changes, inserted.meta.last_row_id, inserted.meta.changed_db, inserted.meta.rows_written]).toEqual([2, 2, true, 2]);
+  expect(Object.keys(inserted.meta).sort()).toEqual([
+    "changed_db",
+    "changes",
+    "duration",
+    "last_row_id",
+    "rows_read",
+    "rows_written",
+    "served_by",
+    "size_after",
+  ]);
+  expect([
+    inserted.meta.changes,
+    inserted.meta.last_row_id,
+    inserted.meta.changed_db,
+    inserted.meta.rows_written,
+  ]).toEqual([2, 2, true, 2]);
   const read = await DB.prepare("SELECT id, name FROM t ORDER BY id").all();
   expect([read.meta.changes, read.meta.changed_db, read.meta.rows_written]).toEqual([0, false, 0]);
-  expect(await DB.prepare("SELECT id, name FROM t ORDER BY id").raw()).toEqual([[1, "one"], [2, "two"]]);
-  expect(await DB.prepare("SELECT id, name FROM t ORDER BY id").raw({ columnNames: true })).toEqual([["id", "name"], [1, "one"], [2, "two"]]);
+  expect(await DB.prepare("SELECT id, name FROM t ORDER BY id").raw()).toEqual([
+    [1, "one"],
+    [2, "two"],
+  ]);
+  expect(await DB.prepare("SELECT id, name FROM t ORDER BY id").raw({ columnNames: true })).toEqual([
+    ["id", "name"],
+    [1, "one"],
+    [2, "two"],
+  ]);
   expect(await DB.prepare("SELECT id FROM t WHERE id > 9").raw({ columnNames: true })).toEqual([["id"]]);
-  expect(await DB.prepare("SELECT 1 AS a, 2 AS a").raw({ columnNames: true })).toEqual([["a", "a"], [1, 2]]);
+  expect(await DB.prepare("SELECT 1 AS a, 2 AS a").raw({ columnNames: true })).toEqual([
+    ["a", "a"],
+    [1, 2],
+  ]);
   expect((await DB.prepare("SELECT 1 AS a, 2 AS a").all()).results).toEqual([{ a: 2 }]);
-  expect(await failure(() => DB.prepare("SELECT id FROM t").first("nope"))).toBe("D1_COLUMN_NOTFOUND: Column not found (nope)");
+  expect(await failure(() => DB.prepare("SELECT id FROM t").first("nope"))).toBe(
+    "D1_COLUMN_NOTFOUND: Column not found (nope)",
+  );
   expect(await DB.prepare("SELECT id FROM t WHERE id > 9").first("nope")).toBeNull();
 });
 
@@ -140,15 +185,74 @@ test("from 2026-10-24: empty SQL, transactions, exec() and sessions as in worker
   const DB = fresh("2026-10-24");
   expect(await failure(() => DB.prepare("").all())).toBe(NO_STATEMENTS);
   expect(await failure(() => DB.batch([]))).toBe(NO_STATEMENTS);
-  expect(await failure(() => DB.prepare("BEGIN TRANSACTION").run())).toMatch(/^D1_ERROR: To execute a transaction, please use the state\.storage\.transaction\(\)/);
+  expect(await failure(() => DB.prepare("BEGIN TRANSACTION").run())).toMatch(
+    /^D1_ERROR: To execute a transaction, please use the state\.storage\.transaction\(\)/,
+  );
   expect(await failure(() => DB.prepare("savepoint x").run())).toMatch(/^D1_ERROR: To execute a transaction/);
   const done = await DB.exec("CREATE TABLE t (id INTEGER)\nINSERT INTO t VALUES (1);\n\nINSERT INTO t VALUES (2);\n");
   expect([done.count, Number.isFinite(done.duration)]).toEqual([3, true]);
   expect(await DB.exec("SELECT 1").then((r) => r.count)).toBe(1);
-  expect(await failure(() => DB.exec("INSERT INTO t VALUES (3);\nSELEC 2"))).toMatch(/^D1_EXEC_ERROR: Error in line 2: SELEC 2: near "SELEC": syntax error/);
+  expect(await failure(() => DB.exec("INSERT INTO t VALUES (3);\nSELEC 2"))).toMatch(
+    /^D1_EXEC_ERROR: Error in line 2: SELEC 2: near "SELEC": syntax error/,
+  );
   expect(await DB.prepare("SELECT count(*) AS n FROM t").first("n")).toBe(2);
   const session = DB.withSession("first-unconstrained");
   expect(await session.prepare("SELECT count(*) AS n FROM t").first("n")).toBe(2);
   expect(session.getBookmark()).toBeNull();
   expect(await session.batch([session.prepare("SELECT 1 AS a")]).then((r) => r[0].results)).toEqual([{ a: 1 }]);
+});
+
+// __sbD1IsTransaction replaced `/^(BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b/i.test(text)`.
+test("a statement is a transaction keyword exactly as the regular expression it replaced said", () => {
+  // oxlint-disable-next-line no-function-constructor -- the prelude is prepended as text in production too
+  const { isTx } = new Function("Porffor", `${source}\nreturn { isTx: __sbD1IsTransaction };`)({ c: () => "" });
+  const old = (text) => /^(BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b/i.test(text);
+  const cases = [
+    "BEGIN",
+    "begin",
+    "Begin TRANSACTION",
+    "begin;",
+    "BEGIN\n",
+    "commit",
+    "COMMIT;",
+    "end",
+    "END TRANSACTION",
+    "rollback to x",
+    "ROLLBACK",
+    "savepoint x",
+    "SAVEPOINT\tx",
+    "release x",
+    "RELEASE",
+    "beginning",
+    "begin_x",
+    "begin1",
+    "ending",
+    "endx",
+    "ender",
+    "committed",
+    "rollbacks",
+    "savepoints",
+    "released",
+    "select 1",
+    "SELECT begin FROM t",
+    "insert into t values (1)",
+    "be",
+    "en",
+    "e",
+    "",
+    "BEGINX",
+    "begin-",
+    "end(",
+    "end.",
+    "release@",
+    "commité",
+    "xbegin",
+    " begin",
+    "savepoint",
+    "savepointx",
+    "rollback_",
+    "ROLLBACKĀ",
+    "bégin",
+  ];
+  for (const text of cases) expect([text, isTx(text)]).toEqual([text, old(text)]);
 });
