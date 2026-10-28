@@ -3092,18 +3092,34 @@ __sbStartupMark();
 // string via the same primitives as __sbEnv / __sbRandomBytes (proven working),
 // then parsed — Porffor's number boxing for a bare inline-C assignment is not
 // relied on. `__sbEntry` samples it around the handler for per-invocation CPU.
+// The number comes back as a number: no text and no parse around it.
 function __sbCpuMs() {
-  let res = "";
+  let ms = 0;
   // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
   Porffor.c`
     struct timespec __ts;
     clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &__ts);
-    double __ms = (double)__ts.tv_sec * 1000.0 + (double)__ts.tv_nsec / 1000000.0;
+    ms = (f64)((double)__ts.tv_sec * 1000.0 + (double)__ts.tv_nsec / 1000000.0);
+  `;
+  return ms;
+}
+
+// The `x-sb-cpu-ms` value for the CPU time since `t0`, as three decimals, floored at zero: one
+// clock read and one format call in C, where it was a read, a format, a parse and a toFixed.
+// oxlint-disable-next-line no-unused-vars -- `t0` is read inside the RawC block below, not by JS.
+function __sbCpuStamp(t0) {
+  let res = "0.000";
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    struct timespec __ts;
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &__ts);
+    double __d = ((double)__ts.tv_sec * 1000.0 + (double)__ts.tv_nsec / 1000000.0) - (t0.type == 1 ? (double)t0.val : 0.0);
+    if (!(__d >= 0)) __d = 0;
     char __b[32];
-    int __n = snprintf(__b, sizeof(__b), "%.3f", __ms);
+    int __n = snprintf(__b, sizeof(__b), "%.3f", __d);
     if (__n > 0) res = porf_box((f64)porf_native_fetch_alloc_bytestring(__b, (size_t)__n), 195);
   `;
-  return res === "" ? 0 : parseFloat(res);
+  return res;
 }
 
 // #28 — stamp `x-sb-cpu-ms` onto a handler Response. Porffor alpha-10's
@@ -3114,7 +3130,6 @@ function __sbCpuMs() {
 // http-sync-v0) with no Set-Cookie to comma-fold; anything else is returned
 // untouched and the edge simply omits cpuMs for that request.
 function __sbTagCpu(res, t0) {
-  const cpu = __sbCpuMs() - t0;
   try {
     // A string body and no Set-Cookie, as before. The native writer reads Headers' flat `_entries`,
     // so the stamp is appended to the handler's own Response instead of building a second one (a
@@ -3122,7 +3137,7 @@ function __sbTagCpu(res, t0) {
     // the handler set itself is replaced by the measured one, as before.
     const headers = res && res.headers;
     if (headers && __sbIsStr(__sbRawBody(res)) && !headers.has("set-cookie")) {
-      const stamp = (cpu >= 0 ? cpu : 0).toFixed(3);
+      const stamp = __sbCpuStamp(t0);
       const entries = headers._entries;
       let set = false;
       for (let i = 0; i < entries.length; i += 2) {
@@ -9111,7 +9126,7 @@ async function __sbFetchWithDrain(res, tasks, bindingCall, rethrow, top) {
   } catch (error) {
     // A Durable Object's stub.fetch() from 2026-10-29: the caller gets the exception.
     if (rethrow) {
-      __sbDrainWaitUntil(tasks);
+      if (tasks.length) __sbDrainWaitUntil(tasks);
       throw error;
     }
     // #179 — a rejected handler promise must not take the process down with it.
@@ -9119,8 +9134,8 @@ async function __sbFetchWithDrain(res, tasks, bindingCall, rethrow, top) {
   }
   // The response goes out now and ctx.waitUntil work keeps running after it, as in
   // workerd; it was awaited first, so a 1.5 s background task delayed the response by
-  // 1.5 s. The 25 s cap still bounds it.
-  __sbDrainWaitUntil(tasks);
+  // 1.5 s. The 25 s cap still bounds it. Not called for no tasks: an async call is a coroutine and a promise.
+  if (tasks.length) __sbDrainWaitUntil(tasks);
   return r;
 }
 
@@ -9151,7 +9166,7 @@ function __sbErrorResponse(error, bindingCall) {
 // sees it. Returns whether the edge vouched for this one.
 function __sbBindingCallIngress(request) {
   const headers = request.headers;
-  const want = __sbEnv("SB_EDGE_TOKEN");
+  const want = __sbEdgeToken();
   const vouched = !!want && headers.get("x-sb-binding-call") === "1" && __sbEqCt(headers.get("x-sb-edge-token") || "", want);
   if (vouched) {
     const url = headers.get("x-sb-url");
@@ -9159,10 +9174,44 @@ function __sbBindingCallIngress(request) {
     if (url && URL.canParse(url) && __sbCompatDate() >= "2026-10-22") request.url = url;
     headers.delete("x-sb-remote-addr");
   }
-  for (const name of ["x-sb-binding-call", "x-sb-url", "x-sb-edge-token"]) {
-    if (headers.get(name) != null) headers.delete(name);
+  // Nearly every request carries none of the three: one look at the stored names tells, where
+  // three lookups (each validating and lowercasing its name) and an array of them did.
+  const stored = headers._entries;
+  let present = stored === undefined;
+  for (let i = 0; !present && i < stored.length; i += 2) {
+    const key = stored[i];
+    if (key === "x-sb-binding-call" || key === "x-sb-url" || key === "x-sb-edge-token") present = true;
+  }
+  if (present) {
+    for (const name of ["x-sb-binding-call", "x-sb-url", "x-sb-edge-token"]) {
+      if (headers.get(name) != null) headers.delete(name);
+    }
   }
   return vouched;
+}
+
+// SB_EDGE_TOKEN is fixed for the life of a process, like SB_TRUSTED_PROXIES above: read once.
+let __sbEdgeTokenCache;
+function __sbEdgeToken() {
+  if (__sbEdgeTokenCache === undefined) __sbEdgeTokenCache = __sbEnv("SB_EDGE_TOKEN");
+  return __sbEdgeTokenCache;
+}
+
+// One header of a request the native server built, by a name that is already lowercase and valid:
+// its stored names are scanned directly, where get() validates and lowercases the name first. A
+// name stored twice, or a headers object that is not the runtime's, goes through get().
+function __sbHeader(headers, name) {
+  const stored = headers._entries;
+  if (stored === undefined) return headers.get(name);
+  let found = null;
+  let count = 0;
+  for (let i = 0; i < stored.length; i += 2) {
+    if (stored[i] === name) {
+      found = stored[i + 1];
+      count++;
+    }
+  }
+  return count > 1 ? headers.get(name) : found;
 }
 
 function __sbLogUncaught(where, error) {
@@ -9328,12 +9377,24 @@ function __sbIngressStream(request, id) {
   request.bytes = async () => await all();
 }
 
+// The id of the current request's streamed body, 0 when it has none (op "t" of __sbReqBodyOp),
+// as a number: every request asks, and the text round trip was a format and a parse.
+function __sbReqBodyTake() {
+  let id = 0;
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    extern unsigned int sb_reqbody_take_current(void);
+    id = (f64)sb_reqbody_take_current();
+  `;
+  return id;
+}
+
 // Native HTTP ingress stores the body as one character per raw byte. Keep
 // that representation for binary consumers, but decode text lazily before
 // handing the request to user code. Request.text() in Porffor otherwise treats
 // the raw bytes as already-decoded characters and corrupts Unicode/HMAC input.
 function __sbDecodeIngress(request) {
-  const streamed = __sbCompatDate() >= "2026-10-27" ? Number(__sbReqBodyOp("t", 0, "")) : 0;
+  const streamed = __sbCompatDate() >= "2026-10-27" ? __sbReqBodyTake() : 0;
   if (streamed > 0) {
     __sbIngressStream(request, streamed);
     return;
@@ -9369,7 +9430,7 @@ function __sbTrustedProxiesOnce() {
 
 globalThis.__sbEntry = function (handlers, request) {
   __sbDecodeIngress(request);
-  const trigger = request.headers.get("x-sb-trigger");
+  const trigger = __sbHeader(request.headers, "x-sb-trigger");
   if (!trigger) {
     const bindingCall = __sbBindingCallIngress(request);
     // #163/#128 — expose the request metadata the edge already has, the
@@ -9379,7 +9440,7 @@ globalThis.__sbEntry = function (handlers, request) {
     const __cf = request.cf || {};
     if (__sbTrustedProxiesOnce().length === 0) {
       // No trusted proxy (the usual case): the peer is the client and no forwarded header counts.
-      __cf.clientIp = __sbNormalizeIp(request.headers.get("x-sb-remote-addr") || "");
+      __cf.clientIp = __sbNormalizeIp(__sbHeader(request.headers, "x-sb-remote-addr") || "");
     } else {
       __cf.clientIp = __sbClientIp(request);
       const __httpProtocol = __sbTrustedProxyHeader(request, "x-sb-http-protocol");

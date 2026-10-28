@@ -33,6 +33,7 @@
     "test:native-timers": "bun packages/runtime/test/native-timers.ts",
     "build:sql-budget": "bun packages/wire/src/build-d1-budget.ts",
     "test:native-response-defaults": "bun packages/runtime/test/native-response-defaults.ts",
+    "test:native-headers": "bun packages/runtime/test/native-headers.ts",
     "test:native-cpu-stamp": "bun packages/runtime/test/native-cpu-stamp.ts",
     "test:native-raw-body": "bun packages/runtime/test/native-raw-body.ts",
     "test:native-url": "bun packages/runtime/test/native-url.ts",
