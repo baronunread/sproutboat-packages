@@ -181,8 +181,12 @@ const RENDER_REPLACEMENTS = [
  * `SB_EXTRA_LINK` before `-lm`, inert unless the variable is set.
  */
 const LINK_ANCHOR = "        uSocketsArchive,\n        '-lm'\n";
+// Spike (SB_SQLITE_ENGINE=turso): the SQLite object the CLI adds to SB_EXTRA_LINK is dropped and
+// SB_TURSO_LIB (Turso's libturso_sqlite3.a for the target) plus SB_TURSO_SYSLIBS (what that Rust
+// static library needs from the system, space-separated) go in its place. Inert unless set.
 const LINK_INJECT =
-  "        ...(process.env.SB_EXTRA_LINK ? process.env.SB_EXTRA_LINK.split(' ').filter(Boolean) : []),\n";
+  "        ...(process.env.SB_EXTRA_LINK ? process.env.SB_EXTRA_LINK.split(' ').filter(Boolean).filter((a) => process.env.SB_SQLITE_ENGINE !== 'turso' || !/sqlite3[^/]*\\.o$/.test(a)) : []),\n" +
+  "        ...(process.env.SB_SQLITE_ENGINE === 'turso' ? [process.env.SB_TURSO_LIB, ...(process.env.SB_TURSO_SYSLIBS || '').split(' ')].filter(Boolean) : []),\n";
 const LINK_MARKER = "SB_EXTRA_LINK";
 
 /**
@@ -286,7 +290,8 @@ export default (ast) => (globalThis.precompile ? ast : walk(ast, false));
  */
 const CFLAGS_ANCHOR = "      ...darwinReleaseCompileArgs,\n";
 const CFLAGS_INJECT =
-  "      ...(process.env.SB_EXTRA_CFLAGS ? process.env.SB_EXTRA_CFLAGS.split(' ').filter(Boolean) : []),\n";
+  "      ...(process.env.SB_EXTRA_CFLAGS ? process.env.SB_EXTRA_CFLAGS.split(' ').filter(Boolean) : []),\n" +
+  "      ...(process.env.SB_SQLITE_ENGINE === 'turso' ? ['-DSB_ENGINE_TURSO=1'] : []),\n";
 const CFLAGS_MARKER = "SB_EXTRA_CFLAGS";
 
 // baronunread/sproutboat#235: clang's default -ffp-contract=on fuses `a * b + c`

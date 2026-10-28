@@ -1,0 +1,5 @@
+#!/bin/sh
+# zig cc for x86_64-linux-musl; drops the clang-style --target= the cc crate adds.
+args=""
+for a in "$@"; do case "$a" in --target=*) ;; -march=*|-mcpu=*|-mtune=*) ;; *) args="$args '$a'";; esac; done
+eval exec zig cc -target x86_64-linux-musl $args

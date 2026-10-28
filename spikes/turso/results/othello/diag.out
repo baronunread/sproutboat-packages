@@ -1,0 +1,40 @@
+users|CREATE TABLE users (
+  id          INTEGER PRIMARY KEY,
+  username    TEXT NOT NULL UNIQUE,
+  created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+)|
+sqlite_autoindex_users_1|(null)|
+posts|CREATE TABLE posts (
+  id          INTEGER PRIMARY KEY,
+  user_id     INTEGER NOT NULL REFERENCES users(id),
+  body        TEXT NOT NULL CHECK (length(body) BETWEEN 1 AND 500),
+  created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+)|
+likes|CREATE TABLE likes (
+  user_id     INTEGER NOT NULL REFERENCES users(id),
+  post_id     INTEGER NOT NULL REFERENCES posts(id),
+  created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  PRIMARY KEY (user_id, post_id)
+)|
+sqlite_autoindex_likes_1|(null)|
+sqlite_stat1|CREATE TABLE sqlite_stat1(tbl,idx,stat)|
+posts_created_at_id_idx|CREATE INDEX posts_created_at_id_idx ON posts (created_at DESC, id DESC)|
+posts_user_id_idx|CREATE INDEX posts_user_id_idx       ON posts (user_id)|
+likes_post_id_idx|CREATE INDEX likes_post_id_idx       ON likes (post_id)|
+rows=9 step=101 prepare=0.2ms run=0.1ms
+1|0|0|SCAN users AS u USING COVERING INDEX sqlite_autoindex_users_1|
+2|0|0|SEARCH p USING INDEX posts_user_id_idx (user_id=?)|
+14|0|0|CORRELATED SCALAR SUBQUERY 1|
+17|14|0|SEARCH l USING COVERING INDEX likes_post_id_idx (post_id=?)|
+40|0|0|USE SORTER FOR ORDER BY|
+rows=5 step=101 prepare=1.3ms run=0.1ms
+499982|Note to self: But that broken small that test there debugging yesterday very shipping deploy cheap. Slow careful weird everywhere pool.|2025-12-31T23:40:02.341Z|sharp_falcon_2327|3|
+499981|PSA: Thinking index tonight running careful deploy that everywhere thinking branch waiting of boring anything. Tomorrow these postgres thinking shipping after just reading usually throughput simple.|2025-12-31T23:38:58.882Z|lucky_orchid_22025|0|
+rows=20 step=101 prepare=0.6ms run=10886.7ms
+499981|PSA: Thinking index tonight running careful deploy that everywhere thinking branch waiting of boring anything. Tomorrow these postgres thinking shipping after just reading usually throughput simple.|2025-12-31T23:38:58.882Z|lucky_orchid_22025|
+rows=20 step=101 prepare=0.5ms run=5316.8ms
+499981|
+rows=20 step=101 prepare=0.2ms run=0.1ms
+18|
+rows=1 step=101 prepare=0.7ms run=0.1ms
+turso-20261028/diag.sh: line 12: sqlite3: command not found

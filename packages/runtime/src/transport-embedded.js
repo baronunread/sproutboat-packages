@@ -60,7 +60,14 @@ extern int sqlite3_close(sqlite3*);
 extern int sqlite3_bind_parameter_count(sqlite3_stmt*);
 extern int sqlite3_stmt_readonly(sqlite3_stmt*);
 extern int sqlite3_extended_errcode(sqlite3*);
+// SB_ENGINE_TURSO (spike): the build links Turso's sqlite3-compatible C API
+// (tursodatabase/turso, bindings/c) instead of the SQLite amalgamation. It has no
+// sqlite3_error_offset, and the "no offset" answer is exactly what -1 means.
+#ifdef SB_ENGINE_TURSO
+static int sqlite3_error_offset(sqlite3* db) { (void)db; return -1; }
+#else
 extern int sqlite3_error_offset(sqlite3*);
+#endif
 
 // baronunread/sproutboat#176 — defined in render.js, alongside
 // porf_native_fetch_read_value (which every inline-C block below already
@@ -87,6 +94,32 @@ static int sb_db_count = 0;
 #include <limits.h>
 #include <sys/file.h>
 
+#ifdef SB_ENGINE_TURSO
+// Turso has no sqlite3_wal_hook, no sqlite3_vfs_find/_register and a stub
+// sqlite3_set_authorizer, so LTX capture cannot run: this block is compiled out.
+// What the rest of the transport needs from it stays, inert. Asking for LTX
+// (SB_LTX_ENABLE=1) on a database this engine would capture refuses to open it.
+extern int sqlite3_open_v2(const char *, sqlite3 **, int, const char *);
+#define SB_LTX_PATH 1024
+static int sb_ltx_compat = 0;
+typedef struct {
+  sqlite3 *db;
+  int lock, failed, read_fd;
+  uint32_t page_size;
+} sb_ltx_state;
+static sb_ltx_state sb_ltx_states[SB_MAX_DB];
+static int sb_ltx_after(int idx) { (void)idx; return 0; }
+static int sb_ltx_register(void) { return -1; }
+static int sb_ltx_start(int idx, sqlite3 *db, const char *path, int lock) {
+  (void)idx; (void)db; (void)path; (void)lock;
+  return -1;
+}
+static int sb_ltx_opted(const char *path) {
+  (void)path;
+  const char *v = getenv("SB_LTX_ENABLE");
+  return v && !strcmp(v, "1") ? -1 : 0;
+}
+#else
 // Public SQLite VFS ABI, from sqlite3.h (public domain). Keeping declarations
 // here preserves standalone builds without an installed SQLite development SDK.
 #ifndef SQLITE3_H
@@ -1167,6 +1200,7 @@ static int sb_ltx_opted(const char *path) {
   size_t n = strlen(path), k = strlen(suffix);
   return n >= k && strcmp(path + n - k, suffix) == 0;
 }
+#endif // SB_ENGINE_TURSO
 // END LTX NATIVE
 
 // One handle per path, opened once and kept for the process lifetime — the same
@@ -1240,10 +1274,20 @@ static int sb_db_for(const char* path) {
   // copies of the binary behind SO_REUSEPORT (#154 scaling recipe): WAL takes
   // concurrent readers plus one writer across processes, and this makes a
   // writer wait for the lock instead of failing SQLITE_BUSY.
+#ifdef SB_ENGINE_TURSO
+  // One statement per call: Turso stops a multi-statement exec at the first pragma it
+  // rejects, and which ones it accepts has moved between its releases.
+  sqlite3_exec(db, "PRAGMA journal_mode=WAL", 0, 0, 0);
+  sqlite3_exec(db, "PRAGMA synchronous=NORMAL", 0, 0, 0);
+  sqlite3_exec(db, "PRAGMA busy_timeout=5000", 0, 0, 0);
+  sqlite3_exec(db, "PRAGMA cache_size=-2000", 0, 0, 0);
+  sqlite3_exec(db, "PRAGMA journal_size_limit=16777216", 0, 0, 0);
+#else
   sqlite3_exec(db,
     "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;"
     "PRAGMA cache_size=-2000; PRAGMA journal_size_limit=16777216;",
     0, 0, 0);
+#endif
   // Durable Object SQLite enforces foreign keys, as in workerd.
   if (do_sql) sqlite3_exec(db, "PRAGMA foreign_keys=ON", 0, 0, 0);
   sb_db_used[slot] = ++sb_db_tick;
