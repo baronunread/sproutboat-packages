@@ -58,7 +58,8 @@
     "test:native-bytes": "bun packages/toolchain/test/native-bytes.ts",
     "test:native-websockets-outbound": "bun packages/runtime/test/native-websockets-outbound.ts",
     "test:native-unhandled-rejection": "bun packages/runtime/test/native-unhandled-rejection.ts",
-    "test:native-jwt": "bun packages/runtime/test/native-jwt.ts"
+    "test:native-jwt": "bun packages/runtime/test/native-jwt.ts",
+    "test:native-concurrent-requests": "bun packages/runtime/test/native-concurrent-requests.ts"
   },
   "devDependencies": {
     "@changesets/cli": "^3.0.2",
