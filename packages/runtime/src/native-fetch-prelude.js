@@ -5310,6 +5310,11 @@ function __sbD1Param(value, strict) {
 // The broker transport leaves it unset and keeps the string hop. (No initializer: the transport is placed ahead of the prelude, and `= null` would run after its assignment.)
 // oxlint-disable-next-line no-unassigned-vars -- the embedded transport assigns it; the broker transport does not.
 var __sbCallDirect;
+// The embedded transport also answers a strict D1 query without the generic dispatch around it
+// (a request object, a walk down the op list, a result object): (db, sql, params) -> the reply
+// __sbD1Run builds. Unset elsewhere, and the query goes through __sbD1Rpc as before.
+// oxlint-disable-next-line no-unassigned-vars -- the embedded transport assigns it; the broker transport does not.
+var __sbD1QueryDirect;
 function __sbRpcDirect(op, extra) {
   if (!__sbCallDirect) return __sbRpc(op, extra);
   const req = { v: 1, id: ++__sbReqId, op };
@@ -5370,10 +5375,30 @@ function __sbD1Fail(message) {
 // transaction statements are refused, exec() runs line by line, and withSession() exists.
 var __sbD1NoTransactions =
   "D1_ERROR: To execute a transaction, please use the state.storage.transaction() or state.storage.transactionSync() APIs instead of the SQL BEGIN TRANSACTION or SAVEPOINT statements. The JavaScript API is safer because it will automatically roll back on exceptions, and because it interacts correctly with Durable Objects' automatic atomic write coalescing.";
+// A statement's first word is one of the transaction keywords: read by character code, where the
+// regular expression this replaced was compiled on every query. The word ends at the first character
+// that is not a letter, digit or underscore (the regular expression's \b after a keyword).
+function __sbD1IsTransaction(text) {
+  let end = 0;
+  while (end < text.length && end < 10) {
+    const c = text.charCodeAt(end) | 32;
+    if (c < 97 || c > 122) break;
+    end++;
+  }
+  if (end < 3 || end > 9) return false;
+  if (end < text.length) {
+    const c = text.charCodeAt(end);
+    if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || c === 95 || (c >= 97 && c <= 122)) return false;
+  }
+  const word = text.slice(0, end).toLowerCase();
+  return (
+    word === "begin" || word === "commit" || word === "end" || word === "rollback" || word === "savepoint" || word === "release"
+  );
+}
 function __sbD1Check(sql) {
   const text = String(sql).trim();
   if (!text) throw __sbD1Fail("D1_ERROR: No SQL statements detected.");
-  if (/^(BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b/i.test(text)) throw __sbD1Fail(__sbD1NoTransactions);
+  if (__sbD1IsTransaction(text)) throw __sbD1Fail(__sbD1NoTransactions);
 }
 function __sbD1Meta(meta, started) {
   const changes = Number(meta.changes) || 0;
@@ -5409,70 +5434,91 @@ function __sbD1Promise(run) {
     return Promise.reject(err);
   }
 }
+// A strict query's reply from the embedded transport's direct lane, or through the generic
+// dispatch. The errors read the same either way: "D1_ERROR: ..." for SQLite's, and the
+// transport's own prefix for anything else.
+function __sbD1Direct(name, sql, params) {
+  try {
+    return __sbD1QueryDirect(name, sql, params);
+  } catch (err) {
+    const message = "sproutboat d1.query: " + (String((err && err.message) || err) || "failed");
+    const at = message.indexOf("D1_");
+    throw new Error(at > 0 ? message.slice(at) : message);
+  }
+}
+// The synchronous core: the answer to one statement as columns, rows and meta. meta is only built
+// when the caller will hand it out (all() and run()): raw() and first() drop it, and building it
+// reads the clock twice.
+function __sbD1Query(dbName, sql, params, strict, wantMeta) {
+  if (strict) __sbD1Check(sql);
+  const started = !strict || wantMeta ? Date.now() : 0;
+  const r = strict && __sbD1QueryDirect ? __sbD1Direct(dbName, sql, params) : __sbD1Rpc("d1.query", { db: dbName, sql, params }, strict);
+  if (!strict) return { results: r.results || [], success: true, meta: r.meta || {} };
+  const table = __sbD1Table(r);
+  return { columns: table.columns, rows: table.rows, meta: wantMeta ? __sbD1Meta(r.meta || {}, started) : null };
+}
+// A prepared statement. A class, so a prepare() or bind() does not allocate five closures.
+class __SbD1Statement {
+  constructor(dbName, sql, params) {
+    this.__name = dbName;
+    this.__sql = sql;
+    this.__params = params;
+  }
+  bind() {
+    const strict = __sbD1Strict();
+    const list = [];
+    for (let i = 0; i < arguments.length; i++) list.push(__sbD1Param(arguments[i], strict));
+    return new __SbD1Statement(this.__name, this.__sql, list);
+  }
+  all() {
+    if (!__sbD1Strict()) return __sbD1Query(this.__name, this.__sql, this.__params, false, true);
+    try {
+      const t = __sbD1Query(this.__name, this.__sql, this.__params, true, true);
+      return Promise.resolve({ success: true, meta: t.meta, results: __sbD1Objects(t.columns, t.rows) });
+    } catch (err) {
+      return Promise.reject(err);
+    }
+  }
+  run() {
+    return this.all();
+  }
+  raw(options) {
+    if (!__sbD1Strict()) {
+      const rows = __sbD1Query(this.__name, this.__sql, this.__params, false, true).results;
+      const out = [];
+      for (let i = 0; i < rows.length; i++) {
+        const cols = [];
+        for (const k in rows[i]) cols.push(rows[i][k]);
+        out.push(cols);
+      }
+      return out;
+    }
+    try {
+      const t = __sbD1Query(this.__name, this.__sql, this.__params, true, false);
+      return Promise.resolve(options && options.columnNames ? [t.columns].concat(t.rows) : t.rows);
+    } catch (err) {
+      return Promise.reject(err);
+    }
+  }
+  first(column) {
+    if (!__sbD1Strict()) {
+      const rows = __sbD1Query(this.__name, this.__sql, this.__params, false, true).results;
+      if (rows.length === 0) return null;
+      return column == null ? rows[0] : rows[0][column];
+    }
+    try {
+      const t = __sbD1Query(this.__name, this.__sql, this.__params, true, false);
+      if (column == null) return Promise.resolve(t.rows.length ? __sbD1Objects(t.columns, [t.rows[0]])[0] : null);
+      const at = t.columns.indexOf(String(column));
+      if (!t.rows.length) return Promise.resolve(null);
+      if (at < 0) throw __sbD1Fail("D1_COLUMN_NOTFOUND: Column not found (" + column + ")");
+      return Promise.resolve(t.rows[0][t.columns.lastIndexOf(String(column))]);
+    } catch (err) {
+      return Promise.reject(err);
+    }
+  }
+}
 function __sbMakeD1(dbName) {
-  // The synchronous core: the answer to one statement as columns, rows and meta.
-  function query(sql, params, strict) {
-    if (strict) __sbD1Check(sql);
-    const started = Date.now();
-    const r = __sbD1Rpc("d1.query", { db: dbName, sql, params }, strict);
-    if (!strict) return { results: r.results || [], success: true, meta: r.meta || {} };
-    const table = __sbD1Table(r);
-    return { columns: table.columns, rows: table.rows, meta: __sbD1Meta(r.meta || {}, started) };
-  }
-  function stmt(sql, params) {
-    const s = {
-      __sql: sql,
-      __params: params,
-      bind() {
-        const strict = __sbD1Strict();
-        const list = [];
-        for (let i = 0; i < arguments.length; i++) list.push(__sbD1Param(arguments[i], strict));
-        return stmt(sql, list);
-      },
-      all() {
-        if (!__sbD1Strict()) return query(sql, params, false);
-        return __sbD1Promise(() => {
-          const t = query(sql, params, true);
-          return { success: true, meta: t.meta, results: __sbD1Objects(t.columns, t.rows) };
-        });
-      },
-      run() {
-        return s.all();
-      },
-      raw(options) {
-        if (!__sbD1Strict()) {
-          const rows = query(sql, params, false).results;
-          const out = [];
-          for (let i = 0; i < rows.length; i++) {
-            const cols = [];
-            for (const k in rows[i]) cols.push(rows[i][k]);
-            out.push(cols);
-          }
-          return out;
-        }
-        return __sbD1Promise(() => {
-          const t = query(sql, params, true);
-          return options && options.columnNames ? [t.columns].concat(t.rows) : t.rows;
-        });
-      },
-      first(column) {
-        if (!__sbD1Strict()) {
-          const rows = query(sql, params, false).results;
-          if (rows.length === 0) return null;
-          return column == null ? rows[0] : rows[0][column];
-        }
-        return __sbD1Promise(() => {
-          const t = query(sql, params, true);
-          if (column == null) return t.rows.length ? __sbD1Objects(t.columns, [t.rows[0]])[0] : null;
-          const at = t.columns.indexOf(String(column));
-          if (!t.rows.length) return null;
-          if (at < 0) throw __sbD1Fail("D1_COLUMN_NOTFOUND: Column not found (" + column + ")");
-          return t.rows[0][t.columns.lastIndexOf(String(column))];
-        });
-      },
-    };
-    return s;
-  }
   function batch(statements) {
     const strict = __sbD1Strict();
     const list = [];
@@ -5510,7 +5556,7 @@ function __sbMakeD1(dbName) {
   }
   const db = {
     prepare(sql) {
-      return stmt(String(sql), []);
+      return new __SbD1Statement(dbName, String(sql), []);
     },
     batch(statements) {
       if (!__sbD1Strict()) return batch(statements);
