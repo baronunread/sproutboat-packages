@@ -60,6 +60,9 @@ test("the standalone shim collects every N requests and when idle; render.js is 
     );
     expect(wrapper).toContain("++sb_gc_since < sb_gc_every()");
     expect(shim).toContain('getenv("SB_GC_EVERY")');
+    // The standalone shim makes EXCLUSIVE locking the default (SB_SQLITE_EXCLUSIVE=0 opts out), keeping a set value.
+    expect(shim).toContain('setenv("SB_SQLITE_EXCLUSIVE", "1", 0)');
+    expect(shim).toContain("__attribute__((constructor))");
     // The old body is still there, reached every N requests and from the idle timer.
     const now = shim.slice(shim.indexOf("static void collect_after_request_now(void) {\n  sb_gc_since = 0;"));
     expect(now.indexOf("porf_native_fetch_collect_normal_from((void*)&porf_stack_anchor);")).toBeGreaterThan(-1);

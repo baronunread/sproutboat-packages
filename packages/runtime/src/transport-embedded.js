@@ -1256,9 +1256,12 @@ static int sb_db_for(const char* path) {
   // and unlock around each transaction, and the WAL index lives in heap memory instead of a shared
   // -shm file. Set before journal_mode, because the heap index is only chosen when WAL starts in
   // exclusive mode. No other process can open the database while the binary runs, which also rules
-  // out the several-copies-behind-SO_REUSEPORT recipe above. Off unless set, and never for a
+  // out the several-copies-behind-SO_REUSEPORT recipe above. Off unless set (see below), and never for a
   // database under LTX replication: capture reads the WAL through its shared index, and in
   // exclusive mode (no -shm file) every capture failed (native-d1's LTX database).
+  // The transport itself only reads the variable, so a host that embeds it (sproutd, the broker) stays
+  // in shared mode unless it is set. A standalone binary sets it to 1 at startup (patch.ts, the shim's
+  // constructor) unless the operator has set it, so SB_SQLITE_EXCLUSIVE=0 opts a standalone binary out.
   // SB_SQLITE_CACHE_MB sizes each database's page cache in MiB (default 2, about -2000 KiB).
   {
     const char* excl = getenv("SB_SQLITE_EXCLUSIVE");
