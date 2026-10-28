@@ -12,6 +12,9 @@
  * immutable guard does (an incoming request's headers, a fetched response's). The runtime
  * sets it from compatibility date 2026-10-23; a copy (`new Headers(h)`) is always mutable.
  */
+// The native checks below sit inside Porffor.c${BT}...${BT} blocks: this is a template literal, so the
+// backtick is interpolated.
+const BT = "`";
 export const HEADERS_CLASS_SOURCE = String.raw`class Headers {
   // sproutboat: Fetch-spec Headers
   constructor(init = undefined) {
@@ -32,14 +35,61 @@ export const HEADERS_CLASS_SOURCE = String.raw`class Headers {
     for (const key in init) this.append(key, init[key]);
   }
 
+  // 1: a valid name with no capital letter (the common case, and its own lowercase), 2: valid with a
+  // capital letter, 0: invalid, -1: not a plain string (the regular expression decides).
+  static _nameKind(s) {
+    let kind = -1;
+    Porffor.c${BT}
+      if (s.type == 195) {
+        const u32 __p = (u32)s.val;
+        const size_t __n = (size_t)*(u32*)(MEM + __p);
+        const unsigned char* __x = (const unsigned char*)(MEM + __p + 4);
+        int __up = 0, __bad = __n == 0;
+        for (size_t __i = 0; __i < __n && !__bad; __i++) {
+          const unsigned char __c = __x[__i];
+          if (__c >= 'a' && __c <= 'z') continue;
+          if (__c >= 'A' && __c <= 'Z') __up = 1;
+          else if ((__c >= '0' && __c <= '9') || (__c && __c < 128 && strchr("!#$%&'*+-.^_\x60|~", __c))) continue;
+          else __bad = 1;
+        }
+        kind = (f64)(__bad ? 0 : __up ? 2 : 1);
+      }
+    ${BT};
+    return kind;
+  }
+
   static _name(name) {
     const s = String(name);
-    if (!/^[!#$%&'*+\-.^_\x60|~0-9A-Za-z]+$/.test(s)) throw new TypeError('Invalid header name: ' + s);
+    const kind = Headers._nameKind(s);
+    if (kind === 1) return s;
+    if (kind === 2) return s.toLowerCase();
+    if (kind === 0 || !/^[!#$%&'*+\-.^_\x60|~0-9A-Za-z]+$/.test(s)) throw new TypeError('Invalid header name: ' + s);
     return s.toLowerCase();
+  }
+
+  // 1: nothing to trim and nothing forbidden (the value as it is), 0: trim or check it in JS.
+  static _valueClean(s) {
+    let clean = 0;
+    Porffor.c${BT}
+      if (s.type == 195) {
+        const u32 __p = (u32)s.val;
+        const size_t __n = (size_t)*(u32*)(MEM + __p);
+        const unsigned char* __x = (const unsigned char*)(MEM + __p + 4);
+        int __ok = 1;
+        if (__n) {
+          const unsigned char __f = __x[0], __l = __x[__n - 1];
+          if (__f == 32 || __f == 9 || __f == 10 || __f == 13 || __l == 32 || __l == 9 || __l == 10 || __l == 13) __ok = 0;
+        }
+        for (size_t __i = 0; __i < __n && __ok; __i++) if (__x[__i] == 0 || __x[__i] == 10 || __x[__i] == 13) __ok = 0;
+        clean = (f64)__ok;
+      }
+    ${BT};
+    return clean;
   }
 
   static _value(value) {
     let s = String(value);
+    if (Headers._valueClean(s) === 1) return s;
     let start = 0, end = s.length;
     while (start < end && (s.charCodeAt(start) == 32 || s.charCodeAt(start) == 9 || s.charCodeAt(start) == 10 || s.charCodeAt(start) == 13)) start++;
     while (end > start && (s.charCodeAt(end - 1) == 32 || s.charCodeAt(end - 1) == 9 || s.charCodeAt(end - 1) == 10 || s.charCodeAt(end - 1) == 13)) end--;
