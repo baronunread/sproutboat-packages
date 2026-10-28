@@ -2018,6 +2018,32 @@ export async function patchBigIntRoots(root: string): Promise<void> {
   );
 }
 
+// A compile-time array (a builtin's module-level `const x = []`, such as Promise's list of pending
+// rejections) lives in the static data image. When it grows past its static capacity its entries
+// move to the heap, and Porffor's static-array shape check rejected any entries pointer outside
+// the static image, so a collection never marked those entries: the block was freed while the
+// array still pointed at it, and the next push or pop wrote into whatever had reused it (a string
+// built by another request, an array's slot, ...). The heap-array check already accepts a block
+// start; the static one now does too.
+const STATIC_ARRAY_ENTRIES_OLD = `  if (entries == body + 16) return porf_gc_static_range(body, 16ull + bytes);
+  return porf_gc_static_range(entries, bytes);
+}`;
+const STATIC_ARRAY_ENTRIES_NEW = `  if (entries == body + 16) return porf_gc_static_range(body, 16ull + bytes);
+  // sproutboat: a static array whose entries grew onto the heap
+  if (porf_gc_in_static(entries)) return porf_gc_static_range(entries, bytes);
+  if (!porf_gc_is_block_start(entries)) return 0;
+  return bytes <= (u64)porf_gc_block_size(entries);
+}`;
+
+export async function patchStaticArrayEntries(root: string): Promise<void> {
+  const file = resolve(root, "compiler/render.js");
+  const src = await readFile(file, "utf8");
+  if (src.includes(STATIC_ARRAY_ENTRIES_NEW)) return;
+  if (src.split(STATIC_ARRAY_ENTRIES_OLD).length !== 2)
+    throw new Error(`could not patch Porffor's static array GC check: anchor not found in ${file}`);
+  await writeFile(file, src.replace(STATIC_ARRAY_ENTRIES_OLD, STATIC_ARRAY_ENTRIES_NEW));
+}
+
 const FETCH_CLASSES_MARKER = "sproutboat: Fetch-spec Request and Response";
 /** Replaces Porffor's Request and Response (fetch-classes.ts); covers patchResponseDefaults. */
 export async function patchFetchClasses(root: string): Promise<void> {
@@ -2230,6 +2256,7 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchUwebsockets(root);
   await patchRenderJs(root);
   await patchBigIntRoots(root);
+  await patchStaticArrayEntries(root);
   await patchStreamingResponses(root);
   await patchQuietCollection(root);
   await patchRequestCollectionInterval(root);
