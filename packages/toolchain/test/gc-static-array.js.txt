@@ -1,0 +1,28 @@
+// Promise.ts keeps its pending rejections in a module-level array compiled into the static data
+// image. When that array grows past its static capacity its entries live on the heap, and a
+// collection has to mark them. If it does not, the block is freed while the array still writes
+// to it, and the next rejection overwrites whatever now lives there.
+const keep = [];
+function pad(r, k) {
+  return "v" + r + "-" + k + "-padpadpad";
+}
+async function main() {
+  for (let round = 0; round < 60; round++) {
+    Porffor.gc();
+    for (let k = 0; k < 40; k++) keep.push(pad(round, k));
+    for (let j = 0; j < 4; j++) {
+      try {
+        await Promise.reject(new Error("e" + j));
+      } catch (e) {}
+    }
+  }
+  let bad = 0;
+  let n = 0;
+  for (let round = 0; round < 60; round++)
+    for (let k = 0; k < 40; k++) {
+      if (keep[n] !== pad(round, k)) bad++;
+      n++;
+    }
+  console.log(bad);
+}
+main();

@@ -27,6 +27,8 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       NATIVE_BYTES_RENDER_ANCHOR +
       "// sb_native_utf8_scalar_v1\n" +
       "static void porf_gc_cons_candidate(u32 c);\n" +
+      // patchStaticArrayEntries' anchor.
+      "  if (entries == body + 16) return porf_gc_static_range(body, 16ull + bytes);\n  return porf_gc_static_range(entries, bytes);\n}\n" +
       // patchIdleTrim's anchor.
       "  const u32 keep_slack = ${prefs.nativeFetch ? '0u' : '16u * 1024u * 1024u'};\n" +
       // Both conservative scanners consume raw f64 values.
