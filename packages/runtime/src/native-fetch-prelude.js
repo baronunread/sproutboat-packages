@@ -3104,22 +3104,47 @@ function __sbCpuMs() {
   return ms;
 }
 
-// The `x-sb-cpu-ms` value for the CPU time since `t0`, as three decimals, floored at zero: one
-// clock read and one format call in C, where it was a read, a format, a parse and a toFixed.
-// oxlint-disable-next-line no-unused-vars -- `t0` is read inside the RawC block below, not by JS.
-function __sbCpuStamp(t0) {
+// The `x-sb-cpu-ms` value for a CPU time in ms, as three decimals, floored at zero: one format call
+// in C, where it was a format, a parse and a toFixed.
+// oxlint-disable-next-line no-unused-vars -- `cpu` is read inside the RawC block below, not by JS.
+function __sbCpuStamp(cpu) {
   let res = "0.000";
   // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
   Porffor.c`
-    struct timespec __ts;
-    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &__ts);
-    double __d = ((double)__ts.tv_sec * 1000.0 + (double)__ts.tv_nsec / 1000000.0) - (t0.type == 1 ? (double)t0.val : 0.0);
+    double __d = cpu.type == 1 ? (double)cpu.val : 0.0;
     if (!(__d >= 0)) __d = 0;
     char __b[32];
     int __n = snprintf(__b, sizeof(__b), "%.3f", __d);
     if (__n > 0) res = porf_box((f64)porf_native_fetch_alloc_bytestring(__b, (size_t)__n), 195);
   `;
   return res;
+}
+
+// Per-request CPU (toolchain async-context.ts): a request is a small id whose thread CPU time is
+// summed over the slices in which it ran, however requests interleave. 0 when no slot is free.
+function __sbCpuBegin() {
+  let id = 0;
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    id = (f64)porf_cpu_begin();
+  `;
+  return id;
+}
+// oxlint-disable-next-line no-unused-vars -- `cell` is read inside the RawC block below, not by JS.
+function __sbCpuTake(cell) {
+  let ms = 0;
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    ms = porf_cpu_read_ms((u32)cell.val);
+  `;
+  return ms;
+}
+// oxlint-disable-next-line no-unused-vars -- `cell` is read inside the RawC block below, not by JS.
+function __sbCpuEnd(cell) {
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    porf_cpu_end((u32)cell.val);
+  `;
 }
 
 // #28 — stamp `x-sb-cpu-ms` onto a handler Response. Porffor alpha-10's
@@ -3129,7 +3154,7 @@ function __sbCpuStamp(t0) {
 // with one extra header. Safe only for a string body (the norm under
 // http-sync-v0) with no Set-Cookie to comma-fold; anything else is returned
 // untouched and the edge simply omits cpuMs for that request.
-function __sbTagCpu(res, t0) {
+function __sbTagCpu(res, cpu) {
   try {
     // A string body and no Set-Cookie, as before. The native writer reads Headers' flat `_entries`,
     // so the stamp is appended to the handler's own Response instead of building a second one (a
@@ -3137,7 +3162,7 @@ function __sbTagCpu(res, t0) {
     // the handler set itself is replaced by the measured one, as before.
     const headers = res && res.headers;
     if (headers && __sbIsStr(__sbRawBody(res)) && !headers.has("set-cookie")) {
-      const stamp = __sbCpuStamp(t0);
+      const stamp = __sbCpuStamp(cpu);
       const entries = headers._entries;
       let set = false;
       for (let i = 0; i < entries.length; i += 2) {
@@ -9160,7 +9185,7 @@ function __sbInstallWebSockets() {
   globalThis.WebSocketRequestResponsePair = __SbWebSocketRequestResponsePair;
 }
 
-async function __sbFetchWithDrain(res, tasks, bindingCall, rethrow, top) {
+async function __sbFetchWithDrain(res, tasks, bindingCall, rethrow, top, cpuCell) {
   let r;
   try {
     r = res && __sbIsFn(res.then) ? await res : res;
@@ -9177,6 +9202,12 @@ async function __sbFetchWithDrain(res, tasks, bindingCall, rethrow, top) {
     }
     // #179 — a rejected handler promise must not take the process down with it.
     r = __sbErrorResponse(error, bindingCall);
+  }
+  // From 2026-11-02 an async handler reports its CPU too: the thread time of the slices in which this
+  // request ran, not its neighbours' (before it, only a handler that answered synchronously did).
+  if (cpuCell) {
+    if (__sbCompatDate() >= "2026-11-02") __sbTagCpu(r, __sbCpuTake(cpuCell));
+    __sbCpuEnd(cpuCell);
   }
   // The response goes out now and ctx.waitUntil work keeps running after it, as in
   // workerd; it was awaited first, so a 1.5 s background task delayed the response by
@@ -9590,7 +9621,8 @@ globalThis.__sbEntry = function (handlers, request) {
     // itself returned, but never one derived from `.then()`, so chaining the
     // tag on hangs the request forever. cpuMs is documented as absent for
     // async handlers (see LogEvent in services/edge) — that is this.
-    const __t0 = __sbCpuMs();
+    const __cpuCell = __sbCpuBegin();
+    const __t0 = __cpuCell ? 0 : __sbCpuMs();
     const __sbTasks = [];
     const ctx = {
       waitUntil(p) {
@@ -9612,14 +9644,21 @@ globalThis.__sbEntry = function (handlers, request) {
     } catch (error) {
       // #179 — a synchronous throw anywhere in the handler must not take the
       // whole process (and every other in-flight request) down with it.
+      __sbCpuEnd(__cpuCell);
       return __sbErrorResponse(error, bindingCall);
     }
     // Same promise-identity rule as above applies to `__sbFetchWithDrain`'s
     // own return, which is why it's tail-called rather than chained on here.
-    if (__sbTasks.length || (__res && __sbIsFn(__res.then)) || __sbHasStreamBody(__res)) return __sbFetchWithDrain(__res, __sbTasks, bindingCall, false, true);
+    if (__sbTasks.length || (__res && __sbIsFn(__res.then)) || __sbHasStreamBody(__res)) return __sbFetchWithDrain(__res, __sbTasks, bindingCall, false, true, __cpuCell);
     // A WebSocket handshake answer (from 2026-10-30): its client end becomes the host socket.
-    if (__sbHasWebSocket(__res)) return __sbWsHostResponse(__res);
-    return __sbTagCpu(__res, __t0);
+    if (__sbHasWebSocket(__res)) {
+      __sbCpuEnd(__cpuCell);
+      return __sbWsHostResponse(__res);
+    }
+    // The request ran alone from start to here: its own slices, or the process delta where no slot was free.
+    const __cpu = __cpuCell ? __sbCpuTake(__cpuCell) : __sbCpuMs() - __t0;
+    __sbCpuEnd(__cpuCell);
+    return __sbTagCpu(__res, __cpu);
   }
   if (!__sbTriggerAuthed(request)) return new Response("forbidden", { status: 403 });
 

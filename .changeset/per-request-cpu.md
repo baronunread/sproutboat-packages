@@ -1,0 +1,5 @@
+---
+"@sproutboat/runtime": minor
+---
+
+`x-sb-cpu-ms` is per request when requests interleave in one process. A request is charged the thread CPU time of the slices in which it ran (the toolchain's async context carries a request id through awaits, reactions and timers, and the clock is read only when the running request changes, so a request that runs alone costs two reads). Before, the stamp was the process CPU delta across the handler, which is right only for a handler that answers synchronously, so an async handler was never stamped. From compatibility date `2026-11-02` an async handler is stamped too (its response is a string with no Set-Cookie, as for a sync one); earlier dates still send no stamp for an async handler. A synchronous handler's stamp is now thread time, which leaves out the egress threads. New native test `test:native-cpu-requests`: a 200 ms spinner among eight waiters is charged its 200 ms and the waiters under 60 ms, two spinners are each charged their own, and the date gate.
