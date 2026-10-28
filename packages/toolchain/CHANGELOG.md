@@ -1,5 +1,20 @@
 # @sproutboat/toolchain
 
+## 0.20.0
+
+### Minor Changes
+
+- 7f5e87b: A standalone binary now opens its SQLite databases in `PRAGMA locking_mode=EXCLUSIVE` by default, with the page cache at 2 MB (`cache_size=-2000`, unchanged). The lock is taken once and held, so a transaction no longer takes and releases file locks around itself, and the WAL index lives in heap memory instead of a shared `-shm` file. The cost: no other process can open the database while the binary runs, so the `sqlite3` shell, `sproutboat kv/d1 --local --data-dir` against a running binary, and the several-copies-behind-`SO_REUSEPORT` recipe do not work on a live binary. Set `SB_SQLITE_EXCLUSIVE=0` to opt out and keep shared locking. A database under LTX replication is never opened exclusive.
+  
+  The default belongs to the standalone binary only: the toolchain's native server shim sets `SB_SQLITE_EXCLUSIVE=1` at startup unless the variable is already set. The embedded transport itself reads only `SB_SQLITE_EXCLUSIVE` (`1` is exclusive, anything else is shared), so sproutd and the broker keep shared locking unless an operator sets it.
+  
+  `SB_SQLITE_CACHE_MB=<n>` (1 to 4096) sets each database's page cache in MiB; unset it stays at 2 MB.
+
+### Patch Changes
+
+- 004b8e7: A request's fixed cost in a native sprout drops five items. The CPU stamp and the streamed-body probe come back as numbers instead of formatted and parsed text (a `printf` and a `parseFloat` each, per request). The ingress reads of `x-sb-trigger` and `x-sb-remote-addr` scan the stored header names instead of validating and lowercasing a name for each, and the three `x-sb-` names the runtime strips are looked for in one pass. `SB_EDGE_TOKEN` is read once. `Headers` checks a name and a value in C and only falls back to its regular expression for a name it cannot judge there, so `get`, `has`, `set`, `append` and `new Response(body, { headers })` stop compiling that expression on every call. Behavior is unchanged.
+- beebad1: A standalone binary writes a response's plain-ASCII header names, header values and body straight from the JavaScript heap. The native server used to copy each of them into a `malloc`ed UTF-8 buffer one byte at a time, twice for every header and once for the body: about 5% of the CPU of a 4 KB reply. A bytestring whose bytes are all below 0x80 already is its UTF-8 text, so it is now read in place; a UTF-16 string or a byte of 0x80 or more takes the same copying path as before. The change is in the native shim only (`compiler/uwebsockets.js`); `render.js`, and so sproutd, is untouched.
+
 ## 0.19.5
 
 ### Patch Changes
