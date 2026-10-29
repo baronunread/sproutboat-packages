@@ -7172,6 +7172,11 @@ function __sbDOv2() {
   return __sbCompatDate() >= "2026-10-29";
 }
 
+// Storage, SQL, id and alarm behaviours that follow workerd more closely, from 2026-11-04.
+function __sbDOv3() {
+  return __sbCompatDate() >= "2026-11-04";
+}
+
 function __sbDOSha(text) {
   return __sbR2HexOf(__sbDigestRaw("256", __sbToBytes(text)));
 }
@@ -7181,7 +7186,27 @@ function __sbDOSeal(cls, body) {
   return body + __sbDOSha("sbdo-id:" + cls + ":" + body).slice(0, 16);
 }
 
+// workerd's DurableObjectId (2026-11-04): a class, so constructor.name and instanceof agree.
+if (globalThis.DurableObjectId == null) {
+  class DurableObjectId {
+    constructor(hex, name) {
+      this.name = name;
+      this.__sbHex = hex;
+    }
+    toString() {
+      return this.__sbHex;
+    }
+    equals(other) {
+      if (!(other instanceof DurableObjectId))
+        throw new TypeError("Failed to execute 'equals' on 'DurableObjectId': parameter 1 is not of type 'DurableObjectId'.");
+      return other.__sbHex === this.__sbHex;
+    }
+  }
+  globalThis.DurableObjectId = DurableObjectId;
+}
+
 function __sbDOMakeId(hex, name) {
+  if (__sbDOv3()) return new globalThis.DurableObjectId(hex, name);
   return {
     name,
     toString() {
@@ -7227,6 +7252,8 @@ function __sbMakeDONamespaceV2(className) {
       return __sbDOMakeId(__sbDOSeal(className, __sbDOHex(crypto.getRandomValues(new Uint8Array(24)))), undefined);
     },
     get(id) {
+      if (__sbDOv3() && !(id instanceof globalThis.DurableObjectId))
+        throw new TypeError("Failed to execute 'get' on 'DurableObjectNamespace': parameter 1 is not of type 'DurableObjectId'.");
       return __sbDOStub(className, __sbIsStr(id) ? ns.idFromString(id) : id);
     },
     getByName(name) {
@@ -7376,13 +7403,19 @@ function __sbGetDOInstance(cls, idText, idObj) {
     const __sbTasks = [];
     const gate = __sbDOMakeGate();
     const state = {
-      id: stateId || {
-        toString() {
-          return id;
-        },
-      },
+      id:
+        stateId ||
+        (__sbDOv3()
+          ? __sbDOMakeId(id, undefined)
+          : {
+              toString() {
+                return id;
+              },
+            }),
       storage: __sbDOGated() ? __sbDOAsyncStorage(cls, id, gate) : __sbDOStorage(cls, id),
       blockConcurrencyWhile(fn) {
+        if (__sbDOv3() && !__sbIsFn(fn))
+          throw new TypeError("Failed to execute 'blockConcurrencyWhile' on 'DurableObjectState': parameter 1 is not of type 'function'.");
         if (!__sbDOGated()) return fn();
         // No event enters until fn settles (2026-10-28).
         gate.locks++;
@@ -7412,6 +7445,15 @@ function __sbGetDOInstance(cls, idText, idObj) {
         if (p && __sbIsFn(p.then)) __sbTasks.push(p);
       },
     };
+    if (__sbDOv3()) {
+      state.props = {};
+      // Forgets this object's memory (the next request builds it afresh) and fails the event with
+      // the reason, as workerd's abort() does. Storage is kept.
+      state.abort = (reason) => {
+        __sbDOInstances[cacheKey] = undefined;
+        throw new Error(reason == null ? "Durable Object was aborted." : String(reason));
+      };
+    }
     // The hibernation API, from 2026-10-30 (where WebSocketPair exists).
     const holder = { inst: null, auto: null, cls, id, restored: [] };
     if (__sbWsEnabled()) __sbDOWebSocketState(state, holder);
@@ -7513,7 +7555,7 @@ function __sbDOGated() {
 }
 
 function __sbDOMakeGate() {
-  return { locks: 0, waiting: [] };
+  return { locks: 0, waiting: [], txnBusy: false, txnQueue: [] };
 }
 
 // Deliver queued events while the gate is open. A delivered event that reads storage shuts
@@ -7550,6 +7592,35 @@ function __sbDOEnter(gate, run) {
       }
     });
   });
+}
+
+// alarm(alarmInfo) from compatibility date 2026-11-04: { retryCount, isRetry }, as workerd
+// passes it. retryCount counts the runs of this alarm that threw or rejected. The three hosts
+// that deliver alarms (the broker, the embedded timer, sproutd) all end up in this prelude, so
+// the count lives here, on the object's instance and per scheduled time; it starts over when the alarm is set
+// for a new time or a run succeeds, and a host that knows its own count passes it as
+// attempts. A prelude that restarts between two runs counts from zero again.
+// (kept on the instance, as __sbAlarmAt and __sbAlarmFails)
+function __sbDOAlarmCall(inst, cls, id, at, attempts) {
+  if (__sbCompatDate() < "2026-11-04") return inst.alarm();
+  const when = Number(at) || 0;
+  if (inst.__sbAlarmAt !== when) {
+    inst.__sbAlarmAt = when;
+    inst.__sbAlarmFails = 0;
+  }
+  const retryCount = attempts != null && Number(attempts) > 0 ? Number(attempts) : inst.__sbAlarmFails;
+  return __sbDOAlarmRun(inst, { retryCount, isRetry: retryCount > 0 });
+}
+
+async function __sbDOAlarmRun(inst, info) {
+  try {
+    const res = inst.alarm(info);
+    if (res && __sbIsFn(res.then)) await res;
+  } catch (error) {
+    inst.__sbAlarmFails = inst.__sbAlarmFails + 1;
+    throw error;
+  }
+  inst.__sbAlarmFails = 0;
 }
 
 const __sbDOTag = "#sb1:";
@@ -7590,7 +7661,10 @@ function __sbDOView(name, bytes) {
 // else is an array whose first element names its type, so no plain value is ambiguous.
 /* oxlint-disable anti-slop/no-runtime-typeof -- structured clone branches on the value's type, as the HTML spec's StructuredSerialize does. */
 // fns (RPC only): functions go there, packed as ["F", index]; storage passes none.
-function __sbDOPack(v, seen, fns) {
+// refs (storage, 2026-11-04): an object met again is ["X", n], n its place in first-seen order, so
+// shared and circular references survive as structured clone keeps them; without it a circular
+// value throws and a shared one is copied.
+function __sbDOPack(v, seen, fns, refs) {
   if (v === null || v === true || v === false || __sbIsStr(v)) return v;
   const t = typeof v;
   if (t === "number") {
@@ -7605,19 +7679,23 @@ function __sbDOPack(v, seen, fns) {
   }
   if (t === "symbol") throw __sbDOCloneError(v.toString());
   if (t !== "object") throw __sbDOCloneError(v);
-  if (seen.indexOf(v) !== -1) throw __sbDOCloneError("a circular value");
+  const was = seen.indexOf(v);
+  if (was !== -1) {
+    if (refs) return ["X", was];
+    throw __sbDOCloneError("a circular value");
+  }
   seen.push(v);
   let out;
-  if (v instanceof Date) out = ["D", v.getTime()];
+  if (v instanceof Date) out = ["D", refs && Number.isNaN(v.getTime()) ? "NaN" : v.getTime()];
   else if (v instanceof Map) {
     out = ["M"];
     v.forEach((x, k) => {
-      out.push(__sbDOPack(k, seen, fns), __sbDOPack(x, seen, fns));
+      out.push(__sbDOPack(k, seen, fns, refs), __sbDOPack(x, seen, fns, refs));
     });
   } else if (v instanceof Set) {
     out = ["S"];
     v.forEach((x) => {
-      out.push(__sbDOPack(x, seen, fns));
+      out.push(__sbDOPack(x, seen, fns, refs));
     });
   } else if (v instanceof ArrayBuffer) out = ["AB", __sbDOHex(new Uint8Array(v))];
   else if (ArrayBuffer.isView(v)) {
@@ -7632,21 +7710,38 @@ function __sbDOPack(v, seen, fns) {
   else if (v instanceof RegExp) out = ["R", v.source, v.flags];
   else if (Array.isArray(v)) {
     out = ["A"];
-    for (let i = 0; i < v.length; i++) out.push(__sbDOPack(v[i], seen, fns));
+    for (let i = 0; i < v.length; i++) out.push(__sbDOPack(v[i], seen, fns, refs));
   } else if (v instanceof Error) out = ["E", String(v.name), String(v.message)];
   else {
     out = ["O"];
     const keys = Object.keys(v);
-    for (let i = 0; i < keys.length; i++) out.push(keys[i], __sbDOPack(v[keys[i]], seen, fns));
+    for (let i = 0; i < keys.length; i++) out.push(keys[i], __sbDOPack(v[keys[i]], seen, fns, refs));
   }
-  seen.pop();
+  if (!refs) seen.pop();
   return out;
 }
 /* oxlint-enable anti-slop/no-runtime-typeof */
 
-function __sbDOUnpack(p, fns) {
+// An error of the type its name says, for the names workerd's structured clone keeps.
+function __sbDOMakeError(name, message) {
+  if (__sbDOv3()) {
+    if (name === "TypeError") return new TypeError(message);
+    if (name === "RangeError") return new RangeError(message);
+    if (name === "SyntaxError") return new SyntaxError(message);
+    if (name === "ReferenceError") return new ReferenceError(message);
+    if (name === "EvalError") return new EvalError(message);
+    if (name === "URIError") return new URIError(message);
+  }
+  const e = new Error(message);
+  e.name = name;
+  return e;
+}
+
+// refs: the objects made so far in first-seen order (see __sbDOPack); undefined for RPC.
+function __sbDOUnpack(p, fns, refs) {
   if (!Array.isArray(p)) return p;
   const tag = p[0];
+  if (tag === "X") return refs[p[1]];
   if (tag === "U") return undefined;
   if (tag === "F" && fns) {
     const fn = fns[p[1]];
@@ -7654,49 +7749,82 @@ function __sbDOUnpack(p, fns) {
   }
   if (tag === "N") return p[1] === "-0" ? -0 : Number(p[1]);
   if (tag === "B") return BigInt(p[1]);
-  if (tag === "D") return new Date(p[1]);
-  if (tag === "AB") return __sbDOUnhex(p[1]).buffer;
-  if (tag === "V") return __sbDOView(p[1], __sbDOUnhex(p[2]));
-  if (tag === "R") return new RegExp(p[1], p[2]);
+  if (tag === "D") {
+    const d = new Date(p[1] === "NaN" ? NaN : p[1]);
+    if (refs) refs.push(d);
+    return d;
+  }
+  if (tag === "AB") {
+    const b = __sbDOUnhex(p[1]).buffer;
+    if (refs) refs.push(b);
+    return b;
+  }
+  if (tag === "V") {
+    const view = __sbDOView(p[1], __sbDOUnhex(p[2]));
+    if (refs) refs.push(view);
+    return view;
+  }
+  if (tag === "R") {
+    const r = new RegExp(p[1], p[2]);
+    if (refs) refs.push(r);
+    return r;
+  }
   if (tag === "E") {
-    const e = new Error(p[2]);
-    e.name = p[1];
+    const e = __sbDOMakeError(p[1], p[2]);
+    if (refs) refs.push(e);
     return e;
   }
   if (tag === "M") {
     const m = new Map();
-    for (let i = 1; i + 1 < p.length; i += 2) m.set(__sbDOUnpack(p[i], fns), __sbDOUnpack(p[i + 1], fns));
+    if (refs) refs.push(m);
+    for (let i = 1; i + 1 < p.length; i += 2) m.set(__sbDOUnpack(p[i], fns, refs), __sbDOUnpack(p[i + 1], fns, refs));
     return m;
   }
   if (tag === "S") {
     const s = new Set();
-    for (let i = 1; i < p.length; i++) s.add(__sbDOUnpack(p[i], fns));
+    if (refs) refs.push(s);
+    for (let i = 1; i < p.length; i++) s.add(__sbDOUnpack(p[i], fns, refs));
     return s;
   }
   if (tag === "A") {
     const a = [];
-    for (let i = 1; i < p.length; i++) a.push(__sbDOUnpack(p[i], fns));
+    if (refs) refs.push(a);
+    for (let i = 1; i < p.length; i++) a.push(__sbDOUnpack(p[i], fns, refs));
     return a;
   }
   const o = {};
-  for (let i = 1; i + 1 < p.length; i += 2) o[p[i]] = __sbDOUnpack(p[i + 1], fns);
+  if (refs) refs.push(o);
+  for (let i = 1; i + 1 < p.length; i += 2) o[p[i]] = __sbDOUnpack(p[i + 1], fns, refs);
   return o;
 }
 
 function __sbDOEncode(value) {
   if (value === undefined) throw new TypeError("put() called with undefined value.");
-  return __sbDOTag + JSON.stringify(__sbDOPack(value, []));
+  return __sbDOTag + JSON.stringify(__sbDOPack(value, [], undefined, __sbDOv3()));
 }
 
 // Reads both formats at every date: tagged (2026-10-28 writes) and plain JSON (earlier ones).
 function __sbDODecode(text) {
-  if (__sbIsStr(text) && text.indexOf(__sbDOTag) === 0) return __sbDOUnpack(JSON.parse(text.slice(__sbDOTag.length)));
+  if (__sbIsStr(text) && text.indexOf(__sbDOTag) === 0) return __sbDOUnpack(JSON.parse(text.slice(__sbDOTag.length)), undefined, []);
   return JSON.parse(text);
 }
 
 function __sbDOListLimit(options) {
   const o = options || {};
   if (o.limit != null && !(Number(o.limit) > 0)) throw new TypeError("List limit must be positive.");
+  if (__sbDOv3()) {
+    if (o.start != null && o.startAfter != null) throw new TypeError("list() cannot be called with both start and startAfter values.");
+    // A fractional limit counts whole entries (the datatype of a SQL LIMIT must be an integer).
+    if (o.limit != null)
+      return {
+        prefix: o.prefix,
+        start: o.start,
+        startAfter: o.startAfter,
+        end: o.end,
+        reverse: o.reverse,
+        limit: Math.max(1, Math.trunc(Number(o.limit))),
+      };
+  }
   return o;
 }
 
@@ -7706,6 +7834,31 @@ function __sbDOInRange(key, o) {
   if (o.startAfter != null && key <= String(o.startAfter)) return false;
   if (o.end != null && key >= String(o.end)) return false;
   return true;
+}
+
+// The keys of a multi-key get, in key order and without repeats.
+function __sbDOSortedKeys(keys) {
+  const out = [];
+  for (let i = 0; i < keys.length; i++) {
+    const k = String(keys[i]);
+    if (out.indexOf(k) === -1) out.push(k);
+  }
+  out.sort();
+  return out;
+}
+
+// put(key, value) and put({ key: value }) as [key, encoded] pairs (2026-11-04). An array or
+// undefined is no key; an entry whose value is undefined is skipped in the object form.
+function __sbDOPutPairs(key, value) {
+  if (key === undefined)
+    throw new TypeError("Failed to execute 'put' on 'DurableObjectStorage': parameter 1 is not of type 'string or object'.");
+  const pairs = [];
+  if (key !== null && __sbIsObj(key) && !Array.isArray(key)) {
+    // Encode every value before writing any, so one bad value writes nothing.
+    const keys = Object.keys(key);
+    for (let i = 0; i < keys.length; i++) if (key[keys[i]] !== undefined) pairs.push([keys[i], __sbDOEncode(key[keys[i]])]);
+  } else pairs.push([String(key), __sbDOEncode(value)]);
+  return pairs;
 }
 
 // The synchronous core of the 2026-10-28 storage: structured values, list() ranges.
@@ -7722,13 +7875,20 @@ function __sbDOStrictStorage(cls, id) {
     get(key) {
       if (!Array.isArray(key)) return get(key);
       const out = new Map();
-      for (let i = 0; i < key.length; i++) {
-        const v = get(key[i]);
-        if (v !== undefined) out.set(key[i], v);
+      // workerd answers in key order, whatever the order asked.
+      const asked = __sbDOv3() ? __sbDOSortedKeys(key) : key;
+      for (let i = 0; i < asked.length; i++) {
+        const v = get(asked[i]);
+        if (v !== undefined) out.set(asked[i], v);
       }
       return out;
     },
     put(key, value) {
+      if (__sbDOv3()) {
+        const pairs = __sbDOPutPairs(key, value);
+        for (let i = 0; i < pairs.length; i++) __sbRpc("do.storage.put", { cls, id, key: pairs[i][0], value: pairs[i][1] });
+        return;
+      }
       if (key != null && __sbIsObj(key)) {
         // Encode every value before writing any, so one bad value writes nothing.
         const keys = Object.keys(key);
@@ -7752,6 +7912,15 @@ function __sbDOStrictStorage(cls, id) {
     },
     setAlarm(when) {
       const at = when instanceof Date ? when.getTime() : when;
+      if (__sbDOv3()) {
+        const inst = __sbDOInstances[cls + " " + id];
+        if (inst && !__sbIsFn(inst.alarm))
+          throw new TypeError("Your Durable Object class must have an alarm() handler in order to call setAlarm()");
+        if (when instanceof Date || Object(when) instanceof Number) {
+          if (!Number.isFinite(at)) throw new TypeError("The value cannot be converted because it is not a valid Date.");
+          if (at <= 0) throw new TypeError("setAlarm() cannot be called with an alarm time <= 0");
+        }
+      }
       if (!Number.isFinite(at))
         throw new TypeError("Failed to execute 'setAlarm' on 'DurableObjectStorage': parameter 1 is not of type 'date'.");
       __sbRpc("do.alarm.set", { cls, id, at: Number(at) });
@@ -7815,6 +7984,28 @@ function __sbDOAsyncStorage(cls, id, gate) {
     const sql = __sbDOSql(cls, id);
     storage.sql = sql;
     storage.transactionSync = (fn) => sql.__sbTransaction(fn);
+    if (__sbDOv3()) {
+      // deleteAll() on a SQLite-backed object drops its tables too.
+      storage.deleteAll = () =>
+        settle(() => {
+          s.deleteAll();
+          sql.__sbDropAll();
+        });
+      // The synchronous key-value API, over the same keys as get() and put().
+      storage.kv = {
+        get: (key) => s.get(key),
+        put: (key, value) => {
+          s.put(key, value);
+        },
+        delete: (key) => s.delete(key),
+        list: (options) => s.list(options).entries(),
+      };
+      // Point-in-time recovery needs the storage engine's log, which this one does not keep.
+      const pitr = () => Promise.reject(new Error("Point-in-time recovery is not supported by this Durable Object storage."));
+      storage.getCurrentBookmark = pitr;
+      storage.getBookmarkForTime = pitr;
+      storage.onNextSessionRestoreBookmark = pitr;
+    }
   }
   return storage;
 }
@@ -7853,6 +8044,135 @@ function __sbDOSqlVerb(q) {
   return q.slice(i, j).toUpperCase();
 }
 
+// exec() with several statements (compatibility date 2026-11-04). Splits the text at the
+// semicolons SQLite would, past quoted names and strings, comments, and the BEGIN ... END body
+// of CREATE TRIGGER. Statements with nothing in them but spaces and comments are dropped.
+// Returns { texts, params }: the statements' text, and for each 1 when it has a ? or a
+// :name, @name or $name outside quotes (which only the last statement may have), else 0.
+function __sbDOSqlSplit(q) {
+  const texts = [];
+  const params = [];
+  const n = q.length;
+  let start = 0;
+  let i = 0;
+  let words = 0; // keywords seen at this statement's top level, to spot CREATE TRIGGER
+  let trigger = false;
+  let inBody = false;
+  let cases = 0;
+  let param = false;
+  let content = false;
+  while (i <= n) {
+    const c = i < n ? q.charCodeAt(i) : 59;
+    if (c === 45 && q.charCodeAt(i + 1) === 45) {
+      const nl = q.indexOf("\n", i);
+      i = nl < 0 ? n : nl + 1;
+    } else if (c === 47 && q.charCodeAt(i + 1) === 42) {
+      const end = q.indexOf("*/", i + 2);
+      i = end < 0 ? n : end + 2;
+    } else if (c === 39 || c === 34 || c === 96 || c === 91) {
+      // 'string', "name", `name`, [name]: a doubled quote stays inside (not for [name]).
+      const close = c === 91 ? 93 : c;
+      content = true;
+      i++;
+      for (;;) {
+        if (i >= n) break;
+        if (q.charCodeAt(i) === close) {
+          if (close !== 93 && q.charCodeAt(i + 1) === close) i += 2;
+          else {
+            i++;
+            break;
+          }
+        } else i++;
+      }
+    } else if (c === 63 || c === 58 || c === 64 || c === 36) {
+      param = true;
+      content = true;
+      i++;
+    } else if ((c | 32) >= 97 && (c | 32) <= 122) {
+      let j = i;
+      while (j < n) {
+        const d = q.charCodeAt(j);
+        if (((d | 32) >= 97 && (d | 32) <= 122) || (d >= 48 && d <= 57) || d === 95 || d === 36) j++;
+        else break;
+      }
+      const word = q.slice(i, j).toUpperCase();
+      content = true;
+      if (words < 4 && !inBody) {
+        words++;
+        if (word === "TRIGGER") trigger = true;
+      }
+      if (trigger && word === "BEGIN") inBody = true;
+      else if (inBody && word === "CASE") cases++;
+      else if (inBody && word === "END") {
+        if (cases > 0) cases--;
+        else inBody = false;
+      }
+      i = j;
+    } else if (c === 59 && !inBody) {
+      if (content) {
+        texts.push(__sbDOSqlTrimStart(q.slice(start, i)));
+        params.push(param ? 1 : 0);
+      }
+      start = i + 1;
+      i++;
+      words = 0;
+      trigger = false;
+      cases = 0;
+      param = false;
+      content = false;
+    } else {
+      if (c > 32 && c !== 59) content = true;
+      i++;
+    }
+  }
+  if (content) {
+    texts.push(__sbDOSqlTrimStart(q.slice(start)));
+    params.push(param ? 1 : 0);
+  }
+  return { texts, params };
+}
+
+function __sbDOSqlTrimStart(text) {
+  let i = 0;
+  while (i < text.length && text.charCodeAt(i) <= 32) i++;
+  return i === 0 ? text : text.slice(i);
+}
+
+// A binding as workerd's sql.exec() takes it (2026-11-04): null and undefined are NULL, strings and
+// numbers themselves (NaN is NULL), binary data a BLOB, a BigInt is refused, and anything else
+// (booleans, Dates, objects, arrays) is its String(): true binds the text "true".
+function __sbDOSqlParam(v) {
+  if (v == null) return null;
+  if (__sbIsStr(v)) return v;
+  if (v instanceof ArrayBuffer || ArrayBuffer.isView(v)) return __sbD1Param(v, false);
+  if (Object(v) instanceof Number) return v !== v ? null : v;
+  /* oxlint-disable-next-line anti-slop/no-runtime-typeof -- a BigInt binding has its own error */
+  if (typeof v === "bigint") throw new TypeError("Cannot convert a BigInt value to a number");
+  return String(v);
+}
+
+const __sbDOSqlPragmas =
+  " foreign_keys table_list table_info table_xinfo index_list index_info index_xinfo foreign_key_list data_version " +
+  "defer_foreign_keys quick_check optimize case_sensitive_like recursive_triggers reverse_unordered_selects ";
+
+// What workerd's SQLite authorizer refuses (2026-11-04): other PRAGMAs, ATTACH, temporary tables,
+// VACUUM, and the functions that report the build. Throws the error workerd gives.
+function __sbDOSqlPolicy(text) {
+  const verb = __sbDOSqlVerb(text);
+  if (verb === "PRAGMA") {
+    const m = /pragma\s+(?:\w+\s*\.\s*)?(\w+)/i.exec(text);
+    if (!m || __sbDOSqlPragmas.indexOf(" " + m[1].toLowerCase() + " ") === -1) throw new Error("not authorized: SQLITE_AUTH");
+  } else if (verb === "ATTACH" || verb === "DETACH") throw new Error("not authorized: SQLITE_AUTH");
+  else if (verb === "VACUUM") throw new Error("cannot VACUUM from within a transaction: SQLITE_ERROR");
+  else if (verb === "CREATE" && /^\s*create\s+temp(orary)?\s/i.test(text)) throw new Error("not authorized: SQLITE_AUTH");
+  const f = /\b(sqlite_version|sqlite_source_id|sqlite_compileoption_used|sqlite_compileoption_get|fts5_source_id|load_extension)\s*\(/i.exec(text);
+  if (f) {
+    const name = f[1].toLowerCase();
+    if (name === "load_extension") throw new Error("not authorized: SQLITE_ERROR");
+    throw new Error("not authorized to use function: " + name + " at offset " + f.index + ": SQLITE_ERROR");
+  }
+}
+
 function __sbDOSql(cls, id) {
   const file = __sbDOIsHex64(id) ? id.toLowerCase() : __sbDOSha("sbdo-file:" + id);
   const run = (sql, params) => {
@@ -7872,8 +8192,49 @@ function __sbDOSql(cls, id) {
       if (verb === "BEGIN" || verb === "COMMIT" || verb === "END" || verb === "ROLLBACK" || verb === "SAVEPOINT" || verb === "RELEASE")
         throw new Error(__sbDOSqlTxnError);
       const params = [];
-      for (let i = 0; i < bindings.length; i++) params.push(__sbD1Param(bindings[i], true));
+      const v3 = __sbDOv3();
+      for (let i = 0; i < bindings.length; i++) params.push(v3 ? __sbDOSqlParam(bindings[i]) : __sbD1Param(bindings[i], true));
+      if (v3) {
+        // workerd runs every statement and the cursor is the last one's. Only that one may take
+        // parameters. A statement that fails stops the script; the ones before it stay done.
+        const split = __sbDOSqlSplit(q);
+        const parts = split.texts;
+        const hasParam = split.params;
+        if (parts.length === 0) throw new Error("SQL code did not contain a statement.");
+        for (let i = 0; i < parts.length - 1; i++)
+          if (hasParam[i] === 1) throw new Error("When executing multiple SQL statements in a single call, only the last statement can have parameters.");
+        for (let i = 0; i < parts.length; i++) {
+          const verb = __sbDOSqlVerb(parts[i]);
+          if (verb === "BEGIN" || verb === "COMMIT" || verb === "END" || verb === "ROLLBACK" || verb === "SAVEPOINT" || verb === "RELEASE")
+            throw new Error(__sbDOSqlTxnError);
+        }
+        let last = null;
+        for (let i = 0; i < parts.length; i++) {
+          __sbDOSqlPolicy(parts[i]);
+          last = run(parts[i], i === parts.length - 1 ? params : []);
+        }
+        return __sbDOCursor(last);
+      }
       return __sbDOCursor(run(q, params));
+    },
+    // deleteAll() drops every table, view and trigger, as workerd does for a SQLite-backed object.
+    // A table another one refers to can refuse while that one is still there: go round again.
+    __sbDropAll() {
+      const quote = (name) => '"' + String(name).split('"').join('""') + '"';
+      for (let pass = 0; pass < 6; pass++) {
+        const rows = run("SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND type IN ('view', 'trigger', 'table')", []).rows || [];
+        if (rows.length === 0) return;
+        let dropped = 0;
+        for (let i = 0; i < rows.length; i++) {
+          try {
+            run("DROP " + String(rows[i][0]).toUpperCase() + " IF EXISTS " + quote(rows[i][1]), []);
+            dropped++;
+          } catch {
+            /* a shadow table goes with its virtual table; one with a reference goes on a later pass */
+          }
+        }
+        if (dropped === 0) return;
+      }
     },
     get databaseSize() {
       return Number(run("PRAGMA page_count", []).rows[0][0]) * Number(run("PRAGMA page_size", []).rows[0][0]);
@@ -7909,6 +8270,9 @@ function __sbDOCursor(r) {
     return o;
   };
   const cursor = {
+    get [Symbol.toStringTag]() {
+      return "Cursor";
+    },
     columnNames: columns,
     rowsRead: rows.length,
     rowsWritten: Number(r.meta && r.meta.changes) || 0,
@@ -7943,7 +8307,15 @@ function __sbDOCursor(r) {
       return it;
     },
     [Symbol.iterator]() {
-      return cursor;
+      // workerd hands out a new iterator over the same rows (2026-11-04), not the cursor itself.
+      if (!__sbDOv3()) return cursor;
+      const it = {
+        next: () => cursor.next(),
+        [Symbol.iterator]() {
+          return it;
+        },
+      };
+      return it;
     },
   };
   return cursor;
@@ -7953,9 +8325,49 @@ function __sbDOCursor(r) {
 // memory (read back by its own get and list) and are written when fn resolves, unless it
 // threw or called txn.rollback(). The input gate stays shut meanwhile, so no other event
 // sees a half-written transaction.
+// From 2026-11-04 transactions on one object run one after another, so two that read, then
+// write the same key (a counter) do not lose an update; workerd gets that by retrying the loser.
+// A transaction() started inside another one waits for it, so it must not be awaited there.
 function __sbDOTransaction(cls, id, s, gate, fn) {
+  if (!__sbDOv3()) return __sbDOTransactionRun(cls, id, s, gate, fn);
+  if (!gate.txnBusy) {
+    gate.txnBusy = true;
+    return __sbDOTransactionStart(cls, id, s, gate, fn);
+  }
+  // Nothing but the waiting starts are kept on the gate, and they go once they have run.
+  return new Promise((resolve, reject) => {
+    gate.txnQueue.push(() => {
+      __sbDOTransactionStart(cls, id, s, gate, fn).then(resolve, reject);
+    });
+  });
+}
+
+function __sbDOTransactionStart(cls, id, s, gate, fn) {
+  const p = __sbDOTransactionRun(cls, id, s, gate, fn);
+  const next = () => {
+    if (gate.txnQueue.length > 0) gate.txnQueue.shift()();
+    else gate.txnBusy = false;
+  };
+  p.then(next, next);
+  return p;
+}
+
+function __sbDOTransactionRun(cls, id, s, gate, fn) {
   const writes = new Map(); // key -> encoded value, or null for a delete
   let rolledBack = false;
+  let committed = false;
+  const v3 = __sbDOv3();
+  // From 2026-11-04 workerd refuses a transaction used after txn.rollback() or after its closure
+  // finished; the refusal is a rejection naming the call.
+  const refused = (name) => {
+    if (!v3) return null;
+    if (rolledBack) return new Error("Cannot " + name + "() on rolled back transaction");
+    if (committed)
+      return new Error(
+        "Cannot call " + name + "() on transaction that has already committed: did you move `txn` outside of the closure?",
+      );
+    return null;
+  };
   const getOne = (key) => {
     const k = String(key);
     if (!writes.has(k)) return s.get(k);
@@ -7965,6 +8377,15 @@ function __sbDOTransaction(cls, id, s, gate, fn) {
   const putOne = (key, value) => {
     writes.set(String(key), __sbDOEncode(value));
   };
+  const putAny = (key, value) => {
+    if (v3) {
+      const pairs = __sbDOPutPairs(key, value);
+      for (let i = 0; i < pairs.length; i++) writes.set(pairs[i][0], pairs[i][1]);
+    } else if (key != null && __sbIsObj(key)) {
+      const keys = Object.keys(key);
+      for (let i = 0; i < keys.length; i++) putOne(keys[i], key[keys[i]]);
+    } else putOne(key, value);
+  };
   const delOne = (key) => {
     const existed = getOne(key) !== undefined;
     writes.set(String(key), null);
@@ -7972,32 +8393,38 @@ function __sbDOTransaction(cls, id, s, gate, fn) {
   };
   const txn = {
     get(key) {
+      const no = refused("get");
+      if (no) return Promise.reject(no);
       if (!Array.isArray(key)) return Promise.resolve(getOne(key));
       const out = new Map();
-      for (let i = 0; i < key.length; i++) {
-        const v = getOne(key[i]);
-        if (v !== undefined) out.set(key[i], v);
+      const asked = v3 ? __sbDOSortedKeys(key) : key;
+      for (let i = 0; i < asked.length; i++) {
+        const v = getOne(asked[i]);
+        if (v !== undefined) out.set(asked[i], v);
       }
       return Promise.resolve(out);
     },
     put(key, value) {
+      const no = refused("put");
+      if (no) return Promise.reject(no);
       try {
-        if (key != null && __sbIsObj(key)) {
-          const keys = Object.keys(key);
-          for (let i = 0; i < keys.length; i++) putOne(keys[i], key[keys[i]]);
-        } else putOne(key, value);
+        putAny(key, value);
         return Promise.resolve();
       } catch (error) {
         return Promise.reject(error);
       }
     },
     delete(key) {
+      const no = refused("delete");
+      if (no) return Promise.reject(no);
       if (!Array.isArray(key)) return Promise.resolve(delOne(key));
       let n = 0;
       for (let i = 0; i < key.length; i++) n += delOne(key[i]) ? 1 : 0;
       return Promise.resolve(n);
     },
     list(options) {
+      const no = refused("list");
+      if (no) return Promise.reject(no);
       try {
         const o = __sbDOListLimit(options);
         const merged = s.list({ prefix: o.prefix, start: o.start, startAfter: o.startAfter, end: o.end });
@@ -8021,10 +8448,31 @@ function __sbDOTransaction(cls, id, s, gate, fn) {
     rollback() {
       rolledBack = true;
     },
-    getAlarm: () => Promise.resolve(s.getAlarm()),
-    setAlarm: (when) => Promise.resolve(s.setAlarm(when)),
-    deleteAlarm: () => Promise.resolve(s.deleteAlarm()),
+    getAlarm() {
+      const no = refused("getAlarm");
+      if (no) return Promise.reject(no);
+      return Promise.resolve(s.getAlarm());
+    },
+    setAlarm(when) {
+      const no = refused("setAlarm");
+      if (no) return Promise.reject(no);
+      try {
+        return Promise.resolve(s.setAlarm(when));
+      } catch (error) {
+        return Promise.reject(error);
+      }
+    },
+    deleteAlarm() {
+      const no = refused("deleteAlarm");
+      if (no) return Promise.reject(no);
+      return Promise.resolve(s.deleteAlarm());
+    },
   };
+  // workerd has txn.deleteAll() and refuses it; earlier dates have no such method.
+  if (v3)
+    txn.deleteAll = function () {
+      return Promise.reject(new Error("Cannot call deleteAll() within a transaction"));
+    };
   gate.locks++;
   const done = () => {
     gate.locks--;
@@ -8039,6 +8487,7 @@ function __sbDOTransaction(cls, id, s, gate, fn) {
   }
   return Promise.resolve(r).then(
     (v) => {
+      committed = true;
       try {
         if (!rolledBack)
           writes.forEach((value, key) => {
@@ -8051,6 +8500,7 @@ function __sbDOTransaction(cls, id, s, gate, fn) {
       return v;
     },
     (error) => {
+      rolledBack = true;
       done();
       throw error;
     },
@@ -9516,6 +9966,21 @@ async function __sb204WithDrain(res, tasks) {
   return new Response(null, { status: 204 });
 }
 
+// The alarm trigger's reply from 2026-11-04: 204 once alarm() and its waitUntil tasks have
+// settled, 500 if alarm() threw or rejected (the broker then retries it).
+async function __sbAlarmWithDrain(res, tasks) {
+  let failed = 0;
+  try {
+    if (res && __sbIsFn(res.then)) await res;
+  } catch (error) {
+    failed = 1;
+    __sbLogUncaught("alarm", error);
+  }
+  await __sbDrainWaitUntil(tasks);
+  if (failed === 1) return new Response("alarm failed", { status: 500 });
+  return new Response(null, { status: 204 });
+}
+
 async function __sbQueueWithDrain(result, tasks) {
   const r = result && __sbIsFn(result.then) ? await result : result;
   await __sbDrainWaitUntil(tasks);
@@ -9815,18 +10280,26 @@ globalThis.__sbEntry = function (handlers, request) {
 
   if (trigger === "alarm") {
     const body = __sbReadJson(request);
-    const inst = __sbGetDOInstance(String(body.cls || ""), String(body.id || ""));
+    const __acls = String(body.cls || "");
+    const __aid = String(body.id || "");
+    const inst = __sbGetDOInstance(__acls, __aid);
     if (!__sbIsFn(inst.alarm)) return new Response("no alarm handler", { status: 404 });
+    const __retries = __sbCompatDate() >= "2026-11-04";
     let __ares;
     try {
-      __ares = __sbDOGated() ? __sbDOEnter(inst.__sbGate, () => inst.alarm()) : inst.alarm();
+      __ares = __sbDOGated()
+        ? __sbDOEnter(inst.__sbGate, () => __sbDOAlarmCall(inst, __acls, __aid, body.scheduledTime, body.attempts))
+        : __sbDOAlarmCall(inst, __acls, __aid, body.scheduledTime, body.attempts);
     } catch (error) {
       // #179 — same rule as fetch: don't let a throw here crash the process.
       __sbLogUncaught("alarm", error);
+      // From 2026-11-04 a failed alarm answers 500, so the broker retries it as workerd does.
+      if (__retries) return new Response("alarm failed", { status: 500 });
       return new Response(null, { status: 204 });
     }
     // Was fire-and-forget before: an async `alarm()` and any `state.waitUntil()`
     // it queued were both dropped the moment 204 went out. Await both.
+    if (__retries) return __sbAlarmWithDrain(__ares, inst.__sbTasks);
     if (inst.__sbTasks.length || (__ares && __sbIsFn(__ares.then))) return __sb204WithDrain(__ares, inst.__sbTasks);
     return new Response(null, { status: 204 });
   }
