@@ -12,6 +12,15 @@ function __sbEnvValue() {
 function __sbSetCompat(date) {
   __sbCompatNow = date;
   Request._cd = date;
+  if (date >= "2026-11-15" && typeof Error.captureStackTrace !== "function") Error.captureStackTrace = __sbCaptureStackTrace;
+}
+// V8's Error.captureStackTrace(target): drivers (pg, @neondatabase/serverless) call it on the errors they
+// build and rethrow. Porffor keeps no frames, so the stack is the first line, as Error.stack is.
+function __sbCaptureStackTrace(target) {
+  if (target === null || (typeof target !== "object" && typeof target !== "function")) throw new TypeError("Invalid argument");
+  const name = target.name === undefined ? "Error" : String(target.name);
+  const message = target.message === undefined ? "" : String(target.message);
+  Object.defineProperty(target, "stack", { value: message === "" ? name : name + ": " + message, configurable: true, writable: true, enumerable: false });
 }
 function __sbSetEnv(value) {
   __sbEnvNow = value;
@@ -4253,8 +4262,12 @@ function __sbRequestBody(body) {
 }
 
 function __sbRawBodyResponse(body, init) {
-  const resp = new Response(body == null ? "" : body, init);
-  if (body != null) {
+  // 204, 205 and 304 carry no body: the constructor refuses even an empty string for them, so a
+  // fetch() of any 204 (a DELETE, a PostgREST write) threw before the caller saw the response.
+  const status = init == null ? 200 : init.status;
+  const bodiless = status === 204 || status === 205 || status === 304;
+  const resp = new Response(bodiless ? null : body == null ? "" : body, init);
+  if (body != null && !bodiless) {
     let decoded = null;
     resp.text = () => {
       if (decoded === null) decoded = __sbFromUtf8(body);
@@ -7192,7 +7205,17 @@ function __sbFollowHop(op, msg, label, mode, signal, hops) {
 function __sbUpstream(op, msg, label, signal, always) {
   if (signal) signal.throwIfAborted();
   const promised = always || __sbCompatDate() >= "2026-10-22" || __sbAsyncAtAnyDate();
-  if (!__sbHttpAsyncEnabled() || !promised) return __sbUpstreamResponse(globalThis.__sbFetchUpstream(op, msg));
+  if (!promised) return __sbUpstreamResponse(globalThis.__sbFetchUpstream(op, msg));
+  if (!__sbHttpAsyncEnabled()) {
+    // A host that runs the exchange to the end before it returns (the standalone binary) still hands
+    // back a promise from 2026-10-22: fetch(url).then(...) is how most libraries call it, and a refusal
+    // rejects instead of throwing.
+    try {
+      return Promise.resolve(__sbUpstreamResponse(globalThis.__sbFetchUpstream(op, msg)));
+    } catch (e) {
+      return Promise.reject(e);
+    }
+  }
   if (__sbCompatDate() >= "2026-10-22") return __sbUpstreamStreamed(op, msg, label, signal);
   return new Promise((resolve, reject) => {
     let onAbort = null;
