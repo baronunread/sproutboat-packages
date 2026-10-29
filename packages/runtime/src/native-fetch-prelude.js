@@ -6147,6 +6147,13 @@ function __sbAssetResponse(path, r) {
 function __sbQueuesStrict() {
   return __sbCompatDate() >= "2026-10-31";
 }
+// From 2026-11-05: the v8 codec keeps shared and circular references, array holes and invalid
+// dates; arguments are checked as workerd checks them; delaySeconds is limited to a day; a
+// delivery that never came back counts as a retry (to the dead letter queue after max_retries);
+// a consumer that runs past the lease keeps its messages.
+function __sbQueuesFixed() {
+  return __sbCompatDate() >= "2026-11-05";
+}
 
 // binding -> { binding, queue, maxBatchSize?, maxBatchTimeout?, maxRetries?, retryDelay?, deadLetterQueue? }
 var __sbQueueConf = {};
@@ -6185,7 +6192,7 @@ function __sbQueueTypeName(value) {
 
 // A body as the stored text "#sbq1:TYPE:PAYLOAD", and its size as Queues counts it.
 function __sbQueueEncode(body, contentType) {
-  const type = contentType === undefined ? "json" : contentType;
+  let type = contentType === undefined ? "json" : contentType;
   let payload;
   let size;
   if (type === "json") {
@@ -6205,13 +6212,18 @@ function __sbQueueEncode(body, contentType) {
     payload = body;
     size = new TextEncoder().encode(body).length;
   } else if (type === "bytes") {
-    const bytes = __sbQueueBytesOf(body);
+    const bytes = __sbQueuesFixed() && !ArrayBuffer.isView(body) ? null : __sbQueueBytesOf(body);
     if (bytes === null)
-      throw new TypeError('Content Type "bytes" requires a value of type ArrayBuffer, but received: ' + __sbQueueTypeName(body));
+      throw new TypeError(
+        'Content Type "bytes" requires a value of type ' + (__sbQueuesFixed() ? "ArrayBufferView" : "ArrayBuffer") + ", but received: " + __sbQueueTypeName(body),
+      );
     payload = __sbDOHex(bytes);
     size = bytes.length;
   } else if (type === "v8") {
-    payload = JSON.stringify(__sbDOPack(body, []));
+    if (__sbQueuesFixed()) {
+      payload = JSON.stringify(__sbQV8Pack(body, []));
+      type = "v8r";
+    } else payload = JSON.stringify(__sbDOPack(body, []));
     size = new TextEncoder().encode(payload).length;
   } else throw new TypeError("Unsupported queue message content type: " + type);
   if (size > __sbQueueMaxMessage)
@@ -6230,8 +6242,122 @@ function __sbQueueDecode(raw) {
     if (type === "json") return JSON.parse(payload);
     if (type === "bytes") return __sbDOUnhex(payload).buffer;
     if (type === "v8") return __sbDOUnpack(JSON.parse(payload));
+    if (type === "v8r") return __sbQV8Unpack(JSON.parse(payload), []);
   }
   return __sbTryParse(raw);
+}
+
+/* oxlint-disable anti-slop/no-runtime-typeof -- structured clone branches on the value's type, as the HTML spec's StructuredSerialize does. */
+// The v8 content type from 2026-11-05: __sbDOPack's JSON, plus references. Every object is
+// numbered when first met (before its contents); meeting it again is ["@", n], which makes
+// shared and circular values come back shared and circular. An array is ["A", length, ...] with
+// ["H"] for a hole; an invalid Date is ["D", "NaN"]. Typed arrays other than Uint8Array and
+// DataView stay unsupported (see __sbDOView).
+function __sbQV8Pack(v, objs) {
+  if (v === null || v === true || v === false || __sbIsStr(v)) return v;
+  const t = typeof v;
+  if (t === "number") {
+    if (v === 0 && 1 / v < 0) return ["N", "-0"];
+    return Number.isFinite(v) ? v : ["N", String(v)];
+  }
+  if (t === "bigint") return ["B", String(v)];
+  if (t === "undefined") return ["U"];
+  if (t !== "object") throw __sbDOCloneError(t === "symbol" ? v.toString() : v);
+  const seen = objs.indexOf(v);
+  if (seen !== -1) return ["@", seen];
+  objs.push(v);
+  if (v instanceof Date) {
+    const time = v.getTime();
+    return ["D", time === time ? time : "NaN"];
+  }
+  if (v instanceof Map) {
+    const out = ["M"];
+    v.forEach((x, k) => {
+      out.push(__sbQV8Pack(k, objs), __sbQV8Pack(x, objs));
+    });
+    return out;
+  }
+  if (v instanceof Set) {
+    const out = ["S"];
+    v.forEach((x) => {
+      out.push(__sbQV8Pack(x, objs));
+    });
+    return out;
+  }
+  if (v instanceof ArrayBuffer) return ["AB", __sbDOHex(new Uint8Array(v))];
+  if (ArrayBuffer.isView(v)) {
+    const name = Object.prototype.toString.call(v).slice(8, -1);
+    if (name !== "Uint8Array" && name !== "DataView") {
+      const error = new Error(name + " is not supported in a v8 queue message here yet; send a Uint8Array of its bytes.");
+      error.name = "DataCloneError";
+      throw error;
+    }
+    return ["V", name, __sbDOHex(new Uint8Array(v.buffer, v.byteOffset, v.byteLength))];
+  }
+  if (v instanceof RegExp) return ["R", v.source, v.flags];
+  if (Array.isArray(v)) {
+    const out = ["A", v.length];
+    for (let i = 0; i < v.length; i++) out.push(i in v ? __sbQV8Pack(v[i], objs) : ["H"]);
+    return out;
+  }
+  if (v instanceof Error) return ["E", String(v.name), String(v.message)];
+  const out = ["O"];
+  const keys = Object.keys(v);
+  for (let i = 0; i < keys.length; i++) out.push(keys[i], __sbQV8Pack(v[keys[i]], objs));
+  return out;
+}
+/* oxlint-enable anti-slop/no-runtime-typeof */
+
+function __sbQV8Unpack(p, objs) {
+  if (!Array.isArray(p)) return p;
+  const tag = p[0];
+  if (tag === "@") return objs[p[1]];
+  if (tag === "U") return undefined;
+  if (tag === "N") return p[1] === "-0" ? -0 : Number(p[1]);
+  if (tag === "B") return BigInt(p[1]);
+  let out;
+  if (tag === "D") {
+    out = new Date(p[1] === "NaN" ? NaN : p[1]);
+    objs.push(out);
+  } else if (tag === "AB") {
+    out = __sbDOUnhex(p[1]).buffer;
+    objs.push(out);
+  } else if (tag === "V") {
+    out = __sbDOView(p[1], __sbDOUnhex(p[2]));
+    objs.push(out);
+  } else if (tag === "R") {
+    out = new RegExp(p[1], p[2]);
+    objs.push(out);
+  } else if (tag === "E") {
+    out = p[1] === "TypeError" ? new TypeError(p[2]) : p[1] === "RangeError" ? new RangeError(p[2]) : new Error(p[2]);
+    out.name = p[1];
+    objs.push(out);
+  } else if (tag === "M") {
+    out = new Map();
+    objs.push(out);
+    for (let i = 1; i + 1 < p.length; i += 2) {
+      const k = __sbQV8Unpack(p[i], objs);
+      out.set(k, __sbQV8Unpack(p[i + 1], objs));
+    }
+  } else if (tag === "S") {
+    out = new Set();
+    objs.push(out);
+    for (let i = 1; i < p.length; i++) out.add(__sbQV8Unpack(p[i], objs));
+  } else if (tag === "A") {
+    out = [];
+    objs.push(out);
+    out.length = p[1];
+    for (let i = 2; i < p.length; i++) {
+      const e = p[i];
+      if (Array.isArray(e) && e[0] === "H") continue;
+      out[i - 2] = __sbQV8Unpack(e, objs);
+    }
+  } else {
+    out = {};
+    objs.push(out);
+    for (let i = 1; i + 1 < p.length; i += 2) out[p[i]] = __sbQV8Unpack(p[i + 1], objs);
+  }
+  return out;
 }
 
 function __sbQueueMetrics(metrics) {
@@ -6248,12 +6374,30 @@ function __sbQueueMetrics(metrics) {
 function __sbQueueDelay(value) {
   return value == null ? 0 : Math.max(0, Number(value) || 0);
 }
+// From 2026-11-05 a delay outside 0 to 86400 s (a day) is refused, not clamped or kept.
+function __sbQueueCheckDelay(value) {
+  if (!__sbQueuesFixed() || value == null) return;
+  const n = Number(value);
+  if (n < 0 || n > 86400) throw new Error("Queue send failed: delaySeconds must be between 0 and 86400, got " + String(value));
+}
+// workerd's check that an options argument is a dictionary (null and undefined are fine).
+function __sbQueueCheckOptions(options, name, position, type) {
+  if (!__sbQueuesFixed() || options == null) return;
+  if (__sbQueueTypeName(options) !== "object")
+    throw new TypeError("Failed to execute '" + name + "' on 'WorkerQueue': parameter " + position + " is not of type '" + type + "'.");
+}
 
 function __sbMakeQueue(binding) {
   return {
-    send(body, options) {
+    send(...args) {
       try {
+        const body = args[0];
+        const options = args[1];
+        if (args.length === 0 && __sbQueuesFixed())
+          throw new TypeError("Failed to execute 'send' on 'WorkerQueue': parameter 1 is not of type 'JsValue'.");
+        __sbQueueCheckOptions(options, "send", 2, "SendOptions");
         const o = options || {};
+        __sbQueueCheckDelay(o.delaySeconds);
         const encoded = __sbQueueEncode(body, o.contentType);
         const reply = __sbRpc("queue.send", {
           queue: binding,
@@ -6270,11 +6414,16 @@ function __sbMakeQueue(binding) {
       try {
         if (messages == null || !__sbIsFn(messages[Symbol.iterator]))
           throw new TypeError("Failed to execute 'sendBatch' on 'WorkerQueue': parameter 1 is not of type 'Sequence'.");
+        __sbQueueCheckOptions(options, "sendBatch", 2, "SendBatchOptions");
+        __sbQueueCheckDelay(options && options.delaySeconds);
         const batchDelay = __sbQueueDelay(options && options.delaySeconds);
         const list = [];
         let total = 0;
         for (const m of messages) {
+          if (__sbQueuesFixed() && (m == null || __sbQueueTypeName(m) !== "object"))
+            throw new TypeError("Incorrect type: the provided value is not of type 'MessageSendRequest'.");
           const item = m || {};
+          __sbQueueCheckDelay(item.delaySeconds);
           const encoded = __sbQueueEncode(item.body, item.contentType);
           total += encoded.size;
           // A message delay of 0 (or none) takes the batch delay, as miniflare does.
@@ -10275,7 +10424,7 @@ globalThis.__sbEntry = function (handlers, request) {
     // Always a promise now (`__sbRunQueueBatch` is async, to await the
     // handler above), so always tail-call the drain wrapper — same
     // promise-identity reasoning as `__sbFetchWithDrain`.
-    return __sbQueueWithDrain(__sbRunQueueBatch(__sbReceiver(handlers, ctx), __sbReadJson(request), ctx), __sbTasks);
+    return __sbQueueWithDrain(__sbRunQueueBatch(__sbReceiver(handlers, ctx), __sbReadJson(request, __sbQueuesFixed()), ctx), __sbTasks);
   }
 
   if (trigger === "alarm") {
@@ -10328,6 +10477,16 @@ async function __sbRunQueueBatch(handlers, body, ctx) {
   const strict = __sbQueuesStrict();
   const binding = String(body.queue || "");
   const settings = __sbQueueSettings(binding);
+  if (__sbQueuesFixed()) {
+    // Tell the store this consumer follows the 2026-11-05 delivery rules, before the handler
+    // runs: a delivery that never comes back is then counted as a retry. An older broker
+    // doesn't know the call and keeps its own rules.
+    try {
+      __sbRpc("queue.consumer", { queue: binding });
+    } catch {
+      /* an older broker */
+    }
+  }
   const acked = [];
   const retried = [];
   // id -> seconds, from retry({ delaySeconds }) (2026-10-31)
@@ -10429,16 +10588,24 @@ async function __sbRunQueueBatch(handlers, body, ctx) {
 // A delivered message and batch from 2026-10-31: their data are own properties, as in
 // workerd, and ack/retry live on the prototype, out of Object.keys().
 function __SbQueueMessage(m, ack, retry) {
-  this.id = String(m.id);
-  this.timestamp = new Date(Number(m.timestamp) || Date.now());
   let decoded;
   try {
     decoded = __sbQueueDecode(m.body);
   } catch {
     decoded = m.body;
   }
-  this.body = decoded;
-  this.attempts = Number(m.attempts) || 1;
+  if (__sbQueuesFixed()) {
+    // Read-only data properties, as in workerd.
+    Object.defineProperty(this, "id", { value: String(m.id), enumerable: true, configurable: true, writable: false });
+    Object.defineProperty(this, "timestamp", { value: new Date(Number(m.timestamp) || Date.now()), enumerable: true, configurable: true, writable: false });
+    Object.defineProperty(this, "body", { value: decoded, enumerable: true, configurable: true, writable: false });
+    Object.defineProperty(this, "attempts", { value: Number(m.attempts) || 1, enumerable: true, configurable: true, writable: false });
+  } else {
+    this.id = String(m.id);
+    this.timestamp = new Date(Number(m.timestamp) || Date.now());
+    this.body = decoded;
+    this.attempts = Number(m.attempts) || 1;
+  }
   Object.defineProperty(this, "__sbDecide", { value: { ack, retry }, enumerable: false });
 }
 __SbQueueMessage.prototype.ack = function () {
@@ -10460,9 +10627,12 @@ __SbQueueBatch.prototype.retryAll = function (options) {
   for (let i = 0; i < this.messages.length; i++) this.__sbDecide.retry(this.messages[i].id, options);
 };
 
-function __sbReadJson(request) {
+function __sbReadJson(request, utf8) {
   try {
     const body = __sbRawBody(request);
+    // The native server hands over one character per byte; from 2026-11-05 a queue delivery
+    // decodes them as UTF-8 (non-ASCII message bodies used to arrive as mojibake).
+    if (utf8 && body != null && request._bodyLatin1 === true) return JSON.parse(__sbFromUtf8(String(body)));
     return JSON.parse(body == null ? "{}" : String(body));
   } catch {
     return {};

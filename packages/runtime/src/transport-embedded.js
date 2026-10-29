@@ -5288,6 +5288,10 @@ function __sbEmbeddedDispatch(msg) {
 
   if (op === "queue.metrics") return { ok: true, metrics: __sbQueueBacklog(store, msg.queue) };
 
+  // A consumer announces itself (the broker uses it to pick the delivery rules of the app's
+  // compatibility date); the embedded store reads the date itself.
+  if (op === "queue.consumer") return { ok: true };
+
   if (op === "do.storage.get") {
     const r = __sbSql(store, "SELECT value FROM do_storage WHERE cls = ? AND id = ? AND key = ?", [
       msg.cls,
@@ -5774,7 +5778,9 @@ function __sbQueueBacklog(store, queue) {
 }
 
 function __sbQueueAttemptCap(settings) {
-  return Math.max(5, (settings.maxRetries !== undefined ? Number(settings.maxRetries) : 3) + 1);
+  const retries = (settings.maxRetries !== undefined ? Number(settings.maxRetries) : 3) + 1;
+  // From 2026-11-05 a lost delivery counts as a retry, so there is no floor of 5.
+  return __sbQueuesFixed() ? retries : Math.max(5, retries);
 }
 
 // How long a queue's due messages wait to fill a batch (max_batch_timeout), in ms.
@@ -5801,11 +5807,13 @@ async function __sbQueuePass(handlers, queues) {
     try {
       // A message whose deliveries never came back (the worker died or timed out each time)
       // stops after 5 attempts, or max_retries + 1 when that is more.
-      __sbSql(store, "UPDATE mq SET dead=1 WHERE queue=? AND visible_at<=? AND attempts>=?", [
-        name,
-        now,
-        __sbQueueAttemptCap(settings),
-      ]);
+      if (__sbQueuesFixed()) __sbQueueRetire(store, name, settings, now);
+      else
+        __sbSql(store, "UPDATE mq SET dead=1 WHERE queue=? AND visible_at<=? AND attempts>=?", [
+          name,
+          now,
+          __sbQueueAttemptCap(settings),
+        ]);
       due = __sbSql(
         store,
         "SELECT id,body,attempts,sent_at,visible_at FROM mq WHERE queue=? AND dead=0 AND visible_at<=? ORDER BY visible_at LIMIT ?",
@@ -5842,11 +5850,43 @@ async function __sbQueuePass(handlers, queues) {
         if (p && __sbIsFn(p.then)) __sbTasks.push(p);
       },
     };
-    let result = __sbRunQueueBatch(handlers, { queue: name, messages, metadata }, ctx);
-    if (result && __sbIsFn(result.then)) result = await result;
-    if (__sbTasks.length) await __sbDrainWaitUntil(__sbTasks);
+    // From 2026-11-05 a consumer that runs past the 30 s lease keeps its messages: the lease
+    // is renewed while it runs, so they are not delivered a second time or lose their ack.
+    const beat = __sbQueuesFixed()
+      ? setInterval(() => {
+          __sbSql(store, "UPDATE mq SET visible_at=? WHERE queue=? AND claim_token=? AND visible_at>?", [Date.now() + 30000, name, claim, Date.now()]);
+        }, 10000)
+      : null;
+    let result;
+    try {
+      result = __sbRunQueueBatch(handlers, { queue: name, messages, metadata }, ctx);
+      if (result && __sbIsFn(result.then)) result = await result;
+      if (__sbTasks.length) await __sbDrainWaitUntil(__sbTasks);
+    } finally {
+      if (beat !== null) clearInterval(beat);
+    }
     __sbQueueSettle(store, name, claim, result);
   }
+}
+
+// From 2026-11-05, the messages whose last allowed delivery never came back (the worker died or
+// timed out): they leave the queue as a message past max_retries does, into the dead letter
+// queue when there is one, or dropped. Runs inside the claim transaction.
+function __sbQueueRetire(store, name, settings, now) {
+  const rows = __sbSql(store, "SELECT id FROM mq WHERE queue=? AND dead=0 AND visible_at<=? AND attempts>=?", [
+    name,
+    now,
+    __sbQueueAttemptCap(settings),
+  ]).rows;
+  if (rows.length === 0) return;
+  if (settings.deadLetterQueue === undefined) {
+    __sbSql(store, "UPDATE mq SET dead=1 WHERE queue=? AND visible_at<=? AND attempts>=?", [name, now, __sbQueueAttemptCap(settings)]);
+    return;
+  }
+  const part = __sbQueuePart(settings.deadLetterQueue);
+  for (let i = 0; i < rows.length; i++)
+    __sbSql(store, "UPDATE mq SET queue=?,visible_at=?,attempts=0,claim_token='',dead=0 WHERE queue=? AND id=?", [part, now, name, rows[i][0]]);
+  if (__sbLocal !== null && __sbLocal.queues.indexOf(part) !== -1) __sbHostDue(now);
 }
 
 // Applies a batch's outcome to the claimed rows. `dead` (past max_retries) move to the dead

@@ -1928,3 +1928,56 @@ test("listen(): a service.fetch body streamed in FRAME_V1_MORE frames reaches th
   socket.destroy();
   server.stop();
 });
+
+test("Queues 2026-11-05: a delivery that never comes back is a retry, and past max_retries goes to the dead letter queue", async () => {
+  const delivered: JsonObject[] = [];
+  const fetchImpl: FetchLike = async (_url, init) => {
+    delivered.push(obj(parseJsonValue(String(init?.body))));
+    throw new Error("the sprout died");
+  };
+  const b = make({
+    bindings: {
+      queues: ["JOBS", "DEAD"],
+      queueConfig: [
+        { binding: "JOBS", queue: "jobs", maxRetries: 1, deadLetterQueue: "dead" },
+        { binding: "DEAD", queue: "dead" },
+      ],
+    },
+    sproutUrl: "http://127.0.0.1:1/",
+    fetchImpl,
+    deliveryTimeoutMs: 100,
+    deliveryLeaseMs: 200,
+  });
+  await b.dispatch({ op: "queue.consumer", queue: "JOBS" });
+  await b.dispatch({ op: "queue.send", queue: "JOBS", body: "work" });
+  await Bun.sleep(2500);
+  // max_retries 1: two deliveries, then the dead letter queue (whose consumer is this sprout too).
+  expect(delivered.filter((d) => d.queue === "JOBS").length).toBe(2);
+  expect(delivered.filter((d) => d.queue === "DEAD").length).toBeGreaterThan(0);
+  expect(await b.dispatch({ op: "queue.metrics", queue: "JOBS" })).toMatchObject({ metrics: { backlogCount: 0 } });
+});
+
+test("Queues: without the 2026-11-05 announcement a lost delivery is retried after 5 s, as before", async () => {
+  const delivered: JsonObject[] = [];
+  const fetchImpl: FetchLike = async (_url, init) => {
+    delivered.push(obj(parseJsonValue(String(init?.body))));
+    throw new Error("the sprout died");
+  };
+  const b = make({
+    bindings: {
+      queues: ["JOBS", "DEAD"],
+      queueConfig: [
+        { binding: "JOBS", queue: "jobs", maxRetries: 1, deadLetterQueue: "dead" },
+        { binding: "DEAD", queue: "dead" },
+      ],
+    },
+    sproutUrl: "http://127.0.0.1:1/",
+    fetchImpl,
+    deliveryTimeoutMs: 100,
+    deliveryLeaseMs: 200,
+  });
+  await b.dispatch({ op: "queue.send", queue: "JOBS", body: "work" });
+  await Bun.sleep(1500);
+  expect(delivered.filter((d) => d.queue === "DEAD").length).toBe(0);
+  expect(delivered.filter((d) => d.queue === "JOBS").length).toBe(1);
+});

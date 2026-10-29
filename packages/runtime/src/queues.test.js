@@ -157,3 +157,139 @@ test("before 2026-10-31 without settings, the outcome has only ack and retry", a
   expect(legacy).toEqual(["dlq", true, 5000]);
   expect(out).toEqual({ ack: [], retry: ["a"] });
 });
+
+// ---- 2026-11-05 ----
+
+const failure = (p) =>
+  p.then(
+    () => "accepted",
+    (e) => e.name + ": " + e.message,
+  );
+
+test("2026-11-05: send() checks arguments and delays as workerd does", async () => {
+  const { QUEUE } = env("2026-11-05");
+  expect(await failure(QUEUE.send())).toBe(
+    "TypeError: Failed to execute 'send' on 'WorkerQueue': parameter 1 is not of type 'JsValue'.",
+  );
+  expect(await failure(QUEUE.send(1, "x"))).toBe(
+    "TypeError: Failed to execute 'send' on 'WorkerQueue': parameter 2 is not of type 'SendOptions'.",
+  );
+  expect(await failure(QUEUE.send(1, null))).toBe("accepted");
+  expect(await failure(QUEUE.send(1, { delaySeconds: -1 }))).toStartWith("Error: Queue send failed: delaySeconds");
+  expect(await failure(QUEUE.send(1, { delaySeconds: 86401 }))).toStartWith("Error: Queue send failed: delaySeconds");
+  expect(await failure(QUEUE.send(1, { delaySeconds: 86400 }))).toBe("accepted");
+  expect(await failure(QUEUE.send(1, { delaySeconds: 1.5 }))).toBe("accepted");
+  expect(await failure(QUEUE.sendBatch([{ body: 1 }], { delaySeconds: 86401 }))).toStartWith(
+    "Error: Queue send failed",
+  );
+  expect(await failure(QUEUE.sendBatch([{ body: 1, delaySeconds: -5 }]))).toStartWith("Error: Queue send failed");
+  expect(await failure(QUEUE.sendBatch([1, 2]))).toBe(
+    "TypeError: Incorrect type: the provided value is not of type 'MessageSendRequest'.",
+  );
+  expect(await failure(QUEUE.send(new Uint8Array([1]).buffer, { contentType: "bytes" }))).toBe(
+    'TypeError: Content Type "bytes" requires a value of type ArrayBufferView, but received: object',
+  );
+  expect(await failure(QUEUE.send(new Uint8Array([1]), { contentType: "bytes" }))).toBe("accepted");
+});
+
+test("before 2026-11-05 the same arguments are accepted or answer as before", async () => {
+  const { QUEUE } = env("2026-11-01");
+  expect(await failure(QUEUE.send(1, { delaySeconds: 86401 }))).toBe("accepted");
+  expect(await failure(QUEUE.send(1, "x"))).toBe("accepted");
+  expect(await failure(QUEUE.sendBatch([{ body: 1, delaySeconds: -5 }]))).toBe("accepted");
+  expect(await failure(QUEUE.send(new Uint8Array([1]).buffer, { contentType: "bytes" }))).toBe("accepted");
+  expect(await failure(QUEUE.send())).toBe("TypeError: Message body cannot be undefined");
+  expect(sent.find((r) => r.delaySeconds === 86401)).toBeDefined();
+});
+
+const roundTrip = async (compat, value) => {
+  const { QUEUE } = env(compat);
+  await QUEUE.send(value, { contentType: "v8" });
+  const body = sent[sent.length - 1].body;
+  let seen;
+  await run(
+    {
+      queue(batch) {
+        seen = batch.messages[0];
+      },
+    },
+    { queue: "QUEUE", messages: [message("a", body)] },
+    ctx,
+  );
+  return { body, seen };
+};
+
+test("2026-11-05: the v8 content type keeps shared and circular references, holes and invalid dates", async () => {
+  const shared = { z: 1 };
+  const circular = { n: 1 };
+  circular.self = circular;
+  const holes = [1];
+  holes[3] = 4;
+  const { body, seen } = await roundTrip("2026-11-05", {
+    a: shared,
+    b: shared,
+    c: circular,
+    holes,
+    d: new Date(NaN),
+    e: new TypeError("boom"),
+    m: new Map([[shared, new Set([shared])]]),
+  });
+  expect(body.startsWith("#sbq1:v8r:")).toBe(true);
+  const v = seen.body;
+  expect(v.a).toBe(v.b);
+  expect(v.c.self).toBe(v.c);
+  expect(v.holes.length).toBe(4);
+  expect(1 in v.holes).toBe(false);
+  expect(v.holes[3]).toBe(4);
+  expect(Number.isNaN(v.d.getTime())).toBe(true);
+  expect(v.e).toBeInstanceOf(TypeError);
+  expect(v.e.message).toBe("boom");
+  const [key, set] = [...v.m][0];
+  expect(key).toBe(v.a);
+  expect([...set][0]).toBe(v.a);
+  expect(Object.getOwnPropertyDescriptor(seen, "body").writable).toBe(false);
+  expect(Object.getOwnPropertyDescriptor(seen, "id").writable).toBe(false);
+});
+
+test("before 2026-11-05 the v8 content type is the earlier codec, and v8r messages decode at any date", async () => {
+  const { body, seen } = await roundTrip("2026-11-01", { d: new Date(1000), m: new Map([[1, 2]]) });
+  expect(body.startsWith("#sbq1:v8:")).toBe(true);
+  expect(seen.body.m.get(1)).toBe(2);
+  const circular = {};
+  circular.self = circular;
+  const later = await roundTrip("2026-11-05", circular);
+  globalThis.__sbCompat = "2026-10-31";
+  let again;
+  await run(
+    {
+      queue(batch) {
+        again = batch.messages[0].body;
+      },
+    },
+    { queue: "QUEUE", messages: [message("a", later.body)] },
+    ctx,
+  );
+  expect(again.self).toBe(again);
+  expect(Object.getOwnPropertyDescriptor(seen, "body").writable).toBe(true);
+});
+
+test("2026-11-05: a consumer announces its queue to the store before the handler runs", async () => {
+  globalThis.__sbCompat = "2026-11-05";
+  sent = [];
+  let at;
+  await run(
+    {
+      queue() {
+        at = sent.length;
+      },
+    },
+    { queue: "QUEUE", messages: [message("a", "1")] },
+    ctx,
+  );
+  expect(sent[0]).toMatchObject({ op: "queue.consumer", queue: "QUEUE" });
+  expect(at).toBe(1);
+  globalThis.__sbCompat = "2026-11-01";
+  sent = [];
+  await run({ queue() {} }, { queue: "QUEUE", messages: [message("a", "1")] }, ctx);
+  expect(sent).toEqual([]);
+});
