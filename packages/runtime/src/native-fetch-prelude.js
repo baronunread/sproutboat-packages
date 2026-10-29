@@ -9855,7 +9855,7 @@ globalThis.__sbEntry = function (handlers, request) {
     // Always a promise now (`__sbRunQueueBatch` is async, to await the
     // handler above), so always tail-call the drain wrapper — same
     // promise-identity reasoning as `__sbFetchWithDrain`.
-    return __sbQueueWithDrain(__sbRunQueueBatch(__sbReceiver(handlers, ctx), __sbReadJson(request), ctx), __sbTasks);
+    return __sbQueueWithDrain(__sbRunQueueBatch(__sbReceiver(handlers, ctx), __sbReadJson(request, __sbQueuesFixed()), ctx), __sbTasks);
   }
 
   if (trigger === "alarm") {
@@ -10050,9 +10050,12 @@ __SbQueueBatch.prototype.retryAll = function (options) {
   for (let i = 0; i < this.messages.length; i++) this.__sbDecide.retry(this.messages[i].id, options);
 };
 
-function __sbReadJson(request) {
+function __sbReadJson(request, utf8) {
   try {
     const body = __sbRawBody(request);
+    // The native server hands over one character per byte; from 2026-11-05 a queue delivery
+    // decodes them as UTF-8 (non-ASCII message bodies used to arrive as mojibake).
+    if (utf8 && body != null && request._bodyLatin1 === true) return JSON.parse(__sbFromUtf8(String(body)));
     return JSON.parse(body == null ? "{}" : String(body));
   } catch {
     return {};
