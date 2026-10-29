@@ -4324,8 +4324,9 @@ function __sbHmacBits(algo) {
   if (!bits || bits === "5") throw __sbCryptoError("NotSupportedError", "HMAC needs SHA-1, SHA-256, SHA-384 or SHA-512");
   return bits;
 }
-if (globalThis.crypto.subtle == null) {
-  globalThis.crypto.subtle = {
+// The subset that shipped first: digest, HMAC, PBKDF2-SHA-256. Compatibility dates before
+// __SB_SUBTLE_DATE keep it, behaviour and errors included.
+const __sbSubtleLegacy = {
     async digest(algo, data) {
       const bits = __sbHashBits(algo);
       if (!bits) throw __sbCryptoError("NotSupportedError", "crypto.subtle.digest: unsupported algorithm");
@@ -4372,8 +4373,990 @@ if (globalThis.crypto.subtle == null) {
       if (x.length !== y.length) throw new TypeError("crypto.subtle.timingSafeEqual: the buffers differ in length");
       return __sbEqCt(x, y);
     },
-  };
+};
+if (globalThis.crypto.subtle == null) globalThis.crypto.subtle = __sbSubtleLegacy;
+
+// SUBTLE-JS:BEGIN (the whole of workerd-style crypto.subtle; wrap.ts drops it for a handler that never touches crypto.subtle)
+// ---------------------------------------------------------------------------
+// crypto.subtle with workerd's surface, from compatibility date __SB_SUBTLE_DATE.
+//
+// What it adds over the digest/HMAC/PBKDF2 subset above: RSASSA-PKCS1-v1_5, RSA-PSS, ECDSA
+// (P-256, P-384, P-521), Ed25519 (and workerd's NODE-ED25519), PBKDF2 and HKDF for every hash,
+// generateKey, importKey and exportKey in raw, spki, pkcs8 and jwk, deriveBits, deriveKey, and
+// errors that are DOMExceptions with workerd's names. The primitives are BearSSL's and
+// Monocypher's, reached through __sbSubtleRaw (embedded transport only; see subtle/README.md).
+// A key's material lives in a byte string: the raw secret, or the DER of its PKCS#8 (private) or
+// SPKI (public) form, so every operation is one call into C with that string and the data.
+// ---------------------------------------------------------------------------
+// Placeholder: the compatibility date this lands at is the maintainers' to pick.
+const __SB_SUBTLE_DATE = "2026-11-06";
+function __sbSubtleOn() {
+  return __sbCompatDate() >= __SB_SUBTLE_DATE;
 }
+// Operation codes: keep in step with SBC_OP_* in subtle/subtle.c.
+const __SBC_PKCS1_SIGN = "1";
+const __SBC_PKCS1_VERIFY = "2";
+const __SBC_PSS_SIGN = "3";
+const __SBC_PSS_VERIFY = "4";
+const __SBC_ECDSA_SIGN = "5";
+const __SBC_ECDSA_VERIFY = "6";
+const __SBC_ED_SIGN = "7";
+const __SBC_ED_VERIFY = "8";
+const __SBC_GCM_ENC = "11";
+const __SBC_GCM_DEC = "12";
+const __SBC_CBC_ENC = "13";
+const __SBC_CBC_DEC = "14";
+const __SBC_CTR = "15";
+const __SBC_KW_WRAP = "16";
+const __SBC_KW_UNWRAP = "17";
+const __SBC_ECDH = "18";
+const __SBC_X25519 = "19";
+const __SBC_OAEP_ENC = "24";
+const __SBC_OAEP_DEC = "25";
+const __SBC_X_PUB = "31";
+const __SBC_PBKDF2 = "9";
+const __SBC_HKDF = "10";
+const __SBC_DECODE_SPKI = "20";
+const __SBC_DECODE_PKCS8 = "21";
+const __SBC_ENCODE_SPKI = "22";
+const __SBC_ENCODE_PKCS8 = "23";
+const __SBC_RSA_KEYGEN = "26";
+const __SBC_EC_KEYGEN = "27";
+const __SBC_ED_KEYGEN = "28";
+const __SBC_ED_PUB = "29";
+const __SBC_POINT_OK = "30";
+// Key kinds sbc_decode reports.
+const __SBC_K_RSA = 1;
+const __SBC_K_EC = 2;
+const __SBC_K_ED = 3;
+const __SBC_K_X = 4;
+
+const __sbScUsageOrder = ["encrypt", "decrypt", "sign", "verify", "deriveKey", "deriveBits", "wrapKey", "unwrapKey"];
+// The algorithm names, upper-cased, to their canonical spelling.
+const __sbScNames = {
+  "RSASSA-PKCS1-V1_5": "RSASSA-PKCS1-v1_5",
+  "RSA-PSS": "RSA-PSS",
+  ECDSA: "ECDSA",
+  "RSA-OAEP": "RSA-OAEP",
+  ECDH: "ECDH",
+  ED25519: "Ed25519",
+  X25519: "X25519",
+  "NODE-ED25519": "NODE-ED25519",
+  "AES-GCM": "AES-GCM",
+  "AES-CBC": "AES-CBC",
+  "AES-CTR": "AES-CTR",
+  "AES-KW": "AES-KW",
+  HMAC: "HMAC",
+  PBKDF2: "PBKDF2",
+  HKDF: "HKDF",
+};
+
+function __sbScErr(name, message) {
+  return new globalThis.DOMException(message, name);
+}
+// A call into the native half. Returns the result byte string, or throws the error it reports.
+function __sbScCall(op, params, b, c, d) {
+  const raw = __sbSubtleRaw(op, params, b, c, d);
+  if (raw === "") throw __sbScErr("NotSupportedError", "This crypto.subtle algorithm needs a runtime built with BearSSL and Monocypher (standalone binaries and sproutd).");
+  const status = raw.charCodeAt(0);
+  if (status === 0) return raw.slice(1);
+  if (status === 1) throw __sbScErr("DataError", "The key data is not valid for this format.");
+  if (status === 3) throw __sbScErr("NotSupportedError", "This crypto.subtle operation is not supported.");
+  throw __sbScErr("OperationError", "The operation failed.");
+}
+// A native call whose OperationError says `message` instead of the generic text.
+function __sbScOr(message, op, params, b, c, d) {
+  try {
+    return __sbScCall(op, params, b, c, d);
+  } catch (e) {
+    if (e.name === "OperationError") throw __sbScErr("OperationError", message);
+    throw e;
+  }
+}
+const __sbScDecryptFailed = "Decryption failed. This could be due to a ciphertext authentication failure, bad padding, incorrect CryptoKey, or another algorithm-specific reason.";
+// BufferSource -> a byte string. `method` and `n` name the call in the TypeError.
+function __sbScBytes(value, method, n) {
+  let view = null;
+  if (value != null && __sbIsObj(value)) {
+    if (ArrayBuffer.isView(value)) view = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    else if (value instanceof ArrayBuffer) view = new Uint8Array(value);
+  }
+  if (view === null) throw new TypeError("Failed to execute '" + method + "' on 'SubtleCrypto': parameter " + n + " is not of type 'ArrayBuffer or ArrayBufferView'.");
+  return __sbToBytes(view);
+}
+function __sbScB64u(bytes) {
+  return btoa(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function __sbScFromB64u(text, what) {
+  if (!__sbIsStr(text) || !/^[A-Za-z0-9_-]*$/.test(text) || text.length % 4 === 1)
+    throw __sbScErr("DataError", what + " requires a base64Url encoding of the key");
+  let s = text.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4 !== 0) s += "=";
+  return atob(s);
+}
+function __sbScU32(n) {
+  return String.fromCharCode((n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255);
+}
+// A list of byte strings framed the way sbc_encode reads them.
+function __sbScFrame(list) {
+  let out = "";
+  for (let i = 0; i < list.length; i++) out += __sbScU32(list[i].length) + list[i];
+  return out;
+}
+// The fields of a decode result: { kind, curve, isPrivate, list }.
+function __sbScUnframe(raw) {
+  const list = [];
+  let i = 3;
+  while (i + 4 <= raw.length) {
+    const n = (raw.charCodeAt(i) << 24) | (raw.charCodeAt(i + 1) << 16) | (raw.charCodeAt(i + 2) << 8) | raw.charCodeAt(i + 3);
+    list.push(raw.slice(i + 4, i + 4 + n));
+    i += 4 + n;
+  }
+  return { kind: raw.charCodeAt(0), curve: raw.charCodeAt(1), isPrivate: raw.charCodeAt(2) === 1, list };
+}
+function __sbScBitLength(bytes) {
+  let i = 0;
+  while (i < bytes.length && bytes.charCodeAt(i) === 0) i++;
+  if (i === bytes.length) return 0;
+  let top = bytes.charCodeAt(i);
+  let bits = (bytes.length - i) * 8;
+  while ((top & 0x80) === 0) {
+    top = top << 1;
+    bits--;
+  }
+  return bits;
+}
+function __sbScStrip(bytes) {
+  let i = 0;
+  while (i < bytes.length - 1 && bytes.charCodeAt(i) === 0) i++;
+  return bytes.slice(i);
+}
+function __sbScName(algo) {
+  let name = algo;
+  if (!__sbIsStr(algo)) {
+    if (algo == null || !__sbIsObj(algo)) throw new TypeError("Missing \"algorithm\" argument.");
+    name = algo.name;
+    if (name === undefined) throw new TypeError('Missing field "name" in "algorithm".');
+  }
+  const canonical = __sbScNames[String(name).toUpperCase()];
+  if (canonical === undefined) throw __sbScErr("NotSupportedError", "Unrecognized name.");
+  return canonical;
+}
+// "256" for SHA-256 and so on; SHA-1 is "1". MD5 is digest-only, as in workerd.
+function __sbScHashBits(hash) {
+  if (hash === undefined || hash === null) throw new TypeError('Missing field "hash" in "algorithm".');
+  const bits = __sbHashBits(hash);
+  if (bits === "" || bits === "5") throw __sbScErr("NotSupportedError", "Unrecognized name.");
+  return bits;
+}
+function __sbScHashName(bits) {
+  return bits === "1" ? "SHA-1" : "SHA-" + bits;
+}
+function __sbScCurve(name) {
+  if (name === "P-256") return 1;
+  if (name === "P-384") return 2;
+  if (name === "P-521") return 3;
+  throw __sbScErr("NotSupportedError", 'Unrecognized or unimplemented EC curve "' + name + '" requested.');
+}
+function __sbScCurveName(id) {
+  return id === 1 ? "P-256" : id === 2 ? "P-384" : "P-521";
+}
+function __sbScCurveSize(id) {
+  return id === 1 ? 32 : id === 2 ? 48 : 66;
+}
+// The usages array, deduplicated and in WebCrypto's order, every one of them in `allowed`.
+// `verb` and `what` shape the error: 'Attempt to import secret HMAC key with invalid usage "encrypt".'
+function __sbScUsages(usages, allowed, verb, what) {
+  const seen = [];
+  if (usages != null) {
+    for (let i = 0; i < usages.length; i++) {
+      const usage = String(usages[i]);
+      if (__sbScUsageOrder.indexOf(usage) < 0) throw new TypeError("Unrecognized key usage '" + usage + "'.");
+      if (allowed.indexOf(usage) < 0) throw __sbScErr("SyntaxError", "Attempt to " + verb + " " + what + ' key with invalid usage "' + usage + '".');
+      if (seen.indexOf(usage) < 0) seen.push(usage);
+    }
+  }
+  const out = [];
+  for (let i = 0; i < __sbScUsageOrder.length; i++) if (seen.indexOf(__sbScUsageOrder[i]) >= 0) out.push(__sbScUsageOrder[i]);
+  return out;
+}
+function __sbScNeedUsages(list) {
+  if (list.length === 0) throw __sbScErr("SyntaxError", "Secret/private CryptoKeys must have at least one usage.");
+}
+
+// CryptoKey. Not constructible by the app; the material hangs off a non-enumerable property.
+const __sbScKeyToken = {};
+class CryptoKey {
+  constructor(token) {
+    if (token !== __sbScKeyToken) throw new TypeError("Illegal constructor");
+  }
+}
+Object.defineProperty(CryptoKey.prototype, Symbol.toStringTag, { value: "CryptoKey", configurable: true });
+globalThis.CryptoKey = CryptoKey;
+function __sbScKey(type, extractable, algorithm, usages, material, kind) {
+  const key = new CryptoKey(__sbScKeyToken);
+  // The order workerd reports them in Object.keys().
+  key.usages = usages;
+  key.algorithm = algorithm;
+  key.extractable = extractable;
+  key.type = type;
+  Object.defineProperty(key, "__sbM", { value: material, enumerable: false });
+  Object.defineProperty(key, "__sbK", { value: kind, enumerable: false });
+  return key;
+}
+function __sbScIsKey(key) {
+  return key != null && __sbIsObj(key) && key.__sbK !== undefined;
+}
+function __sbScCheckKey(key, method, n) {
+  if (!__sbScIsKey(key)) throw new TypeError("Failed to execute '" + method + "' on 'SubtleCrypto': parameter " + n + " is not of type 'CryptoKey'.");
+}
+function __sbScCheckUse(key, usage, algName) {
+  if (algName !== undefined && key.algorithm.name !== algName)
+    throw __sbScErr("InvalidAccessError", 'Requested algorithm "' + algName + '" does not match this CryptoKey\'s algorithm "' + key.algorithm.name + '".');
+  if (key.usages.indexOf(usage) < 0) throw __sbScErr("InvalidAccessError", 'Requested key usage "' + usage + '" does not match any usage listed in this CryptoKey.');
+}
+
+// The parameters of an algorithm that carries more than its name, checked once.
+function __sbScAlgo(algorithm) {
+  const name = __sbScName(algorithm);
+  const a = { name };
+  if (name === "HMAC") {
+    a.hashBits = __sbScHashBits(algorithm.hash);
+    if (algorithm.length !== undefined) a.length = Number(algorithm.length);
+  } else if (name === "RSASSA-PKCS1-v1_5" || name === "RSA-PSS" || name === "RSA-OAEP") {
+    a.hashBits = __sbScHashBits(algorithm.hash);
+    a.modulusLength = algorithm.modulusLength;
+    a.publicExponent = algorithm.publicExponent;
+  } else if (name === "AES-GCM" || name === "AES-CBC" || name === "AES-CTR" || name === "AES-KW") {
+    if (algorithm.length !== undefined) a.length = Number(algorithm.length);
+  } else if (name === "ECDSA" || name === "ECDH") {
+    // Import and generateKey need the curve; deriveBits and sign get it from the key.
+    if (algorithm.namedCurve !== undefined) a.curve = __sbScCurve(String(algorithm.namedCurve));
+  } else if (name === "PBKDF2" || name === "HKDF") {
+    if (algorithm.hash !== undefined) a.hashBits = __sbScHashBits(algorithm.hash);
+  }
+  return a;
+}
+
+function __sbScHmacKey(bytes, a, extractable, usages) {
+  const length = a.length !== undefined && a.length > 0 ? a.length : bytes.length * 8;
+  return __sbScKey("secret", extractable, { name: "HMAC", hash: { name: __sbScHashName(a.hashBits) }, length }, usages, bytes, "hmac");
+}
+function __sbScRsaKey(der, type, a, extractable, usages) {
+  const parts = __sbScUnframe(__sbScCall(type === "private" ? __SBC_DECODE_PKCS8 : __SBC_DECODE_SPKI, "", der, "", ""));
+  if (parts.kind !== __SBC_K_RSA) throw __sbScErr("DataError", "The key is not an RSA key.");
+  const exponent = new Uint8Array(parts.list[1].length);
+  for (let i = 0; i < exponent.length; i++) exponent[i] = parts.list[1].charCodeAt(i);
+  const algorithm = { name: a.name, modulusLength: __sbScBitLength(parts.list[0]), publicExponent: exponent, hash: { name: __sbScHashName(a.hashBits) } };
+  return __sbScKey(type, extractable, algorithm, usages, der, "rsa");
+}
+function __sbScEcKey(der, type, a, extractable, usages, curve) {
+  return __sbScKey(type, extractable, { name: a.name, namedCurve: __sbScCurveName(curve) }, usages, der, "ec");
+}
+function __sbScEdKey(der, type, a, extractable, usages) {
+  const algorithm = a.name === "NODE-ED25519" ? { name: "NODE-ED25519", namedCurve: "NODE-ED25519" } : { name: a.name };
+  return __sbScKey(type, extractable, algorithm, usages, der, "ed");
+}
+// The usages a key of this algorithm may have: [public, private].
+function __sbScAllowed(name) {
+  if (name === "RSA-OAEP") return [["encrypt", "wrapKey"], ["decrypt", "unwrapKey"]];
+  if (name === "ECDH" || name === "X25519") return [[], ["deriveKey", "deriveBits"]];
+  return [["verify"], ["sign"]];
+}
+function __sbScJwkCheck(jwk, what, extractable) {
+  if (jwk == null || !__sbIsObj(jwk)) throw new TypeError("Failed to execute 'importKey' on 'SubtleCrypto': parameter 2 is not of type 'JsonWebKey'.");
+  if (jwk.ext === false && extractable) throw __sbScErr("DataError", 'JWK ext field for "' + what + '" is set to false but extractable is true');
+}
+function __sbScRsaAlg(a) {
+  if (a.name === "RSA-OAEP") return a.hashBits === "1" ? "RSA-OAEP" : "RSA-OAEP-" + a.hashBits;
+  const prefix = a.name === "RSA-PSS" ? "PS" : "RS";
+  return prefix + (a.hashBits === "1" ? "1" : a.hashBits);
+}
+
+function __sbScImportHmac(format, keyData, a, extractable, usages) {
+  let bytes;
+  if (format === "raw") bytes = __sbScBytes(keyData, "importKey", 2);
+  else if (format === "jwk") {
+    __sbScJwkCheck(keyData, "HMAC", extractable);
+    if (keyData.kty !== "oct")
+      throw __sbScErr("DataError", 'HMAC "jwk" key import requires a JSON Web Key with Key Type parameter ("kty") equal to "oct" (encountered "' + keyData.kty + '").');
+    bytes = __sbScFromB64u(keyData.k, 'HMAC "jwk" key import');
+    if (keyData.alg !== undefined) {
+      const expected = a.hashBits === "1" ? "HS1" : "HS" + a.hashBits;
+      if (keyData.alg !== expected)
+        throw __sbScErr("DataError", 'HMAC "jwk" key import specifies "alg" that is incompatible with the hash name (encountered "' + keyData.alg + '", expected "' + expected + '").');
+    }
+  } else throw __sbScErr("NotSupportedError", 'Unrecognized key import format "' + format + '".');
+  const list = __sbScUsages(usages, ["sign", "verify"], "import", "secret HMAC");
+  __sbScNeedUsages(list);
+  if (bytes.length === 0 && (a.length === undefined || a.length === 0))
+    throw __sbScErr("DataError", "Imported HMAC key length (0) must be a non-zero value up to 7 bits less than, and no greater than, the bit length of the raw key data (0).");
+  if (a.length !== undefined) {
+    const bits = bytes.length * 8;
+    if (a.length === 0 || a.length > bits || a.length <= bits - 8)
+      throw __sbScErr("DataError", "Imported HMAC key length (" + a.length + ") must be a non-zero value up to 7 bits less than, and no greater than, the bit length of the raw key data (" + bits + ").");
+  }
+  return __sbScHmacKey(bytes, a, extractable, list);
+}
+
+function __sbScImportKdf(format, keyData, a, extractable, usages) {
+  if (format !== "raw") throw __sbScErr("NotSupportedError", a.name + " keys can only be imported in raw format");
+  if (extractable) throw __sbScErr("SyntaxError", a.name + " key cannot be extractable.");
+  const bytes = __sbScBytes(keyData, "importKey", 2);
+  const list = __sbScUsages(usages, ["deriveKey", "deriveBits"], "import", "secret " + a.name);
+  __sbScNeedUsages(list);
+  return __sbScKey("secret", false, { name: a.name }, list, bytes, "kdf");
+}
+
+function __sbScImportRsa(format, keyData, a, extractable, usages) {
+  if (format === "spki") {
+    const der = __sbScBytes(keyData, "importKey", 2);
+    const list = __sbScUsages(usages, __sbScAllowed(a.name)[0], "import", "public " + a.name);
+    try {
+      __sbScUnframe(__sbScCall(__SBC_DECODE_SPKI, "", der, "", ""));
+    } catch (e) {
+      throw __sbScErr("DataError", "Invalid SPKI input.");
+    }
+    return __sbScRsaKey(der, "public", a, extractable, list);
+  }
+  if (format === "pkcs8") {
+    const der = __sbScBytes(keyData, "importKey", 2);
+    const list = __sbScUsages(usages, __sbScAllowed(a.name)[1], "import", "private " + a.name);
+    __sbScNeedUsages(list);
+    try {
+      __sbScUnframe(__sbScCall(__SBC_DECODE_PKCS8, "", der, "", ""));
+    } catch (e) {
+      throw __sbScErr("DataError", "Invalid PKCS8 input.");
+    }
+    return __sbScRsaKey(der, "private", a, extractable, list);
+  }
+  if (format !== "jwk") throw __sbScErr("NotSupportedError", 'Unrecognized key import format "' + format + '".');
+  __sbScJwkCheck(keyData, a.name, extractable);
+  if (keyData.kty !== "RSA") throw __sbScErr("DataError", 'Invalid key type in JWK for ' + a.name + ' (expected "RSA", got "' + keyData.kty + '").');
+  if (keyData.alg !== undefined && keyData.alg !== __sbScRsaAlg(a))
+    throw __sbScErr("DataError", 'JWK "alg" does not match the requested algorithm (encountered "' + keyData.alg + '", expected "' + __sbScRsaAlg(a) + '").');
+  const n = __sbScFromB64u(keyData.n, "RSA JWK n");
+  const e = __sbScFromB64u(keyData.e, "RSA JWK e");
+  if (keyData.d !== undefined) {
+    const list = __sbScUsages(usages, __sbScAllowed(a.name)[1], "import", "private " + a.name);
+    __sbScNeedUsages(list);
+    const fields = [n, e, __sbScFromB64u(keyData.d, "RSA JWK d")];
+    const names = ["p", "q", "dp", "dq", "qi"];
+    for (let i = 0; i < names.length; i++) {
+      if (keyData[names[i]] === undefined) throw __sbScErr("DataError", "RSA JWK private keys must include p, q, dp, dq and qi.");
+      fields.push(__sbScFromB64u(keyData[names[i]], "RSA JWK " + names[i]));
+    }
+    const der = __sbScCall(__SBC_ENCODE_PKCS8, "1,0", __sbScFrame(fields), "", "");
+    return __sbScRsaKey(der, "private", a, extractable, list);
+  }
+  const list = __sbScUsages(usages, __sbScAllowed(a.name)[0], "import", "public " + a.name);
+  const der = __sbScCall(__SBC_ENCODE_SPKI, "1,0", __sbScFrame([n, e]), "", "");
+  return __sbScRsaKey(der, "public", a, extractable, list);
+}
+
+function __sbScImportEc(format, keyData, a, extractable, usages) {
+  const curve = a.curve;
+  if (curve === undefined) throw new TypeError('Missing field "namedCurve" in "algorithm".');
+  const size = __sbScCurveSize(curve);
+  const pointOk = (point) => __sbScCall(__SBC_POINT_OK, String(curve), point, "", "").charCodeAt(0) === 1;
+  if (format === "raw") {
+    const point = __sbScBytes(keyData, "importKey", 2);
+    const list = __sbScUsages(usages, __sbScAllowed(a.name)[0], "import", "public " + a.name);
+    if (!pointOk(point)) throw __sbScErr("DataError", "Invalid raw EC key.");
+    const der = __sbScCall(__SBC_ENCODE_SPKI, "2," + curve, __sbScFrame([point]), "", "");
+    return __sbScEcKey(der, "public", a, extractable, list, curve);
+  }
+  if (format === "spki") {
+    const der = __sbScBytes(keyData, "importKey", 2);
+    const list = __sbScUsages(usages, __sbScAllowed(a.name)[0], "import", "public " + a.name);
+    let parts = null;
+    try {
+      parts = __sbScUnframe(__sbScCall(__SBC_DECODE_SPKI, "", der, "", ""));
+    } catch (e) {
+      throw __sbScErr("DataError", "Invalid SPKI input.");
+    }
+    if (parts.kind !== __SBC_K_EC || parts.curve !== curve || !pointOk(parts.list[0])) throw __sbScErr("DataError", "The key is not a valid " + __sbScCurveName(curve) + " public key.");
+    return __sbScEcKey(der, "public", a, extractable, list, curve);
+  }
+  if (format === "pkcs8") {
+    const der = __sbScBytes(keyData, "importKey", 2);
+    const list = __sbScUsages(usages, __sbScAllowed(a.name)[1], "import", "private " + a.name);
+    __sbScNeedUsages(list);
+    let parts = null;
+    try {
+      parts = __sbScUnframe(__sbScCall(__SBC_DECODE_PKCS8, "", der, "", ""));
+    } catch (e) {
+      throw __sbScErr("DataError", "Invalid PKCS8 input.");
+    }
+    if (parts.kind !== __SBC_K_EC || parts.curve !== curve) throw __sbScErr("DataError", "The key is not a " + __sbScCurveName(curve) + " private key.");
+    return __sbScEcKey(der, "private", a, extractable, list, curve);
+  }
+  if (format !== "jwk") throw __sbScErr("NotSupportedError", 'Unrecognized key import format "' + format + '".');
+  __sbScJwkCheck(keyData, a.name, extractable);
+  if (keyData.kty !== "EC") throw __sbScErr("DataError", 'Invalid key type in JWK for ECDSA (expected "EC", got "' + keyData.kty + '").');
+  if (keyData.crv !== __sbScCurveName(curve)) throw __sbScErr("DataError", 'JWK "crv" does not match the requested curve "' + __sbScCurveName(curve) + '".');
+  const x = __sbScFromB64u(keyData.x, "EC JWK x");
+  const y = __sbScFromB64u(keyData.y, "EC JWK y");
+  if (x.length !== size || y.length !== size) throw __sbScErr("DataError", "EC JWK coordinates have the wrong length.");
+  const point = String.fromCharCode(4) + x + y;
+  if (!pointOk(point)) throw __sbScErr("OperationError", 'Invalid EC key; public key coordinates "x" and "y" are invalid: Point is not on curve..');
+  if (keyData.d !== undefined) {
+    const list = __sbScUsages(usages, __sbScAllowed(a.name)[1], "import", "private " + a.name);
+    __sbScNeedUsages(list);
+    const d = __sbScFromB64u(keyData.d, "EC JWK d");
+    if (d.length !== size) throw __sbScErr("DataError", "EC JWK d has the wrong length.");
+    const der = __sbScCall(__SBC_ENCODE_PKCS8, "2," + curve, __sbScFrame([point, d]), "", "");
+    return __sbScEcKey(der, "private", a, extractable, list, curve);
+  }
+  const list = __sbScUsages(usages, __sbScAllowed(a.name)[0], "import", "public " + a.name);
+  const der = __sbScCall(__SBC_ENCODE_SPKI, "2," + curve, __sbScFrame([point]), "", "");
+  return __sbScEcKey(der, "public", a, extractable, list, curve);
+}
+
+function __sbScImportEd(format, keyData, a, extractable, usages) {
+  if (format === "raw") {
+    const pub = __sbScBytes(keyData, "importKey", 2);
+    const list = __sbScUsages(usages, __sbScAllowed(a.name)[0], "import", "public " + a.name);
+    if (pub.length !== 32) throw __sbScErr("DataError", "Invalid raw Ed25519 key length.");
+    const der = __sbScCall(__SBC_ENCODE_SPKI, (a.name === "X25519" ? "4,0" : "3,0"), __sbScFrame([pub]), "", "");
+    return __sbScEdKey(der, "public", a, extractable, list);
+  }
+  if (format === "spki") {
+    const der = __sbScBytes(keyData, "importKey", 2);
+    const list = __sbScUsages(usages, __sbScAllowed(a.name)[0], "import", "public " + a.name);
+    let parts = null;
+    try {
+      parts = __sbScUnframe(__sbScCall(__SBC_DECODE_SPKI, "", der, "", ""));
+    } catch (e) {
+      throw __sbScErr("DataError", "Invalid SPKI input.");
+    }
+    if (parts.kind !== (a.name === "X25519" ? __SBC_K_X : __SBC_K_ED)) throw __sbScErr("DataError", "The key is not an " + a.name + " key.");
+    return __sbScEdKey(der, "public", a, extractable, list);
+  }
+  if (format === "pkcs8") {
+    const der = __sbScBytes(keyData, "importKey", 2);
+    const list = __sbScUsages(usages, __sbScAllowed(a.name)[1], "import", "private " + a.name);
+    __sbScNeedUsages(list);
+    let parts = null;
+    try {
+      parts = __sbScUnframe(__sbScCall(__SBC_DECODE_PKCS8, "", der, "", ""));
+    } catch (e) {
+      throw __sbScErr("DataError", "Invalid PKCS8 input.");
+    }
+    if (parts.kind !== (a.name === "X25519" ? __SBC_K_X : __SBC_K_ED)) throw __sbScErr("DataError", "The key is not an " + a.name + " key.");
+    return __sbScEdKey(der, "private", a, extractable, list);
+  }
+  if (format !== "jwk") throw __sbScErr("NotSupportedError", 'Unrecognized key import format "' + format + '".');
+  __sbScJwkCheck(keyData, a.name, extractable);
+  if (keyData.kty !== "OKP") throw __sbScErr("DataError", 'Invalid key type in JWK for ' + a.name + ' (expected "OKP", got "' + keyData.kty + '").');
+  const crv = a.name === "X25519" ? "X25519" : "Ed25519";
+  if (keyData.crv !== crv) throw __sbScErr("DataError", 'JWK "crv" must be "' + crv + '".');
+  const x = __sbScFromB64u(keyData.x, "Ed25519 JWK x");
+  if (x.length !== 32) throw __sbScErr("DataError", "Ed25519 JWK x has the wrong length.");
+  if (keyData.d !== undefined) {
+    const list = __sbScUsages(usages, __sbScAllowed(a.name)[1], "import", "private " + a.name);
+    __sbScNeedUsages(list);
+    const d = __sbScFromB64u(keyData.d, "Ed25519 JWK d");
+    if (d.length !== 32) throw __sbScErr("DataError", "Ed25519 JWK d has the wrong length.");
+    const der = __sbScCall(__SBC_ENCODE_PKCS8, (a.name === "X25519" ? "4,0" : "3,0"), __sbScFrame([x, d]), "", "");
+    return __sbScEdKey(der, "private", a, extractable, list);
+  }
+  const list = __sbScUsages(usages, __sbScAllowed(a.name)[0], "import", "public " + a.name);
+  const der = __sbScCall(__SBC_ENCODE_SPKI, (a.name === "X25519" ? "4,0" : "3,0"), __sbScFrame([x]), "", "");
+  return __sbScEdKey(der, "public", a, extractable, list);
+}
+
+function __sbScAesAlg(name, bytes) {
+  return "A" + bytes * 8 + (name === "AES-GCM" ? "GCM" : name === "AES-CBC" ? "CBC" : name === "AES-CTR" ? "CTR" : "KW");
+}
+function __sbScImportAes(format, keyData, a, extractable, usages) {
+  let bytes;
+  if (format === "raw") bytes = __sbScBytes(keyData, "importKey", 2);
+  else if (format === "jwk") {
+    __sbScJwkCheck(keyData, a.name, extractable);
+    if (keyData.kty !== "oct") throw __sbScErr("DataError", a.name + ' "jwk" key import requires a JSON Web Key with Key Type parameter ("kty") equal to "oct" (encountered "' + keyData.kty + '").');
+    bytes = __sbScFromB64u(keyData.k, a.name + ' "jwk" key import');
+    if (keyData.alg !== undefined && bytes.length > 0 && keyData.alg !== __sbScAesAlg(a.name, bytes.length))
+      throw __sbScErr("DataError", "The JWK \"alg\" does not match this AES key (encountered \"" + keyData.alg + "\", expected \"" + __sbScAesAlg(a.name, bytes.length) + "\").");
+  } else throw __sbScErr("NotSupportedError", 'Unrecognized key import format "' + format + '".');
+  if (bytes.length !== 16 && bytes.length !== 24 && bytes.length !== 32)
+    throw __sbScErr("DataError", "Imported AES key length must be 128, 192, or 256 bits but provided " + bytes.length * 8 + ".");
+  const list = __sbScUsages(usages, a.name === "AES-KW" ? ["wrapKey", "unwrapKey"] : ["encrypt", "decrypt", "wrapKey", "unwrapKey"], "import", "secret " + a.name);
+  __sbScNeedUsages(list);
+  return __sbScKey("secret", extractable, { name: a.name, length: bytes.length * 8 }, list, bytes, "aes");
+}
+
+function __sbScImport(format, keyData, algorithm, extractable, usages) {
+  if (format !== "raw" && format !== "pkcs8" && format !== "spki" && format !== "jwk")
+    throw __sbScErr("NotSupportedError", 'Unrecognized key import format "' + format + '".');
+  const a = __sbScAlgo(algorithm);
+  if (a.name === "HMAC") return __sbScImportHmac(format, keyData, a, extractable, usages);
+  if (a.name === "PBKDF2" || a.name === "HKDF") return __sbScImportKdf(format, keyData, a, extractable, usages);
+  if (a.name === "RSASSA-PKCS1-v1_5" || a.name === "RSA-PSS" || a.name === "RSA-OAEP") return __sbScImportRsa(format, keyData, a, extractable, usages);
+  if (a.name === "ECDSA" || a.name === "ECDH") return __sbScImportEc(format, keyData, a, extractable, usages);
+  if (a.name === "Ed25519" || a.name === "NODE-ED25519" || a.name === "X25519") return __sbScImportEd(format, keyData, a, extractable, usages);
+  return __sbScImportAes(format, keyData, a, extractable, usages);
+}
+
+// ---- export ---------------------------------------------------------------------------------
+// workerd writes a JWK with its members in this order, which is the order a wrapped JWK is hashed in.
+const __sbScJwkOrder = ["kty", "use", "key_ops", "alg", "ext", "crv", "x", "y", "d", "n", "e", "p", "q", "dp", "dq", "qi", "oth", "k"];
+function __sbScJwkBase(key, jwk) {
+  jwk.key_ops = key.usages.slice();
+  jwk.ext = key.extractable;
+  const ordered = {};
+  for (let i = 0; i < __sbScJwkOrder.length; i++) {
+    const name = __sbScJwkOrder[i];
+    if (jwk[name] !== undefined) ordered[name] = jwk[name];
+  }
+  return ordered;
+}
+function __sbScExport(format, key) {
+  __sbScCheckKey(key, "exportKey", 2);
+  if (format !== "raw" && format !== "pkcs8" && format !== "spki" && format !== "jwk")
+    throw __sbScErr("NotSupportedError", 'Unrecognized key export format "' + format + '".');
+  const name = key.algorithm.name;
+  if (!key.extractable) throw __sbScErr("InvalidAccessError", "Attempt to export non-extractable " + name + " key.");
+  const kind = key.__sbK;
+  if (kind === "aes") {
+    if (format === "raw") return __sbBufFrom(key.__sbM);
+    if (format === "jwk") return __sbScJwkBase(key, { kty: "oct", k: __sbScB64u(key.__sbM), alg: __sbScAesAlg(name, key.__sbM.length) });
+    throw __sbScErr("InvalidAccessError", 'Cannot export "' + name + '" in "' + format + '" format.');
+  }
+  if (kind === "kdf") throw __sbScErr("InvalidAccessError", "Attempt to export non-extractable " + name + " key.");
+  if (kind === "hmac") {
+    if (format === "raw") return __sbBufFrom(key.__sbM);
+    if (format === "jwk") {
+      const hash = key.algorithm.hash.name;
+      return __sbScJwkBase(key, { kty: "oct", k: __sbScB64u(key.__sbM), alg: hash === "SHA-1" ? "HS1" : "HS" + hash.slice(4) });
+    }
+    throw __sbScErr("InvalidAccessError", 'Cannot export "' + name + '" in "' + format + '" format.');
+  }
+  const isPrivate = key.type === "private";
+  if (format === "raw") {
+    if (kind === "rsa") throw __sbScErr("InvalidAccessError", 'Cannot export "' + name + '" in "raw" format.');
+    if (isPrivate) throw __sbScErr("InvalidAccessError", kind === "ec" ? "Raw export of elliptic curve keys is only allowed for public keys." : "Raw export of Ed25519 keys is only allowed for public keys.");
+    return __sbBufFrom(__sbScUnframe(__sbScCall(__SBC_DECODE_SPKI, "", key.__sbM, "", "")).list[0]);
+  }
+  if (format === "pkcs8") {
+    if (!isPrivate) throw __sbScErr("InvalidAccessError", "Cannot export a public key in \"pkcs8\" format.");
+    return __sbBufFrom(key.__sbM);
+  }
+  if (format === "spki") {
+    if (isPrivate) throw __sbScErr("InvalidAccessError", "Cannot export a private key in \"spki\" format.");
+    return __sbBufFrom(key.__sbM);
+  }
+  const parts = __sbScUnframe(__sbScCall(isPrivate ? __SBC_DECODE_PKCS8 : __SBC_DECODE_SPKI, "", key.__sbM, "", ""));
+  const l = parts.list;
+  if (kind === "rsa") {
+    const jwk = { kty: "RSA", n: __sbScB64u(l[0]), e: __sbScB64u(l[1]) };
+    if (isPrivate) {
+      jwk.d = __sbScB64u(l[2]);
+      jwk.p = __sbScB64u(l[3]);
+      jwk.q = __sbScB64u(l[4]);
+      jwk.dp = __sbScB64u(l[5]);
+      jwk.dq = __sbScB64u(l[6]);
+      jwk.qi = __sbScB64u(l[7]);
+    }
+    const hash = key.algorithm.hash.name;
+    if (name === "RSA-OAEP") jwk.alg = hash === "SHA-1" ? "RSA-OAEP" : "RSA-OAEP-" + hash.slice(4);
+    else jwk.alg = (name === "RSA-PSS" ? "PS" : "RS") + (hash === "SHA-1" ? "1" : hash.slice(4));
+    return __sbScJwkBase(key, jwk);
+  }
+  if (kind === "ec") {
+    const size = __sbScCurveSize(parts.curve);
+    const point = l[0];
+    const jwk = { kty: "EC", crv: __sbScCurveName(parts.curve), x: __sbScB64u(point.slice(1, 1 + size)), y: __sbScB64u(point.slice(1 + size)) };
+    if (isPrivate) jwk.d = __sbScB64u(l[1]);
+    return __sbScJwkBase(key, jwk);
+  }
+  const jwk = { kty: "OKP", crv: name === "X25519" ? "X25519" : "Ed25519", x: __sbScB64u(l[0]) };
+  if (isPrivate) jwk.d = __sbScB64u(l[1]);
+  if (name === "Ed25519") jwk.alg = "EdDSA";
+  return __sbScJwkBase(key, jwk);
+}
+
+// ---- generateKey ----------------------------------------------------------------------------
+function __sbScPair(privateKey, publicKey) {
+  return { publicKey, privateKey };
+}
+function __sbScGenerate(algorithm, extractable, usages) {
+  const a = __sbScAlgo(algorithm);
+  const name = a.name;
+  if (name === "HMAC") {
+    const list = __sbScUsages(usages, ["sign", "verify"], "generate", name);
+    __sbScNeedUsages(list);
+    let length = a.length;
+    if (length === undefined) length = a.hashBits === "384" || a.hashBits === "512" ? 1024 : 512;
+    if (!(length > 0)) throw __sbScErr("OperationError", "HMAC key length must be non-zero.");
+    const bytes = __sbRandomBytes(String(Math.ceil(length / 8)));
+    return __sbScHmacKey(bytes, a, extractable, list);
+  }
+  if (name === "PBKDF2" || name === "HKDF") throw __sbScErr("NotSupportedError", "Key generation is not supported for " + name + ".");
+  if (name === "AES-GCM" || name === "AES-CBC" || name === "AES-CTR" || name === "AES-KW") {
+    const list = __sbScUsages(usages, name === "AES-KW" ? ["wrapKey", "unwrapKey"] : ["encrypt", "decrypt", "wrapKey", "unwrapKey"], "generate", name);
+    __sbScNeedUsages(list);
+    if (a.length !== 128 && a.length !== 192 && a.length !== 256) throw __sbScErr("OperationError", "Generated AES key length must be 128, 192, or 256 bits but requested " + a.length + ".");
+    return __sbScKey("secret", extractable, { name, length: a.length }, list, __sbRandomBytes(String(a.length / 8)), "aes");
+  }
+  // The rest are key pairs: each usage goes to the half that can use it.
+  const allowed = __sbScAllowed(name);
+  const all = __sbScUsages(usages, allowed[0].concat(allowed[1]), "generate", name);
+  const priv = [];
+  const pub = [];
+  for (let i = 0; i < all.length; i++) (allowed[1].indexOf(all[i]) >= 0 ? priv : pub).push(all[i]);
+  if (priv.length === 0) throw __sbScErr("SyntaxError", "Attempt to generate asymmetric keys with no valid private key usages.");
+  if (name === "RSASSA-PKCS1-v1_5" || name === "RSA-PSS" || name === "RSA-OAEP") {
+    const exp = a.publicExponent;
+    if (exp == null || !ArrayBuffer.isView(exp)) throw new TypeError('Missing field "publicExponent" in "algorithm".');
+    let e = 0;
+    for (let i = 0; i < exp.length; i++) e = e * 256 + exp[i];
+    if (e !== 3 && e !== 65537) throw __sbScErr("OperationError", 'The "publicExponent" must be either 3 or 65537, but got ' + e + ".");
+    const bits = Number(a.modulusLength);
+    if (!(bits >= 256)) throw __sbScErr("OperationError", "Invalid modulusLength.");
+    const der = __sbScCall(__SBC_RSA_KEYGEN, bits + "," + e, "", "", "");
+    const parts = __sbScUnframe(__sbScCall(__SBC_DECODE_PKCS8, "", der, "", ""));
+    const spki = __sbScCall(__SBC_ENCODE_SPKI, "1,0", __sbScFrame([parts.list[0], parts.list[1]]), "", "");
+    return __sbScPair(__sbScRsaKey(der, "private", a, extractable, priv), __sbScRsaKey(spki, "public", a, true, pub));
+  }
+  if (name === "ECDSA" || name === "ECDH") {
+    if (a.curve === undefined) throw new TypeError('Missing field "namedCurve" in "algorithm".');
+    const der = __sbScCall(__SBC_EC_KEYGEN, String(a.curve), "", "", "");
+    const parts = __sbScUnframe(__sbScCall(__SBC_DECODE_PKCS8, "", der, "", ""));
+    const spki = __sbScCall(__SBC_ENCODE_SPKI, "2," + a.curve, __sbScFrame([parts.list[0]]), "", "");
+    return __sbScPair(__sbScEcKey(der, "private", a, extractable, priv, a.curve), __sbScEcKey(spki, "public", a, true, pub, a.curve));
+  }
+  const seed = __sbScCall(__SBC_ED_KEYGEN, "", "", "", "");
+  const code = name === "X25519" ? "4,0" : "3,0";
+  const publicOf = name === "X25519" ? __SBC_X_PUB : __SBC_ED_PUB;
+  const der = __sbScCall(__SBC_ENCODE_PKCS8, code, __sbScFrame([__sbScCall(publicOf, "", seed, "", ""), seed]), "", "");
+  const parts = __sbScUnframe(__sbScCall(__SBC_DECODE_PKCS8, "", der, "", ""));
+  const spki = __sbScCall(__SBC_ENCODE_SPKI, code, __sbScFrame([parts.list[0]]), "", "");
+  return __sbScPair(__sbScEdKey(der, "private", a, extractable, priv), __sbScEdKey(spki, "public", a, true, pub));
+}
+
+// ---- sign and verify ------------------------------------------------------------------------
+function __sbScEcdsaHash(algorithm) {
+  if (algorithm.hash === undefined)
+    throw new TypeError('Missing "hash" in AlgorithmIdentifier. (ECDSA requires that the hash algorithm be specified at call time rather than on the key. This differs from other WebCrypto algorithms for historical reasons.)');
+  return __sbScHashBits(algorithm.hash);
+}
+function __sbScSign(algorithm, key, data) {
+  __sbScCheckKey(key, "sign", 2);
+  const name = __sbScName(algorithm);
+  __sbScCheckUse(key, "sign", name);
+  const bytes = __sbScBytes(data, "sign", 3);
+  if (name === "HMAC") {
+    const out = __sbHmacRaw(__sbScHmacBits(key), key.__sbM, bytes);
+    if (!out) throw __sbScErr("OperationError", "HMAC signing failed.");
+    return __sbBufFrom(out);
+  }
+  if (name === "RSASSA-PKCS1-v1_5") return __sbBufFrom(__sbScCall(__SBC_PKCS1_SIGN, __sbScKeyHash(key), key.__sbM, bytes, ""));
+  if (name === "RSA-PSS") return __sbBufFrom(__sbScCall(__SBC_PSS_SIGN, __sbScKeyHash(key) + "," + __sbScSalt(algorithm), key.__sbM, bytes, ""));
+  if (name === "ECDSA") return __sbBufFrom(__sbScCall(__SBC_ECDSA_SIGN, __sbScEcdsaHash(algorithm), key.__sbM, bytes, ""));
+  if (name !== "Ed25519" && name !== "NODE-ED25519") throw __sbScErr("NotSupportedError", "Unrecognized name.");
+  const seed = __sbScUnframe(__sbScCall(__SBC_DECODE_PKCS8, "", key.__sbM, "", "")).list[1];
+  return __sbBufFrom(__sbScCall(__SBC_ED_SIGN, "", seed, bytes, ""));
+}
+function __sbScVerify(algorithm, key, signature, data) {
+  __sbScCheckKey(key, "verify", 2);
+  const name = __sbScName(algorithm);
+  __sbScCheckUse(key, "verify", name);
+  const sig = __sbScBytes(signature, "verify", 3);
+  const bytes = __sbScBytes(data, "verify", 4);
+  if (name === "HMAC") {
+    const mac = __sbHmacRaw(__sbScHmacBits(key), key.__sbM, bytes);
+    return !!mac && __sbEqCt(mac, sig);
+  }
+  let out = "";
+  if (name === "RSASSA-PKCS1-v1_5") out = __sbScCall(__SBC_PKCS1_VERIFY, __sbScKeyHash(key), key.__sbM, sig, bytes);
+  else if (name === "RSA-PSS") out = __sbScCall(__SBC_PSS_VERIFY, __sbScKeyHash(key) + "," + __sbScSalt(algorithm), key.__sbM, sig, bytes);
+  else if (name === "ECDSA") {
+    const parts = __sbScUnframe(__sbScCall(__SBC_DECODE_SPKI, "", key.__sbM, "", ""));
+    out = __sbScCall(__SBC_ECDSA_VERIFY, __sbScEcdsaHash(algorithm) + "," + parts.curve, parts.list[0], sig, bytes);
+  } else {
+    if (name !== "Ed25519" && name !== "NODE-ED25519") throw __sbScErr("NotSupportedError", "Unrecognized name.");
+    const parts = __sbScUnframe(__sbScCall(__SBC_DECODE_SPKI, "", key.__sbM, "", ""));
+    out = __sbScCall(__SBC_ED_VERIFY, "", parts.list[0], sig, bytes);
+  }
+  return out.charCodeAt(0) === 1;
+}
+function __sbScHmacBits(key) {
+  const name = key.algorithm.hash.name;
+  return name === "SHA-1" ? "1" : name.slice(4);
+}
+function __sbScKeyHash(key) {
+  return __sbScHmacBits(key);
+}
+function __sbScSalt(algorithm) {
+  if (algorithm.saltLength === undefined) throw __sbScErr("DataError", "Failed to provide salt for RSA-PSS key operation which requires a salt");
+  const n = Number(algorithm.saltLength);
+  if (!(n >= 0) || n !== Math.floor(n)) throw new TypeError("Invalid saltLength.");
+  return String(n);
+}
+
+// ---- encrypt, decrypt, wrapKey, unwrapKey ----------------------------------------------------
+function __sbScIv(algorithm, size) {
+  const iv = __sbScBytes(algorithm.iv, "encrypt", 1);
+  if (size !== 0 && iv.length !== size) throw __sbScErr("OperationError", "AES-CBC IV must be " + size + " bytes long (provided " + iv.length + " bytes).");
+  return iv;
+}
+// One cipher call. usage is "encrypt" or "wrapKey" (and the decrypt side); bytes is the input.
+function __sbScCipher(decrypt, algorithm, key, bytes, usage, method) {
+  __sbScCheckKey(key, method, 2);
+  const name = __sbScName(algorithm);
+  __sbScCheckUse(key, usage, name);
+  if (name === "AES-GCM") {
+    const tag = algorithm.tagLength === undefined ? 128 : Number(algorithm.tagLength);
+    if (tag !== 32 && tag !== 64 && tag !== 96 && tag !== 104 && tag !== 112 && tag !== 120 && tag !== 128)
+      throw __sbScErr("OperationError", "Invalid AES-GCM tag length " + tag + ".");
+    const iv = __sbScIv(algorithm, 0);
+    if (iv.length === 0) throw __sbScErr("OperationError", "Initialization vector must not be empty.");
+    const aad = algorithm.additionalData === undefined ? "" : __sbScBytes(algorithm.additionalData, method, 1);
+    return __sbScOr(__sbScDecryptFailed, decrypt ? __SBC_GCM_DEC : __SBC_GCM_ENC, String(tag), key.__sbM, iv, __sbScFrame([bytes, aad]));
+  }
+  if (name === "AES-CBC") return __sbScOr(__sbScDecryptFailed, decrypt ? __SBC_CBC_DEC : __SBC_CBC_ENC, "", key.__sbM, __sbScIv(algorithm, 16), bytes);
+  if (name === "AES-CTR") {
+    const counter = __sbScBytes(algorithm.counter, method, 1);
+    if (counter.length !== 16) throw __sbScErr("OperationError", "Counter must be 16 bytes (got " + counter.length + ").");
+    const length = Number(algorithm.length);
+    if (!(length >= 1 && length <= 128)) throw __sbScErr("OperationError", "AES-CTR length must be between 1 and 128 (got " + algorithm.length + ").");
+    return __sbScOr("Counter block values will repeat.", __SBC_CTR, String(length), key.__sbM, counter, bytes);
+  }
+  if (name === "AES-KW") {
+    if (usage !== "wrapKey" && usage !== "unwrapKey") throw __sbScErr("NotSupportedError", "AES-KW only supports wrapKey and unwrapKey.");
+    return __sbScOr("AES-KW key " + (decrypt ? "unwrapping" : "wrapping") + " failed.", decrypt ? __SBC_KW_UNWRAP : __SBC_KW_WRAP, "", key.__sbM, "", bytes);
+  }
+  if (name === "RSA-OAEP") {
+    const label = algorithm.label === undefined ? "" : __sbScBytes(algorithm.label, method, 1);
+    return __sbScOr("RSA-OAEP failed encrypt/decrypt.", decrypt ? __SBC_OAEP_DEC : __SBC_OAEP_ENC, __sbScKeyHash(key), key.__sbM, label, bytes);
+  }
+  throw __sbScErr("NotSupportedError", "Unrecognized name.");
+}
+function __sbScWrap(format, key, wrappingKey, wrapAlgorithm) {
+  __sbScCheckKey(key, "wrapKey", 2);
+  __sbScCheckKey(wrappingKey, "wrapKey", 3);
+  const exported = __sbScExport(format, key);
+  const bytes = format === "jwk" ? __sbToBytes(new TextEncoder().encode(JSON.stringify(exported))) : __sbToBytes(new Uint8Array(exported));
+  return __sbBufFrom(__sbScCipher(false, wrapAlgorithm, wrappingKey, bytes, "wrapKey", "wrapKey"));
+}
+function __sbScUnwrap(format, wrapped, unwrappingKey, unwrapAlgorithm, keyAlgorithm, extractable, usages) {
+  const bytes = __sbScBytes(wrapped, "unwrapKey", 2);
+  const plain = __sbScCipher(true, unwrapAlgorithm, unwrappingKey, bytes, "unwrapKey", "unwrapKey");
+  let data;
+  if (format === "jwk") {
+    try {
+      data = JSON.parse(__sbFromUtf8(plain));
+    } catch (e) {
+      throw __sbScErr("DataError", "The unwrapped key is not valid JSON.");
+    }
+  } else data = __sbBufFrom(plain);
+  return __sbScImport(format, data, keyAlgorithm, extractable, usages);
+}
+
+// ---- deriveBits and deriveKey ---------------------------------------------------------------
+function __sbScDeriveBits(algorithm, baseKey, length, usage) {
+  __sbScCheckKey(baseKey, usage === "deriveKey" ? "deriveKey" : "deriveBits", 2);
+  const name = __sbScName(algorithm);
+  __sbScCheckUse(baseKey, usage, name);
+  const a = __sbScAlgo(algorithm);
+  if (name === "PBKDF2") {
+    if (a.hashBits === undefined) throw new TypeError('Missing field "hash" in "algorithm".');
+    const salt = __sbScBytes(algorithm.salt, "deriveBits", 1);
+    const iterations = Number(algorithm.iterations);
+    if (!(iterations > 0)) throw __sbScErr("OperationError", "PBKDF2 requires a positive iteration count (requested " + iterations + ").");
+    if (length === null || length === undefined) throw __sbScErr("OperationError", "PBKDF2 cannot derive a key with null length.");
+    if (length % 8 !== 0) throw __sbScErr("OperationError", "PBKDF2 requires a derived key length that is a multiple of eight (requested " + length + ").");
+    return __sbScCall(__SBC_PBKDF2, a.hashBits + "," + iterations + "," + length / 8, baseKey.__sbM, salt, "");
+  }
+  if (name === "HKDF") {
+    if (a.hashBits === undefined) throw new TypeError('Missing field "hash" in "algorithm".');
+    const salt = __sbScBytes(algorithm.salt, "deriveBits", 1);
+    const info = __sbScBytes(algorithm.info, "deriveBits", 1);
+    if (length === null || length === undefined) throw __sbScErr("OperationError", "HKDF cannot derive a key with null length.");
+    if (length % 8 !== 0) throw __sbScErr("OperationError", "HKDF requires a derived key length that is a multiple of eight (requested " + length + ").");
+    try {
+      return __sbScCall(__SBC_HKDF, a.hashBits + "," + length / 8, baseKey.__sbM, salt, info);
+    } catch (e) {
+      throw __sbScErr("OperationError", "HKDF deriveBits failed.");
+    }
+  }
+  if (name === "ECDH" || name === "X25519") {
+    const peer = algorithm.public;
+    if (!__sbScIsKey(peer) || peer.type !== "public" || peer.algorithm.name !== name)
+      throw __sbScErr("InvalidAccessError", "The public key must be an " + name + " public key.");
+    let secret = "";
+    if (name === "ECDH") {
+      const mine = __sbScUnframe(__sbScCall(__SBC_DECODE_PKCS8, "", baseKey.__sbM, "", ""));
+      const theirs = __sbScUnframe(__sbScCall(__SBC_DECODE_SPKI, "", peer.__sbM, "", ""));
+      if (theirs.curve !== mine.curve) throw __sbScErr("InvalidAccessError", "The public key is on a different curve.");
+      secret = __sbScCall(__SBC_ECDH, String(mine.curve), baseKey.__sbM, theirs.list[0], "");
+    } else {
+      const mine = __sbScUnframe(__sbScCall(__SBC_DECODE_PKCS8, "", baseKey.__sbM, "", ""));
+      const theirs = __sbScUnframe(__sbScCall(__SBC_DECODE_SPKI, "", peer.__sbM, "", ""));
+      secret = __sbScCall(__SBC_X25519, "", mine.list[1], theirs.list[0], "");
+    }
+    if (length === null || length === undefined) return secret;
+    if (length > secret.length * 8) throw __sbScErr("OperationError", "Derived key length (" + length + " bits) is too long (should be at most " + secret.length * 8 + " bits).");
+    const whole = Math.ceil(length / 8);
+    let out = secret.slice(0, whole);
+    if (length % 8 !== 0 && whole > 0) out = out.slice(0, whole - 1) + String.fromCharCode(out.charCodeAt(whole - 1) & (0xff << (8 - (length % 8))));
+    return out;
+  }
+  throw __sbScErr("NotSupportedError", "Unrecognized name.");
+}
+// The length in bits a derived key of this type needs.
+function __sbScKeyLength(type) {
+  const a = __sbScAlgo(type);
+  if (a.name === "HMAC") return a.length !== undefined ? a.length : a.hashBits === "384" || a.hashBits === "512" ? 1024 : 512;
+  if (a.name === "AES-GCM" || a.name === "AES-CBC" || a.name === "AES-CTR" || a.name === "AES-KW") {
+    if (a.length !== 128 && a.length !== 192 && a.length !== 256) throw __sbScErr("OperationError", "Generated AES key length must be 128, 192, or 256 bits but requested " + a.length + ".");
+    return a.length;
+  }
+  throw __sbScErr("NotSupportedError", "Unrecognized name.");
+}
+
+const __sbSubtleNext = {
+  timingSafeEqual(a, b) {
+    const x = __sbScBytes(a, "timingSafeEqual", 1);
+    const y = __sbScBytes(b, "timingSafeEqual", 2);
+    if (x.length !== y.length) throw new TypeError("Input buffers must have the same byte length.");
+    return __sbEqCt(x, y);
+  },
+  async digest(algorithm, data) {
+    const bits = __sbHashBits(algorithm);
+    if (!bits) throw __sbScErr("NotSupportedError", "Unrecognized or unimplemented digest algorithm requested.");
+    const out = __sbDigestRaw(bits, __sbScBytes(data, "digest", 2));
+    if (!out) throw __sbScErr("OperationError", "Digest failed.");
+    return __sbBufFrom(out);
+  },
+  async importKey(format, keyData, algorithm, extractable, usages) {
+    return __sbScImport(format, keyData, algorithm, !!extractable, usages);
+  },
+  async exportKey(format, key) {
+    return __sbScExport(format, key);
+  },
+  async generateKey(algorithm, extractable, usages) {
+    return __sbScGenerate(algorithm, !!extractable, usages);
+  },
+  async sign(algorithm, key, data) {
+    return __sbScSign(algorithm, key, data);
+  },
+  async verify(algorithm, key, signature, data) {
+    return __sbScVerify(algorithm, key, signature, data);
+  },
+  async deriveBits(algorithm, baseKey, length) {
+    return __sbBufFrom(__sbScDeriveBits(algorithm, baseKey, length, "deriveBits"));
+  },
+  async encrypt(algorithm, key, data) {
+    return __sbBufFrom(__sbScCipher(false, algorithm, key, __sbScBytes(data, "encrypt", 3), "encrypt", "encrypt"));
+  },
+  async decrypt(algorithm, key, data) {
+    return __sbBufFrom(__sbScCipher(true, algorithm, key, __sbScBytes(data, "decrypt", 3), "decrypt", "decrypt"));
+  },
+  async wrapKey(format, key, wrappingKey, wrapAlgorithm) {
+    return __sbScWrap(format, key, wrappingKey, wrapAlgorithm);
+  },
+  async unwrapKey(format, wrappedKey, unwrappingKey, unwrapAlgorithm, unwrappedKeyAlgorithm, extractable, usages) {
+    return __sbScUnwrap(format, wrappedKey, unwrappingKey, unwrapAlgorithm, unwrappedKeyAlgorithm, !!extractable, usages);
+  },
+  async deriveKey(algorithm, baseKey, derivedKeyType, extractable, usages) {
+    const bits = __sbScKeyLength(derivedKeyType);
+    const raw = __sbScDeriveBits(algorithm, baseKey, bits, "deriveKey");
+    return __sbScImport("raw", __sbBufFrom(raw), derivedKeyType, !!extractable, usages);
+  },
+};
+
+// One crypto.subtle, two implementations: the date picks per call, so an app built before
+// __SB_SUBTLE_DATE sees what it always saw. 
+function __sbScLater(name) {
+  return Promise.reject(__sbScErr("NotSupportedError", "crypto.subtle." + name + " is not supported."));
+}
+class SubtleCrypto {}
+Object.defineProperty(SubtleCrypto.prototype, Symbol.toStringTag, { value: "SubtleCrypto", configurable: true });
+globalThis.SubtleCrypto = SubtleCrypto;
+if (globalThis.crypto.subtle === __sbSubtleLegacy) {
+  globalThis.crypto.subtle = Object.assign(new SubtleCrypto(), {
+    digest(algo, data) {
+      return __sbSubtleOn() ? __sbSubtleNext.digest(algo, data) : __sbSubtleLegacy.digest(algo, data);
+    },
+    importKey(format, keyData, algo, extractable, usages) {
+      return __sbSubtleOn() ? __sbSubtleNext.importKey(format, keyData, algo, extractable, usages) : __sbSubtleLegacy.importKey(format, keyData, algo, extractable, usages);
+    },
+    exportKey(format, key) {
+      return __sbSubtleOn() ? __sbSubtleNext.exportKey(format, key) : __sbSubtleLegacy.exportKey(format, key);
+    },
+    generateKey(algo, extractable, usages) {
+      return __sbSubtleOn() ? __sbSubtleNext.generateKey(algo, extractable, usages) : __sbSubtleLegacy.generateKey(algo, extractable, usages);
+    },
+    sign(algo, key, data) {
+      return __sbSubtleOn() ? __sbSubtleNext.sign(algo, key, data) : __sbSubtleLegacy.sign(algo, key, data);
+    },
+    verify(algo, key, signature, data) {
+      return __sbSubtleOn() ? __sbSubtleNext.verify(algo, key, signature, data) : __sbSubtleLegacy.verify(algo, key, signature, data);
+    },
+    deriveBits(algo, baseKey, length) {
+      return __sbSubtleOn() ? __sbSubtleNext.deriveBits(algo, baseKey, length) : __sbSubtleLegacy.deriveBits(algo, baseKey, length);
+    },
+    deriveKey(algo, baseKey, derivedKeyType, extractable, usages) {
+      return __sbSubtleOn() ? __sbSubtleNext.deriveKey(algo, baseKey, derivedKeyType, extractable, usages) : __sbScLater("deriveKey");
+    },
+    encrypt(algo, key, data) {
+      return __sbSubtleOn() ? __sbSubtleNext.encrypt(algo, key, data) : __sbScLater("encrypt");
+    },
+    decrypt(algo, key, data) {
+      return __sbSubtleOn() ? __sbSubtleNext.decrypt(algo, key, data) : __sbScLater("decrypt");
+    },
+    wrapKey(format, key, wrappingKey, wrapAlgo) {
+      return __sbSubtleOn() ? __sbSubtleNext.wrapKey(format, key, wrappingKey, wrapAlgo) : __sbScLater("wrapKey");
+    },
+    unwrapKey(format, wrapped, unwrappingKey, unwrapAlgo, keyAlgo, extractable, usages) {
+      return __sbSubtleOn() ? __sbSubtleNext.unwrapKey(format, wrapped, unwrappingKey, unwrapAlgo, keyAlgo, extractable, usages) : __sbScLater("unwrapKey");
+    },
+    timingSafeEqual(a, b) {
+      return __sbSubtleOn() ? __sbSubtleNext.timingSafeEqual(a, b) : __sbSubtleLegacy.timingSafeEqual(a, b);
+    },
+  });
+}
+
+// crypto.DigestStream, as workerd has it: a WritableStream whose .digest promise resolves to the
+// hash of everything written. From __SB_SUBTLE_DATE only (the property reads as undefined before).
+// The chunks are gathered and hashed once at close: the hash functions have no incremental
+// entry from JavaScript, so memory is the size of the stream.
+class DigestStream extends globalThis.WritableStream {
+  constructor(algorithm) {
+    const bits = __sbHashBits(algorithm);
+    if (!bits) throw __sbScErr("NotSupportedError", "Unrecognized or unimplemented digest algorithm requested.");
+    const chunks = [];
+    let settle = null;
+    let fail = null;
+    const digest = new Promise((resolve, reject) => {
+      settle = resolve;
+      fail = reject;
+    });
+    super({
+      write(chunk) {
+        chunks.push(__sbScBytes(chunk, "write", 1));
+      },
+      close() {
+        const out = __sbDigestRaw(bits, chunks.join(""));
+        if (!out) fail(__sbScErr("OperationError", "Digest failed."));
+        else settle(__sbBufFrom(out));
+      },
+      abort(reason) {
+        fail(reason);
+      },
+    });
+    this.digest = digest;
+  }
+}
+Object.defineProperty(globalThis.crypto, "DigestStream", {
+  get() {
+    return __sbSubtleOn() ? DigestStream : undefined;
+  },
+  configurable: true,
+});
+// SUBTLE-JS:END
 
 // #153 — scrypt verification, for migrating password hashes made elsewhere
 // (Node/Bun `scrypt`, N/r/p). Not on WebCrypto; deliberately verify-only, so it

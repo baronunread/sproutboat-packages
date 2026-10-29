@@ -1098,3 +1098,10 @@ globalThis.__sbAssetsGet = function (path) {
   reply.body = __sbTakeBin();
   return reply;
 };
+
+// crypto.subtle's native half (RSA, ECDSA, Ed25519, key encodings) needs BearSSL and Monocypher, which
+// the embedded transport links (standalone binaries and sproutd). Here it answers "" and the prelude
+// reports NotSupportedError.
+function __sbSubtleRaw(_op, _a, _b, _c, _d) {
+  return "";
+}
