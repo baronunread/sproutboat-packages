@@ -3738,6 +3738,40 @@ if (globalThis.crypto.getRandomValues == null) {
   };
 }
 
+// DOMException. Porffor's own global is a stub that reports typeof "function" but cannot be
+// constructed (`new DOMException("m", "AbortError")` throws "not a constructor"), so the runtime
+// installs a real one: legacy codes, the named constants, the options form with `cause`, and
+// instanceof Error, as in workerd. AbortSignal reasons, the stream polyfill and WebCrypto errors
+// use it, so a library can test `error instanceof DOMException` and `error.name`.
+const __sbDomCodes = {
+  IndexSizeError: 1, HierarchyRequestError: 3, WrongDocumentError: 4, InvalidCharacterError: 5,
+  NoModificationAllowedError: 7, NotFoundError: 8, NotSupportedError: 9, InUseAttributeError: 10,
+  InvalidStateError: 11, SyntaxError: 12, InvalidModificationError: 13, NamespaceError: 14,
+  InvalidAccessError: 15, TypeMismatchError: 17, SecurityError: 18, NetworkError: 19,
+  AbortError: 20, URLMismatchError: 21, QuotaExceededError: 22, TimeoutError: 23,
+  InvalidNodeTypeError: 24, DataCloneError: 25,
+};
+/* oxlint-disable anti-slop/no-runtime-typeof -- the second argument is a name or an options bag, as in WebIDL */
+class __SbDOMException extends Error {
+  constructor(message = "", options = "Error") {
+    super(message === undefined ? "" : String(message));
+    let name = "Error";
+    if (options !== null && typeof options === "object") {
+      name = options.name === undefined ? "Error" : String(options.name);
+      if ("cause" in options) this.cause = options.cause;
+    } else if (options !== undefined) name = String(options);
+    this.name = name;
+    const code = __sbDomCodes[name];
+    this.code = code === undefined ? 0 : code;
+  }
+}
+for (const key of Object.keys(__sbDomCodes)) {
+  const constant = key.replace(/([a-z])([A-Z])/g, "$1_$2").toUpperCase().replace(/_ERROR$/, "_ERR");
+  __SbDOMException[constant] = __sbDomCodes[key];
+}
+/* oxlint-enable anti-slop/no-runtime-typeof */
+globalThis.DOMException = __SbDOMException;
+
 /* oxlint-disable anti-slop/no-runtime-typeof -- these Web API polyfills branch on JavaScript types
    exactly where their specs do (listener: function or { handleEvent }; structured clone: by value type). */
 // Event, CustomEvent, EventTarget, AbortSignal and AbortController, as workerd has
@@ -3745,11 +3779,7 @@ if (globalThis.crypto.getRandomValues == null) {
 // conformance suite; libraries use AbortController for fetch timeouts and EventTarget
 // for their own events.
 if (typeof globalThis.EventTarget !== "function") {
-  const namedError = (name, message) => {
-    const e = new Error(message);
-    e.name = name;
-    return e;
-  };
+  const namedError = (name, message) => new globalThis.DOMException(message, name);
   class Event {
     constructor(type, init) {
       if (arguments.length === 0) throw new TypeError("Event requires a type");
@@ -4268,9 +4298,7 @@ function __sbHexOrBytes(value) {
 
 // Errors as WebCrypto names them (DOMException names; plain Errors here).
 function __sbCryptoError(name, message) {
-  const e = new Error(message);
-  e.name = name;
-  return e;
+  return new globalThis.DOMException(message, name);
 }
 // An HMAC key as importKey and generateKey return it. MD5 is digest-only, as in workerd.
 function __sbHmacKey(bytes, bits, extractable, usages) {
