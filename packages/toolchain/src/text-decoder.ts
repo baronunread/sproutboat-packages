@@ -5,11 +5,18 @@
  * conformance suite against workerd.
  */
 export const TEXT_DECODER_SOURCE = String.raw`class TextDecoder {
-  // sproutboat: WHATWG UTF-8 decoder
+  // sproutboat: WHATWG UTF-8 decoder, also UTF-16LE/BE and windows-1252
   constructor(label = 'utf-8', options = undefined) {
     const name = String(label).trim().toLowerCase();
-    if (name != 'utf-8' && name != 'utf8' && name != 'unicode-1-1-utf-8') throw new RangeError('TextDecoder: unsupported encoding ' + label);
-    this.encoding = 'utf-8';
+    let encoding = '';
+    if (name == 'utf-8' || name == 'utf8' || name == 'unicode-1-1-utf-8' || name == 'unicode11utf8' || name == 'unicode20utf8' || name == 'x-unicode20utf8') encoding = 'utf-8';
+    else if (name == 'utf-16le' || name == 'utf-16' || name == 'ucs-2' || name == 'unicode' || name == 'csunicode' || name == 'iso-10646-ucs-2' || name == 'unicodefeff') encoding = 'utf-16le';
+    else if (name == 'utf-16be' || name == 'unicodefffe') encoding = 'utf-16be';
+    else if (name == 'windows-1252' || name == 'ascii' || name == 'us-ascii' || name == 'ansi_x3.4-1968' || name == 'cp1252' || name == 'x-cp1252' || name == 'cp819' || name == 'ibm819' || name == 'iso-8859-1' || name == 'iso8859-1' || name == 'iso88591' || name == 'iso_8859-1' || name == 'iso_8859-1:1987' || name == 'iso-ir-100' || name == 'csisolatin1' || name == 'l1' || name == 'latin1') encoding = 'windows-1252';
+    else throw new RangeError('TextDecoder: unsupported encoding ' + label);
+    this.encoding = encoding;
+    this._lead = -1;
+    this._odd = -1;
     this.fatal = !!(options && options.fatal);
     this.ignoreBOM = !!(options && options.ignoreBOM);
     this._pending = [];
@@ -23,6 +30,8 @@ export const TEXT_DECODER_SOURCE = String.raw`class TextDecoder {
     else if (input instanceof ArrayBuffer) view = new Uint8Array(input);
     else if (ArrayBuffer.isView(input)) view = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
     else throw new TypeError('TextDecoder.decode: input must be an ArrayBuffer or a view of one');
+    if (this.encoding == 'windows-1252') return this._decode1252(view);
+    if (this.encoding != 'utf-8') return this._decode16(view, stream);
     let bytes = view;
     if (this._pending.length > 0) {
       bytes = new Uint8Array(this._pending.length + view.length);
@@ -87,6 +96,72 @@ export const TEXT_DECODER_SOURCE = String.raw`class TextDecoder {
       this._started = false;
     }
     return out;
+  }
+
+  _decode1252(view) {
+    const high = [0x20ac, 0x81, 0x201a, 0x192, 0x201e, 0x2026, 0x2020, 0x2021, 0x2c6, 0x2030, 0x160, 0x2039, 0x152, 0x8d, 0x17d, 0x8f, 0x90, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014, 0x2dc, 0x2122, 0x161, 0x203a, 0x153, 0x9d, 0x17e, 0x178];
+    let out = '';
+    for (let i = 0; i < view.length; i++) {
+      const b = view[i];
+      out += String.fromCharCode(b >= 0x80 && b < 0xa0 ? high[b - 0x80] : b);
+    }
+    return out;
+  }
+
+  _decode16(view, stream) {
+    const be = this.encoding == 'utf-16be';
+    let out = '';
+    let at = 0;
+    const n = view.length;
+    while (at < n) {
+      let unit;
+      if (this._odd >= 0) {
+        unit = be ? (this._odd << 8) | view[at] : (view[at] << 8) | this._odd;
+        at++;
+        this._odd = -1;
+      } else {
+        if (at + 1 >= n) { this._odd = view[at]; at++; break; }
+        unit = be ? (view[at] << 8) | view[at + 1] : (view[at + 1] << 8) | view[at];
+        at += 2;
+      }
+      if (this._lead >= 0) {
+        const lead = this._lead;
+        this._lead = -1;
+        if (unit >= 0xdc00 && unit <= 0xdfff) {
+          out += String.fromCharCode(lead, unit);
+          continue;
+        }
+        if (this.fatal) { this._reset16(); throw new TypeError('The encoded data was not valid ' + this.encoding); }
+        out += '\ufffd';
+      }
+      if (unit >= 0xd800 && unit <= 0xdbff) { this._lead = unit; continue; }
+      if (unit >= 0xdc00 && unit <= 0xdfff) {
+        if (this.fatal) { this._reset16(); throw new TypeError('The encoded data was not valid ' + this.encoding); }
+        out += '\ufffd';
+        continue;
+      }
+      if (!this._started) {
+        this._started = true;
+        if (unit == 0xfeff && !this.ignoreBOM) continue;
+      }
+      out += String.fromCharCode(unit);
+    }
+    if (n > 0) this._started = true;
+    if (!stream) {
+      const dangling = this._lead >= 0 || this._odd >= 0;
+      this._reset16();
+      if (dangling) {
+        if (this.fatal) throw new TypeError('The encoded data was not valid ' + this.encoding);
+        out += '\ufffd';
+      }
+    }
+    return out;
+  }
+
+  _reset16() {
+    this._lead = -1;
+    this._odd = -1;
+    this._started = false;
   }
 }
 `;
