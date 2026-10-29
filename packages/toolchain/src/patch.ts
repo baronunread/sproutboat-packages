@@ -28,6 +28,7 @@ import {
 } from "./fetch-classes";
 import * as requestStreaming from "./request-streaming";
 import * as websockets from "./websockets";
+import { patchAsyncContext } from "./async-context";
 import {
   NATIVE_BYTES_LAYOUT,
   NATIVE_BYTES_MARKER,
@@ -2265,6 +2266,7 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchGcFootprint(root);
   await patchPromiseResolveNull(root);
   await patchUnhandledRejections(root);
+  await patchAsyncContext(root);
   await patchReplaceAll(root);
   await patchLocalFunctionTypes(root);
   await patchFunctionSourcesScan(root);

@@ -6,6 +6,7 @@ import { basename, join } from "node:path";
 import { ensurePorffor, PORFFOR_COMMIT_FULL, PorfforToolchainError } from "./index";
 import { PATCH_FINGERPRINT } from "./fingerprint";
 import { NATIVE_BYTES_LAYOUT, NATIVE_BYTES_RENDER_ANCHOR } from "./native-bytes";
+import { ASYNC_CONTEXT_PROMISE_ANCHORS, ASYNC_CONTEXT_RENDER_ANCHORS } from "./async-context";
 
 const temporary: string[] = [];
 afterEach(async () => {
@@ -25,6 +26,8 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "${st}jsval porf_promise_rejected(jsval value) {\n  return porf_promise_settled(value, 2);\n}" +
       "  porf_promise_settle_direct(out_promise, porf_exception, 2);\n" +
       NATIVE_BYTES_RENDER_ANCHOR +
+      // patchAsyncContext's anchors.
+      ASYNC_CONTEXT_RENDER_ANCHORS +
       "// sb_native_utf8_scalar_v1\n" +
       "static void porf_gc_cons_candidate(u32 c);\n" +
       // patchStaticArrayEntries' anchor.
@@ -253,6 +256,7 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "      return;\n" +
       "    }\n" +
       "  }\n" +
+      ASYNC_CONTEXT_PROMISE_ANCHORS +
       "};\n" +
       "export const __Porffor_promise_runJobs = (): void => {\n" +
       "  while (pendingRejections.length > 0) {\n" +
