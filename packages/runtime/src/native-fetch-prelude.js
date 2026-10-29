@@ -8251,7 +8251,19 @@ function __sbDOTransactionStart(cls, id, s, gate, fn) {
 function __sbDOTransactionRun(cls, id, s, gate, fn) {
   const writes = new Map(); // key -> encoded value, or null for a delete
   let rolledBack = false;
+  let committed = false;
   const v3 = __sbDOv3();
+  // From 2026-11-04 workerd refuses a transaction used after txn.rollback() or after its closure
+  // finished; the refusal is a rejection naming the call.
+  const refused = (name) => {
+    if (!v3) return null;
+    if (rolledBack) return new Error("Cannot " + name + "() on rolled back transaction");
+    if (committed)
+      return new Error(
+        "Cannot call " + name + "() on transaction that has already committed: did you move `txn` outside of the closure?",
+      );
+    return null;
+  };
   const getOne = (key) => {
     const k = String(key);
     if (!writes.has(k)) return s.get(k);
@@ -8277,6 +8289,8 @@ function __sbDOTransactionRun(cls, id, s, gate, fn) {
   };
   const txn = {
     get(key) {
+      const no = refused("get");
+      if (no) return Promise.reject(no);
       if (!Array.isArray(key)) return Promise.resolve(getOne(key));
       const out = new Map();
       const asked = v3 ? __sbDOSortedKeys(key) : key;
@@ -8287,6 +8301,8 @@ function __sbDOTransactionRun(cls, id, s, gate, fn) {
       return Promise.resolve(out);
     },
     put(key, value) {
+      const no = refused("put");
+      if (no) return Promise.reject(no);
       try {
         putAny(key, value);
         return Promise.resolve();
@@ -8295,12 +8311,16 @@ function __sbDOTransactionRun(cls, id, s, gate, fn) {
       }
     },
     delete(key) {
+      const no = refused("delete");
+      if (no) return Promise.reject(no);
       if (!Array.isArray(key)) return Promise.resolve(delOne(key));
       let n = 0;
       for (let i = 0; i < key.length; i++) n += delOne(key[i]) ? 1 : 0;
       return Promise.resolve(n);
     },
     list(options) {
+      const no = refused("list");
+      if (no) return Promise.reject(no);
       try {
         const o = __sbDOListLimit(options);
         const merged = s.list({ prefix: o.prefix, start: o.start, startAfter: o.startAfter, end: o.end });
@@ -8325,9 +8345,13 @@ function __sbDOTransactionRun(cls, id, s, gate, fn) {
       rolledBack = true;
     },
     getAlarm() {
+      const no = refused("getAlarm");
+      if (no) return Promise.reject(no);
       return Promise.resolve(s.getAlarm());
     },
     setAlarm(when) {
+      const no = refused("setAlarm");
+      if (no) return Promise.reject(no);
       try {
         return Promise.resolve(s.setAlarm(when));
       } catch (error) {
@@ -8335,6 +8359,8 @@ function __sbDOTransactionRun(cls, id, s, gate, fn) {
       }
     },
     deleteAlarm() {
+      const no = refused("deleteAlarm");
+      if (no) return Promise.reject(no);
       return Promise.resolve(s.deleteAlarm());
     },
   };
@@ -8357,6 +8383,7 @@ function __sbDOTransactionRun(cls, id, s, gate, fn) {
   }
   return Promise.resolve(r).then(
     (v) => {
+      committed = true;
       try {
         if (!rolledBack)
           writes.forEach((value, key) => {
@@ -8369,6 +8396,7 @@ function __sbDOTransactionRun(cls, id, s, gate, fn) {
       return v;
     },
     (error) => {
+      rolledBack = true;
       done();
       throw error;
     },
