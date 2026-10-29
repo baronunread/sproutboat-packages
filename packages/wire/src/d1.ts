@@ -119,6 +119,117 @@ function execLineError(error: Error, line: string): string {
       : undefined;
   return d1Error(failure, own).message.replace(/^D1_ERROR: /, "");
 }
+/** A parameter in SQL text: where it sits, and which bound value it takes. */
+type Placeholder = { start: number; end: number; index: number };
+const placeholderCache = new Map<string, Placeholder[]>();
+const isWordChar = (c: number) =>
+  (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || c === 95 || (c >= 97 && c <= 122) || c > 127;
+/** The position of the `;` that ends the first statement of `sql` (strings, quoted names and comments skipped), or -1. */
+export function firstSemicolon(sql: string): number {
+  for (let i = 0; i < sql.length; i++) {
+    const c = sql.charCodeAt(i);
+    if (c === 59) return i;
+    if (c === 39 || c === 34 || c === 96 || c === 91) {
+      const close = sql.indexOf(c === 91 ? "]" : sql[i]!, i + 1);
+      if (close < 0) return -1;
+      i = close;
+    } else if (c === 45 && sql.charCodeAt(i + 1) === 45) {
+      const nl = sql.indexOf("\n", i);
+      if (nl < 0) return -1;
+      i = nl;
+    } else if (c === 47 && sql.charCodeAt(i + 1) === 42) {
+      const close = sql.indexOf("*/", i + 2);
+      if (close < 0) return -1;
+      i = close + 1;
+    }
+  }
+  return -1;
+}
+function placeholders(sql: string): Placeholder[] {
+  const known = placeholderCache.get(sql);
+  if (known) return known;
+  const found: Placeholder[] = [];
+  const names = new Map<string, number>();
+  let max = 0;
+  for (let i = 0; i < sql.length; i++) {
+    const c = sql.charCodeAt(i);
+    if (c === 39 || c === 34 || c === 96 || c === 91) {
+      const close = sql.indexOf(c === 91 ? "]" : sql[i]!, i + 1);
+      if (close < 0) break;
+      i = close;
+    } else if (c === 45 && sql.charCodeAt(i + 1) === 45) {
+      const nl = sql.indexOf("\n", i);
+      if (nl < 0) break;
+      i = nl;
+    } else if (c === 47 && sql.charCodeAt(i + 1) === 42) {
+      const close = sql.indexOf("*/", i + 2);
+      if (close < 0) break;
+      i = close + 1;
+    } else if (c === 63) {
+      let end = i + 1;
+      while (end < sql.length && sql.charCodeAt(end) >= 48 && sql.charCodeAt(end) <= 57) end++;
+      const index = end > i + 1 ? Number(sql.slice(i + 1, end)) : max + 1;
+      max = Math.max(max, index);
+      found.push({ start: i, end, index });
+      i = end - 1;
+    } else if (c === 58 || c === 64 || c === 36) {
+      let end = i + 1;
+      while (end < sql.length && isWordChar(sql.charCodeAt(end))) end++;
+      if (end > i + 1) {
+        const name = sql.slice(i, end);
+        let index = names.get(name);
+        if (index === undefined) {
+          index = ++max;
+          names.set(name, index);
+        }
+        found.push({ start: i, end, index });
+        i = end - 1;
+      }
+    }
+  }
+  if (placeholderCache.size >= 256) {
+    const oldest = placeholderCache.keys().next();
+    if (!oldest.done) placeholderCache.delete(oldest.value);
+  }
+  placeholderCache.set(sql, found);
+  return found;
+}
+const REAL_PREFIX = "CAST(";
+const REAL_SUFFIX = " AS REAL)";
+/**
+ * workerd binds every JS number (and boolean) as a REAL; bun:sqlite binds a whole number as an INTEGER, and
+ * has no way to say otherwise. Wrap the placeholders that take one: `CAST(?1 AS REAL)` is the same value as
+ * the REAL SQLite would have been given, keeps an index lookup (`WHERE id = CAST(? AS REAL)` still searches
+ * the rowid) and reads `typeof(?)` as real, `7 / 2` as 3.5, and a number stored in a TEXT column as "7.0".
+ * `wraps` are the start offsets of the wrapped placeholders in the new text, to put an error offset back.
+ */
+export function bindReal(sql: string, values: SqlParam[]): { sql: string; wraps: number[] } | undefined {
+  let out: string | undefined;
+  let last = 0;
+  const wraps: number[] = [];
+  for (const p of placeholders(sql)) {
+    const v = values[p.index - 1];
+    if (!Number.isInteger(v)) continue;
+    out = (out ?? "") + sql.slice(last, p.start);
+    wraps.push(out.length);
+    out += REAL_PREFIX + sql.slice(p.start, p.end) + REAL_SUFFIX;
+    last = p.end;
+  }
+  return out === undefined ? undefined : { sql: out + sql.slice(last), wraps };
+}
+/** An error offset in bindReal's text, in the text the caller wrote. */
+function unwrapOffset(text: string, wraps: number[], offset: number): number {
+  let shift = 0;
+  for (const at of wraps) {
+    const start = Buffer.byteLength(text.slice(0, at));
+    if (offset < start) break;
+    shift += Math.min(offset - start, REAL_PREFIX.length);
+    const body = text.indexOf(" AS REAL)", at) - (at + REAL_PREFIX.length);
+    if (offset >= start + REAL_PREFIX.length + body)
+      shift += Math.min(offset - (start + REAL_PREFIX.length + body), REAL_SUFFIX.length);
+  }
+  return offset - shift;
+}
 export type D1Request = { owner: string; key: string; path: string; name: string; msg: Frame };
 
 /** maxOpen > 0 (Durable Object SQL, one file per object): at most that many connections stay
@@ -131,22 +242,79 @@ export function createD1Store(executionMs = 0, capability = "", maxOpen = 0) {
   // and rows come back as arrays with their column names.
   // A read changes nothing: changes() still holds the last write's count, total_changes() does not move.
   const total = (db: Database) => db.query<{ n: number }, []>("SELECT total_changes() AS n").get()?.n ?? 0;
-  const runStrict = (db: Database, sql: string, values: SqlParam[]) => {
+  type Statement = ReturnType<Database["query"]>;
+  // The text after statement's own (a statement bun:sqlite prepared; it ignores what follows): blank when it is
+  // the only one. Unbound, a statement's text is its own source; one with parameters can only be the last.
+  const tailOf = (statement: Statement, text: string) => {
+    const semi = text.indexOf(";");
+    if (semi < 0 || text.slice(semi + 1).trim() === "") return "";
+    let own = text;
+    if (statement.paramsCount === 0) own = statement.toString();
+    else {
+      const end = firstSemicolon(text);
+      if (end >= 0) own = text.slice(0, end + 1);
+    }
+    return text.startsWith(own) ? text.slice(own.length) : "";
+  };
+  const runStrict = (db: Database, sql: string, values: SqlParam[], parity = false) => {
     const started = performance.now();
     const before = total(db);
+    // 2026-11-03: numbers bind as REAL, as in workerd (see bindReal)
+    const real = parity ? bindReal(sql, values) : undefined;
+    const text = real ? real.sql : sql;
+    const fail = (e: Error) => {
+      const at = Number(isSqliteFailure(e) ? e.byteOffset : -1);
+      return d1Error(e, real && at >= 0 ? unwrapOffset(text, real.wraps, at) : undefined);
+    };
     let statement;
     try {
-      statement = db.query<SqliteValue[], SqlParam[]>(sql);
+      statement = db.query<SqliteValue[], SqlParam[]>(text);
     } catch (error) {
-      throw d1Error(error instanceof Error ? error : new Error(String(error)));
+      throw fail(error instanceof Error ? error : new Error(String(error)));
     }
-    if (statement.paramsCount !== values.length)
-      throw new Error("D1_ERROR: Wrong number of parameter bindings for SQL query.");
+    // 2026-11-03: a statement with more behind it runs them all and answers with the last, as workerd
+    // does (one savepoint: all or none), and only the last can take parameters.
+    const rest = parity ? tailOf(statement, text) : "";
+    let multi = false;
+    if (rest.trim() !== "") {
+      multi = true;
+      db.exec("SAVEPOINT sb_d1_multi");
+    }
     let rows: SqliteValue[][];
     try {
+      if (multi) {
+        let more = rest;
+        for (;;) {
+          more = more.trimStart();
+          if (more === "") break;
+          if (statement.paramsCount > 0)
+            throw new Error(
+              "D1_ERROR: When executing multiple SQL statements in a single call, only the last statement can have parameters.",
+            );
+          statement.run();
+          let next;
+          try {
+            next = db.query<SqliteValue[], SqlParam[]>(more);
+          } catch (error) {
+            // bun:sqlite has no statement to give for a tail of comments or semicolons
+            if (error instanceof Error && !isSqliteFailure(error))
+              throw new Error("D1_ERROR: SQL code did not contain a statement.");
+            throw error;
+          }
+          statement = next;
+          more = tailOf(next, more);
+        }
+      }
+      if (statement.paramsCount !== values.length)
+        throw new Error("D1_ERROR: Wrong number of parameter bindings for SQL query.");
       rows = statement.values(...values) ?? [];
+      if (multi) db.exec("RELEASE sb_d1_multi");
     } catch (error) {
-      throw d1Error(error instanceof Error ? error : new Error(String(error)));
+      if (multi) {
+        db.exec("ROLLBACK TO sb_d1_multi");
+        db.exec("RELEASE sb_d1_multi");
+      }
+      throw fail(error instanceof Error ? error : new Error(String(error)));
     }
     const meta = db
       .query<{ changes: number; last_row_id: number }, []>(
@@ -158,7 +326,7 @@ export function createD1Store(executionMs = 0, capability = "", maxOpen = 0) {
       rows: rows.map((row) => row.map((v) => cell(v, true))),
       meta: {
         duration: performance.now() - started,
-        changes: total(db) > before ? (meta?.changes ?? 0) : 0,
+        changes: multi ? total(db) - before : total(db) > before ? (meta?.changes ?? 0) : 0,
         last_row_id: meta?.last_row_id ?? 0,
         rows_read: rows.length,
       },
@@ -243,7 +411,10 @@ export function createD1Store(executionMs = 0, capability = "", maxOpen = 0) {
         // Foreign keys are enforced from compatibility date 2026-10-24, as in D1. The
         // pragma is per connection and a no-op inside a transaction, so set it per call.
         if (msg.op !== "d1.backup") db.exec(strict ? "PRAGMA foreign_keys = ON" : "PRAGMA foreign_keys = OFF");
-        const exec1 = strict ? runStrict : run;
+        const parity = msg.parity === true;
+        const exec1 = strict
+          ? (d: Database, sql: string, values: SqlParam[]) => runStrict(d, sql, values, parity)
+          : run;
         switch (msg.op) {
           case "d1.query":
             return { ok: true, ...exec1(db, str(msg.sql), params(msg.params)) };

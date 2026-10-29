@@ -385,3 +385,92 @@ test("from 2026-11-03: a statement with no statement in it, an empty exec, and P
   const old = fresh("2026-11-02");
   expect(await failure(() => old.exec(""))).toBe("D1_ERROR: No SQL statements detected.");
 });
+
+test("from 2026-11-03: prepare('A; B') runs every statement and answers with the last", async () => {
+  const DB = fresh("2026-11-03");
+  await DB.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, v TEXT UNIQUE)");
+  const r = await DB.prepare("INSERT INTO t (id) VALUES (7); INSERT INTO t (id) VALUES (8)").run();
+  expect([r.meta.changes, r.meta.last_row_id, r.results]).toEqual([2, 8, []]);
+  expect((await DB.prepare("INSERT INTO t (id) VALUES (10); UPDATE t SET name = 'x'").run()).meta.changes).toBe(4);
+  expect((await DB.prepare("SELECT 1 AS a; SELECT 2 AS b").all()).results).toEqual([{ b: 2 }]);
+  expect((await DB.prepare("UPDATE t SET name = 'y'; SELECT id FROM t WHERE id = 10").all()).results).toEqual([
+    { id: 10 },
+  ]);
+  expect(await DB.prepare("SELECT 1; SELECT 2, 3").raw()).toEqual([[2, 3]]);
+  expect(
+    (await DB.prepare("INSERT INTO t (id) VALUES (30); INSERT INTO t (id) VALUES (31); ").run()).meta.changes,
+  ).toBe(2);
+  expect((await DB.prepare("SELECT 1; SELECT ? AS p").bind(5).first()).p).toBe(5);
+  // all or nothing
+  const count = () => DB.prepare("SELECT count(*) AS c FROM t").first("c");
+  const before = await count();
+  expect(await failure(() => DB.prepare("INSERT INTO t (id) VALUES (40); garbage").run())).toBe(
+    'D1_ERROR: near "garbage": syntax error at offset 0: SQLITE_ERROR',
+  );
+  expect(
+    await failure(() =>
+      DB.prepare("INSERT INTO t (id, v) VALUES (41, 'a'); INSERT INTO t (id, v) VALUES (42, 'a')").run(),
+    ),
+  ).toMatch(/^D1_ERROR: UNIQUE constraint failed: t\.v: SQLITE_CONSTRAINT/);
+  expect(await count()).toBe(before);
+  expect(
+    await failure(() => DB.prepare("INSERT INTO t (id) VALUES (?); INSERT INTO t (id) VALUES (?)").bind(50, 51).run()),
+  ).toBe(
+    "D1_ERROR: When executing multiple SQL statements in a single call, only the last statement can have parameters.",
+  );
+  expect(await failure(() => DB.prepare("SELECT 1;;").all())).toBe("D1_ERROR: SQL code did not contain a statement.");
+  expect(await failure(() => DB.prepare("SELECT 1; -- c").all())).toBe(
+    "D1_ERROR: SQL code did not contain a statement.",
+  );
+  expect(await failure(() => DB.prepare("SELECT 1; PRAGMA user_version").all())).toBe(NOT_AUTHORIZED);
+  expect(await failure(() => DB.prepare("SELECT 1; SELECT ? AS p").bind(1, 2).all())).toBe(WRONG_COUNT);
+  expect(await count()).toBe(before);
+  // a trigger body is one statement
+  await DB.prepare("CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET name = 'trig' WHERE id = new.id; END").run();
+  await DB.prepare("INSERT INTO t (id) VALUES (60)").run();
+  expect(await DB.prepare("SELECT name FROM t WHERE id = 60").first("name")).toBe("trig");
+  // before the date only the first statement runs
+  const old = fresh("2026-11-02");
+  await old.exec("CREATE TABLE t (id INTEGER PRIMARY KEY)");
+  expect((await old.prepare("INSERT INTO t (id) VALUES (1); INSERT INTO t (id) VALUES (2)").run()).meta.changes).toBe(
+    1,
+  );
+});
+
+test("from 2026-11-03: every number binds as a REAL, as in workerd", async () => {
+  const DB = fresh("2026-11-03");
+  expect(
+    await DB.prepare("SELECT typeof(?1) AS a, typeof(?2) AS b, typeof(?3) AS c, typeof(?4) AS d, typeof(?5) AS e")
+      .bind(1, 1.5, "1", true, null)
+      .first(),
+  ).toEqual({ a: "real", b: "real", c: "text", d: "real", e: "null" });
+  expect(await DB.prepare("SELECT ? / ? AS d").bind(7, 2).first("d")).toBe(3.5);
+  expect(await DB.prepare("SELECT :a + :a AS d, @b AS b").bind(2, 3).first()).toEqual({ d: 4, b: 3 });
+  await DB.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, n INT, name TEXT)");
+  const r = await DB.prepare("INSERT INTO t (id, n, name) VALUES (?, ?, ?)").bind(70, 7, 7).run();
+  expect([r.meta.changes, r.meta.last_row_id]).toEqual([1, 70]);
+  expect(
+    await DB.prepare("SELECT typeof(id) AS a, typeof(n) AS b, name, typeof(name) AS c FROM t WHERE id = ?")
+      .bind(70)
+      .first(),
+  ).toEqual({
+    a: "integer",
+    b: "integer",
+    name: "7.0",
+    c: "text",
+  });
+  expect(
+    (await DB.prepare("SELECT id FROM t WHERE id IN (?, ?) LIMIT ? OFFSET ?").bind(70, 71, 5, 0).all()).results,
+  ).toEqual([{ id: 70 }]);
+  // a '?' inside a string or a comment is not a parameter
+  expect(await DB.prepare("SELECT '?' AS q, ? AS p -- ?").bind(2).first()).toEqual({ q: "?", p: 2 });
+  // an error's offset counts the SQL as written
+  expect(await failure(() => DB.prepare("SELECT ?, zz FROM t").bind(1).all())).toBe(
+    "D1_ERROR: no such column: zz at offset 10: SQLITE_ERROR",
+  );
+  expect(await failure(() => DB.prepare("SELECT ?, ?, zz FROM t").bind(1, 2).all())).toBe(
+    "D1_ERROR: no such column: zz at offset 13: SQLITE_ERROR",
+  );
+  const old = fresh("2026-11-02");
+  expect(await old.prepare("SELECT typeof(?1) AS a").bind(1).first("a")).toBe("integer");
+});

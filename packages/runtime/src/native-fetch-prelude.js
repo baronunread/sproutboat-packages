@@ -5356,6 +5356,7 @@ function __sbRpcDirect(op, extra) {
 function __sbD1Rpc(op, extra, strict) {
   if (!strict) return __sbRpcDirect(op, extra);
   extra.strict = true;
+  if (__sbD1Parity()) extra.parity = true;
   try {
     return __sbRpcDirect(op, extra);
   } catch (err) {
@@ -5512,8 +5513,12 @@ function __sbD1Check(sql) {
   if (!text) throw __sbD1Fail("D1_ERROR: No SQL statements detected.");
   if (__sbD1IsTransaction(text)) throw __sbD1Fail(__sbD1NoTransactions);
   const first = text.charCodeAt(0);
-  if (((first | 32) === 112 || first === 45 || first === 47 || first === 59) && __sbD1Parity()) return __sbD1CheckPragma(text);
-  return 0;
+  let kind = 0;
+  if (((first | 32) === 112 || first === 45 || first === 47 || first === 59) && __sbD1Parity()) kind = __sbD1CheckPragma(text);
+  // more statements behind the first run too (2026-11-03), each one through the allow-list
+  const semi = text.indexOf(";");
+  if (semi >= 0 && semi < text.length - 1 && __sbD1Parity() && __sbD1LinePragmaDenied(text)) throw __sbD1Fail(__sbD1NotAuthorized);
+  return kind;
 }
 function __sbD1Meta(meta, started) {
   const changes = Number(meta.changes) || 0;
