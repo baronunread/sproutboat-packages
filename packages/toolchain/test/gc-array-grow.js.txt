@@ -1,0 +1,36 @@
+// An array that grew while old leaves its previous entries block behind. That block still holds
+// the pointers it had, to objects that later die, and a collection that scans it (a minor one does
+// when a neighbouring write dirtied its card) marks whatever now lives where they were. Promise's
+// list of pending rejections grows like this when one request rejects more promises than it holds.
+function churn(n) {
+  let t = "";
+  const keep = [];
+  for (let i = 0; i < n; i++) {
+    t = "pad" + i + "-x";
+    if (i % 50 == 0) keep.push([t]);
+  }
+  return keep.length;
+}
+const N = 400;
+const neighbours = [];
+const grown = [];
+for (let i = 0; i < N; i++) {
+  neighbours.push([0, 0, 0, 0]);
+  const a = [];
+  for (let j = 0; j < 5; j++) a.push(0);
+  grown.push(a);
+}
+for (let r = 0; r < 3; r++) churn(2500000); // the arrays and their entries become old
+for (let i = 0; i < N; i++) for (let j = 0; j < 6; j++) grown[i].push(new Promise(() => {})); // past capacity: the old block is left behind
+for (let i = 0; i < N; i++) grown[i].length = 0; // the promises die
+churn(2500000);
+const reused = [];
+for (let i = 0; i < 4000; i++) reused.push([i, i + 1, i + 2, i + 3]); // take the promises' blocks
+for (let r = 0; r < 4; r++) {
+  for (let i = 0; i < N; i++) neighbours[i][0] = { w: i }; // dirties the card the old block is in
+  churn(2500000);
+}
+let bad = 0;
+for (let i = 0; i < 4000; i++) if (reused[i][0] !== i || reused[i][3] !== i + 3) bad++;
+for (let i = 0; i < N; i++) if (neighbours[i][0].w !== i) bad++;
+console.log(bad);

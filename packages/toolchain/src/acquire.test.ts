@@ -32,6 +32,8 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "static void porf_gc_cons_candidate(u32 c);\n" +
       // patchStaticArrayEntries' anchor.
       "  if (entries == body + 16) return porf_gc_static_range(body, 16ull + bytes);\n  return porf_gc_static_range(entries, bytes);\n}\n" +
+      // patchArrayGrowEntries' anchor.
+      "  const u32 ent = porf_alloc((u32)cap << 3, 0);\n  memcpy(MEM + ent, MEM + PORF_ARR_ENT(a), (size_t)copy << 3);\n  memset(MEM + ent + ((u64)copy << 3), 0, ((size_t)cap - (size_t)copy) << 3);\n  PORF_ARR_ENT(a) = ent; PORF_ARR_CAP(a) = cap;\n" +
       // patchIdleTrim's anchor.
       "  const u32 keep_slack = ${prefs.nativeFetch ? '0u' : '16u * 1024u * 1024u'};\n" +
       // Both conservative scanners consume raw f64 values.

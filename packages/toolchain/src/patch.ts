@@ -2045,6 +2045,38 @@ export async function patchStaticArrayEntries(root: string): Promise<void> {
   await writeFile(file, src.replace(STATIC_ARRAY_ENTRIES_OLD, STATIC_ARRAY_ENTRIES_NEW));
 }
 
+// An array that outgrows its capacity copies its entries to a bigger block and leaves the old one
+// where it was. The old block is garbage, but while it is old only a full collection reclaims it,
+// and a minor collection keeps scanning it whenever its 512-byte card is dirty (a write to any
+// neighbouring object dirties it). Its slots still hold the pointers it had, and the objects they
+// name were freed by an earlier minor collection (nothing else referred to them, and the card was
+// clean then), so the scan marks a freed block, by now reused for something else, with the type
+// the stale slot claims. A reused array marked as a Promise is then read as a Promise, and its
+// "reaction chain" is whatever the array holds: SIGBUS in the collector, or silent corruption.
+// Promise's list of pending rejections reaches it as soon as one request rejects more promises
+// than the list has room for. The abandoned block is now classed as a leaf, which no collection scans.
+const ARRAY_GROW_OLD = `  const u32 ent = porf_alloc((u32)cap << 3, 0);
+  memcpy(MEM + ent, MEM + PORF_ARR_ENT(a), (size_t)copy << 3);
+  memset(MEM + ent + ((u64)copy << 3), 0, ((size_t)cap - (size_t)copy) << 3);
+  PORF_ARR_ENT(a) = ent; PORF_ARR_CAP(a) = cap;
+`;
+const ARRAY_GROW_NEW = `  const u32 old_ent = PORF_ARR_ENT(a); /* sproutboat: an abandoned entries block holds no live references */
+  const u32 ent = porf_alloc((u32)cap << 3, 0);
+  memcpy(MEM + ent, MEM + PORF_ARR_ENT(a), (size_t)copy << 3);
+  memset(MEM + ent + ((u64)copy << 3), 0, ((size_t)cap - (size_t)copy) << 3);
+  PORF_ARR_ENT(a) = ent; PORF_ARR_CAP(a) = cap;
+  if (old_ent != a + 16 && porf_gc_is_block_start((i32)old_ent)) porf_gc_set_kind((i32)old_ent, PORF_GC_KIND_LEAF);
+`;
+
+export async function patchArrayGrowEntries(root: string): Promise<void> {
+  const file = resolve(root, "compiler/render.js");
+  const src = await readFile(file, "utf8");
+  if (src.includes(ARRAY_GROW_NEW)) return;
+  if (src.split(ARRAY_GROW_OLD).length !== 2)
+    throw new Error(`could not patch Porffor's array growth: anchor not found in ${file}`);
+  await writeFile(file, src.replace(ARRAY_GROW_OLD, ARRAY_GROW_NEW));
+}
+
 const FETCH_CLASSES_MARKER = "sproutboat: Fetch-spec Request and Response";
 /** Replaces Porffor's Request and Response (fetch-classes.ts); covers patchResponseDefaults. */
 export async function patchFetchClasses(root: string): Promise<void> {
@@ -2258,6 +2290,7 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchRenderJs(root);
   await patchBigIntRoots(root);
   await patchStaticArrayEntries(root);
+  await patchArrayGrowEntries(root);
   await patchStreamingResponses(root);
   await patchQuietCollection(root);
   await patchRequestCollectionInterval(root);
