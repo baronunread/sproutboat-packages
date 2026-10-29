@@ -1,0 +1,6 @@
+---
+"@sproutboat/runtime": minor
+"@sproutboat/wire": minor
+---
+
+Queues parity, from compatibility date 2026-11-05 (earlier dates answer as before). The v8 content type keeps shared and circular references, array holes and invalid dates, and an Error keeps its TypeError or RangeError type (it used to throw "a circular value could not be cloned", copy a shared object, fill holes with undefined and turn an invalid Date into 1970). A message's id, timestamp, body and attempts are read-only, as in workerd. send() and sendBatch() check arguments as workerd does: no arguments, an options argument that is not an object, a sendBatch item that is not an object, `bytes` given an ArrayBuffer (workerd takes an ArrayBufferView), and a delaySeconds outside 0 to 86400, which was clamped or kept. A delivery that never comes back (the worker died or timed out) now counts as a retry: the message is delivered at most max_retries + 1 times, and then goes to the dead letter queue, where it used to be retried up to 5 times and marked dead without reaching it. The consumer announces itself to the broker (`queue.consumer`) so the broker applies this only to apps on the new date. On the embedded transport a consumer that runs past the 30 s lease renews it, so its messages are no longer delivered twice with their acks lost.

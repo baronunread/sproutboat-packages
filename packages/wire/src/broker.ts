@@ -56,6 +56,9 @@ export type Bindings = {
     maxBatchSize?: number;
     maxBatchTimeout?: number;
     maxRetries?: number;
+    retryDelay?: number;
+    /** The queue name of this queue's dead letter queue. */
+    deadLetterQueue?: string;
   }>;
   analytics: string[];
   do: Array<{ binding: string; className: string }>;
@@ -678,6 +681,16 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   const queueStore = (part: string): { store: Database; part: string } =>
     part.startsWith("#") ? { store: db, part } : storeFor("queue", requireQueue(part));
   const queueSettingsOf = (binding: string) => bindings.queueConfig?.find((q) => q.binding === binding);
+  /** Queue bindings whose sprout follows the 2026-11-05 delivery rules (see "queue.consumer"). */
+  const strictQueues = new Set<string>();
+  /** The partition of a queue binding's dead letter queue: its binding when the sprout binds that
+   *  queue, else "#name" (as the sprout computes it), or "" when there is none. */
+  const deadLetterPartOf = (binding: string): string => {
+    const name = queueSettingsOf(binding)?.deadLetterQueue;
+    if (name === undefined) return "";
+    const bound = bindings.queues.find((b) => (queueSettingsOf(b)?.queue ?? b) === name);
+    return bound ?? "#" + name;
+  };
   const requireAe = bound(bindings.analytics, "analytics dataset");
   const rateLimiterNames = bindings.ratelimiters.map((r) => r.binding);
   const requireRateLimiter = bound(rateLimiterNames, "rate limiter");
@@ -1801,6 +1814,12 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
           ? { ok: true, count: msgs.length, metrics: queueBacklog(store, q) }
           : { ok: true, count: msgs.length };
       }
+      case "queue.consumer": {
+        // A sprout from compatibility date 2026-11-05 announces its queue before its handler
+        // runs: from then on a delivery that never comes back counts as a retry.
+        strictQueues.add(requireQueue(msg.queue));
+        return { ok: true };
+      }
       case "queue.metrics": {
         const { store, part: q } = storeFor("queue", requireQueue(msg.queue));
         return { ok: true, metrics: queueBacklog(store, q) };
@@ -2256,11 +2275,44 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       const wait = Math.max(0, Number(settings?.maxBatchTimeout) || 0) * 1000;
       // Deliveries that never came back (the sprout died or timed out each time) stop after
       // 5 attempts, or max_retries + 1 when that is more.
-      const cap = Math.max(QUEUE_MAX_ATTEMPTS, (settings?.maxRetries ?? 3) + 1);
+      const strict = strictQueues.has(binding);
+      const maxRetries = settings?.maxRetries ?? 3;
+      // From 2026-11-05 a lost delivery counts as a retry, so the cap is exactly max_retries + 1
+      // and the message goes to the dead letter queue like any other past it.
+      const cap = strict ? maxRetries + 1 : Math.max(QUEUE_MAX_ATTEMPTS, maxRetries + 1);
+      const deadPart = strict ? deadLetterPartOf(binding) : "";
       const now = Date.now();
       const claim = randomBytes(24).toString("hex");
       const rows = store
         .transaction(() => {
+          const lost = strict
+            ? store
+                .query<{ id: string; body: string; sent_at: number }, [string, number, number]>(
+                  "SELECT id, body, sent_at FROM mq WHERE queue = ? AND dead = 0 AND visible_at <= ? AND attempts >= ?",
+                )
+                .all(part, now, cap)
+            : [];
+          if (lost.length && deadPart) {
+            try {
+              const target = queueStore(deadPart);
+              for (const r of lost) {
+                if (target.store === store)
+                  store
+                    .query(
+                      "UPDATE mq SET queue = ?, visible_at = ?, attempts = 0, claim_token = '', dead = 0 WHERE queue = ? AND id = ?",
+                    )
+                    .run(target.part, now, part, r.id);
+                else {
+                  target.store
+                    .query("INSERT OR IGNORE INTO mq (queue, id, body, visible_at, sent_at) VALUES (?, ?, ?, ?, ?)")
+                    .run(target.part, r.id, r.body, now, r.sent_at);
+                  store.query("DELETE FROM mq WHERE queue = ? AND id = ?").run(part, r.id);
+                }
+              }
+            } catch {
+              // not a queue this broker serves: they are marked dead below, like a queue without one
+            }
+          }
           store
             .query("UPDATE mq SET dead = 1 WHERE queue = ? AND visible_at <= ? AND attempts >= ?")
             .run(part, now, cap);
@@ -2302,6 +2354,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         let dead: string[] = [];
         let deadLetter = "";
         let delays: JsonObject | null = null;
+        let answered = false;
         if (res?.ok) {
           try {
             const parsed = jsonObject(parseJsonValue(await res.text()));
@@ -2314,6 +2367,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
             dead = (parsed && ids(parsed.dead)) ?? [];
             deadLetter = parsed && isString(parsed.deadLetter) ? parsed.deadLetter : "";
             delays = (parsed && jsonObject(parsed.delays ?? null)) ?? null;
+            answered = true;
           } catch {
             ack = [];
             retry = rows.map((r) => r.id);
@@ -2321,6 +2375,17 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
         } else {
           ack = [];
           retry = rows.map((r) => r.id);
+        }
+        if (strict && !answered) {
+          // No usable answer (the sprout timed out, died or sent garbage): from 2026-11-05 that is
+          // a retry like the sprout's own, with the queue's retry delay, and a message on its last
+          // allowed delivery goes to the dead letter queue.
+          const seconds = Math.max(0, Number(settings?.retryDelay) || 0);
+          const last = new Set(rows.filter((r) => r.attempts + 1 > maxRetries).map((r) => r.id));
+          dead = retry.filter((id) => last.has(id));
+          deadLetter = deadPart;
+          delays = Object.fromEntries(retry.filter((id) => !last.has(id)).map((id) => [id, seconds]));
+          retry = retry.filter((id) => !last.has(id));
         }
         if (closed || !dispatchEnabled()) return;
         const retrySet = new Set(retry);
