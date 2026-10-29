@@ -78,6 +78,7 @@ export function assembleSubtleC(): string {
   const alias = INTERNAL_NAMES.map((n) => `#define ${n} sbm_${n}`).join("\n");
   const unalias = INTERNAL_NAMES.map((n) => `#undef ${n}`).join("\n");
   return [
+    "#include <bearssl.h>",
     "// Monocypher 4.0.2 (BSD-2-Clause OR CC0-1.0), Loup Vaillant: vendor/monocypher*.[ch] without comments.",
     alias,
     headers,
@@ -127,25 +128,25 @@ function __sbSubtleRaw(op, a, b, c, d) {
 }
 `;
 
-/** The transport with the generated block (re)written between its markers. */
-export function spliceSubtle(transport: string): string {
-  const start = transport.indexOf(SUBTLE_BEGIN);
-  const end = transport.indexOf(SUBTLE_END);
-  if (start < 0 || end < start) throw new Error("transport-embedded.js has no SUBTLE markers");
+/** The prelude with the generated block (re)written between its markers. */
+export function spliceSubtle(prelude: string): string {
+  const start = prelude.indexOf(SUBTLE_BEGIN);
+  const end = prelude.indexOf(SUBTLE_END);
+  if (start < 0 || end < start) throw new Error("native-fetch-prelude.js has no SUBTLE markers");
   const block = assembleSubtleC();
   if (/`|\$\{/.test(block)) throw new Error("subtle C contains a backtick or ${: it is spliced into a JS template");
   return (
-    transport.slice(0, start) +
+    prelude.slice(0, start) +
     SUBTLE_BEGIN +
     "\n// oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.\nPorffor.c`\n" +
     block +
     "\n`;\n" +
     SUBTLE_RAW +
-    transport.slice(end)
+    prelude.slice(end)
   );
 }
 
 if (import.meta.main) {
-  const path = new URL("../transport-embedded.js", import.meta.url);
+  const path = new URL("../native-fetch-prelude.js", import.meta.url);
   writeFileSync(path, spliceSubtle(readFileSync(path, "utf8")));
 }

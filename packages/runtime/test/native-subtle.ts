@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readdirSync, existsSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { ensurePorffor } from "../../toolchain/src/acquire";
 import { jsonObject, parseJsonValue, type JsonObject, type JsonValue } from "../../wire/src/json";
@@ -54,8 +55,8 @@ export default {
     out.tse = await t(() => [s.timingSafeEqual(raw, raw), s.timingSafeEqual(raw, new Uint8Array(32))]);
     out.tseLength = await t(() => s.timingSafeEqual(raw, new Uint8Array(3)));
     out.isKey = await t(async () => { const k = await s.importKey("raw", raw, hmac, true, ["sign"]); return [k instanceof CryptoKey, Object.keys(k)]; });
-    // The broker transport has no native half: an algorithm that needs it says so, as a DOMException.
-    out.needsNative = await t(() => s.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign"]));
+    // The native half is in the prelude on every transport.
+    out.needsNative = await t(async () => { const k = await s.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]); const sig = await s.sign({ name: "ECDSA", hash: "SHA-256" }, k.privateKey, raw); return await s.verify({ name: "ECDSA", hash: "SHA-256" }, k.publicKey, sig, raw); });
     out.unsupportedCurve = await t(() => s.generateKey({ name: "ECDSA", namedCurve: "secp256k1" }, true, ["sign"]));
     return Response.json(out);
   },
@@ -83,7 +84,7 @@ const expectedNew: JsonObject = {
   tse: [true, false],
   tseLength: "ERR TypeError",
   isKey: [true, ["usages", "algorithm", "extractable", "type"]],
-  needsNative: "ERR NotSupportedError" + dom,
+  needsNative: true,
   unsupportedCurve: "ERR NotSupportedError" + dom,
 };
 // The digests are checked against Bun, not typed in.
@@ -96,6 +97,22 @@ const digests: JsonValue[] = [
   Buffer.from(new Bun.CryptoHasher("md5").update(rawBytes).digest()).toString("hex"),
 ];
 expectedNew.digests = digests;
+
+// The prelude carries the native half on every transport now, so a compile that reaches it needs
+// BearSSL on the include path and link line, as the CLI arranges. Use the CLI cache; skip without it.
+const bearssl = join(process.env.SPROUTBOAT_TOOLCHAIN_CACHE ?? join(homedir(), ".cache/sproutboat"), "bearssl-0.6");
+const objects = join(bearssl, "obj-host");
+if (!existsSync(objects)) {
+  console.log("crypto.subtle native test skipped: no BearSSL in the CLI cache (a standalone build creates it)");
+  process.exit(0);
+}
+const bearsslEnv = {
+  SB_EXTRA_CFLAGS: `-I ${join(bearssl, "bearssl-0.6/inc")}`,
+  SB_EXTRA_LINK: readdirSync(objects)
+    .filter((name) => name.endsWith(".o") && name !== "trust-anchors.o")
+    .map((name) => join(objects, name))
+    .join(" "),
+};
 
 function freePort(): number {
   const listener = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });

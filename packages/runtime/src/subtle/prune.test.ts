@@ -1,15 +1,16 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { preludePath, pruneSubtle, TRANSPORT_MARKER, transportPath, wrapNativeFetchHandler } from "../wrap";
+import { preludePath, pruneSubtle, wrapNativeFetchHandler } from "../wrap";
 
-const embedded = readFileSync(transportPath("embedded"), "utf8");
-const prelude = readFileSync(preludePath, "utf8").replace(TRANSPORT_MARKER, embedded);
+const prelude = readFileSync(preludePath, "utf8");
 const handler = (body: string) => `export default { async fetch() { ${body} return new Response("x"); } };`;
 
 test("pruning removes the workerd-style crypto.subtle, its C and its glue, and nothing else", () => {
   const pruned = pruneSubtle(prelude);
   for (const gone of [
     "__sbSubtleNext",
+    "__sbSubtleLegacy",
+    "SUBTLE:",
     "const __SB_SUBTLE_DATE",
     "sbc_op",
     "crypto_ed25519_sign",
@@ -17,13 +18,7 @@ test("pruning removes the workerd-style crypto.subtle, its C and its glue, and n
     "class DigestStream",
   ])
     expect(pruned).not.toContain(gone);
-  for (const kept of [
-    "__sbSubtleLegacy",
-    "globalThis.crypto.subtle = __sbSubtleLegacy",
-    "br_sha256_init",
-    "__sbHmacRaw",
-  ])
-    expect(pruned).toContain(kept);
+  for (const kept of ["globalThis.crypto.subtle = {", "sb_sha256_block", "__sbHmacRaw"]) expect(pruned).toContain(kept);
   expect(pruned.length).toBeLessThan(prelude.length - 150_000);
   // What is left is still JavaScript.
   new Bun.Transpiler().transformSync(pruned);

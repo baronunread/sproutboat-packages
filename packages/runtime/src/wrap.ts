@@ -206,7 +206,7 @@ export function neutraliseExports(source: string): string | null {
  * Object.freeze in native mode.
  */
 /**
- * What a handler needs of crypto.subtle: `"always"` (the default) leaves the prelude as it is, which
+ * What a handler needs of crypto.subtle: `"always"` (the default for the embedded transport) leaves the prelude as it is, which
  * is what a shared template needs (sproutd compiles apps against one prelude). `"auto"` drops the
  * workerd-style crypto.subtle (its JavaScript, and the BearSSL and Monocypher C behind it) from a
  * handler whose source never mentions `subtle`, `DigestStream` or `CryptoKey`: such a handler cannot
@@ -226,16 +226,14 @@ export function pruneSubtle(prelude: string): string {
   for (const [begin, end] of SUBTLE_BLOCKS) {
     const start = out.indexOf(begin);
     const stop = out.indexOf(end, start);
-    // The broker transport has no native block; only the JavaScript block is required.
     if (start < 0 || stop < 0) {
-      if (begin === "// SUBTLE:BEGIN") continue;
       throw new Error(`the prelude has no ${begin} ... ${end} block to prune`);
     }
     out = out.slice(0, start) + out.slice(out.indexOf("\n", stop) + 1);
   }
   return out;
 }
-const reachesSubtle = (source: string) => /\b(?:subtle|DigestStream|CryptoKey)\b/.test(source);
+export const reachesSubtle = (source: string) => /\b(?:subtle|DigestStream|CryptoKey)\b/.test(source);
 
 export function wrapNativeFetchHandler(
   source: string,
@@ -256,9 +254,12 @@ export function wrapNativeFetchHandler(
    * own self-describing identity rather than a broker round trip.
    */
   versionMetadata?: { binding: string; id: string; tag: string; timestamp: string },
-  subtle: SubtleMode = "always",
+  subtle?: SubtleMode,
 ): string {
-  if (subtle === "auto" && !reachesSubtle(source)) prelude = pruneSubtle(prelude);
+  // The shared template (sproutd) is the embedded transport and needs it all; a broker build links BearSSL only for
+  // a handler that uses crypto.subtle (the CLI does that), so it defaults to pruning.
+  if ((subtle ?? (transport === "embedded" ? "always" : "auto")) === "auto" && !reachesSubtle(source))
+    prelude = pruneSubtle(prelude);
   const neutralised = neutraliseExports(inlineWorkersImports(source));
   // A WorkerEntrypoint may serve only RPC, and a Worker only scheduled() or queue(), with
   // no fetch() at all, as in workerd.
