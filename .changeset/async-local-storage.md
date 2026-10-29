@@ -1,6 +1,0 @@
----
-"@sproutboat/runtime": minor
-"@sproutboat/toolchain": minor
----
-
-`AsyncLocalStorage` (`import { AsyncLocalStorage } from "node:async_hooks"`, once the CLI maps the import), as Workers has it: `run`, `exit`, `getStore` and the static `snapshot`. `enterWith` and `disable` throw, as there. The static `bind` is not provided: Porffor compiles a `.bind(` call on a function value to `Function.prototype.bind`, so use `snapshot()`. The toolchain patches Porffor's job queue and timers to carry one current-context value: a promise reaction (then, await, a coroutine resume, a native response callback) and a timer record it when they are created and set it when they run, so the store follows a request across awaits, microtasks, timers, intervals, async fetch and WebSocket callbacks and `ctx.waitUntil`, and requests interleaved in one process never see each other's. Cost: a reaction is 56 bytes, not 40, and each job does one load. The context is only ever set by `AsyncLocalStorage`. Nothing an existing app observes changes, so there is no new compatibility date: `node:async_hooks` did not work at any date before (the import built and `new AsyncLocalStorage()` threw). New native test `test:native-async-local-storage` (needs `SB_CLI`).
