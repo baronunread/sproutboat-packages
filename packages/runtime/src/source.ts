@@ -30,6 +30,14 @@ const alwaysForbidden: Array<[RegExp, string]> = [
 /** `new WebSocket(url)` connects out from this compatibility date (earlier, only WebSocketPair makes one). */
 export const OUTBOUND_WEBSOCKET_DATE = "2026-11-01";
 
+/**
+ * From this date `cloudflare:sockets` connect() exists, and so does the bundled Buffer and process
+ * stub a database driver brings: the bundler inlines both, so `Buffer.from` and `process.nextTick`
+ * in the output are the bundle's own code, not a host API.
+ */
+export const SOCKETS_DATE = "2026-11-02";
+const driverAllowed = (message: string) => message === "Node, Bun, and Deno APIs are not supported";
+
 export function validateHttpSyncSource(module: string, compatibilityDate?: string): SourceValidation {
   // `cloudflare:workers` is the one import allowed past bundling: the compiler turns it
   // into globals the same way (see inlineWorkersImports).
@@ -48,7 +56,11 @@ export function validateHttpSyncSource(module: string, compatibilityDate?: strin
       "handler must default-export an object with fetch(request), scheduled() or queue(), or a WorkerEntrypoint class",
     );
   }
-  for (const [pattern, message] of alwaysForbidden) if (pattern.test(source)) errors.push(message);
+  const sockets = compatibilityDate !== undefined && compatibilityDate >= SOCKETS_DATE;
+  for (const [pattern, message] of alwaysForbidden) {
+    if (sockets && driverAllowed(message) && !/['"`]node:/.test(source)) continue;
+    if (pattern.test(source)) errors.push(message);
+  }
   if (
     /\bWebSocket\s*\(/.test(source) &&
     !(compatibilityDate !== undefined && compatibilityDate >= OUTBOUND_WEBSOCKET_DATE)

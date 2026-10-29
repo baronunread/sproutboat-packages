@@ -3213,6 +3213,10 @@ typedef struct sb_wsc {
   uint64_t rng;
   char *host, *path, *headers, *protocols;
   int port, tls;
+  // Raw TCP (cloudflare:sockets connect()): no WebSocket framing, bytes both ways.
+  int raw, starttls_req, shutdown_req, want_drain;
+  size_t unsent, window;
+  char sni[256];
 } sb_wsc;
 static pthread_mutex_t sb_wsc_lock = PTHREAD_MUTEX_INITIALIZER;
 static sb_wsc* sb_wscs = 0;
@@ -3300,10 +3304,23 @@ static int sb_wsc_frame(sb_wsc* c, int opcode, const char* data, size_t len, uns
 
 // --- the socket the I/O thread owns: plain, or TLS through BearSSL's engine ---
 typedef struct {
+  const br_x509_class* vtable;
+  br_x509_decoder_context dec;
+  int first;
+} sb_xnv;
+static void sb_xnv_start_chain(const br_x509_class** c, const char* name) { sb_xnv* x = (sb_xnv*)c; (void)name; br_x509_decoder_init(&x->dec, 0, 0); x->first = 1; }
+static void sb_xnv_start_cert(const br_x509_class** c, uint32_t len) { (void)c; (void)len; }
+static void sb_xnv_append(const br_x509_class** c, const unsigned char* b, size_t len) { sb_xnv* x = (sb_xnv*)c; if (x->first) br_x509_decoder_push(&x->dec, b, len); }
+static void sb_xnv_end_cert(const br_x509_class** c) { sb_xnv* x = (sb_xnv*)c; x->first = 0; }
+static unsigned sb_xnv_end_chain(const br_x509_class** c) { sb_xnv* x = (sb_xnv*)c; return br_x509_decoder_last_error(&x->dec); }
+static const br_x509_pkey* sb_xnv_get_pkey(const br_x509_class* const* c, unsigned* usages) { sb_xnv* x = (sb_xnv*)c; if (usages) *usages = BR_KEYTYPE_KEYX | BR_KEYTYPE_SIGN; return br_x509_decoder_get_pkey(&x->dec); }
+static const br_x509_class sb_xnv_vtable = { sizeof(sb_xnv), sb_xnv_start_chain, sb_xnv_start_cert, sb_xnv_append, sb_xnv_end_cert, sb_xnv_end_chain, sb_xnv_get_pkey };
+typedef struct {
   int fd, tls;
   br_ssl_client_context* sc;
   br_x509_minimal_context* xc;
   unsigned char* iobuf;
+  void* xnv;
 } sb_wsio;
 
 static int sb_wsio_wait(int fd, int wakefd, short events, int ms) {
@@ -3408,6 +3425,7 @@ static long sb_wsio_pump(sb_wsc* c, sb_wsio* io, unsigned char* buf, size_t cap,
   }
 }
 
+static int sb_wsio_start_tls(sb_wsio* io, const char* host, char* why, size_t whylen);
 static int sb_wsio_open(sb_wsio* io, const char* host, int port, int tls, char* why, size_t whylen) {
   memset(io, 0, sizeof(*io));
   io->fd = sb_tcp_connect(host, port, why, whylen);
@@ -3418,12 +3436,25 @@ static int sb_wsio_open(sb_wsio* io, const char* host, int port, int tls, char* 
   fcntl(io->fd, F_SETFL, fcntl(io->fd, F_GETFL) | O_NONBLOCK);
   io->tls = tls;
   if (!tls) return 0;
+  return sb_wsio_start_tls(io, host, why, whylen);
+}
+// Starts TLS on an open fd (connect with secureTransport "on", or startTls()).
+static int sb_wsio_start_tls(sb_wsio* io, const char* host, char* why, size_t whylen) {
+  io->tls = 1;
   io->sc = (br_ssl_client_context*)malloc(sizeof(br_ssl_client_context));
   io->xc = (br_x509_minimal_context*)malloc(sizeof(br_x509_minimal_context));
   io->iobuf = (unsigned char*)malloc(BR_SSL_BUFSIZE_BIDI);
   if (!io->sc || !io->xc || !io->iobuf) { snprintf(why, whylen, "out of memory setting up TLS for %s", host); return -1; }
   sb_init_anchors();
   br_ssl_client_init_full(io->sc, io->xc, sb_all_anchors, sb_all_anchor_count);
+  // SPIKE ONLY: SB_TCP_TLS_INSECURE=1 accepts any certificate (a local database with a self-signed cert).
+  if (getenv("SB_TCP_TLS_INSECURE")) {
+    sb_xnv* xnv = (sb_xnv*)calloc(1, sizeof(sb_xnv));
+    if (!xnv) { snprintf(why, whylen, "out of memory setting up TLS for %s", host); return -1; }
+    io->xnv = xnv;
+    xnv->vtable = &sb_xnv_vtable;
+    br_ssl_engine_set_x509(&io->sc->eng, &xnv->vtable);
+  }
   br_ssl_engine_set_buffer(&io->sc->eng, io->iobuf, BR_SSL_BUFSIZE_BIDI, 1);
   char bare[256];
   size_t hl = strlen(host);
@@ -3434,7 +3465,7 @@ static int sb_wsio_open(sb_wsio* io, const char* host, int port, int tls, char* 
 }
 static void sb_wsio_close(sb_wsio* io) {
   if (io->fd >= 0) close(io->fd);
-  free(io->sc); free(io->xc); free(io->iobuf);
+  free(io->sc); free(io->xc); free(io->iobuf); free(io->xnv);
   memset(io, 0, sizeof(*io));
   io->fd = -1;
 }
@@ -3671,6 +3702,91 @@ finish:
   return 0;
 }
 
+// Raw TCP: the thread for connect(). Events: 1 data, 3 error (reason in data), 4 connected (plain),
+// 6 end of input, 8 send queue drained (after a write left more than the high-water mark queued),
+// 9 TLS handshake finished.
+#define SB_TCP_READ_WINDOW (256u << 10)
+static void* sb_tcp_thread(void* arg) {
+  sb_wsc* c = (sb_wsc*)arg;
+  sb_wsio io;
+  memset(&io, 0, sizeof(io));
+  io.fd = -1;
+  char why[512] = "";
+  unsigned char buf[16384];
+  unsigned char* wq = 0; size_t wq_len = 0, wq_cap = 0;
+  int tls_waiting = 0, eof = 0, shut = 0;
+  if (sb_wsio_open(&io, c->host, c->port, c->tls, why, sizeof(why)) != 0) { sb_wsc_push(c, 3, 0, why, strlen(why)); goto finish; }
+  if (c->tls) tls_waiting = 1; else sb_wsc_push(c, 4, 0, "", 0);
+  for (;;) {
+    pthread_mutex_lock(&c->lock);
+    int rel = c->released;
+    size_t window = c->unacked;
+    int st = c->starttls_req; c->starttls_req = 0;
+    int sh = c->shutdown_req;
+    char sni[256]; memcpy(sni, c->sni, sizeof(sni));
+    if (c->outq_len) {
+      if (wq_len + c->outq_len > wq_cap) {
+        size_t cap = wq_cap ? wq_cap : 4096;
+        while (cap < wq_len + c->outq_len) cap *= 2;
+        unsigned char* grown = (unsigned char*)realloc(wq, cap);
+        if (grown) { wq = grown; wq_cap = cap; }
+      }
+      if (wq_len + c->outq_len <= wq_cap) { memcpy(wq + wq_len, c->outq, c->outq_len); wq_len += c->outq_len; c->outq_len = 0; }
+    }
+    c->unsent = wq_len;
+    pthread_mutex_unlock(&c->lock);
+    if (rel) {
+      if (wq_len) sb_wsio_pump(c, &io, buf, sizeof(buf), wq, &wq_len, 0, 0);
+      goto finish;
+    }
+    if (st && !io.tls) {
+      if (wq_len) sb_wsio_pump(c, &io, buf, sizeof(buf), wq, &wq_len, 0, 0);
+      if (sb_wsio_start_tls(&io, sni[0] ? sni : c->host, why, sizeof(why)) != 0) { sb_wsc_push(c, 3, 0, why, strlen(why)); goto finish; }
+      tls_waiting = 1;
+    }
+    long n = sb_wsio_pump(c, &io, buf, sizeof(buf), wq, &wq_len, !eof && window < SB_TCP_READ_WINDOW, tls_waiting ? 20 : -1);
+    if (tls_waiting && io.tls && (br_ssl_engine_current_state(&io.sc->eng) & (BR_SSL_SENDAPP | BR_SSL_RECVAPP))) {
+      tls_waiting = 0;
+      sb_wsc_push(c, 9, 0, "", 0);
+    }
+    if (n == -2) continue;
+    if (n < 0) {
+      int err = io.tls ? br_ssl_engine_last_error(&io.sc->eng) : 0;
+      if (err != 0 && err != BR_ERR_IO) { snprintf(why, sizeof(why), "TLS error %d", err); sb_wsc_push(c, 3, 0, why, strlen(why)); goto finish; }
+      if (tls_waiting) { snprintf(why, sizeof(why), "connection closed during the TLS handshake"); sb_wsc_push(c, 3, 0, why, strlen(why)); goto finish; }
+      if (!eof) { eof = 1; sb_wsc_push(c, 6, 0, "", 0); }
+      // keep serving writes until released; with no reader the pump just waits for the wake pipe
+      n = 0;
+    }
+    if (n == 0) sb_wsc_drain_wake(c);
+    else sb_wsc_push(c, 1, 0, (const char*)buf, (size_t)n);
+    if (sh && wq_len == 0 && !shut) {
+      shut = 1;
+      if (io.tls) br_ssl_engine_close(&io.sc->eng); else shutdown(io.fd, SHUT_WR);
+    }
+    int drained = 0;
+    pthread_mutex_lock(&c->lock);
+    c->unsent = wq_len;
+    if (c->want_drain && c->outq_len + wq_len == 0) { c->want_drain = 0; drained = 1; }
+    pthread_mutex_unlock(&c->lock);
+    if (drained) sb_wsc_push(c, 8, 0, "", 0);
+  }
+finish:
+  sb_wsio_close(&io);
+  free(wq);
+  pthread_mutex_lock(&c->lock);
+  c->finished = 1;
+  int rel2 = c->released;
+  pthread_mutex_unlock(&c->lock);
+  if (rel2) {
+    pthread_mutex_lock(&sb_wsc_lock);
+    for (sb_wsc** at = &sb_wscs; *at; at = &(*at)->next) if (*at == c) { *at = c->next; break; }
+    pthread_mutex_unlock(&sb_wsc_lock);
+    sb_wsc_free(c);
+  }
+  return 0;
+}
+
 static sb_wsc* sb_wsc_find(unsigned id) {
   pthread_mutex_lock(&sb_wsc_lock);
   sb_wsc* c = sb_wscs;
@@ -3699,6 +3815,52 @@ static void sb_wsc_drain(void) {
 
 // The JS side's ops. data is borrowed for the call.
 static long long sb_wsc_op(int op, unsigned id, const char* data, size_t len, size_t n, char* out, size_t cap) {
+  if (op == 'T') {
+    // data: host \n port \n mode (0 off, 1 on, 2 starttls) \n servername
+    sb_wsc* c = (sb_wsc*)calloc(1, sizeof(sb_wsc));
+    if (!c) return 0;
+    char* copy = (char*)malloc(len + 1);
+    if (!copy) { free(c); return 0; }
+    memcpy(copy, data, len); copy[len] = 0;
+    char* parts[4]; char* cur = copy;
+    for (int i = 0; i < 4; i++) {
+      parts[i] = cur;
+      char* nl = strchr(cur, '\n');
+      if (nl) { *nl = 0; cur = nl + 1; } else cur += strlen(cur);
+    }
+    c->raw = 1; c->window = SB_TCP_READ_WINDOW;
+    c->host = strdup(parts[0]); c->port = atoi(parts[1]); c->tls = atoi(parts[2]) == 1;
+    snprintf(c->sni, sizeof(c->sni), "%s", parts[3]);
+    c->path = strdup(""); c->protocols = strdup(""); c->headers = strdup("");
+    free(copy);
+    if (!c->host || !c->path || !c->protocols || !c->headers || pipe(c->wake) != 0) { free(c->host); free(c->path); free(c->protocols); free(c->headers); free(c); return 0; }
+    for (int k = 0; k < 2; k++) { fcntl(c->wake[k], F_SETFD, FD_CLOEXEC); fcntl(c->wake[k], F_SETFL, fcntl(c->wake[k], F_GETFL) | O_NONBLOCK); }
+    pthread_mutex_init(&c->lock, 0);
+    pthread_mutex_lock(&sb_wsc_lock);
+    int live = 0;
+    for (sb_wsc* k = sb_wscs; k; k = k->next) live++;
+    if (live >= SB_WSC_MAX) { pthread_mutex_unlock(&sb_wsc_lock); sb_wsc_free(c); return 0; }
+    sb_wsc_next = (sb_wsc_next + 1) & 0x7fffffffu;
+    if (!sb_wsc_next) sb_wsc_next = 1;
+    c->id = sb_wsc_next | SB_WSC_BIT;
+    c->next = sb_wscs; sb_wscs = c;
+    pthread_mutex_unlock(&sb_wsc_lock);
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&attr, 512 * 1024);
+    pthread_t thread;
+    int failed = pthread_create(&thread, &attr, sb_tcp_thread, c);
+    pthread_attr_destroy(&attr);
+    if (failed) {
+      pthread_mutex_lock(&sb_wsc_lock);
+      for (sb_wsc** at = &sb_wscs; *at; at = &(*at)->next) if (*at == c) { *at = c->next; break; }
+      pthread_mutex_unlock(&sb_wsc_lock);
+      sb_wsc_free(c);
+      return 0;
+    }
+    return (long long)c->id;
+  }
   if (op == 'u') {
     // data: host \n port \n tls(0|1) \n path \n protocols \n header lines (to the end)
     sb_wsc* c = (sb_wsc*)calloc(1, sizeof(sb_wsc));
@@ -3748,7 +3910,40 @@ static long long sb_wsc_op(int op, unsigned id, const char* data, size_t len, si
   sb_wsc* c = sb_wsc_find(id);
   if (!c) return op == 'p' || op == 'k' || op == 'w' || op == 'r' ? 0 : -1;
   switch (op) {
-    case 't': case 'b': return sb_wsc_frame(c, op == 't' ? 1 : 2, data, len, 0, 0);
+    case 'b': if (c->raw) {
+      // raw bytes: queue them, say how many are still unsent, and ask for a drain event past the mark
+      pthread_mutex_lock(&c->lock);
+      size_t need = c->outq_len + len;
+      if (need > c->outq_cap) {
+        size_t cap = c->outq_cap ? c->outq_cap : 4096;
+        while (cap < need) cap *= 2;
+        unsigned char* grown = (unsigned char*)realloc(c->outq, cap);
+        if (!grown) { pthread_mutex_unlock(&c->lock); return -1; }
+        c->outq = grown; c->outq_cap = cap;
+      }
+      memcpy(c->outq + c->outq_len, data, len);
+      c->outq_len += len;
+      size_t queued = c->outq_len + c->unsent;
+      if (queued > (256u << 10)) c->want_drain = 1;
+      pthread_mutex_unlock(&c->lock);
+      sb_wsc_wake_thread(c);
+      return (long long)queued;
+    }
+    /* fall through */
+    case 't': return sb_wsc_frame(c, op == 't' ? 1 : 2, data, len, 0, 0);
+    case 'S':
+      pthread_mutex_lock(&c->lock);
+      snprintf(c->sni, sizeof(c->sni), "%.*s", (int)(len < sizeof(c->sni) - 1 ? len : sizeof(c->sni) - 1), data ? data : "");
+      c->starttls_req = 1;
+      pthread_mutex_unlock(&c->lock);
+      sb_wsc_wake_thread(c);
+      return 0;
+    case 'H':
+      pthread_mutex_lock(&c->lock);
+      c->shutdown_req = 1;
+      pthread_mutex_unlock(&c->lock);
+      sb_wsc_wake_thread(c);
+      return 0;
     case 'c': {
       pthread_mutex_lock(&c->lock);
       int already = c->close_queued;

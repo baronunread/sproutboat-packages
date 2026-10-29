@@ -137,6 +137,20 @@ function hasBindings(b: Bindings): boolean {
  * leaves the specifier external for this.
  */
 export function inlineWorkersImports(source: string): string {
+  // `cloudflare:sockets` (compatibility date 2026-11-02): connect() lives on a prelude global.
+  // postgres/cf loads it lazily: `await import("cloudflare:sockets")`.
+  source = source.replace(/\bimport\(\s*["']cloudflare:sockets["']\s*\)/g, "Promise.resolve(globalThis.__sbSockets)");
+  source = source.replace(
+    /^import\s*\{([^}]*)\}\s*from\s*["']cloudflare:sockets["'];?[ \t]*$/gm,
+    (_match, names: string) => {
+      const pairs = names
+        .split(",")
+        .map((part) => part.trim())
+        .filter(Boolean)
+        .map((part) => part.replace(/^(\S+)\s+as\s+(\S+)$/, "$1: $2"));
+      return `const { ${pairs.join(", ")} } = globalThis.__sbSockets;`;
+    },
+  );
   return source.replace(
     /^import\s*\{([^}]*)\}\s*from\s*["']cloudflare:workers["'];?[ \t]*$/gm,
     (_match, names: string) => {

@@ -17,6 +17,10 @@ import {
   patchStreamingResponses,
   patchAsyncWaker,
   patchSplitGlobals,
+  patchMacroNames,
+  patchTypedArrayShadow,
+  patchCallArgOrder,
+  patchNavigatorWritable,
   patchGlobalThisSync,
   patchBlobClass,
   patchFetchClasses,
@@ -868,4 +872,64 @@ test("globalThis patch rewrites only changed bindings on access, idempotently", 
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+// One idempotent, anchor-checked edit of a Porffor source file, as the patches above are tested.
+async function expectPatch(
+  patch: (root: string) => Promise<void>,
+  file: string,
+  anchor: string,
+  expected: string,
+): Promise<void> {
+  const root = await mkdtemp(join(tmpdir(), "sb-patch-"));
+  try {
+    await mkdir(join(root, "compiler"));
+    const path = join(root, file);
+    await writeFile(path, `// before\n${anchor}// after\n`);
+    await patch(root);
+    const patched = await readFile(path, "utf8");
+    expect(patched).toContain(expected);
+    await patch(root);
+    expect(await readFile(path, "utf8")).toBe(patched);
+    await writeFile(path, "export const x = 1;\n");
+    await expect(patch(root)).rejects.toThrow("anchor not found");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+test("patchMacroNames prefixes all-caps bindings so libc macros cannot rewrite them", async () => {
+  await expectPatch(
+    patchMacroNames,
+    "compiler/render.js",
+    "  while (cReservedNames.has(out) || sanitizeUsed.has(out)) out = '_' + out;\n",
+    "if (/^[A-Z][A-Z0-9_]+$/.test(out)) out = 'js_' + out;",
+  );
+});
+
+test("patchTypedArrayShadow lets a typed array with an underlying object shadow builtin methods", async () => {
+  await expectPatch(
+    patchTypedArrayShadow,
+    "compiler/codegen.js",
+    "        const call = owner === 'RegExp' && shadowable ? shadowed : () => generate(scope, builtinCallNode);\n",
+    "(owner === 'RegExp' || owner === 'TypedArray') && shadowable",
+  );
+});
+
+test("patchCallArgOrder copies earlier arguments before a later one that assigns", async () => {
+  await expectPatch(
+    patchCallArgOrder,
+    "compiler/codegen.js",
+    "const generateCall = (scope, decl) => {\n",
+    "if (!decl._argsOrdered && !globalThis.precompile && decl.arguments.length > 1) {",
+  );
+});
+
+test("patchNavigatorWritable makes navigator.userAgent assignable", async () => {
+  await expectPatch(
+    patchNavigatorWritable,
+    "compiler/builtins.js",
+    "      writable: false,\n      enumerable: true,\n      configurable: false\n    }, {\n      userAgent: 'x'\n",
+    "writable: true, // sproutboat: navigator is writable",
+  );
 });
