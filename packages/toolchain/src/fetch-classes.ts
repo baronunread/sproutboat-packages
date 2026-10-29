@@ -311,6 +311,10 @@ export const RESPONSE_CLASS_SOURCE = String.raw`class Response {
   }
 
   get statusText() { return this._statusText ?? ''; }
+  // '' for a Response you construct, as in the Fetch standard; a fetch() result sets the address it came from.
+  get url() { return this._url ?? ''; }
+  set url(value) { this._url = value; }
+  get redirected() { return false; }
   get type() { return this._type ?? 'default'; }
   get ok() { return this.status >= 200 && this.status < 300; }
   // null when there is none, as in workerd; before 2026-10-30 (no WebSocketPair) undefined.
@@ -405,6 +409,15 @@ export const BLOB_CLASS_SOURCE = String.raw`class Blob {
   arrayBuffer() { return Promise.resolve(this._bytes.slice().buffer); }
   bytes() { return Promise.resolve(this._bytes.slice()); }
   text() { return Promise.resolve(new TextDecoder().decode(this._bytes)); }
+  stream() {
+    const bytes = this._bytes.slice();
+    return new ReadableStream({
+      start(controller) {
+        if (bytes.length > 0) controller.enqueue(bytes);
+        controller.close();
+      },
+    });
+  }
 }
 
 class File extends Blob {
