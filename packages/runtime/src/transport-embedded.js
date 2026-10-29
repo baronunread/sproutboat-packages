@@ -5863,7 +5863,9 @@ async function __sbAlarmPass() {
     try {
       const instance = __sbGetDOInstance(cls, id);
       if (__sbIsFn(instance.alarm)) {
-        const res = __sbDOGated() ? __sbDOEnter(instance.__sbGate, () => instance.alarm()) : instance.alarm();
+        const res = __sbDOGated()
+          ? __sbDOEnter(instance.__sbGate, () => __sbDOAlarmCall(instance, cls, id, due.rows[i][2], null))
+          : __sbDOAlarmCall(instance, cls, id, due.rows[i][2], null);
         if (res && __sbIsFn(res.then)) await res;
         if (instance.__sbTasks.length) await __sbDrainWaitUntil(instance.__sbTasks);
       }
