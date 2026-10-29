@@ -1,0 +1,164 @@
+diff --git a/src/bundle.ts b/src/bundle.ts
+index d801252..bb02b5c 100644
+--- a/src/bundle.ts
++++ b/src/bundle.ts
+@@ -54,6 +54,42 @@ const nodeShimsPlugin: import("bun").BunPlugin = {
+   },
+ };
+ 
++/** What a driver reads off `process`: an empty environment and a microtask for nextTick. */
++const PROCESS_STUB = `
++const env = {};
++function nextTick(fn, ...args) { Promise.resolve().then(() => fn(...args)); }
++const process = { env, platform: "linux", arch: "wasm32", version: "v20.0.0", versions: {}, argv: [], browser: true, nextTick, emitWarning() {}, cwd() { return "/"; }, stderr: { write() {} }, stdout: { write() {} }, on() {}, off() {}, once() {}, emit() {} };
++export default process;
++`;
++
++/**
++ * Node libraries use `Buffer` and `process` as free globals. Bun's browser target does not
++ * inject them for a CommonJS file, so a dependency that never imports Buffer would throw a
++ * ReferenceError at runtime. This gives every dependency file that uses one a local binding to the
++ * bundled implementation (the `buffer` package, which Porffor compiles; see the toolchain notes on
++ * typed array method dispatch). Applied only to node_modules, never to the handler's own code.
++ */
++const nodeGlobalsPlugin: import("bun").BunPlugin = {
++  name: "sproutboat-node-globals",
++  setup(build) {
++    build.onResolve({ filter: /^sb-node-process$/ }, () => ({ path: "sb-node-process", namespace: "sb-node-global" }));
++    build.onLoad({ filter: /.*/, namespace: "sb-node-global" }, () => ({ contents: PROCESS_STUB, loader: "js" }));
++    build.onLoad({ filter: /node_modules\/.*\.(?:c?js|mjs)$/ }, async (args) => {
++      const text = await Bun.file(args.path).text();
++      const usesBuffer = /(?:^|[^.\w$])Buffer\s*[.(]/m.test(text) && !/\b(?:import|require)\b[^;\n]*\bBuffer\b/.test(text) && !/(?:const|let|var)\s+\{?\s*Buffer\b/.test(text);
++      const usesProcess = /(?:^|[^.\w$])process\s*\./m.test(text) && !/\b(?:import|require)\b[^;\n]*\bprocess\b/.test(text) && !/(?:const|let|var|function)\s+\{?\s*process\b/.test(text);
++      const usesGlobal = /(?:^|[^.\w$])global\s*\./m.test(text) && !/(?:const|let|var|function)\s+\{?\s*global\b/.test(text);
++      if (!usesBuffer && !usesProcess && !usesGlobal) return undefined;
++      const esm = /^\s*(?:import|export)\s/m.test(text);
++      let prefix = "";
++      if (usesBuffer) prefix += esm ? `import { Buffer } from "buffer";\n` : `var { Buffer } = require("buffer");\n`;
++      if (usesProcess) prefix += esm ? `import process from "sb-node-process";\n` : `var process = require("sb-node-process").default;\n`;
++      if (usesGlobal) prefix += "var global = globalThis;\n";
++      return { contents: prefix + text, loader: "js" };
++    });
++  },
++};
++
+ /** Bun reports resolution failures on `AggregateError.errors`; its own message is just "Bundle failed". */
+ function bundleDetail(cause: unknown): string {
+   const errors = cause instanceof AggregateError ? cause.errors : [];
+@@ -78,10 +114,11 @@ export async function bundleHandler(entryPath: string, projectDir: string): Prom
+       minify: false,
+       splitting: false,
+       sourcemap: "none",
+-      plugins: [nodeShimsPlugin],
++      conditions: process.env.SB_SPIKE_CONDITIONS ? process.env.SB_SPIKE_CONDITIONS.split(",") : undefined,
++      plugins: process.env.SB_SPIKE_CONDITIONS ? [nodeShimsPlugin, nodeGlobalsPlugin] : [nodeShimsPlugin],
+       // WorkerEntrypoint, DurableObject, RpcTarget and env are runtime globals; the
+       // compiler turns this import into them, so it stays in the bundle as written.
+-      external: ["cloudflare:workers"],
++      external: ["cloudflare:workers", "cloudflare:sockets"],
+     });
+   } catch (cause) {
+     // An unresolvable specifier arrives as an AggregateError whose `errors`
+diff --git a/src/main.ts b/src/main.ts
+index 831d3f6..15355ff 100755
+--- a/src/main.ts
++++ b/src/main.ts
+@@ -236,7 +236,8 @@ async function readProject(directory = process.cwd()) {
+     fail(cause instanceof BundleError ? cause.message : String(cause));
+   }
+   const supported = validateHttpSyncSource(bundle.code, project.config.compatibility_date);
+-  if (!supported.ok) fail(supported.errors.join("\n"));
++  if (!supported.ok && !process.env.SB_SPIKE_NOCHECK) fail(supported.errors.join("\n"));
++  if (!supported.ok) console.warn("SPIKE: skipped checks:\n" + supported.errors.join("\n"));
+   return { ...project, sourcePath, source, bundle };
+ }
+ 
+diff --git a/src/node-shims.ts b/src/node-shims.ts
+index f6c7c9c..12aaa61 100644
+--- a/src/node-shims.ts
++++ b/src/node-shims.ts
+@@ -371,7 +371,84 @@ export { NodeURL as URL, NodeURLSearchParams as URLSearchParams, urlFormat as fo
+ export default { URL: NodeURL, URLSearchParams: NodeURLSearchParams, format: urlFormat, parse: urlParse, resolve: urlResolve };
+ `;
+ 
++/**
++ * node:net, node:tls, node:dns, node:fs and node:util/types for drivers that carry a Node code path
++ * next to their Workers one (pg, mysql2). The Workers path never calls them: every function throws
++ * a message that names cloudflare:sockets, so a driver that does take the Node path says why.
++ */
++const unavailable = (what: string) =>
++  `function unavailable() { throw new Error("${what} is not available in a compiled handler; use cloudflare:sockets (connect())"); }\n`;
++const NODE_NET_SHIM =
++  unavailable("the net module") +
++  `class Socket { constructor() { unavailable(); } }
++const ipv4 = /^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$/;
++function isIP(x) { return ipv4.test(String(x)) ? 4 : String(x).indexOf(":") >= 0 && /^[0-9a-fA-F:.]+$/.test(String(x)) ? 6 : 0; }
++function connect() { unavailable(); }
++export { Socket, isIP, connect };
++export default { Socket, isIP, connect, createConnection: connect };
++`;
++const NODE_TLS_SHIM =
++  unavailable("the tls module") +
++  `function connect() { unavailable(); }
++export { connect };
++export default { connect };
++`;
++const NODE_DNS_SHIM =
++  unavailable("the dns module") +
++  `function lookup() { unavailable(); }
++export { lookup };
++export default { lookup, promises: { lookup } };
++`;
++const NODE_FS_SHIM =
++  unavailable("the fs module") +
++  `function readFileSync() { unavailable(); }
++function existsSync() { return false; }
++function statSync() { unavailable(); }
++function createReadStream() { unavailable(); }
++export { readFileSync, existsSync, statSync, createReadStream };
++export default { readFileSync, existsSync, statSync, createReadStream };
++`;
++const NODE_UTIL_TYPES_SHIM = `
++const isDate = (v) => v instanceof Date;
++const isTypedArray = (v) => ArrayBuffer.isView(v) && !(v instanceof DataView);
++const isUint8Array = (v) => v instanceof Uint8Array;
++const isArrayBuffer = (v) => v instanceof ArrayBuffer;
++const isPromise = (v) => v instanceof Promise;
++const isRegExp = (v) => v instanceof RegExp;
++export { isDate, isTypedArray, isUint8Array, isArrayBuffer, isPromise, isRegExp };
++export default { isDate, isTypedArray, isUint8Array, isArrayBuffer, isPromise, isRegExp };
++`;
++
++/**
++ * node:crypto as a Workers handler has it: the Web Crypto global, not the Node API. pg asks for
++ * `crypto.webcrypto || globalThis.crypto` and for createHash("md5") inside a try, so a createHash
++ * that throws sends it to crypto.subtle. Bun's default polyfill (crypto-browserify) is 20k lines,
++ * and its elliptic-curve code does not compile under Porffor.
++ */
++const NODE_CRYPTO_SHIM = `
++function unavailable() { throw new Error("this crypto function is not available; use crypto.subtle"); }
++const webcrypto = globalThis.crypto;
++function randomBytes(n) { return webcrypto.getRandomValues(new Uint8Array(n)); }
++function randomUUID() { return webcrypto.randomUUID(); }
++function createHash() { unavailable(); }
++function createHmac() { unavailable(); }
++export { webcrypto, randomBytes, randomUUID, createHash, createHmac };
++export default { webcrypto, randomBytes, randomUUID, createHash, createHmac, getRandomValues: (a) => webcrypto.getRandomValues(a), subtle: webcrypto.subtle };
++`;
++
+ export const NODE_SHIMS = {
++  "node:crypto": NODE_CRYPTO_SHIM,
++  crypto: NODE_CRYPTO_SHIM,
++  "node:net": NODE_NET_SHIM,
++  net: NODE_NET_SHIM,
++  "node:tls": NODE_TLS_SHIM,
++  tls: NODE_TLS_SHIM,
++  "node:dns": NODE_DNS_SHIM,
++  dns: NODE_DNS_SHIM,
++  "node:fs": NODE_FS_SHIM,
++  fs: NODE_FS_SHIM,
++  "node:util/types": NODE_UTIL_TYPES_SHIM,
++  "util/types": NODE_UTIL_TYPES_SHIM,
+   "node:path": NODE_PATH_SHIM,
+   "node:querystring": NODE_QUERYSTRING_SHIM,
+   "node:url": NODE_URL_SHIM,
