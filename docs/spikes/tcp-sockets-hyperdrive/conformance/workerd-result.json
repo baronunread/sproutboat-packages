@@ -1,0 +1,233 @@
+{
+  "shape": {
+    "readable": true,
+    "writable": true,
+    "opened": true,
+    "closed": true,
+    "close": "function",
+    "startTls": "function",
+    "upgraded": false,
+    "secureTransport": "off",
+    "openedInfoKeys": ["localAddress", "remoteAddress"],
+    "remoteAddressType": "string"
+  },
+  "addressForms": {
+    "string": {
+      "ok": true,
+      "opened": {
+        "resolved": true,
+        "value": "object"
+      }
+    },
+    "obj": {
+      "ok": true,
+      "opened": {
+        "resolved": true,
+        "value": "object"
+      }
+    },
+    "noPort": {
+      "threw": {
+        "name": "TypeError",
+        "message": "Specified address is missing port."
+      }
+    },
+    "badPort": {
+      "threw": {
+        "name": "TypeError",
+        "message": "The value cannot be converted because it is not an integer."
+      }
+    },
+    "port0": {
+      "ok": true,
+      "opened": {
+        "rejected": {
+          "name": "Error",
+          "message": "proxy request failed, cannot connect to the specified address"
+        }
+      }
+    },
+    "empty": {
+      "threw": {
+        "name": "TypeError",
+        "message": "Specified address is missing hostname."
+      }
+    }
+  },
+  "port25": {
+    "ok": true,
+    "opened": {
+      "state": {
+        "rejected": {
+          "name": "Error",
+          "message": "proxy request failed, cannot connect to the specified address"
+        }
+      }
+    },
+    "closed": {
+      "state": {
+        "rejected": {
+          "name": "Error",
+          "message": "proxy request failed, cannot connect to the specified address"
+        }
+      }
+    }
+  },
+  "echo": {
+    "out": "hello\n",
+    "done": false
+  },
+  "bulk": {
+    "got": 1048576,
+    "checksumOk": true
+  },
+  "halfOpenTrue": {
+    "got": {
+      "out": "x\nFIN-SEEN\n",
+      "done": true
+    },
+    "closedAfterEof": "pending"
+  },
+  "halfOpenFalse": {
+    "got": {
+      "out": "x\nFIN-SEEN\n",
+      "done": true
+    },
+    "closedAfterEof": {
+      "resolved": true,
+      "value": "undefined"
+    }
+  },
+  "serverEof": {
+    "got": {
+      "out": "HELLO-FROM-SERVER\n",
+      "done": true
+    },
+    "closedAfterEof": {
+      "resolved": true,
+      "value": "undefined"
+    },
+    "writeAfter": {
+      "name": "TypeError",
+      "message": "This WritableStream has been closed."
+    }
+  },
+  "closeSemantics": {
+    "closeReturnsPromise": true,
+    "pendingRead": {
+      "state": {
+        "rejected": {
+          "name": "TypeError",
+          "message": "This socket has been closed."
+        }
+      }
+    },
+    "closed": {
+      "state": {
+        "resolved": true,
+        "value": "undefined"
+      }
+    },
+    "closeResolved": {
+      "state": {
+        "resolved": true,
+        "value": "undefined"
+      }
+    },
+    "writeAfterClose": {
+      "name": "TypeError",
+      "message": "This WritableStream belongs to an object that is closing."
+    },
+    "closeTwice": {
+      "state": {
+        "resolved": true,
+        "value": "undefined"
+      }
+    }
+  },
+  "refused": {
+    "opened": {
+      "rejected": {
+        "name": "Error",
+        "message": "proxy request failed, cannot connect to the specified address"
+      }
+    },
+    "closed": {
+      "rejected": {
+        "name": "Error",
+        "message": "proxy request failed, cannot connect to the specified address"
+      }
+    },
+    "read": {
+      "state": {
+        "resolved": true,
+        "value": "boolean"
+      }
+    }
+  },
+  "writeTypes": {
+    "string": "ok",
+    "arrayBuffer": "ok",
+    "u8": "ok",
+    "dataview": "ok",
+    "number": {
+      "name": "TypeError",
+      "message": "This TransformStream is being used as a byte stream, but received an object of non-ArrayBuffer/ArrayBufferView type on i"
+    },
+    "nullv": {
+      "name": "TypeError",
+      "message": "This TransformStream is being used as a byte stream, but received an object of non-ArrayBuffer/ArrayBufferView type on i"
+    }
+  },
+  "tlsOn": {
+    "opened": {
+      "resolved": true,
+      "value": "object"
+    },
+    "got": {
+      "out": "secure\n",
+      "done": false
+    },
+    "secureTransport": "on"
+  },
+  "startTls": {
+    "ok": {
+      "out": "OK\n",
+      "done": false
+    },
+    "oldReadableLocked": false,
+    "oldWritableLocked": false,
+    "sameObject": false,
+    "upgraded": false,
+    "s2Upgraded": false,
+    "s2Secure": "on",
+    "echo": {
+      "out": "tls!\n",
+      "done": false
+    },
+    "s2Opened": {
+      "resolved": true,
+      "value": "object"
+    },
+    "secondStartTls": {
+      "name": "TypeError",
+      "message": "The connection was closed before startTls could be started."
+    }
+  },
+  "startTlsOnPlain": {
+    "threw": {
+      "name": "TypeError",
+      "message": "The `secureTransport` socket option must be set to 'starttls' for startTls to be used."
+    }
+  },
+  "backpressure": {
+    "writesResolvedWithinWindow": 12,
+    "stalled": true,
+    "bytesAccepted": 786432,
+    "desiredSize": 1,
+    "finite": true
+  },
+  "abort": {
+    "closedAfterReadableCancel": "pending"
+  }
+}
