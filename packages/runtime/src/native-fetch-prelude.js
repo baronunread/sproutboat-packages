@@ -4451,6 +4451,14 @@ const __sbScNames = {
   HKDF: "HKDF",
 };
 
+// WebIDL [EnforceRange] unsigned long: a number outside 0..2^32-1 (or not finite) is a TypeError.
+function __sbScULong(value, what) {
+  const n = Number(value);
+  if (!(n === n) || n === Infinity || n === -Infinity) throw new TypeError(what + " is not a valid unsigned long.");
+  const whole = n < 0 ? Math.ceil(n) : Math.floor(n);
+  if (whole < 0 || whole > 4294967295) throw new TypeError(what + " is out of range for an unsigned long.");
+  return whole;
+}
 function __sbScErr(name, message) {
   return new globalThis.DOMException(message, name);
 }
@@ -4545,9 +4553,10 @@ function __sbScName(algo) {
 // "256" for SHA-256 and so on; SHA-1 is "1". MD5 is digest-only, as in workerd.
 function __sbScHashBits(hash) {
   if (hash === undefined || hash === null) throw new TypeError('Missing field "hash" in "algorithm".');
-  const bits = __sbHashBits(hash);
-  if (bits === "" || bits === "5") throw __sbScErr("NotSupportedError", "Unrecognized name.");
-  return bits;
+  // Exact names only (any case): the legacy digest also takes "SHA256" and "SHA1".
+  const name = String((hash && hash.name) || hash).toUpperCase();
+  if (name !== "SHA-1" && name !== "SHA-256" && name !== "SHA-384" && name !== "SHA-512") throw __sbScErr("NotSupportedError", "Unrecognized name.");
+  return __sbHashBits(name);
 }
 function __sbScHashName(bits) {
   return bits === "1" ? "SHA-1" : "SHA-" + bits;
@@ -4571,7 +4580,7 @@ function __sbScUsages(usages, allowed, verb, what) {
   if (usages != null) {
     for (let i = 0; i < usages.length; i++) {
       const usage = String(usages[i]);
-      if (__sbScUsageOrder.indexOf(usage) < 0) throw new TypeError("Unrecognized key usage '" + usage + "'.");
+      if (__sbScUsageOrder.indexOf(usage) < 0) throw __sbScErr("SyntaxError", "Unrecognized key usage '" + usage + "'.");
       if (allowed.indexOf(usage) < 0) throw __sbScErr("SyntaxError", "Attempt to " + verb + " " + what + ' key with invalid usage "' + usage + '".');
       if (seen.indexOf(usage) < 0) seen.push(usage);
     }
@@ -4622,13 +4631,13 @@ function __sbScAlgo(algorithm) {
   const a = { name };
   if (name === "HMAC") {
     a.hashBits = __sbScHashBits(algorithm.hash);
-    if (algorithm.length !== undefined) a.length = Number(algorithm.length);
+    if (algorithm.length !== undefined) a.length = __sbScULong(algorithm.length, "length");
   } else if (name === "RSASSA-PKCS1-v1_5" || name === "RSA-PSS" || name === "RSA-OAEP") {
     a.hashBits = __sbScHashBits(algorithm.hash);
-    a.modulusLength = algorithm.modulusLength;
+    if (algorithm.modulusLength !== undefined) a.modulusLength = __sbScULong(algorithm.modulusLength, "modulusLength");
     a.publicExponent = algorithm.publicExponent;
   } else if (name === "AES-GCM" || name === "AES-CBC" || name === "AES-CTR" || name === "AES-KW") {
-    if (algorithm.length !== undefined) a.length = Number(algorithm.length);
+    if (algorithm.length !== undefined) a.length = __sbScULong(algorithm.length, "length");
   } else if (name === "ECDSA" || name === "ECDH") {
     // Import and generateKey need the curve; deriveBits and sign get it from the key.
     if (algorithm.namedCurve !== undefined) a.curve = __sbScCurve(String(algorithm.namedCurve));
@@ -4662,6 +4671,9 @@ function __sbScAllowed(name) {
   if (name === "RSA-OAEP") return [["encrypt", "wrapKey"], ["decrypt", "unwrapKey"]];
   if (name === "ECDH" || name === "X25519") return [[], ["deriveKey", "deriveBits"]];
   return [["verify"], ["sign"]];
+}
+function __sbScJwkUse(jwk, expected, what) {
+  if (jwk.use !== undefined && jwk.use !== expected) throw __sbScErr("DataError", 'JWK "use" for ' + what + ' must be "' + expected + '".');
 }
 function __sbScJwkCheck(jwk, what, extractable) {
   if (jwk == null || !__sbIsObj(jwk)) throw new TypeError("Failed to execute 'importKey' on 'SubtleCrypto': parameter 2 is not of type 'JsonWebKey'.");
@@ -4732,6 +4744,7 @@ function __sbScImportRsa(format, keyData, a, extractable, usages) {
   }
   if (format !== "jwk") throw __sbScErr("NotSupportedError", 'Unrecognized key import format "' + format + '".');
   __sbScJwkCheck(keyData, a.name, extractable);
+  __sbScJwkUse(keyData, a.name === "RSA-OAEP" ? "enc" : "sig", a.name);
   if (keyData.kty !== "RSA") throw __sbScErr("DataError", 'Invalid key type in JWK for ' + a.name + ' (expected "RSA", got "' + keyData.kty + '").');
   if (keyData.alg !== undefined && keyData.alg !== __sbScRsaAlg(a))
     throw __sbScErr("DataError", 'JWK "alg" does not match the requested algorithm (encountered "' + keyData.alg + '", expected "' + __sbScRsaAlg(a) + '").');
@@ -4793,6 +4806,7 @@ function __sbScImportEc(format, keyData, a, extractable, usages) {
   }
   if (format !== "jwk") throw __sbScErr("NotSupportedError", 'Unrecognized key import format "' + format + '".');
   __sbScJwkCheck(keyData, a.name, extractable);
+  __sbScJwkUse(keyData, a.name === "ECDH" ? "enc" : "sig", a.name);
   if (keyData.kty !== "EC") throw __sbScErr("DataError", 'Invalid key type in JWK for ECDSA (expected "EC", got "' + keyData.kty + '").');
   if (keyData.crv !== __sbScCurveName(curve)) throw __sbScErr("DataError", 'JWK "crv" does not match the requested curve "' + __sbScCurveName(curve) + '".');
   const x = __sbScFromB64u(keyData.x, "EC JWK x");
@@ -4848,6 +4862,7 @@ function __sbScImportEd(format, keyData, a, extractable, usages) {
   }
   if (format !== "jwk") throw __sbScErr("NotSupportedError", 'Unrecognized key import format "' + format + '".');
   __sbScJwkCheck(keyData, a.name, extractable);
+  __sbScJwkUse(keyData, a.name === "X25519" ? "enc" : "sig", a.name);
   if (keyData.kty !== "OKP") throw __sbScErr("DataError", 'Invalid key type in JWK for ' + a.name + ' (expected "OKP", got "' + keyData.kty + '").');
   const crv = a.name === "X25519" ? "X25519" : "Ed25519";
   if (keyData.crv !== crv) throw __sbScErr("DataError", 'JWK "crv" must be "' + crv + '".');
@@ -5090,7 +5105,7 @@ function __sbScKeyHash(key) {
 }
 function __sbScSalt(algorithm) {
   if (algorithm.saltLength === undefined) throw __sbScErr("DataError", "Failed to provide salt for RSA-PSS key operation which requires a salt");
-  const n = Number(algorithm.saltLength);
+  const n = __sbScULong(algorithm.saltLength, "saltLength");
   if (!(n >= 0) || n !== Math.floor(n)) throw new TypeError("Invalid saltLength.");
   return String(n);
 }
@@ -5163,8 +5178,9 @@ function __sbScDeriveBits(algorithm, baseKey, length, usage) {
   if (name === "PBKDF2") {
     if (a.hashBits === undefined) throw new TypeError('Missing field "hash" in "algorithm".');
     const salt = __sbScBytes(algorithm.salt, "deriveBits", 1);
-    const iterations = Number(algorithm.iterations);
+    const iterations = __sbScULong(algorithm.iterations, "iterations");
     if (!(iterations > 0)) throw __sbScErr("OperationError", "PBKDF2 requires a positive iteration count (requested " + iterations + ").");
+    if (length !== null && length !== undefined) length = __sbScULong(length, "length");
     if (length === null || length === undefined) throw __sbScErr("OperationError", "PBKDF2 cannot derive a key with null length.");
     if (length % 8 !== 0) throw __sbScErr("OperationError", "PBKDF2 requires a derived key length that is a multiple of eight (requested " + length + ").");
     return __sbScCall(__SBC_PBKDF2, a.hashBits + "," + iterations + "," + length / 8, baseKey.__sbM, salt, "");
@@ -5173,6 +5189,7 @@ function __sbScDeriveBits(algorithm, baseKey, length, usage) {
     if (a.hashBits === undefined) throw new TypeError('Missing field "hash" in "algorithm".');
     const salt = __sbScBytes(algorithm.salt, "deriveBits", 1);
     const info = __sbScBytes(algorithm.info, "deriveBits", 1);
+    if (length !== null && length !== undefined) length = __sbScULong(length, "length");
     if (length === null || length === undefined) throw __sbScErr("OperationError", "HKDF cannot derive a key with null length.");
     if (length % 8 !== 0) throw __sbScErr("OperationError", "HKDF requires a derived key length that is a multiple of eight (requested " + length + ").");
     try {
@@ -5196,6 +5213,7 @@ function __sbScDeriveBits(algorithm, baseKey, length, usage) {
       const theirs = __sbScUnframe(__sbScCall(__SBC_DECODE_SPKI, "", peer.__sbM, "", ""));
       secret = __sbScCall(__SBC_X25519, "", mine.list[1], theirs.list[0], "");
     }
+    if (length !== null && length !== undefined) length = __sbScULong(length, "length");
     if (length === null || length === undefined) return secret;
     if (length > secret.length * 8) throw __sbScErr("OperationError", "Derived key length (" + length + " bits) is too long (should be at most " + secret.length * 8 + " bits).");
     const whole = Math.ceil(length / 8);
@@ -5224,7 +5242,8 @@ const __sbSubtleNext = {
     return __sbEqCt(x, y);
   },
   async digest(algorithm, data) {
-    const bits = __sbHashBits(algorithm);
+    const exact = String((algorithm && algorithm.name) || algorithm).toUpperCase();
+    const bits = exact === "SHA-1" || exact === "SHA-256" || exact === "SHA-384" || exact === "SHA-512" || exact === "MD5" ? __sbHashBits(exact) : "";
     if (!bits) throw __sbScErr("NotSupportedError", "Unrecognized or unimplemented digest algorithm requested.");
     const out = __sbDigestRaw(bits, __sbScBytes(data, "digest", 2));
     if (!out) throw __sbScErr("OperationError", "Digest failed.");
