@@ -373,6 +373,77 @@ int main(void) {
     (e: Error) => e.message === 'D1_EXEC_ERROR: Error in line 2: SELEC 2: near "SELEC": syntax error',
   );
   assert.equal(ops.__sbD1Run(ex, "SELECT count(*) AS n FROM x", [], false).results[0].n, 2, "exec rolled back");
+  // From 2026-11-03 (parity): D1's text, with the failing statement's own offset (counted from its first
+  // non-space character) and SQLite's result code.
+  const parityError = (lines: string[]) => {
+    try {
+      ops.__sbD1ExecLines(ex, lines, true);
+    } catch (e) {
+      return e instanceof Error ? e.message : String(e);
+    }
+    return "did not throw";
+  };
+  const parityCases: [string[], string][] = [
+    [
+      ["INSERT INTO x VALUES (3); SELEC 2"],
+      'Error in line 1: INSERT INTO x VALUES (3); SELEC 2: near "SELEC": syntax error at offset 0: SQLITE_ERROR',
+    ],
+    [["SELEC 2"], 'Error in line 1: SELEC 2: near "SELEC": syntax error at offset 0: SQLITE_ERROR'],
+    [["SELECT 1;", "  SELEC 3"], 'Error in line 2:   SELEC 3: near "SELEC": syntax error at offset 2: SQLITE_ERROR'],
+    [["/*c*/ SELEC 1"], 'Error in line 1: /*c*/ SELEC 1: near "SELEC": syntax error at offset 6: SQLITE_ERROR'],
+    [["SELECT * FROM nope"], "Error in line 1: SELECT * FROM nope: no such table: nope: SQLITE_ERROR"],
+    [["SELECT 1,"], "Error in line 1: SELECT 1,: incomplete input: SQLITE_ERROR"],
+  ];
+  for (const [lines, text] of parityCases) assert.equal(parityError(lines), "D1_EXEC_ERROR: " + text);
+  ops.__sbD1ExecLines(ex, ["CREATE TABLE ux (a UNIQUE)", "INSERT INTO ux VALUES (1)"], true);
+  assert.equal(
+    parityError(["INSERT INTO ux VALUES (1)"]),
+    "D1_EXEC_ERROR: Error in line 1: INSERT INTO ux VALUES (1): UNIQUE constraint failed: ux.a: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_UNIQUE)",
+  );
+  // From 2026-11-03 (multi): a statement with more behind it runs them all, in one savepoint, and answers with the last.
+  const mdb = join(work, "data/d1/MULTI.sqlite");
+  const multi = (sql: string, params: unknown[] = []) => ops.__sbD1Run(mdb, sql, params, true, true);
+  const multiError = (sql: string, params: unknown[] = []) => {
+    try {
+      multi(sql, params);
+    } catch (e) {
+      return e instanceof Error ? e.message : String(e);
+    }
+    return "did not throw";
+  };
+  multi("CREATE TABLE m (id INTEGER PRIMARY KEY, name TEXT, v TEXT UNIQUE)");
+  const two = multi("INSERT INTO m (id) VALUES (7); INSERT INTO m (id) VALUES (8)");
+  assert.deepEqual([two.meta.changes, two.meta.last_row_id, two.rows.length], [2, 8, 0]);
+  assert.equal(multi("INSERT INTO m (id) VALUES (10); UPDATE m SET name = 'x'").meta.changes, 4);
+  assert.deepEqual(multi("SELECT 1 AS a; SELECT 2 AS b").columns, ["b"]);
+  assert.deepEqual(multi("SELECT 1; SELECT ? AS p", [5]).rows, [[5]]);
+  assert.equal(multi("INSERT INTO m (id) VALUES (30); INSERT INTO m (id) VALUES (31); ").meta.changes, 2);
+  const mcount = () => ops.__sbD1Run(mdb, "SELECT count(*) FROM m", [], true, true).rows[0][0];
+  const mbefore = mcount();
+  assert.equal(
+    multiError("INSERT INTO m (id) VALUES (40); garbage"),
+    'D1_ERROR: near "garbage": syntax error at offset 0: SQLITE_ERROR',
+  );
+  assert.match(
+    multiError("INSERT INTO m (id, v) VALUES (41, 'a'); INSERT INTO m (id, v) VALUES (42, 'a')"),
+    /^D1_ERROR: UNIQUE constraint failed: m\.v: SQLITE_CONSTRAINT/,
+  );
+  assert.equal(
+    multiError("INSERT INTO m (id) VALUES (?); INSERT INTO m (id) VALUES (?)", [50, 51]),
+    "D1_ERROR: When executing multiple SQL statements in a single call, only the last statement can have parameters.",
+  );
+  assert.equal(multiError("SELECT 1;;"), "D1_ERROR: SQL code did not contain a statement.");
+  assert.equal(multiError("SELECT 1; -- c"), "D1_ERROR: SQL code did not contain a statement.");
+  assert.equal(
+    multiError("SELECT 1; SELECT ? AS p", [1, 2]),
+    "D1_ERROR: Wrong number of parameter bindings for SQL query.",
+  );
+  assert.equal(mcount(), mbefore, "a failing script left nothing behind");
+  assert.equal(
+    ops.__sbD1Run(mdb, "INSERT INTO m (id) VALUES (60); INSERT INTO m (id) VALUES (61)", [], true, false).meta.changes,
+    1,
+    "without multi only the first runs",
+  );
   const db2 = join(work, "data/d1/OPS.sqlite");
   ops.__sbD1Run(db2, "CREATE TABLE p (id INTEGER PRIMARY KEY)", [], false);
   ops.__sbD1Run(db2, "CREATE TABLE c (id INTEGER PRIMARY KEY, p INTEGER REFERENCES p(id))", [], false);

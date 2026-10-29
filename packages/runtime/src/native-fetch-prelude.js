@@ -5356,6 +5356,7 @@ function __sbRpcDirect(op, extra) {
 function __sbD1Rpc(op, extra, strict) {
   if (!strict) return __sbRpcDirect(op, extra);
   extra.strict = true;
+  if (__sbD1Parity()) extra.parity = true;
   try {
     return __sbRpcDirect(op, extra);
   } catch (err) {
@@ -5420,10 +5421,104 @@ function __sbD1IsTransaction(text) {
     word === "begin" || word === "commit" || word === "end" || word === "rollback" || word === "savepoint" || word === "release"
   );
 }
+// From 2026-11-03: workerd's D1 authorizer lets a PRAGMA run only if it is one of these (the name as
+// written: PRAGMA TABLE_INFO is refused, as is any schema but main). Any other reads "not authorized".
+// Checked in the shim, so every transport answers alike. A query or batch statement is only looked at
+// when it starts with P (after spaces and comments); an exec line is scanned statement by statement.
+function __sbD1Parity() {
+  return __sbCompatDate() >= "2026-11-03";
+}
+var __sbD1PragmaAllowed =
+  " table_list table_info table_xinfo index_list index_info index_xinfo foreign_keys foreign_key_list foreign_key_check quick_check optimize defer_foreign_keys case_sensitive_like recursive_triggers data_version legacy_alter_table reverse_unordered_selects ignore_check_constraints ";
+var __sbD1NotAuthorized = "D1_ERROR: not authorized: SQLITE_AUTH";
+function __sbD1IsIdent(c) {
+  return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || c === 95 || (c >= 97 && c <= 122) || c > 127;
+}
+// Index of the first character at or after i that is not whitespace, a comment, or (when
+// semicolons) a semicolon.
+function __sbD1SkipBlank(s, i, semicolons) {
+  for (;;) {
+    const c = s.charCodeAt(i);
+    if (c === 32 || c === 9 || c === 10 || c === 13 || c === 12 || (semicolons && c === 59)) i++;
+    else if (c === 45 && s.charCodeAt(i + 1) === 45) {
+      while (i < s.length && s.charCodeAt(i) !== 10) i++;
+    } else if (c === 47 && s.charCodeAt(i + 1) === 42) {
+      const end = s.indexOf("*/", i + 2);
+      i = end < 0 ? s.length : end + 2;
+    } else return i;
+  }
+}
+// An identifier at i (plain, or quoted with " ` or [ ]): its text and where it ends.
+function __sbD1Name(s, i) {
+  const q = s.charCodeAt(i);
+  if (q === 34 || q === 96 || q === 91) {
+    const end = s.indexOf(q === 91 ? "]" : String.fromCharCode(q), i + 1);
+    if (end < 0) return { text: s.slice(i + 1), end: s.length };
+    return { text: s.slice(i + 1, end), end: end + 1 };
+  }
+  let end = i;
+  while (end < s.length && __sbD1IsIdent(s.charCodeAt(end))) end++;
+  return { text: s.slice(i, end), end };
+}
+// The statement at i (already past blanks): 0 when it is not a PRAGMA or one D1 allows, 1 when D1 refuses
+// it, 2 when it sets foreign_keys (which D1 never lets a call switch off: the pragma is a no-op inside
+// the transaction every D1 call runs in, so the caller puts it back).
+function __sbD1PragmaKind(s, i) {
+  if ((s.charCodeAt(i) | 32) !== 112 || s.slice(i, i + 6).toLowerCase() !== "pragma" || __sbD1IsIdent(s.charCodeAt(i + 6))) return 0;
+  let at = __sbD1SkipBlank(s, i + 6, false);
+  let name = __sbD1Name(s, at);
+  at = __sbD1SkipBlank(s, name.end, false);
+  if (s.charCodeAt(at) === 46) {
+    // schema.name: SQLite itself answers for a schema that does not exist
+    const schema = name.text.toLowerCase();
+    if (schema !== "main") return schema === "temp" ? 1 : 0;
+    name = __sbD1Name(s, __sbD1SkipBlank(s, at + 1, false));
+    at = __sbD1SkipBlank(s, name.end, false);
+  }
+  if (__sbD1PragmaAllowed.indexOf(" " + name.text + " ") < 0) return 1;
+  const next = s.charCodeAt(at);
+  return name.text === "foreign_keys" && (next === 61 || next === 40) ? 2 : 0;
+}
+// A query or batch statement (its first character is P, - ; or /): only its first statement is looked
+// at. Returns 2 for a foreign_keys assignment.
+function __sbD1CheckPragma(text) {
+  const at = __sbD1SkipBlank(text, 0, true);
+  if (at >= text.length) throw __sbD1Fail("D1_ERROR: SQL code did not contain a statement.");
+  const kind = __sbD1PragmaKind(text, at);
+  if (kind === 1) throw __sbD1Fail(__sbD1NotAuthorized);
+  return kind;
+}
+// An exec line can hold several statements: look at the start of each. A ';' inside a quoted name or
+// string or a comment does not end one.
+function __sbD1LinePragmaDenied(line) {
+  if (line.toLowerCase().indexOf("pragma") < 0) return false;
+  let i = __sbD1SkipBlank(line, 0, true);
+  while (i < line.length) {
+    if (__sbD1PragmaKind(line, i) === 1) return true;
+    let c = line.charCodeAt(i);
+    while (i < line.length && c !== 59) {
+      if (c === 39 || c === 34 || c === 96 || c === 91) {
+        const end = line.indexOf(c === 91 ? "]" : String.fromCharCode(c), i + 1);
+        i = end < 0 ? line.length : end + 1;
+      } else if ((c === 45 && line.charCodeAt(i + 1) === 45) || (c === 47 && line.charCodeAt(i + 1) === 42)) i = __sbD1SkipBlank(line, i, false);
+      else i++;
+      c = line.charCodeAt(i);
+    }
+    i = __sbD1SkipBlank(line, i, true);
+  }
+  return false;
+}
 function __sbD1Check(sql) {
   const text = String(sql).trim();
   if (!text) throw __sbD1Fail("D1_ERROR: No SQL statements detected.");
   if (__sbD1IsTransaction(text)) throw __sbD1Fail(__sbD1NoTransactions);
+  const first = text.charCodeAt(0);
+  let kind = 0;
+  if (((first | 32) === 112 || first === 45 || first === 47 || first === 59) && __sbD1Parity()) kind = __sbD1CheckPragma(text);
+  // more statements behind the first run too (2026-11-03), each one through the allow-list
+  const semi = text.indexOf(";");
+  if (semi >= 0 && semi < text.length - 1 && __sbD1Parity() && __sbD1LinePragmaDenied(text)) throw __sbD1Fail(__sbD1NotAuthorized);
+  return kind;
 }
 function __sbD1Meta(meta, started) {
   const changes = Number(meta.changes) || 0;
@@ -5475,10 +5570,11 @@ function __sbD1Direct(name, sql, params) {
 // when the caller will hand it out (all() and run()): raw() and first() drop it, and building it
 // reads the clock twice.
 function __sbD1Query(dbName, sql, params, strict, wantMeta) {
-  if (strict) __sbD1Check(sql);
+  const foreignKeys = strict ? __sbD1Check(sql) : 0;
   const started = !strict || wantMeta ? Date.now() : 0;
   const r = strict && __sbD1QueryDirect ? __sbD1Direct(dbName, sql, params) : __sbD1Rpc("d1.query", { db: dbName, sql, params }, strict);
   if (!strict) return { results: r.results || [], success: true, meta: r.meta || {} };
+  if (foreignKeys === 2) __sbD1Rpc("d1.query", { db: dbName, sql: "PRAGMA foreign_keys = ON", params: [] }, true);
   const table = __sbD1Table(r);
   return { columns: table.columns, rows: table.rows, meta: wantMeta ? __sbD1Meta(r.meta || {}, started) : null };
 }
@@ -5575,8 +5671,16 @@ function __sbMakeD1(dbName) {
     const all = String(sql).trim().split("\n");
     const lines = [];
     for (let i = 0; i < all.length; i++) if (all[i].trim()) lines.push(all[i]);
-    if (!lines.length) throw __sbD1Fail("D1_ERROR: No SQL statements detected.");
-    __sbD1Rpc("d1.exec", { db: dbName, sql: lines.join("\n"), lines }, true);
+    const parity = __sbD1Parity();
+    if (!lines.length)
+      throw __sbD1Fail(parity ? "D1_EXEC_ERROR: Error in line 1: : No SQL statements detected." : "D1_ERROR: No SQL statements detected.");
+    if (parity)
+      for (let i = 0; i < lines.length; i++) {
+        const head = "D1_EXEC_ERROR: Error in line " + (i + 1) + ": " + lines[i] + ": ";
+        if (__sbD1SkipBlank(lines[i], 0, true) >= lines[i].length) throw __sbD1Fail(head + "SQL code did not contain a statement.");
+        if (__sbD1LinePragmaDenied(lines[i])) throw __sbD1Fail(head + "not authorized: SQLITE_AUTH");
+      }
+    __sbD1Rpc("d1.exec", parity ? { db: dbName, sql: lines.join("\n"), lines, parity: true } : { db: dbName, sql: lines.join("\n"), lines }, true);
     return { count: lines.length, duration: Date.now() - started };
   }
   const db = {

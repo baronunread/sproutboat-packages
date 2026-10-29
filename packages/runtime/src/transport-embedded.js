@@ -61,6 +61,8 @@ extern int sqlite3_bind_parameter_count(sqlite3_stmt*);
 extern int sqlite3_stmt_readonly(sqlite3_stmt*);
 extern int sqlite3_extended_errcode(sqlite3*);
 extern int sqlite3_error_offset(sqlite3*);
+extern const char* sqlite3_sql(sqlite3_stmt*);
+extern int sqlite3_total_changes(sqlite3*);
 
 // baronunread/sproutboat#176 — defined in render.js, alongside
 // porf_native_fetch_read_value (which every inline-C block below already
@@ -2138,7 +2140,7 @@ static char* sb_sql_script(const char* path, const char* sql) {
   if (idx < 0 && sb_db_capture_failed(path)) { sb_puts(&b, "{\"ok\":false,\"error\":\"" SB_LTX_FAILED "\",\"code\":10}"); return b.p; }
   if (idx < 0) { sb_puts(&b, "{\"ok\":false,\"error\":\"cannot open database\"}"); return b.p; }
   char* err = 0;
-  int script_rc = 0, capture_failed = 0, quota_full = 0, failure_code = 0;
+  int script_rc = 0, capture_failed = 0, quota_full = 0, failure_code = 0, failure_offset = -1;
   char failure[512] = { 0 };
   if (sb_ltx_states[idx].db) {
     const char *next = sql;
@@ -2149,19 +2151,25 @@ static char* sb_sql_script(const char* path, const char* sql) {
       if (!script_rc && st) { do { script_rc = sqlite3_step(st); } while (script_rc == SB_SQLITE_ROW); if (script_rc == SB_SQLITE_DONE) script_rc = 0; }
       // Keep the statement's error before capture runs statements of its own (it would
       // read "not an error" after them).
-      if (script_rc && !failure[0]) { snprintf(failure, sizeof(failure), "%s", sqlite3_errmsg(sb_dbs[idx])); failure_code = sqlite3_extended_errcode(sb_dbs[idx]); }
+      if (script_rc && !failure[0]) { snprintf(failure, sizeof(failure), "%s", sqlite3_errmsg(sb_dbs[idx])); failure_code = sqlite3_extended_errcode(sb_dbs[idx]); failure_offset = sqlite3_error_offset(sb_dbs[idx]); }
       if (st) sqlite3_finalize(st);
       if (sb_ltx_after(idx)) { script_rc = 10; capture_failed = 1; }
       if (!tail || tail <= next) break;
       next = tail;
+      // as sqlite3_exec does: the next statement starts at its first non-space character, so an
+      // error offset counts from there
+      while (*next == ' ' || *next == '\t' || *next == '\n' || *next == '\r' || *next == '\f') next++;
     }
-  } else script_rc = sqlite3_exec(sb_dbs[idx], sql, 0, 0, &err);
+  } else {
+    script_rc = sqlite3_exec(sb_dbs[idx], sql, 0, 0, &err);
+    if (script_rc) { failure_code = sqlite3_extended_errcode(sb_dbs[idx]); failure_offset = sqlite3_error_offset(sb_dbs[idx]); }
+  }
   if (script_rc != 0) {
     const char* m = quota_full ? SB_QUOTA_FULL : capture_failed ? SB_LTX_FAILED : failure[0] ? failure : err ? err : sqlite3_errmsg(sb_dbs[idx]);
     sb_puts(&b, "{\"ok\":false,\"error\":");
     sb_putjson_text(&b, m, strlen(m));
     char code[32];
-    snprintf(code, sizeof(code), ",\"code\":%d}", quota_full ? 13 : capture_failed ? 10 : failure[0] ? failure_code : 0);
+    snprintf(code, sizeof(code), ",\"code\":%d,\"offset\":%d}", quota_full ? 13 : capture_failed ? 10 : failure_code, quota_full || capture_failed ? -1 : failure_offset);
     sb_puts(&b, code);
     return b.p;
   }
@@ -2187,6 +2195,39 @@ static char* sb_sql_error(sqlite3* db, const char* message, int code, int skip) 
 // D1 calls from compatibility date 2026-10-24 put this comment first: the statement must
 // get exactly as many parameters as it has, like D1.
 #define SB_D1_STRICT "/*sb-d1-strict*/"
+// 2026-11-03: a statement with more behind it runs all of them, as workerd does (the marker follows
+// SB_D1_STRICT). A query without a tail never looks past its first statement.
+#define SB_D1_MULTI "/*sb-d1-multi*/"
+#define SB_MULTI_PARAMS "When executing multiple SQL statements in a single call, only the last statement can have parameters."
+#define SB_NO_STATEMENT "SQL code did not contain a statement."
+// Runs st (the first statement, cached) and every statement after it but the last, inside one
+// savepoint: they all take effect or none does. Returns the last statement, prepared here (the
+// caller finalizes it and ends the savepoint), or NULL with *error set (savepoint rolled back).
+static sqlite3_stmt* sb_multi_open(int idx, sqlite3* db, sqlite3_stmt* st, const char* rest, char** error) {
+  sqlite3_stmt* cur = st;
+  int cached = 1;
+  *error = 0;
+  sqlite3_exec(db, "SAVEPOINT sb_d1_multi", 0, 0, 0);
+  for (;;) {
+    rest = sb_skip_ws(rest);
+    if (!*rest) return cur;
+    if (sqlite3_bind_parameter_count(cur) > 0) { *error = sb_sql_error(db, SB_MULTI_PARAMS, 0, 0); break; }
+    if (sb_quota_frozen[idx] && !sqlite3_stmt_readonly(cur)) { *error = sb_sql_error(db, SB_QUOTA_FULL, 13, 0); break; }
+    int rc;
+    while ((rc = sqlite3_step(cur)) == SB_SQLITE_ROW) {}
+    if (rc != SB_SQLITE_DONE) { *error = sb_sql_error(db, 0, -1, 0); break; }
+    if (cached) sqlite3_reset(cur); else sqlite3_finalize(cur);
+    cur = 0;
+    sqlite3_stmt* next = 0; const char* tail = 0;
+    if (sqlite3_prepare_v2(db, rest, -1, &next, &tail)) { *error = sb_sql_error(db, 0, -1, 0); break; }
+    if (!next) { *error = sb_sql_error(db, SB_NO_STATEMENT, 0, 0); break; }
+    cur = next; cached = 0; rest = tail ? tail : "";
+  }
+  if (cur) { if (cached) sqlite3_reset(cur); else sqlite3_finalize(cur); }
+  sqlite3_exec(db, "ROLLBACK TO sb_d1_multi", 0, 0, 0);
+  sqlite3_exec(db, "RELEASE sb_d1_multi", 0, 0, 0);
+  return 0;
+}
 
 // Run one statement. Returns malloc'd JSON:
 //   {"ok":true,"cols":[...],"rows":[[...]],"changes":n,"rowid":n}
@@ -2243,18 +2284,38 @@ static char* sb_sql_run_x(const char* path, const char* sql, const char* params,
   if (idx < 0) { sb_puts(&b, "{\"ok\":false,\"error\":\"cannot open database\"}"); return b.p; }
   sqlite3* db = sb_dbs[idx];
   const int strict = strncmp(sql, SB_D1_STRICT, sizeof(SB_D1_STRICT) - 1) == 0;
+  const int multi = strict && strncmp(sql + sizeof(SB_D1_STRICT) - 1, SB_D1_MULTI, sizeof(SB_D1_MULTI) - 1) == 0;
+  const int skip = strict ? (int)sizeof(SB_D1_STRICT) - 1 + (multi ? (int)sizeof(SB_D1_MULTI) - 1 : 0) : 0;
   // Durable Object SQL databases return BLOBs as D1 does.
   const int d1 = strstr(path, "/d1/") != 0 || sb_is_do_sql(path);
   sqlite3_stmt* st = sb_stmt_get(idx, db, sql);
-  if (!st) return sb_sql_error(db, 0, -1, strict ? (int)sizeof(SB_D1_STRICT) - 1 : 0);
+  if (!st) return sb_sql_error(db, 0, -1, skip);
+  // More than one statement: workerd runs them all and answers with the last one's rows; only the last
+  // can take parameters. (sqlite3_sql is the first statement's text, a prefix of sql.)
+  sqlite3_stmt* owned = 0;
+  long long multi_before = 0;
+  int in_multi = 0;
+  if (multi) {
+    const char* own = sqlite3_sql(st);
+    size_t olen = own ? strlen(own) : 0;
+    if (own && strncmp(sql, own, olen) == 0 && *sb_skip_ws(sql + olen)) {
+      char* merr = 0;
+      multi_before = sqlite3_total_changes(db);
+      owned = sb_multi_open(idx, db, st, sql + olen, &merr);
+      if (!owned) return merr;
+      st = owned; in_multi = 1;
+    }
+  }
   int bound = params && *params ? sb_bind_params(st, params) : 0;
   if (sb_quota_frozen[idx] && !sqlite3_stmt_readonly(st)) {
-    sqlite3_reset(st);
-    return sb_sql_error(db, SB_QUOTA_FULL, 13, 0);
+    char* e = sb_sql_error(db, SB_QUOTA_FULL, 13, 0);
+    if (owned) { sqlite3_finalize(owned); sqlite3_exec(db, "ROLLBACK TO sb_d1_multi", 0, 0, 0); sqlite3_exec(db, "RELEASE sb_d1_multi", 0, 0, 0); } else sqlite3_reset(st);
+    return e;
   }
   if (strict && bound != sqlite3_bind_parameter_count(st)) {
-    sqlite3_reset(st);
-    return sb_sql_error(db, "Wrong number of parameter bindings for SQL query.", 0, 0);
+    char* e = sb_sql_error(db, "Wrong number of parameter bindings for SQL query.", 0, 0);
+    if (owned) { sqlite3_finalize(owned); sqlite3_exec(db, "ROLLBACK TO sb_d1_multi", 0, 0, 0); sqlite3_exec(db, "RELEASE sb_d1_multi", 0, 0, 0); } else sqlite3_reset(st);
+    return e;
   }
 
   int ncol = sqlite3_column_count(st);
@@ -2330,25 +2391,41 @@ static char* sb_sql_run_x(const char* path, const char* sql, const char* params,
   }
   // A read-only statement changed nothing: sqlite3_changes still holds the last write's count.
   if (native) {
-    cells->changes = sqlite3_stmt_readonly(st) ? 0 : sqlite3_changes(db);
+    cells->changes = in_multi ? (int)(sqlite3_total_changes(db) - multi_before) : sqlite3_stmt_readonly(st) ? 0 : sqlite3_changes(db);
     cells->rowid = (long long)sqlite3_last_insert_rowid(db);
   } else {
     char tail[96];
-    int k = snprintf(tail, 96, "],\"changes\":%d,\"rowid\":%lld}", sqlite3_stmt_readonly(st) ? 0 : sqlite3_changes(db), (long long)sqlite3_last_insert_rowid(db));
+    int k = snprintf(tail, 96, "],\"changes\":%d,\"rowid\":%lld}", in_multi ? (int)(sqlite3_total_changes(db) - multi_before) : sqlite3_stmt_readonly(st) ? 0 : sqlite3_changes(db), (long long)sqlite3_last_insert_rowid(db));
     sb_put(&b, tail, (size_t)k);
   }
   // Reset, don't finalize: the statement stays compiled in sb_stmt_cache. Reset
   // now (not just on next reuse) so a SELECT stops holding its read transaction.
-  sqlite3_reset(st);
-  if (cells && cells->used < 0) { free(b.p); sb_cells_free(cells); return sb_sql_error(db, "out of memory", 7, 0); }
-  // The statement's own error, kept before LTX capture runs: capture executes statements
-  // of its own, after which SQLite reports "not an error".
+  // The statement's own error, kept before anything runs another statement (a rollback, LTX capture):
+  // after those SQLite reports "not an error".
   char failure[512] = { 0 };
   int failure_code = 0;
   if (rc != SB_SQLITE_DONE && rc != SB_SQLITE_ROW) {
     snprintf(failure, sizeof(failure), "%s", sqlite3_errmsg(db));
     failure_code = sqlite3_extended_errcode(db);
   }
+  sqlite3_reset(st);
+  if (owned) {
+    sqlite3_finalize(owned);
+    if (rc == SB_SQLITE_DONE || rc == SB_SQLITE_ROW) {
+      // a deferred constraint can fail here, as it does at COMMIT
+      if (sqlite3_exec(db, "RELEASE sb_d1_multi", 0, 0, 0)) {
+        snprintf(failure, sizeof(failure), "%s", sqlite3_errmsg(db));
+        failure_code = sqlite3_extended_errcode(db);
+        rc = 1;
+        sqlite3_exec(db, "ROLLBACK TO sb_d1_multi", 0, 0, 0);
+        sqlite3_exec(db, "RELEASE sb_d1_multi", 0, 0, 0);
+      }
+    } else {
+      sqlite3_exec(db, "ROLLBACK TO sb_d1_multi", 0, 0, 0);
+      sqlite3_exec(db, "RELEASE sb_d1_multi", 0, 0, 0);
+    }
+  }
+  if (cells && cells->used < 0) { free(b.p); sb_cells_free(cells); return sb_sql_error(db, "out of memory", 7, 0); }
   const int capture_failed = sb_ltx_after(idx) != 0;
   if (capture_failed) rc = 10;
   if (rc != SB_SQLITE_DONE && rc != SB_SQLITE_ROW) {
@@ -4878,7 +4955,7 @@ function __sbEmbeddedDispatch(msg) {
       __sbD1Open(path, msg.strict === true);
       __sbD1Quota(path);
       if (msg.strict === true && Array.isArray(msg.lines)) {
-        __sbD1ExecLines(path, msg.lines);
+        __sbD1ExecLines(path, msg.lines, msg.parity === true);
         return { ok: true };
       }
       const reply = JSON.parse(__sbSqlScriptRaw(path, String(msg.sql)));
@@ -4888,8 +4965,8 @@ function __sbEmbeddedDispatch(msg) {
     const strict = msg.strict === true;
     __sbD1Open(path, strict);
     __sbD1Quota(path);
-    if (op === "d1.batch") return { ok: true, results: __sbD1Batch(path, msg.statements || [], strict) };
-    const one = __sbD1Run(path, msg.sql, msg.params, strict);
+    if (op === "d1.batch") return { ok: true, results: __sbD1Batch(path, msg.statements || [], strict, msg.parity === true) };
+    const one = __sbD1Run(path, msg.sql, msg.params, strict, msg.parity === true);
     return { ok: true, results: one.results, columns: one.columns, rows: one.rows, native: one.native, meta: one.meta, success: true };
   }
 
@@ -5436,10 +5513,10 @@ function __sbD1Bytes(cell) {
   for (let i = 0; i + 1 < hex.length; i += 2) out += String.fromCharCode(parseInt(hex.slice(i, i + 2), 16));
   return out;
 }
-function __sbD1Run(path, sql, params, strict) {
+function __sbD1Run(path, sql, params, strict, multi) {
   if (strict) {
     // Rows come back as arrays, built in C (see __sbSqlRowsRaw); the header is small JSON.
-    const pair = __sbSqlRowsRaw(path, "/*sb-d1-strict*/" + String(sql), JSON.stringify(params || []));
+    const pair = __sbSqlRowsRaw(path, multi ? "/*sb-d1-strict*//*sb-d1-multi*/" + String(sql) : "/*sb-d1-strict*/" + String(sql), JSON.stringify(params || []));
     if (pair[0] !== "") {
       const head = JSON.parse(pair[0]);
       if (head.ok === false) throw __sbD1Error(head);
@@ -5480,11 +5557,11 @@ function __sbD1Undo(path, savepoint) {
   return null;
 }
 // One transaction, like D1: a statement that fails undoes the ones before it.
-function __sbD1Batch(path, list, strict) {
+function __sbD1Batch(path, list, strict, multi) {
   const results = [];
   __sbD1Control(path, "SAVEPOINT sb_d1_batch", strict);
   try {
-    for (let i = 0; i < list.length; i++) results.push(__sbD1Run(path, list[i].sql, list[i].params, strict));
+    for (let i = 0; i < list.length; i++) results.push(__sbD1Run(path, list[i].sql, list[i].params, strict, multi));
   } catch (err) {
     __sbD1Undo(path, "sb_d1_batch");
     throw err;
@@ -5502,13 +5579,15 @@ function __sbD1Release(path, savepoint, strict) {
   throw strict ? __sbD1Error(r) : new Error("sqlite: " + r.error);
 }
 // exec() from 2026-10-24: line by line as workerd runs it, all or nothing.
-function __sbD1ExecLines(path, lines) {
+function __sbD1ExecLines(path, lines, parity) {
   __sbD1Control(path, "SAVEPOINT sb_d1_exec", true);
   for (let i = 0; i < lines.length; i++) {
     const reply = JSON.parse(__sbSqlScriptRaw(path, String(lines[i])));
     if (reply.ok === false) {
       if (Number(reply.code) !== 10) __sbD1Undo(path, "sb_d1_exec");
-      throw new Error("D1_EXEC_ERROR: Error in line " + (i + 1) + ": " + lines[i] + ": " + reply.error);
+      // parity (2026-11-03): D1's own wording after the line, " at offset N: SQLITE_ERROR" and all
+      const detail = parity ? __sbD1Error(reply).message.slice(10) : reply.error;
+      throw new Error("D1_EXEC_ERROR: Error in line " + (i + 1) + ": " + lines[i] + ": " + detail);
     }
   }
   __sbD1Release(path, "sb_d1_exec", true);
@@ -5618,7 +5697,7 @@ __sbD1QueryDirect = function (db, sql, params) {
   const path = __sbD1Path(String(db));
   __sbD1Open(path, true);
   __sbD1Quota(path);
-  return __sbD1Run(path, sql, params, true);
+  return __sbD1Run(path, sql, params, true, __sbCompatDate() >= "2026-11-03");
 };
 
 // The same dispatch without the JSON text either side: D1 calls take this (see __sbRpcDirect).
