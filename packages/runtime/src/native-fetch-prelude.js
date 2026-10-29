@@ -3642,9 +3642,17 @@ __sbDefineURLAccessor("password", function () {
 // fallback — a silent downgrade to a weak source is worse than throwing.
 if (globalThis.crypto == null) globalThis.crypto = {};
 if (globalThis.crypto.getRandomValues == null) {
+  // Every byte of the view, as WebCrypto fills it: a Uint32Array gets 4 random bytes per element.
+  // Only integer views are accepted (a Float32Array or a DataView throws TypeMismatchError), and one
+  // call may ask for at most 65536 bytes.
   globalThis.crypto.getRandomValues = function (view) {
-    const n = view.length >>> 0;
-    // WebCrypto caps a single call at 65536 bytes.
+    const integer = ArrayBuffer.isView(view) && !(view instanceof DataView) && !(view instanceof Float32Array) && !(view instanceof Float64Array);
+    if (!integer) {
+      const e = new Error("The data argument must be an integer-type TypedArray");
+      e.name = "TypeMismatchError";
+      throw e;
+    }
+    const n = view.byteLength >>> 0;
     if (n > 65536) {
       // WebCrypto's error for an oversized request (a DOMException named QuotaExceededError).
       const e = new Error("crypto.getRandomValues: byte length exceeds 65536");
@@ -3652,11 +3660,10 @@ if (globalThis.crypto.getRandomValues == null) {
       throw e;
     }
     if (n === 0) return view;
-    // One CSPRNG byte per element. Correct for Uint8Array (and randomUUID); a
-    // wider view gets its low byte filled, matching the previous polyfill's shape.
-    const bytes = __sbRandomBytes(String(n));
-    if (bytes.length !== n) throw new Error("crypto.getRandomValues: OS entropy source unavailable");
-    for (let i = 0; i < n; i++) view[i] = bytes.charCodeAt(i) & 0xff;
+    const random = __sbRandomBytes(String(n));
+    if (random.length !== n) throw new Error("crypto.getRandomValues: OS entropy source unavailable");
+    const out = new Uint8Array(view.buffer, view.byteOffset, n);
+    for (let i = 0; i < n; i++) out[i] = random.charCodeAt(i) & 0xff;
     return view;
   };
 }
