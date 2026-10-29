@@ -2138,7 +2138,7 @@ static char* sb_sql_script(const char* path, const char* sql) {
   if (idx < 0 && sb_db_capture_failed(path)) { sb_puts(&b, "{\"ok\":false,\"error\":\"" SB_LTX_FAILED "\",\"code\":10}"); return b.p; }
   if (idx < 0) { sb_puts(&b, "{\"ok\":false,\"error\":\"cannot open database\"}"); return b.p; }
   char* err = 0;
-  int script_rc = 0, capture_failed = 0, quota_full = 0, failure_code = 0;
+  int script_rc = 0, capture_failed = 0, quota_full = 0, failure_code = 0, failure_offset = -1;
   char failure[512] = { 0 };
   if (sb_ltx_states[idx].db) {
     const char *next = sql;
@@ -2149,19 +2149,25 @@ static char* sb_sql_script(const char* path, const char* sql) {
       if (!script_rc && st) { do { script_rc = sqlite3_step(st); } while (script_rc == SB_SQLITE_ROW); if (script_rc == SB_SQLITE_DONE) script_rc = 0; }
       // Keep the statement's error before capture runs statements of its own (it would
       // read "not an error" after them).
-      if (script_rc && !failure[0]) { snprintf(failure, sizeof(failure), "%s", sqlite3_errmsg(sb_dbs[idx])); failure_code = sqlite3_extended_errcode(sb_dbs[idx]); }
+      if (script_rc && !failure[0]) { snprintf(failure, sizeof(failure), "%s", sqlite3_errmsg(sb_dbs[idx])); failure_code = sqlite3_extended_errcode(sb_dbs[idx]); failure_offset = sqlite3_error_offset(sb_dbs[idx]); }
       if (st) sqlite3_finalize(st);
       if (sb_ltx_after(idx)) { script_rc = 10; capture_failed = 1; }
       if (!tail || tail <= next) break;
       next = tail;
+      // as sqlite3_exec does: the next statement starts at its first non-space character, so an
+      // error offset counts from there
+      while (*next == ' ' || *next == '\t' || *next == '\n' || *next == '\r' || *next == '\f') next++;
     }
-  } else script_rc = sqlite3_exec(sb_dbs[idx], sql, 0, 0, &err);
+  } else {
+    script_rc = sqlite3_exec(sb_dbs[idx], sql, 0, 0, &err);
+    if (script_rc) { failure_code = sqlite3_extended_errcode(sb_dbs[idx]); failure_offset = sqlite3_error_offset(sb_dbs[idx]); }
+  }
   if (script_rc != 0) {
     const char* m = quota_full ? SB_QUOTA_FULL : capture_failed ? SB_LTX_FAILED : failure[0] ? failure : err ? err : sqlite3_errmsg(sb_dbs[idx]);
     sb_puts(&b, "{\"ok\":false,\"error\":");
     sb_putjson_text(&b, m, strlen(m));
     char code[32];
-    snprintf(code, sizeof(code), ",\"code\":%d}", quota_full ? 13 : capture_failed ? 10 : failure[0] ? failure_code : 0);
+    snprintf(code, sizeof(code), ",\"code\":%d,\"offset\":%d}", quota_full ? 13 : capture_failed ? 10 : failure_code, quota_full || capture_failed ? -1 : failure_offset);
     sb_puts(&b, code);
     return b.p;
   }
@@ -4878,7 +4884,7 @@ function __sbEmbeddedDispatch(msg) {
       __sbD1Open(path, msg.strict === true);
       __sbD1Quota(path);
       if (msg.strict === true && Array.isArray(msg.lines)) {
-        __sbD1ExecLines(path, msg.lines);
+        __sbD1ExecLines(path, msg.lines, msg.parity === true);
         return { ok: true };
       }
       const reply = JSON.parse(__sbSqlScriptRaw(path, String(msg.sql)));
@@ -5502,13 +5508,15 @@ function __sbD1Release(path, savepoint, strict) {
   throw strict ? __sbD1Error(r) : new Error("sqlite: " + r.error);
 }
 // exec() from 2026-10-24: line by line as workerd runs it, all or nothing.
-function __sbD1ExecLines(path, lines) {
+function __sbD1ExecLines(path, lines, parity) {
   __sbD1Control(path, "SAVEPOINT sb_d1_exec", true);
   for (let i = 0; i < lines.length; i++) {
     const reply = JSON.parse(__sbSqlScriptRaw(path, String(lines[i])));
     if (reply.ok === false) {
       if (Number(reply.code) !== 10) __sbD1Undo(path, "sb_d1_exec");
-      throw new Error("D1_EXEC_ERROR: Error in line " + (i + 1) + ": " + lines[i] + ": " + reply.error);
+      // parity (2026-11-03): D1's own wording after the line, " at offset N: SQLITE_ERROR" and all
+      const detail = parity ? __sbD1Error(reply).message.slice(10) : reply.error;
+      throw new Error("D1_EXEC_ERROR: Error in line " + (i + 1) + ": " + lines[i] + ": " + detail);
     }
   }
   __sbD1Release(path, "sb_d1_exec", true);

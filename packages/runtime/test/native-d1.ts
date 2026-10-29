@@ -373,6 +373,33 @@ int main(void) {
     (e: Error) => e.message === 'D1_EXEC_ERROR: Error in line 2: SELEC 2: near "SELEC": syntax error',
   );
   assert.equal(ops.__sbD1Run(ex, "SELECT count(*) AS n FROM x", [], false).results[0].n, 2, "exec rolled back");
+  // From 2026-11-03 (parity): D1's text, with the failing statement's own offset (counted from its first
+  // non-space character) and SQLite's result code.
+  const parityError = (lines: string[]) => {
+    try {
+      ops.__sbD1ExecLines(ex, lines, true);
+    } catch (e) {
+      return e instanceof Error ? e.message : String(e);
+    }
+    return "did not throw";
+  };
+  const parityCases: [string[], string][] = [
+    [
+      ["INSERT INTO x VALUES (3); SELEC 2"],
+      'Error in line 1: INSERT INTO x VALUES (3); SELEC 2: near "SELEC": syntax error at offset 0: SQLITE_ERROR',
+    ],
+    [["SELEC 2"], 'Error in line 1: SELEC 2: near "SELEC": syntax error at offset 0: SQLITE_ERROR'],
+    [["SELECT 1;", "  SELEC 3"], 'Error in line 2:   SELEC 3: near "SELEC": syntax error at offset 2: SQLITE_ERROR'],
+    [["/*c*/ SELEC 1"], 'Error in line 1: /*c*/ SELEC 1: near "SELEC": syntax error at offset 6: SQLITE_ERROR'],
+    [["SELECT * FROM nope"], "Error in line 1: SELECT * FROM nope: no such table: nope: SQLITE_ERROR"],
+    [["SELECT 1,"], "Error in line 1: SELECT 1,: incomplete input: SQLITE_ERROR"],
+  ];
+  for (const [lines, text] of parityCases) assert.equal(parityError(lines), "D1_EXEC_ERROR: " + text);
+  ops.__sbD1ExecLines(ex, ["CREATE TABLE ux (a UNIQUE)", "INSERT INTO ux VALUES (1)"], true);
+  assert.equal(
+    parityError(["INSERT INTO ux VALUES (1)"]),
+    "D1_EXEC_ERROR: Error in line 1: INSERT INTO ux VALUES (1): UNIQUE constraint failed: ux.a: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_UNIQUE)",
+  );
   const db2 = join(work, "data/d1/OPS.sqlite");
   ops.__sbD1Run(db2, "CREATE TABLE p (id INTEGER PRIMARY KEY)", [], false);
   ops.__sbD1Run(db2, "CREATE TABLE c (id INTEGER PRIMARY KEY, p INTEGER REFERENCES p(id))", [], false);

@@ -256,3 +256,132 @@ test("a statement is a transaction keyword exactly as the regular expression it 
   ];
   for (const text of cases) expect([text, isTx(text)]).toEqual([text, old(text)]);
 });
+
+// From 2026-11-03: workerd's PRAGMA allow-list (the strict path only; exec lines and batch statements too).
+const ALLOWED_PRAGMAS = [
+  "table_list",
+  "table_info(t)",
+  "table_xinfo(t)",
+  "index_list(t)",
+  "index_info(i)",
+  "index_xinfo(i)",
+  "foreign_keys",
+  "foreign_key_list(t)",
+  "foreign_key_check",
+  "quick_check",
+  "optimize",
+  "defer_foreign_keys",
+  "case_sensitive_like",
+  "recursive_triggers",
+  "data_version",
+  "legacy_alter_table",
+  "reverse_unordered_selects",
+  "ignore_check_constraints",
+];
+const NOT_AUTHORIZED = "D1_ERROR: not authorized: SQLITE_AUTH";
+test("from 2026-11-03: PRAGMAs outside D1's allow-list are refused, the allowed ones run", async () => {
+  const DB = fresh("2026-11-03");
+  await DB.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT);\nCREATE INDEX i ON t (a)");
+  for (const pragma of ALLOWED_PRAGMAS)
+    expect(await failure(() => DB.prepare(`PRAGMA ${pragma}`).all())).not.toBe(NOT_AUTHORIZED);
+  expect((await DB.prepare("PRAGMA table_info(t)").raw()).map((c) => c[1])).toEqual(["id", "a"]);
+  expect(await DB.prepare("PRAGMA foreign_keys").first("foreign_keys")).toBe(1);
+  for (const sql of [
+    "PRAGMA user_version",
+    "PRAGMA user_version = 3",
+    "pragma integrity_check",
+    "PRAGMA journal_mode",
+    "PRAGMA page_count",
+    "PRAGMA TABLE_INFO(t)",
+    "PRAGMA Foreign_Keys",
+    "PRAGMA nonexistent",
+    "PRAGMA temp.table_info(t)",
+    "PRAGMA main.user_version",
+    '  PRAGMA "user_version"',
+    "/* x */ PRAGMA user_version",
+    "-- x\nPRAGMA user_version",
+  ])
+    expect(await failure(() => DB.prepare(sql).run())).toBe(NOT_AUTHORIZED);
+  expect(await failure(() => DB.prepare("PRAGMA main.table_info(t)").all())).not.toBe(NOT_AUTHORIZED);
+  expect(await failure(() => DB.prepare('PRAGMA "table_info"(t)').all())).not.toBe(NOT_AUTHORIZED);
+  expect(await failure(() => DB.prepare("PRAGMA nosuch.user_version").all())).not.toBe(NOT_AUTHORIZED);
+  // not a PRAGMA at all
+  expect((await DB.prepare("SELECT 'PRAGMA user_version' AS p").first()).p).toBe("PRAGMA user_version");
+  expect(await failure(() => DB.batch([DB.prepare("SELECT 1"), DB.prepare("PRAGMA user_version")]))).toBe(
+    NOT_AUTHORIZED,
+  );
+  expect(await failure(() => DB.exec("SELECT 1;\nPRAGMA user_version"))).toBe(
+    "D1_EXEC_ERROR: Error in line 2: PRAGMA user_version: not authorized: SQLITE_AUTH",
+  );
+  expect(await failure(() => DB.exec("PRAGMA foreign_keys = ON; PRAGMA user_version = 3"))).toBe(
+    "D1_EXEC_ERROR: Error in line 1: PRAGMA foreign_keys = ON; PRAGMA user_version = 3: not authorized: SQLITE_AUTH",
+  );
+  // a ';' inside a string does not start a statement
+  expect((await DB.exec("SELECT ';PRAGMA user_version'")).count).toBe(1);
+  expect((await DB.exec("PRAGMA foreign_keys = ON; PRAGMA table_info(t)")).count).toBe(1);
+});
+
+test("before 2026-11-03: every PRAGMA still runs", async () => {
+  const DB = fresh("2026-11-02");
+  expect(await DB.prepare("PRAGMA user_version").first("user_version")).toBe(0);
+  expect((await DB.exec("PRAGMA user_version = 3")).count).toBe(1);
+  expect(await DB.prepare("PRAGMA user_version").first("user_version")).toBe(3);
+});
+
+test("exec errors read as D1's: the statement's offset and SQLite's code, from 2026-11-03", async () => {
+  const DB = fresh("2026-11-03");
+  const text = (sql) => failure(() => DB.exec(sql));
+  await DB.exec("CREATE TABLE t (id INTEGER)");
+  expect(await text("INSERT INTO t (id) VALUES (1); SELEC 2")).toBe(
+    'D1_EXEC_ERROR: Error in line 1: INSERT INTO t (id) VALUES (1); SELEC 2: near "SELEC": syntax error at offset 0: SQLITE_ERROR',
+  );
+  expect(await text("SELEC 2")).toBe(
+    'D1_EXEC_ERROR: Error in line 1: SELEC 2: near "SELEC": syntax error at offset 0: SQLITE_ERROR',
+  );
+  expect(await text("SELECT 1;\n  SELEC 3")).toBe(
+    'D1_EXEC_ERROR: Error in line 2:   SELEC 3: near "SELEC": syntax error at offset 2: SQLITE_ERROR',
+  );
+  expect(await text("/*c*/ SELEC 1")).toBe(
+    'D1_EXEC_ERROR: Error in line 1: /*c*/ SELEC 1: near "SELEC": syntax error at offset 6: SQLITE_ERROR',
+  );
+  expect(await text("SELECT ';'; SELEC 1")).toBe(
+    `D1_EXEC_ERROR: Error in line 1: SELECT ';'; SELEC 1: near "SELEC": syntax error at offset 0: SQLITE_ERROR`,
+  );
+  expect(await text("SELECT * FROM nope")).toBe(
+    "D1_EXEC_ERROR: Error in line 1: SELECT * FROM nope: no such table: nope: SQLITE_ERROR",
+  );
+  expect(await text("SELECT 1,")).toBe("D1_EXEC_ERROR: Error in line 1: SELECT 1,: incomplete input: SQLITE_ERROR");
+  await DB.exec("CREATE TABLE u (a UNIQUE); INSERT INTO u VALUES (1)");
+  expect(await text("INSERT INTO u VALUES (1)")).toBe(
+    "D1_EXEC_ERROR: Error in line 1: INSERT INTO u VALUES (1): UNIQUE constraint failed: u.a: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_UNIQUE)",
+  );
+  // earlier dates keep the bare message
+  const old = fresh("2026-11-02");
+  expect(await failure(() => old.exec("SELEC 2"))).toBe(
+    'D1_EXEC_ERROR: Error in line 1: SELEC 2: near "SELEC": syntax error',
+  );
+});
+
+test("from 2026-11-03: a statement with no statement in it, an empty exec, and PRAGMA foreign_keys = OFF", async () => {
+  const DB = fresh("2026-11-03");
+  const NONE = "D1_ERROR: SQL code did not contain a statement.";
+  for (const sql of [";", " ; ", "-- hi", "/* x */", "-- a\n/* b */;"])
+    expect(await failure(() => DB.prepare(sql).all())).toBe(NONE);
+  expect((await DB.prepare("-- c\nSELECT 1 AS a").first()).a).toBe(1);
+  expect(await failure(() => DB.exec(""))).toBe("D1_EXEC_ERROR: Error in line 1: : No SQL statements detected.");
+  expect(await failure(() => DB.exec(";"))).toBe(
+    "D1_EXEC_ERROR: Error in line 1: ;: SQL code did not contain a statement.",
+  );
+  expect(await failure(() => DB.exec("SELECT 1;\n-- x"))).toBe(
+    "D1_EXEC_ERROR: Error in line 2: -- x: SQL code did not contain a statement.",
+  );
+  await DB.exec("CREATE TABLE p (id INTEGER PRIMARY KEY);\nCREATE TABLE c (a REFERENCES p(id))");
+  await DB.prepare("PRAGMA foreign_keys = OFF").run();
+  expect(await DB.prepare("PRAGMA foreign_keys").first("foreign_keys")).toBe(1);
+  expect(await failure(() => DB.prepare("INSERT INTO c VALUES (5)").run())).toMatch(
+    /^D1_ERROR: FOREIGN KEY constraint failed/,
+  );
+  // earlier dates keep the old answers
+  const old = fresh("2026-11-02");
+  expect(await failure(() => old.exec(""))).toBe("D1_ERROR: No SQL statements detected.");
+});

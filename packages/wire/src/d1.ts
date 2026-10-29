@@ -64,16 +64,60 @@ const SQLITE_CODES = [
   "SQLITE_NOTADB",
 ];
 /** D1's wording for a SQLite error, as the embedded transport words it for strict calls. */
-export function d1Error(error: Error): Error {
+export function d1Error(error: Error, byteOffset?: number): Error {
   if (!isSqliteFailure(error)) return error;
   let text = `D1_ERROR: ${error.message}`;
-  if (Number.isInteger(error.byteOffset) && Number(error.byteOffset) >= 0) text += ` at offset ${error.byteOffset}`;
+  const offset = byteOffset ?? error.byteOffset;
+  if (Number.isInteger(offset) && Number(offset) >= 0) text += ` at offset ${offset}`;
   const base = SQLITE_CODES[(Number(error.errno) || 0) & 255];
   if (base) {
     text += `: ${base}`;
     if (base === "SQLITE_CONSTRAINT" && error.code && error.code !== base) text += ` (extended: ${error.code})`;
   }
   return new Error(text);
+}
+/**
+ * Where, in a line of statements, the statement that fails at byte `offset` begins. bun:sqlite counts an
+ * error's offset from the start of the whole string; D1 (SQLite's own exec loop) counts it from the first
+ * non-space character of the failing statement. A `;` inside a quoted name or string or a comment does not
+ * end a statement.
+ */
+export function statementStart(sql: Uint8Array, offset: number): number {
+  const at = (i: number) => (i < sql.length ? sql[i] : 0);
+  const space = (c: number) => c === 32 || c === 9 || c === 10 || c === 13 || c === 12;
+  let start = 0;
+  let i = 0;
+  while (i < offset) {
+    const c = sql[i];
+    if (c === 59) {
+      i++;
+      while (space(at(i))) i++;
+      if (i <= offset) start = i;
+    } else if (c === 39 || c === 34 || c === 96 || c === 91) {
+      const close = c === 91 ? 93 : c;
+      i++;
+      while (i < sql.length && sql[i] !== close) i++;
+      i++;
+    } else if (c === 45 && at(i + 1) === 45) {
+      while (i < sql.length && sql[i] !== 10) i++;
+    } else if (c === 47 && at(i + 1) === 42) {
+      i += 2;
+      while (i < sql.length && !(sql[i] === 42 && at(i + 1) === 47)) i++;
+      i += 2;
+    } else i++;
+  }
+  return start;
+}
+/** D1's text for the failure of one exec line (from 2026-11-03: with " at offset N: SQLITE_ERROR" and all). */
+function execLineError(error: Error, line: string): string {
+  const failure = error;
+  if (!isSqliteFailure(failure)) return failure.message;
+  const offset = Number(failure.byteOffset);
+  const own =
+    Number.isInteger(offset) && offset > 0
+      ? offset - statementStart(new TextEncoder().encode(line), offset)
+      : undefined;
+  return d1Error(failure, own).message.replace(/^D1_ERROR: /, "");
 }
 export type D1Request = { owner: string; key: string; path: string; name: string; msg: Frame };
 
@@ -216,7 +260,13 @@ export function createD1Store(executionMs = 0, capability = "", maxOpen = 0) {
                   db.exec(line);
                 } catch (error) {
                   throw new Error(
-                    `D1_EXEC_ERROR: Error in line ${i + 1}: ${line}: ${error instanceof Error ? error.message : String(error)}`,
+                    `D1_EXEC_ERROR: Error in line ${i + 1}: ${line}: ${
+                      msg.parity === true
+                        ? execLineError(error instanceof Error ? error : new Error(String(error)), line)
+                        : error instanceof Error
+                          ? error.message
+                          : String(error)
+                    }`,
                   );
                 }
               }),
