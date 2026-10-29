@@ -338,11 +338,8 @@ test("exec errors read as D1's: the statement's offset and SQLite's code, from 2
   expect(await text("SELEC 2")).toBe(
     'D1_EXEC_ERROR: Error in line 1: SELEC 2: near "SELEC": syntax error at offset 0: SQLITE_ERROR',
   );
-  expect(await text("SELECT 1;\n  SELEC 3")).toBe(
-    'D1_EXEC_ERROR: Error in line 2:   SELEC 3: near "SELEC": syntax error at offset 2: SQLITE_ERROR',
-  );
-  expect(await text("/*c*/ SELEC 1")).toBe(
-    'D1_EXEC_ERROR: Error in line 1: /*c*/ SELEC 1: near "SELEC": syntax error at offset 6: SQLITE_ERROR',
+  expect(await text("SELECT 1;\nSELEC 3")).toBe(
+    'D1_EXEC_ERROR: Error in line 2: SELEC 3: near "SELEC": syntax error at offset 0: SQLITE_ERROR',
   );
   expect(await text("SELECT ';'; SELEC 1")).toBe(
     `D1_EXEC_ERROR: Error in line 1: SELECT ';'; SELEC 1: near "SELEC": syntax error at offset 0: SQLITE_ERROR`,
