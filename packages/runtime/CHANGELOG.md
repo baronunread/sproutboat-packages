@@ -1,5 +1,12 @@
 # @sproutboat/runtime
 
+## 0.36.0
+
+### Minor Changes
+
+- 7a9c1f9: `AsyncLocalStorage` (`import { AsyncLocalStorage } from "node:async_hooks"`, once the CLI maps the import), as Workers has it: `run`, `exit`, `getStore` and the static `snapshot`. `enterWith` and `disable` throw, as there. The static `bind` is not provided: Porffor compiles a `.bind(` call on a function value to `Function.prototype.bind`, so use `snapshot()`. The toolchain patches Porffor's job queue and timers to carry one current-context value: a promise reaction (then, await, a coroutine resume, a native response callback) and a timer record it when they are created and set it when they run, so the store follows a request across awaits, microtasks, timers, intervals, async fetch and WebSocket callbacks and `ctx.waitUntil`, and requests interleaved in one process never see each other's. Cost: a reaction is 56 bytes, not 40, and each job does one load. The context is only ever set by `AsyncLocalStorage`. Nothing an existing app observes changes, so there is no new compatibility date: `node:async_hooks` did not work at any date before (the import built and `new AsyncLocalStorage()` threw). New native test `test:native-async-local-storage` (needs `SB_CLI`).
+- a68d923: `x-sb-cpu-ms` is per request when requests interleave in one process. A request is charged the thread CPU time of the slices in which it ran (the toolchain's async context carries a request id through awaits, reactions and timers, and the clock is read only when the running request changes, so a request that runs alone costs two reads). Before, the stamp was the process CPU delta across the handler, which is right only for a handler that answers synchronously, so an async handler was never stamped. From compatibility date `2026-11-02` an async handler is stamped too (its response is a string with no Set-Cookie, as for a sync one); earlier dates still send no stamp for an async handler. A synchronous handler's stamp is now thread time, which leaves out the egress threads. New native test `test:native-cpu-requests`: a 200 ms spinner among eight waiters is charged its 200 ms and the waiters under 60 ms, two spinners are each charged their own, and the date gate.
+
 ## 0.35.0
 
 ### Minor Changes
