@@ -17,6 +17,7 @@ import {
   patchStreamingResponses,
   patchAsyncWaker,
   patchSplitGlobals,
+  patchTypedArrayShadow,
   patchGlobalThisSync,
   patchBlobClass,
   patchFetchClasses,
@@ -868,4 +869,37 @@ test("globalThis patch rewrites only changed bindings on access, idempotently", 
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+// One idempotent, anchor-checked edit of a Porffor source file, as the patches above are tested.
+async function expectPatch(
+  patch: (root: string) => Promise<void>,
+  file: string,
+  anchor: string,
+  expected: string,
+): Promise<void> {
+  const root = await mkdtemp(join(tmpdir(), "sb-patch-"));
+  try {
+    await mkdir(join(root, "compiler"));
+    const path = join(root, file);
+    await writeFile(path, `// before\n${anchor}// after\n`);
+    await patch(root);
+    const patched = await readFile(path, "utf8");
+    expect(patched).toContain(expected);
+    await patch(root);
+    expect(await readFile(path, "utf8")).toBe(patched);
+    await writeFile(path, "export const x = 1;\n");
+    await expect(patch(root)).rejects.toThrow("anchor not found");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+test("patchTypedArrayShadow lets a typed array with an underlying object shadow builtin methods", async () => {
+  await expectPatch(
+    patchTypedArrayShadow,
+    "compiler/codegen.js",
+    "        const call = owner === 'RegExp' && shadowable ? shadowed : () => generate(scope, builtinCallNode);\n",
+    "(owner === 'RegExp' || owner === 'TypedArray') && shadowable",
+  );
 });

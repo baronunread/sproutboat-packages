@@ -1989,6 +1989,29 @@ export async function patchSplitGlobals(root: string): Promise<void> {
   await writeFile(file, src);
 }
 
+// A typed array that has an underlying object (a subclass instance, a custom prototype, own
+// properties) can shadow a builtin method: `class Buffer extends Uint8Array { toString(enc) {} }`
+// or Node's Buffer, whose toString(encoding), indexOf and fill replace the typed array ones. The
+// compiler bound those calls to the builtin by type, so `buf.toString("hex")` returned "1,255".
+// Regexps already take the dynamic path when they have an underlying object; typed arrays now do too.
+const TA_SHADOW_MARKER = "sproutboat: typed arrays can shadow";
+const TA_SHADOW_ANCHOR =
+  "const call = owner === 'RegExp' && shadowable ? shadowed : () => generate(scope, builtinCallNode);";
+const TA_SHADOW_INJECT =
+  "// " +
+  TA_SHADOW_MARKER +
+  " their builtin methods (Buffer.toString)\n        " +
+  "const call = (owner === 'RegExp' || owner === 'TypedArray') && shadowable ? shadowed : () => generate(scope, builtinCallNode);";
+
+export async function patchTypedArrayShadow(root: string): Promise<void> {
+  const file = resolve(root, "compiler/codegen.js");
+  const src = await readFile(file, "utf8");
+  if (src.includes(TA_SHADOW_MARKER)) return;
+  if (src.split(TA_SHADOW_ANCHOR).length !== 2)
+    throw new Error(`could not patch Porffor's typed array method dispatch: anchor not found in ${file}`);
+  await writeFile(file, src.replace(TA_SHADOW_ANCHOR, TA_SHADOW_INJECT));
+}
+
 // The conservative scanner must recognize the encoded f64 form used by BigInt builtins.
 const BIGINT_GC_ANCHOR = "static void porf_gc_cons_candidate(u32 c);\n";
 const BIGINT_GC_HELPER = `static void porf_gc_cons_f64(f64 d) {
@@ -2318,6 +2341,7 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchCaseMapping(root);
   await patchZeroDelayTimers(root);
   await patchSplitGlobals(root);
+  await patchTypedArrayShadow(root);
   await patchStreamingRequests(root);
   await patchWebSockets(root);
   // After every patch that edits write_response_value (streaming, raw bodies, WebSockets).

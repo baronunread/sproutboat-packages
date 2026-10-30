@@ -219,6 +219,7 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "        const sync = [];\n        if (name === 'globalThis') globalThisUserSync(Box(getPtr, Const(T.i32, TYPES.object)), sync);\n" +
       "        out.push(BlockStmt(sync));\n",
     "compiler/codegen.js":
+      "        const call = owner === 'RegExp' && shadowable ? shadowed : () => generate(scope, builtinCallNode);\n" +
       "  Reinterpret, Box, JvType, JvNum, JvPtr, JvIsNum,\n" +
       "  globalThisUserSync: (objJv, sync) => {\n    const finalizer = () => {\n      sync.length = 0;\n      const seen = new Set();\n      const push = (key, value) => {\n        seen.add(key);\n        sync.push(builtinCall(scope, '__Porffor_object_set', [ objJv, makeString(scope, key), value ]));\n      };\n" +
       "    includeBuiltin(topLevelFunc, '__Porffor_promise_resolve');\n" +
