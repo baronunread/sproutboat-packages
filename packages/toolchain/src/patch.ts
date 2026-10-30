@@ -28,6 +28,7 @@ import {
 } from "./fetch-classes";
 import * as requestStreaming from "./request-streaming";
 import * as websockets from "./websockets";
+import * as restart from "./restart";
 import { patchAsyncContext } from "./async-context";
 import {
   NATIVE_BYTES_LAYOUT,
@@ -2386,6 +2387,8 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchWebSockets(root);
   // After every patch that edits write_response_value (streaming, raw bodies, WebSockets).
   await patchResponseWriteInPlace(root);
+  await patchGracefulRestart(root);
+  await patchMuslTarget(root);
   await patchNativeBytes(root);
   await patchStringAppend(root);
   await patchRegexReplace(root);
@@ -2396,4 +2399,58 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await precompileBuiltins(root);
   await patchUnicode(root);
   done.add(root);
+}
+
+/**
+ * Standalone only: restart without dropping a connection (systemd socket activation, SIGUSR2, and a
+ * draining SIGTERM). See restart.ts. It edits the native shim, never render.js. The
+ * behaviour is switched on by the embedded transport (the weak `sb_standalone_app_name`), so a broker
+ * sprout built from the same shim is unchanged.
+ */
+export async function patchGracefulRestart(root: string): Promise<void> {
+  const file = resolve(root, "compiler/uwebsockets.js");
+  let src = await readFile(file, "utf8");
+  if (src.includes(restart.RESTART_MARKER)) return;
+  for (const [anchor, inject, after] of [
+    [restart.RESTART_ANCHOR, restart.RESTART_SOURCE, false],
+    [restart.RESTART_HEADER_ANCHOR, restart.RESTART_HEADER_INJECT, false],
+    [restart.RESTART_LISTEN_ANCHOR, restart.RESTART_LISTEN_INJECT, true],
+  ] as const) {
+    if (src.split(anchor).length !== 2)
+      throw new Error(`could not patch Porffor's restart handling: anchor not found in ${file}`);
+    const at = src.indexOf(anchor) + (after ? anchor.length : 0);
+    src = src.slice(0, at) + inject + src.slice(at);
+  }
+  await writeFile(file, src);
+}
+
+/**
+ * A musl build targets x86_64 only in Porffor: the compiler triple and the uSockets cache directory
+ * are fixed. `SB_MUSL_TARGET` (for example `aarch64-linux-musl`) names another Linux target, and
+ * `SB_UWS_VARIANT` suffixes the uWebSockets cache directory so a tree built for one target is not
+ * reused for another. Both are inert when unset, so every existing build is byte-identical.
+ */
+export async function patchMuslTarget(root: string): Promise<void> {
+  const indexFile = resolve(root, "compiler/index.js");
+  const index = await readFile(indexFile, "utf8");
+  const marker = "SB_MUSL_TARGET";
+  if (!index.includes(marker)) {
+    const plain = "'x86_64-linux-musl'";
+    if (index.split(plain).length !== 3)
+      throw new Error(`could not patch Porffor's musl target: anchors not found in ${indexFile}`);
+    await writeFile(indexFile, index.replaceAll(plain, "(process.env.SB_MUSL_TARGET || 'x86_64-linux-musl')"));
+  }
+  const uwsFile = resolve(root, "compiler/uwebsockets.js");
+  const uws = await readFile(uwsFile, "utf8");
+  if (uws.includes("SB_UWS_VARIANT")) return;
+  const anchor = "uWebSockets-${UWS_COMMIT}${Prefs.musl ? '-musl' : ''}`);\n  const appHeader";
+  if (uws.split(anchor).length !== 2)
+    throw new Error(`could not patch Porffor's uWebSockets cache directory: anchor not found in ${uwsFile}`);
+  await writeFile(
+    uwsFile,
+    uws.replace(
+      anchor,
+      "uWebSockets-${UWS_COMMIT}${Prefs.musl ? '-musl' + (process.env.SB_UWS_VARIANT ? '-' + process.env.SB_UWS_VARIANT : '') : ''}`);\n  const appHeader",
+    ),
+  );
 }
