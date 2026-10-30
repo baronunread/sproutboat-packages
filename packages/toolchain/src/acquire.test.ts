@@ -92,6 +92,9 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "const path = require('node:path');\n" +
       "fs.writeFileSync(path.join(__dirname, 'builtins_precompiled.js'), fs.readFileSync(path.join(__dirname, 'builtins/typedarray.js')));\n",
     "compiler/builtins_precompiled.js": "fixture:precompiled\n",
+    // patchObjectGrowEntries' anchor.
+    "compiler/builtins/_internal_object.ts":
+      "  Porffor.IR.storeU16(obj, 2, capacity);\n  Porffor.IR.storeI32(obj, 12, newEntriesPtr);\n  Porffor.IR.gcBarrier(obj, Porffor.TYPES.object);\n  return newEntriesPtr;\n",
     "compiler/builtins/date.ts": "export const __ecma262_ParseDTSF = (string: string) => {\n};\n",
     "compiler/builtins/arraybuffer.ts": "// maxByteLength -1 for fixed length, -2 for immutable\n",
     "compiler/builtins/typedarray.js":

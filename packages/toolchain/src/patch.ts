@@ -2100,6 +2100,44 @@ export async function patchArrayGrowEntries(root: string): Promise<void> {
   await writeFile(file, src.replace(ARRAY_GROW_OLD, ARRAY_GROW_NEW));
 }
 
+// An object that outgrows its capacity copies its entries to a bigger block and leaves the old one
+// where it was, the same way an array does (patchArrayGrowEntries). While that block is old, only a
+// full collection frees it, and a minor collection scans it (as PORF_GC_KIND_OBJECT_ENTRIES, a kind
+// an earlier collection gave it) whenever a write to a neighbouring block dirties its 512-byte card.
+// Its slots still hold the pointers it had; the objects they name were freed by an earlier minor
+// collection, so the scan marks whatever now lives there as the type the slot claims (a reused
+// array becomes a Promise) and the collector reads it as that: SIGBUS or silent corruption. Plain
+// object slots are partly protected by porf_gc_object_shape_valid; every other type is not. The
+// abandoned block is now classed as a leaf, which no collection scans. The inline entries at obj + 16
+// belong to the object's own block and are left alone.
+const OBJECT_GROW_MARKER = "sproutboat: an abandoned entries block holds no live references";
+const OBJECT_GROW_OLD = `  Porffor.IR.storeU16(obj, 2, capacity);
+  Porffor.IR.storeI32(obj, 12, newEntriesPtr);
+  Porffor.IR.gcBarrier(obj, Porffor.TYPES.object);
+  return newEntriesPtr;
+`;
+const OBJECT_GROW_NEW = `  Porffor.IR.storeU16(obj, 2, capacity);
+  Porffor.IR.storeI32(obj, 12, newEntriesPtr);
+  // sproutboat: an abandoned entries block holds no live references
+  const inlineEntries: i32 = Porffor.IR.ptr(obj) + 16;
+  Porffor.c\`
+#if PORF_GC_ENABLED
+    if (entriesPtr != inlineEntries && porf_gc_is_block_start(entriesPtr)) porf_gc_set_kind(entriesPtr, PORF_GC_KIND_LEAF);
+#endif
+  \`;
+  Porffor.IR.gcBarrier(obj, Porffor.TYPES.object);
+  return newEntriesPtr;
+`;
+
+export async function patchObjectGrowEntries(root: string): Promise<void> {
+  const file = resolve(root, "compiler/builtins/_internal_object.ts");
+  const src = await readFile(file, "utf8");
+  if (src.includes(OBJECT_GROW_MARKER)) return;
+  if (src.split(OBJECT_GROW_OLD).length !== 2)
+    throw new Error(`could not patch Porffor's object growth: anchor not found in ${file}`);
+  await writeFile(file, src.replace(OBJECT_GROW_OLD, OBJECT_GROW_NEW));
+}
+
 const FETCH_CLASSES_MARKER = "sproutboat: Fetch-spec Request and Response";
 /** Replaces Porffor's Request and Response (fetch-classes.ts); covers patchResponseDefaults. */
 export async function patchFetchClasses(root: string): Promise<void> {
@@ -2314,6 +2352,8 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchBigIntRoots(root);
   await patchStaticArrayEntries(root);
   await patchArrayGrowEntries(root);
+  // Before the precompile, which compiles it.
+  await patchObjectGrowEntries(root);
   await patchStreamingResponses(root);
   await patchQuietCollection(root);
   await patchRequestCollectionInterval(root);
