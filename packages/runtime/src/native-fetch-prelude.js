@@ -12,12 +12,12 @@ function __sbEnvValue() {
 function __sbSetCompat(date) {
   __sbCompatNow = date;
   Request._cd = date;
-  if (date >= "2026-11-15" && typeof Error.captureStackTrace !== "function") Error.captureStackTrace = __sbCaptureStackTrace;
+  if (date >= "2026-11-15" && Error.captureStackTrace === undefined) Error.captureStackTrace = __sbCaptureStackTrace;
 }
 // V8's Error.captureStackTrace(target): drivers (pg, @neondatabase/serverless) call it on the errors they
 // build and rethrow. Porffor keeps no frames, so the stack is the first line, as Error.stack is.
 function __sbCaptureStackTrace(target) {
-  if (target === null || (typeof target !== "object" && typeof target !== "function")) throw new TypeError("Invalid argument");
+  if (Object(target) !== target) throw new TypeError("Invalid argument");
   const name = target.name === undefined ? "Error" : String(target.name);
   const message = target.message === undefined ? "" : String(target.message);
   Object.defineProperty(target, "stack", { value: message === "" ? name : name + ": " + message, configurable: true, writable: true, enumerable: false });
