@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { ensurePorffor } from "../../toolchain/src/acquire";
+import { bearsslEnv } from "./bearssl";
 import { preludePath, TRANSPORT_MARKER, transportPath, wrapNativeFetchHandler } from "../src/wrap";
 
 // These values come from Bun WebCrypto and node:crypto, not from the runtime
@@ -71,26 +72,28 @@ try {
   const node = Bun.which("node");
   if (!node) throw new Error("native crypto test needs node on PATH");
 
-  const [core, broker] = await Promise.all([
-    readFile(preludePath, "utf8"),
-    readFile(transportPath("broker"), "utf8"),
-  ]);
+  const [core, broker] = await Promise.all([readFile(preludePath, "utf8"), readFile(transportPath("broker"), "utf8")]);
   assert(core.includes(TRANSPORT_MARKER), "runtime prelude is missing its transport marker");
   const prelude = core.replace(TRANSPORT_MARKER, broker);
   const generated = join(workdir, "crypto.generated.js");
   const binary = join(workdir, "crypto-native");
   // This is a direct ESM import into Porffor, with no bundler in front of it.
-  await writeFile(join(workdir, "crypto-helper.js"),
-    "export const keyBytes = () => Uint8Array.from({ length: 16 }, (_, index) => index + 1);\n");
+  await writeFile(
+    join(workdir, "crypto-helper.js"),
+    "export const keyBytes = () => Uint8Array.from({ length: 16 }, (_, index) => index + 1);\n",
+  );
   await writeFile(generated, wrapNativeFetchHandler(handler, prelude));
   await rm(binary, { force: true });
 
-  const compile = Bun.spawn([node, resolve(porffor, "runtime/index.js"), "native", generated, "-o", binary, "-s", "-O0"], {
-    cwd: workdir,
-    env: process.env,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
+  const compile = Bun.spawn(
+    [node, resolve(porffor, "runtime/index.js"), "native", generated, "-o", binary, "-s", "-O0"],
+    {
+      cwd: workdir,
+      env: { ...process.env, ...(await bearsslEnv()) },
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
   const [exitCode, stdout, stderr] = await Promise.all([
     compile.exited,
     new Response(compile.stdout).text(),

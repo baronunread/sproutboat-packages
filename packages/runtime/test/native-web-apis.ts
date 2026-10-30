@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { ensurePorffor } from "../../toolchain/src/acquire";
+import { bearsslEnv } from "./bearssl";
 import { preludePath, TRANSPORT_MARKER, transportPath, wrapNativeFetchHandler } from "../src/wrap";
 
 // Web API behaviour the W2 conformance suite found wrong, compared with Bun: Headers
@@ -25,7 +26,8 @@ const CASES = [
   `new URL("http://münchen.test/x").host`,
   `crypto.subtle.digest("SHA-1", new TextEncoder().encode("abc")).then((b) => Array.from(new Uint8Array(b), (x) => x.toString(16).padStart(2, "0")).join(""))`,
   `crypto.subtle.importKey("raw", new TextEncoder().encode("key"), { name: "HMAC", hash: "SHA-1" }, true, ["sign"]).then(async (k) => [k.algorithm.hash.name, k.algorithm.length, Array.from(new Uint8Array(await crypto.subtle.sign("HMAC", k, new TextEncoder().encode("msg"))), (x) => x.toString(16).padStart(2, "0")).join(""), new Uint8Array(await crypto.subtle.exportKey("raw", k)).length].join())`,
-  `crypto.subtle.generateKey({ name: "HMAC", hash: "SHA-512" }, true, ["sign"]).then(async (k) => [k.type, k.algorithm.length, (await crypto.subtle.exportKey("raw", k)).byteLength].join())`,  `(async () => { const collect = async (rs) => { const r = rs.getReader(); const out = []; for (;;) { const { value, done } = await r.read(); if (done) return out; out.push(value); } }; const bytes = new ReadableStream({ start(c) { c.enqueue(new Uint8Array([0x61, 0xe2])); c.enqueue(new Uint8Array([0x82, 0xac, 0xf0, 0x9f])); c.enqueue(new Uint8Array([0x98, 0x80])); c.close(); } }); const text = new ReadableStream({ start(c) { c.enqueue("a\\uD83D"); c.enqueue("\\uDE00b"); c.close(); } }); return (await collect(bytes.pipeThrough(new TextDecoderStream()))).join("|") + ";" + (await collect(text.pipeThrough(new TextEncoderStream()))).map((u) => Array.from(u).join(",")).join("|"); })()`,
+  `crypto.subtle.generateKey({ name: "HMAC", hash: "SHA-512" }, true, ["sign"]).then(async (k) => [k.type, k.algorithm.length, (await crypto.subtle.exportKey("raw", k)).byteLength].join())`,
+  `(async () => { const collect = async (rs) => { const r = rs.getReader(); const out = []; for (;;) { const { value, done } = await r.read(); if (done) return out; out.push(value); } }; const bytes = new ReadableStream({ start(c) { c.enqueue(new Uint8Array([0x61, 0xe2])); c.enqueue(new Uint8Array([0x82, 0xac, 0xf0, 0x9f])); c.enqueue(new Uint8Array([0x98, 0x80])); c.close(); } }); const text = new ReadableStream({ start(c) { c.enqueue("a\\uD83D"); c.enqueue("\\uDE00b"); c.close(); } }); return (await collect(bytes.pipeThrough(new TextDecoderStream()))).join("|") + ";" + (await collect(text.pipeThrough(new TextEncoderStream()))).map((u) => Array.from(u).join(",")).join("|"); })()`,
 ];
 const handler = `export default {async fetch() {
   const cases = [
@@ -37,7 +39,15 @@ ${CASES.map((c) => `    () => (${c}),`).join("\n")}
   }
   return new Response(JSON.stringify(out));
 }};`;
-const want = await Promise.all(CASES.map(async (c) => { try { return String(await new Function("return " + c)()); } catch (e) { return "THROWS " + (e instanceof Error ? e.message : String(e)); } }));
+const want = await Promise.all(
+  CASES.map(async (c) => {
+    try {
+      return String(await new Function("return " + c)());
+    } catch (e) {
+      return "THROWS " + (e instanceof Error ? e.message : String(e));
+    }
+  }),
+);
 
 function freePort(): number {
   const listener = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
@@ -53,10 +63,7 @@ try {
   const node = Bun.which("node");
   if (!node) throw new Error("native streams test needs node on PATH");
 
-  const [core, broker] = await Promise.all([
-    readFile(preludePath, "utf8"),
-    readFile(transportPath("broker"), "utf8"),
-  ]);
+  const [core, broker] = await Promise.all([readFile(preludePath, "utf8"), readFile(transportPath("broker"), "utf8")]);
   assert(core.includes(TRANSPORT_MARKER), "runtime prelude is missing its transport marker");
   const prelude = core.replace(TRANSPORT_MARKER, broker);
   const generated = join(workdir, "web-apis.generated.js");
@@ -64,12 +71,15 @@ try {
   await writeFile(generated, wrapNativeFetchHandler(handler, prelude));
   await rm(binary, { force: true });
 
-  const compile = Bun.spawn([node, resolve(porffor, "runtime/index.js"), "native", generated, "-o", binary, "-s", "-O0"], {
-    cwd: workdir,
-    env: process.env,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
+  const compile = Bun.spawn(
+    [node, resolve(porffor, "runtime/index.js"), "native", generated, "-o", binary, "-s", "-O0"],
+    {
+      cwd: workdir,
+      env: { ...process.env, ...(await bearsslEnv()) },
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
   const [exitCode, stdout, stderr] = await Promise.all([
     compile.exited,
     new Response(compile.stdout).text(),
@@ -98,8 +108,14 @@ try {
   // SAFETY: the handler above is the only producer of this body: a JSON array with one
   // string per case; the comparison below reports any entry that differs.
   const got = JSON.parse(await (await fetch(`http://127.0.0.1:${port}/`)).text()) as string[];
-  const diffs = CASES.flatMap((c, i) => (got[i] === want[i] ? [] : [`${c}\n    want ${JSON.stringify(want[i])}\n    got  ${JSON.stringify(got[i])}`]));
-  assert.deepEqual(diffs, [], `Web API results differ from Bun in ${diffs.length} of ${CASES.length} cases:\n${diffs.join("\n")}`);
+  const diffs = CASES.flatMap((c, i) =>
+    got[i] === want[i] ? [] : [`${c}\n    want ${JSON.stringify(want[i])}\n    got  ${JSON.stringify(got[i])}`],
+  );
+  assert.deepEqual(
+    diffs,
+    [],
+    `Web API results differ from Bun in ${diffs.length} of ${CASES.length} cases:\n${diffs.join("\n")}`,
+  );
   console.log(`Native Web APIs match Bun in all ${CASES.length} cases`);
 } finally {
   if (server) {

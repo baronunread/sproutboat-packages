@@ -205,6 +205,36 @@ export function neutraliseExports(source: string): string | null {
  * leaks that change to later requests. Freeze upstream once Porffor supports
  * Object.freeze in native mode.
  */
+/**
+ * What a handler needs of crypto.subtle: `"always"` (the default for the embedded transport) leaves the prelude as it is, which
+ * is what a shared template needs (sproutd compiles apps against one prelude). `"auto"` drops the
+ * workerd-style crypto.subtle (its JavaScript, and the BearSSL and Monocypher C behind it) from a
+ * handler whose source never mentions `subtle`, `DigestStream` or `CryptoKey`: such a handler cannot
+ * reach it, and the code is about 330 KB of a 5.3 MB standalone binary and about 2 s of its build.
+ * A handler that reaches crypto.subtle without naming it (a computed property name) gets the
+ * digest/HMAC/PBKDF2 subset that earlier dates have.
+ */
+export type SubtleMode = "always" | "auto";
+
+const SUBTLE_BLOCKS: Array<[string, string]> = [
+  ["// SUBTLE-JS:BEGIN", "// SUBTLE-JS:END"],
+  ["// SUBTLE:BEGIN", "// SUBTLE:END"],
+];
+/** The prelude without workerd-style crypto.subtle. Throws if a marker is missing: a silent no-op would ship the code. */
+export function pruneSubtle(prelude: string): string {
+  let out = prelude;
+  for (const [begin, end] of SUBTLE_BLOCKS) {
+    const start = out.indexOf(begin);
+    const stop = out.indexOf(end, start);
+    if (start < 0 || stop < 0) {
+      throw new Error(`the prelude has no ${begin} ... ${end} block to prune`);
+    }
+    out = out.slice(0, start) + out.slice(out.indexOf("\n", stop) + 1);
+  }
+  return out;
+}
+export const reachesSubtle = (source: string) => /\b(?:subtle|DigestStream|CryptoKey)\b/.test(source);
+
 export function wrapNativeFetchHandler(
   source: string,
   prelude: string,
@@ -224,7 +254,17 @@ export function wrapNativeFetchHandler(
    * own self-describing identity rather than a broker round trip.
    */
   versionMetadata?: { binding: string; id: string; tag: string; timestamp: string },
+  subtle?: SubtleMode,
 ): string {
+  // The shared template (sproutd) is the embedded transport and needs it all; a broker build links BearSSL only for
+  // a handler that uses crypto.subtle (the CLI does that), so it defaults to pruning.
+  // A prelude without the block (a test stub) is left alone; prune.test.ts holds the real one to it.
+  if (
+    (subtle ?? (transport === "embedded" ? "always" : "auto")) === "auto" &&
+    !reachesSubtle(source) &&
+    prelude.includes("// SUBTLE-JS:BEGIN")
+  )
+    prelude = pruneSubtle(prelude);
   const neutralised = neutraliseExports(inlineWorkersImports(source));
   // A WorkerEntrypoint may serve only RPC, and a Worker only scheduled() or queue(), with
   // no fetch() at all, as in workerd.

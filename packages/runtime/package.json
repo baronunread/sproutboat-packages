@@ -12,6 +12,7 @@
   "types": "./src/index.ts",
   "scripts": {
     "test": "bun test ./",
-    "gen:egress": "bun src/gen-egress.ts"
+    "gen:egress": "bun src/gen-egress.ts",
+    "gen:subtle": "bun src/subtle/assemble.ts"
   }
 }
