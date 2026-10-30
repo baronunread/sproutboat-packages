@@ -12,7 +12,9 @@ const bear = join(
   "bearssl-0.6/bearssl-0.6",
 );
 const lib = join(bear, "build/libbearssl.a");
-const available = existsSync(lib);
+// SUBTLE_DRIVER: a prebuilt driver binary (a machine with no C compiler, or a cross-built one).
+const prebuilt = process.env.SUBTLE_DRIVER;
+const available = prebuilt !== undefined || existsSync(lib);
 
 const OP = {
   pkcs1Sign: 1,
@@ -56,7 +58,9 @@ const arg = (v: string | Uint8Array | undefined) =>
 
 let driver = "";
 let work = "";
-if (available) {
+if (prebuilt !== undefined) {
+  driver = prebuilt;
+} else if (available) {
   work = mkdtempSync(join(tmpdir(), "sb-subtle-"));
   writeFileSync(join(work, "assembled.c"), assembleSubtleC());
   await Bun.write(join(work, "driver.c"), Bun.file(new URL("./driver.c", import.meta.url)));
