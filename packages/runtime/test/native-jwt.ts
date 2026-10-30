@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { ensurePorffor } from "../../toolchain/src/acquire";
+import { bearsslEnv } from "./bearssl";
 import { preludePath, TRANSPORT_MARKER, transportPath, wrapNativeFetchHandler } from "../src/wrap";
 
 // The pieces of a JWT check (base64url decode, TextEncoder, HMAC verify) against values that do
@@ -290,7 +291,7 @@ try {
     [node, resolve(porffor, "runtime/index.js"), "native", generated, "-o", binary, "-s", "-O0"],
     {
       cwd: workdir,
-      env: process.env,
+      env: { ...process.env, ...(await bearsslEnv()) },
       stdout: "pipe",
       stderr: "pipe",
     },

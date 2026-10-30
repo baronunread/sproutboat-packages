@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { readdirSync, existsSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { bearsslEnv } from "./bearssl";
 import { ensurePorffor } from "../../toolchain/src/acquire";
 import { jsonObject, parseJsonValue, type JsonObject, type JsonValue } from "../../wire/src/json";
 import { SUBTLE_DATE } from "../src/subtle-date";
@@ -98,22 +98,6 @@ const digests: JsonValue[] = [
 ];
 expectedNew.digests = digests;
 
-// The prelude carries the native half on every transport now, so a compile that reaches it needs
-// BearSSL on the include path and link line, as the CLI arranges. Use the CLI cache; skip without it.
-const bearssl = join(process.env.SPROUTBOAT_TOOLCHAIN_CACHE ?? join(homedir(), ".cache/sproutboat"), "bearssl-0.6");
-const objects = join(bearssl, "obj-host");
-if (!existsSync(objects)) {
-  console.log("crypto.subtle native test skipped: no BearSSL in the CLI cache (a standalone build creates it)");
-  process.exit(0);
-}
-const bearsslEnv = {
-  SB_EXTRA_CFLAGS: `-I ${join(bearssl, "bearssl-0.6/inc")}`,
-  SB_EXTRA_LINK: readdirSync(objects)
-    .filter((name) => name.endsWith(".o") && name !== "trust-anchors.o")
-    .map((name) => join(objects, name))
-    .join(" "),
-};
-
 function freePort(): number {
   const listener = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
   const port = listener.port;
@@ -143,7 +127,7 @@ async function run(date: string): Promise<JsonObject> {
       [node, resolve(porffor, "runtime/index.js"), "native", generated, "-o", binary, "-s", "-O0"],
       {
         cwd: workdir,
-        env: process.env,
+        env: { ...process.env, ...(await bearsslEnv()) },
         stdout: "pipe",
         stderr: "pipe",
       },
@@ -192,7 +176,7 @@ const [before, after] = await Promise.all([
 ]);
 assert.deepEqual(after, expectedNew, "from the new date crypto.subtle answers as workerd does");
 // Before the date nothing changed: the old subset, its plain-object keys and its errors.
-assert.equal(before.jwkImport, "ERR NotSupportedError", "before the date, jwk import is not supported");
-assert.equal(before.needsNative, "ERR NotSupportedError", "before the date, ECDSA is not supported");
+assert.equal(before.jwkImport, "ERR NotSupportedError dom", "before the date, jwk import is not supported");
+assert.equal(before.needsNative, "ERR NotSupportedError dom", "before the date, ECDSA is not supported");
 assert.deepEqual(before.signVerify, [64, true, false]);
 console.log("crypto.subtle: the date gate and the transport-independent surface match workerd");
