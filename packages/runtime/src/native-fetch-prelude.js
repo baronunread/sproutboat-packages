@@ -7209,7 +7209,9 @@ function __sbUpstream(op, msg, label, signal, always) {
   if (!__sbHttpAsyncEnabled()) {
     // A host that runs the exchange to the end before it returns (the standalone binary) still hands
     // back a promise from 2026-10-22: fetch(url).then(...) is how most libraries call it, and a refusal
-    // rejects instead of throwing.
+    // rejects instead of throwing. Earlier dates keep the Response (the embedded transport's
+    // __sbAsyncAtAnyDate is true for sproutd's sake, not for this).
+    if (!always && __sbCompatDate() < "2026-10-22") return __sbUpstreamResponse(globalThis.__sbFetchUpstream(op, msg));
     try {
       return Promise.resolve(__sbUpstreamResponse(globalThis.__sbFetchUpstream(op, msg)));
     } catch (e) {
