@@ -258,7 +258,12 @@ export function wrapNativeFetchHandler(
 ): string {
   // The shared template (sproutd) is the embedded transport and needs it all; a broker build links BearSSL only for
   // a handler that uses crypto.subtle (the CLI does that), so it defaults to pruning.
-  if ((subtle ?? (transport === "embedded" ? "always" : "auto")) === "auto" && !reachesSubtle(source))
+  // A prelude without the block (a test stub) is left alone; prune.test.ts holds the real one to it.
+  if (
+    (subtle ?? (transport === "embedded" ? "always" : "auto")) === "auto" &&
+    !reachesSubtle(source) &&
+    prelude.includes("// SUBTLE-JS:BEGIN")
+  )
     prelude = pruneSubtle(prelude);
   const neutralised = neutraliseExports(inlineWorkersImports(source));
   // A WorkerEntrypoint may serve only RPC, and a Worker only scheduled() or queue(), with
