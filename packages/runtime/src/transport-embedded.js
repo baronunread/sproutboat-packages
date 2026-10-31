@@ -4942,8 +4942,13 @@ function __sbEmbeddedDispatch(msg) {
   if (op === "secret.get") {
     // Secrets reach a standalone binary through the environment, the same
     // channel the launcher and the supervisor use; there is nothing to decrypt.
-    const value = __sbEnv(String(msg.name));
-    if (!value) throw new Error("secret not set: " + msg.name);
+    const raw = __sbEnv(String(msg.name));
+    if (!raw) throw new Error("secret not set: " + msg.name);
+    // __sbEnv hands back the environment's bytes as a bytestring, one char per byte, so a UTF-8 secret ("é" is
+    // C3 A9) reached the app as "Ã©". From compatibility date 2026-11-07 it is decoded as UTF-8, as workerd's
+    // secrets are text. Bytes that are not valid UTF-8 pass through unchanged (__sbFromUtf8's rule). The broker
+    // transport is not touched: its secrets arrive as JSON, already real strings.
+    const value = __sbCompatDate() >= "2026-11-07" ? __sbFromUtf8(raw) : raw;
     return { ok: true, value };
   }
 
