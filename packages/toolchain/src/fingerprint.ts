@@ -12,6 +12,7 @@ export const PATCH_SOURCES = [
   "patch.ts",
   "pin.ts",
   "request-streaming.ts",
+  "restart.ts",
   "streaming.ts",
   "strings.ts",
   "text-decoder.ts",
@@ -26,7 +27,7 @@ export const PATCH_SOURCES = [
  * patch.ts as the module patch.ts is everywhere else. Kept current by fingerprint.test.ts
  * (UPDATE_FINGERPRINT=1 bun test packages/toolchain/src/fingerprint.test.ts).
  */
-export const RELEASED_FINGERPRINT = "5bc6fc3302c1";
+export const RELEASED_FINGERPRINT = "4cbf15e4cbeb";
 
 /** The fingerprint of the sources in dir, or null where they are not on disk. */
 export function sourceFingerprint(dir: string): string | null {

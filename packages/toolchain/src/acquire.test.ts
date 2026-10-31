@@ -86,6 +86,8 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
     "compiler/index.js":
       "import { hashId } from './modules.js';\n" +
       "      const uwsDir = uwebsockets.ensureUWebSockets();\n" +
+      "    if (Prefs.musl) compiler = [ 'zig', 'cc', '-target', 'x86_64-linux-musl' ];\n" +
+      "    if (Prefs.musl) cxx = [ 'zig', 'c++', '-target', 'x86_64-linux-musl' ];\n" +
       "      '-fno-ident', '-ffunction-sections', '-fdata-sections',\n      ...darwinReleaseCompileArgs,\n        uSocketsArchive,\n        '-lm'\n",
     "compiler/precompile.js":
       "const fs = require('node:fs');\n" +
@@ -111,6 +113,7 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "    len = i;\n" +
       "  }\n\n  arr.length = len;\n\n  return new ${name}(arr);\n};\n",
     "compiler/uwebsockets.js":
+      "const repoDir = path.join(cacheRoot, `uWebSockets-${UWS_COMMIT}${Prefs.musl ? '-musl' : ''}`);\n  const appHeader = 1;\n" +
       'export const makeUWebSocketsShimSource = () => `\n#include "App.h"\n' +
       "void porf_native_fetch_collect_normal_from(void* stack_top);\n" +
       "static void collect_after_request(void) {\n  volatile int porf_stack_anchor = 0;\n" +
@@ -186,7 +189,7 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "\n" +
       "  if (body_owned) free(body_owned);\n" +
       "}\n" +
-      'int main(void) {\n  porf_native_fetch_runtime_init();\n  porf_native_fetch_static_init();\n\n  uWS::App().any("/*", [](auto* res, auto* req) {\n    on_request(res, req);\n  }).run();\n  return 0;\n}\n',
+      'int main(void) {\n  porf_native_fetch_runtime_init();\n  porf_native_fetch_static_init();\n\n  uWS::App().any("/*", [](auto* res, auto* req) {\n    on_request(res, req);\n  }).listen(port, [&listened, port](auto* token) {\n    if (token) {\n      listened = true;\n    }\n  }).run();\n  return 0;\n}\n',
     "compiler/builtins/json.ts":
       "// sb_json_utf16_v1\n" +
       "export const __Porffor_json_serialize = (_buffer: i32, value: any): i32 => {\n" +
