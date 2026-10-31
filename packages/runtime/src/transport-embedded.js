@@ -3145,11 +3145,16 @@ typedef struct sb_async_job {
   char *host, *path, *method, *headers, *body, *out;
   size_t body_len;
 } sb_async_job;
+// sproutd runs one host per sprout among hundreds, so a few threads each; a standalone binary is the
+// only process of its app, and workerd lets one request hold 50 subrequests.
 #define SB_ASYNC_THREADS 8
+#define SB_ASYNC_THREADS_STANDALONE 32
 static pthread_mutex_t sb_async_lock = PTHREAD_MUTEX_INITIALIZER;
 static sb_async_job *sb_async_queue = 0, *sb_async_queue_tail = 0, *sb_async_done = 0, *sb_async_current = 0;
 static int sb_async_pipe[2] = { -1, -1 };
 static int sb_async_threads = 0;
+// The standalone server's way back onto its loop (uWS defer, patchAsyncWaker); set by sb_async_set_waker.
+static void (*sb_wsc_waker)(void) = 0;
 
 int sb_async_enable(void) {
   if (sb_async_pipe[0] >= 0) return sb_async_pipe[0];
@@ -3160,7 +3165,10 @@ int sb_async_enable(void) {
   }
   return sb_async_pipe[0];
 }
-int sb_async_enabled(void) { return sb_async_pipe[0] >= 0; }
+// A host runs requests off its loop when it watches the pipe (sproutd) or gave a waker (standalone).
+int sb_async_enabled(void) { return sb_async_pipe[0] >= 0 || sb_wsc_waker != 0; }
+// Only the pipe host (sproutd) has always answered fetch() with a promise; see __sbAsyncAtAnyDate.
+int sb_async_piped(void) { return sb_async_pipe[0] >= 0; }
 static void sb_async_free(sb_async_job* j) {
   free(j->host); free(j->path); free(j->method); free(j->headers); free(j->body); free(j->out); free(j);
 }
@@ -3168,8 +3176,12 @@ static void sb_async_free(sb_async_job* j) {
 static void sb_async_finish_locked(sb_async_job* j) {
   j->next = sb_async_done;
   sb_async_done = j;
-  char one = 1;
-  while (write(sb_async_pipe[1], &one, 1) < 0 && errno == EINTR) {}
+  if (sb_async_pipe[1] >= 0) {
+    char one = 1;
+    while (write(sb_async_pipe[1], &one, 1) < 0 && errno == EINTR) {}
+  }
+  // uWS's defer is thread-safe and never takes sb_async_lock, so calling it here cannot deadlock.
+  if (sb_wsc_waker) sb_wsc_waker();
 }
 static void* sb_async_thread(void* unused) {
   (void)unused;
@@ -3192,7 +3204,7 @@ static void sb_async_start(sb_async_job* j) {
   j->next = 0;
   if (sb_async_queue_tail) sb_async_queue_tail->next = j; else sb_async_queue = j;
   sb_async_queue_tail = j;
-  int spawn = sb_async_threads < SB_ASYNC_THREADS;
+  int spawn = sb_async_threads < (sb_async_pipe[0] >= 0 ? SB_ASYNC_THREADS : SB_ASYNC_THREADS_STANDALONE);
   if (spawn) sb_async_threads++;
   pthread_mutex_unlock(&sb_async_lock);
   if (!spawn) return;
@@ -3236,7 +3248,7 @@ static void (*sb_wsc_drain_hook)(void) = 0;
 // Host: the fd became readable. Fires each finished request's callback.
 void sb_async_drain(void) {
   char buf[64];
-  while (read(sb_async_pipe[0], buf, sizeof(buf)) > 0) {}
+  if (sb_async_pipe[0] >= 0) while (read(sb_async_pipe[0], buf, sizeof(buf)) > 0) {}
   if (sb_wsc_drain_hook) sb_wsc_drain_hook();
   pthread_mutex_lock(&sb_async_lock);
   sb_async_job* done = sb_async_done;
@@ -3294,7 +3306,6 @@ typedef struct sb_wsc {
 static pthread_mutex_t sb_wsc_lock = PTHREAD_MUTEX_INITIALIZER;
 static sb_wsc* sb_wscs = 0;
 static unsigned sb_wsc_next = 0;
-static void (*sb_wsc_waker)(void) = 0;
 void sb_async_set_waker(void (*wake)(void)) { sb_wsc_waker = wake; }
 static int sb_wsc_pipe_enabled(void) { return sb_async_pipe[0] >= 0; }
 static void sb_async_poke(void) {
@@ -4318,12 +4329,21 @@ function __sbHttpAsyncResult(asyncId) {
 // placeholder timer cleared, the reply is dropped when it arrives.
 function __sbCancelAsync() {}
 
-// sproutd ran fetch() off its loop, as a promise, at every compatibility date (B18).
+// sproutd ran fetch() off its loop, as a promise, at every compatibility date (B18). The standalone
+// server (a waker, no pipe) keeps the date its fetch() promise has always had.
 function __sbAsyncAtAnyDate() {
-  return true;
+  let res = false;
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    int sb_async_piped(void);
+    if (sb_async_piped()) res = porf_box(1, 2);
+  `;
+  return res;
 }
 
-// Whether the host runs async requests (sb_async_enable was called).
+// Whether the host runs async requests: sproutd (sb_async_enable was called) at any date, the
+// standalone server (it gave a waker) from the date its fetch() leaves the loop, so an app that
+// relied on one request at a time across an `await fetch()` keeps that until it opts in.
 function __sbHttpAsyncEnabled() {
   let res = false;
   // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
@@ -4331,7 +4351,7 @@ function __sbHttpAsyncEnabled() {
     int sb_async_enabled(void);
     if (sb_async_enabled()) res = porf_box(1, 2);
   `;
-  return res;
+  return res && (__sbAsyncAtAnyDate() || __sbCompatDate() >= "2026-11-16");
 }
 
 // The outbound client's JSON reply -> the fetch op's result.
