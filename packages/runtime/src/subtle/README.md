@@ -12,10 +12,10 @@ uses it.
 
 | Need | Source | Licence |
 | --- | --- | --- |
-| SHA-1/256/384/512, HMAC, HKDF | BearSSL 0.6 | MIT |
-| RSA (private and public operations, key generation, PKCS#1 v1.5 padding), RSA-OAEP | BearSSL 0.6 | MIT |
-| ECDSA and ECDH on P-256, P-384, P-521, EC key generation | BearSSL 0.6 | MIT |
-| AES (constant-time), CBC, CTR, GCM | BearSSL 0.6 | MIT |
+| SHA-1/256/384/512, HMAC, HKDF | BearSSL (master 7bea48e) | MIT |
+| RSA (private and public operations, key generation, PKCS#1 v1.5 padding), RSA-OAEP | BearSSL (master 7bea48e) | MIT |
+| ECDSA and ECDH on P-256, P-384, P-521, EC key generation | BearSSL (master 7bea48e) | MIT |
+| AES (constant-time), CBC, CTR, GCM | BearSSL (master 7bea48e) | MIT |
 | Ed25519, X25519 | Monocypher 4.0.2, vendored in `vendor/` | BSD-2-Clause or CC0-1.0 |
 
 BearSSL is already linked into every embedded sprout (standalone binaries and sproutd) for

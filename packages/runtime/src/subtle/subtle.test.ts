@@ -9,7 +9,7 @@ import { assembleSubtleC } from "./assemble";
 
 const bear = join(
   process.env.SPROUTBOAT_TOOLCHAIN_CACHE ?? join(homedir(), ".cache/sproutboat"),
-  "bearssl-0.6/bearssl-0.6",
+  "bearssl-7bea48e/BearSSL-7bea48e",
 );
 const lib = join(bear, "build/libbearssl.a");
 // SUBTLE_DRIVER: a prebuilt driver binary (a machine with no C compiler, or a cross-built one).

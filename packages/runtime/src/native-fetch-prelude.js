@@ -9397,6 +9397,14 @@ static const sbc_u8 sbc_oid_x25519[] = { 0x2b, 0x65, 0x6e };
 static int sbc_oid_eq(const sbc_u8* a, size_t al, const sbc_u8* b, size_t bl) { return al == bl && memcmp(a, b, al) == 0; }
 
 static int sbc_curve_br(int c) { return c == 1 ? BR_EC_secp256r1 : c == 2 ? BR_EC_secp384r1 : c == 3 ? BR_EC_secp521r1 : 0; }
+
+static const br_ec_impl* sbc_ec(int br_curve) {
+  if (br_curve == BR_EC_secp256r1) {
+    const br_ec_impl* fast = br_ec_p256_m64_get();
+    if (fast) return fast;
+  }
+  return br_ec_get_default();
+}
 static int sbc_curve_from_br(int c) { return c == BR_EC_secp256r1 ? 1 : c == BR_EC_secp384r1 ? 2 : c == BR_EC_secp521r1 ? 3 : 0; }
 static size_t sbc_curve_size(int c) { return c == 1 ? 32 : c == 2 ? 48 : c == 3 ? 66 : 0; }
 static void sbc_curve_oid(int c, const sbc_u8** o, size_t* n) {
@@ -9579,7 +9587,7 @@ static int sbc_decode(int pkcs8, const sbc_u8* der, size_t len, sbc_buf* out) {
       if (cv) {
         sbc_u8 pub[133];
         br_ec_public_key pk;
-        if (br_ec_compute_pub(br_ec_get_default(), &pk, pub, sk) != 0) {
+        if (br_ec_compute_pub(sbc_ec(sk->curve), &pk, pub, sk) != 0) {
           sbc_put1(out, SBC_K_EC); sbc_put1(out, (sbc_u8)cv); sbc_put1(out, 1);
           sbc_field(out, pk.q, pk.qlen);
 
@@ -9862,7 +9870,7 @@ static int sbc_ecdsa_sign(int bits, const sbc_u8* key, size_t kl, const sbc_u8* 
   sbc_u8 h[64], sig[132];
   rc = SBC_OPERATION;
   if (sbc_digest(bits, m, ml, h)) {
-    size_t n = br_ecdsa_sign_raw_get_default()(br_ec_get_default(), sbc_hash(bits), h, sk, sig);
+    size_t n = br_ecdsa_sign_raw_get_default()(sbc_ec(sk->curve), sbc_hash(bits), h, sk, sig);
     if (n) { sbc_put(out, sig, n); rc = SBC_OK; }
   }
   free(dc);
@@ -9877,7 +9885,7 @@ static int sbc_ecdsa_verify(int bits, int curve, const sbc_u8* point, size_t pl,
   if (sl != 2 * fs) return SBC_OK;
   br_ec_public_key pk;
   pk.curve = sbc_curve_br(curve); pk.q = (sbc_u8*)point; pk.qlen = pl;
-  if (br_ecdsa_vrfy_raw_get_default()(br_ec_get_default(), h, sbc_hlen(bits), &pk, sig, sl)) *ok = 1;
+  if (br_ecdsa_vrfy_raw_get_default()(sbc_ec(pk.curve), h, sbc_hlen(bits), &pk, sig, sl)) *ok = 1;
   return SBC_OK;
 }
 
@@ -9887,12 +9895,12 @@ static int sbc_ec_point_ok(int curve, const sbc_u8* point, size_t pl) {
   sbc_u8 q[133];
   memcpy(q, point, pl);
   sbc_u8 one[1] = { 1 };
-  return br_ec_get_default()->mul(q, pl, one, 1, sbc_curve_br(curve)) != 0;
+  return sbc_ec(sbc_curve_br(curve))->mul(q, pl, one, 1, sbc_curve_br(curve)) != 0;
 }
 static int sbc_ec_keygen(int curve, sbc_buf* out) {
   br_ec_private_key sk; br_ec_public_key pk;
   sbc_u8 kb[BR_EC_KBUF_PRIV_MAX_SIZE], pb[BR_EC_KBUF_PUB_MAX_SIZE];
-  const br_ec_impl* impl = br_ec_get_default();
+  const br_ec_impl* impl = sbc_ec(sbc_curve_br(curve));
   if (!br_ec_keygen(&sbc_prng, impl, &sk, kb, sbc_curve_br(curve))) return SBC_OPERATION;
   if (!br_ec_compute_pub(impl, &pk, pb, &sk)) return SBC_OPERATION;
   size_t need = br_encode_ec_pkcs8_der(0, &sk, &pk);
@@ -10059,8 +10067,9 @@ static int sbc_ecdh(int curve, const sbc_u8* pkcs8, size_t kl, const sbc_u8* pee
   if (sk->curve == sbc_curve_br(curve) && fs && pl == 1 + 2 * fs && peer[0] == 4) {
     sbc_u8 pt[133];
     memcpy(pt, peer, pl);
-    if (br_ec_get_default()->mul(pt, pl, sk->x, sk->xlen, sk->curve)) {
-      size_t xl; size_t xo = br_ec_get_default()->xoff(sk->curve, &xl);
+    const br_ec_impl* impl = sbc_ec(sk->curve);
+    if (impl->mul(pt, pl, sk->x, sk->xlen, sk->curve)) {
+      size_t xl; size_t xo = impl->xoff(sk->curve, &xl);
       sbc_put(out, pt + xo, xl); rc = SBC_OK;
     }
   }
