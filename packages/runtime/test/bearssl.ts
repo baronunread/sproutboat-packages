@@ -7,9 +7,10 @@ import { join, resolve } from "node:path";
 // The prelude carries crypto.subtle's native half on every transport, so a test that compiles a
 // handler using crypto.subtle needs BearSSL on the include path and link line, as the CLI arranges
 // for a build. Same pinned source as the CLI's src/bearssl.ts; built once into the toolchain cache.
-const VERSION = "0.6";
-const URL_ = `https://bearssl.org/bearssl-${VERSION}.tar.gz`;
-const SHA256 = "6705bba1714961b41a728dfc5debbe348d2966c117649392f8c8139efc83ff14";
+const COMMIT = "7bea48e5e850ab4cafbe68d3765cdaba13a86d6f";
+const VERSION = COMMIT.slice(0, 7);
+const URL_ = `https://bearssl.org/gitweb/?p=BearSSL;a=snapshot;h=${COMMIT};sf=tgz`;
+const SHA256 = "ed397832b1613582737d9c1ce01c1af74ad6a9e9c52a341e24433987cda0f372";
 
 const walk = async (dir: string): Promise<string[]> =>
   (
@@ -28,7 +29,7 @@ export async function bearsslEnv(): Promise<{ SB_EXTRA_CFLAGS: string; SB_EXTRA_
     process.env.SPROUTBOAT_TOOLCHAIN_CACHE ?? join(homedir(), ".cache/sproutboat"),
     `bearssl-${VERSION}-test`,
   );
-  const tree = join(root, `bearssl-${VERSION}`);
+  const tree = join(root, `BearSSL-${VERSION}`);
   const objects = join(root, "obj");
   const marker = join(objects, ".complete");
   if (!existsSync(marker)) {
