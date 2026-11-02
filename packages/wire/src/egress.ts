@@ -12,13 +12,16 @@
  *   SB_EGRESS_TOKEN=... bun egress.ts --port 8070
  *
  * Either way the request goes through `vettedFetch`, so the address checks and
- * `SB_EGRESS_ALLOW` behave identically.
+ * `SB_EGRESS_ALLOW` behave identically. `connect()` sockets take the same road: a raw TCP
+ * listener next to the HTTP one (`--tcp-port`, default the HTTP port + 1) runs the tunnel from
+ * tcp.ts with the same token and the same vetting.
  */
 import { timingSafeEqual } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import { parseArgs } from "node:util";
 import { egressAllowList, egressRefusal } from "@sproutboat/runtime";
+import { createTcpTunnels, listenTunnelService } from "./tcp";
 
 type FetchLike = (input: URL | string, init?: RequestInit) => Promise<Response>;
 export type Resolve = (hostname: string) => Promise<Array<{ address: string }>>;
@@ -78,7 +81,13 @@ export async function vettedFetch(
 }
 
 /** Bun's fetch codes for a connection that never opened. */
-const CONNECT_FAILURES = new Set(["FailedToOpenSocket", "ConnectionRefused", "ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH"]);
+const CONNECT_FAILURES = new Set([
+  "FailedToOpenSocket",
+  "ConnectionRefused",
+  "ECONNREFUSED",
+  "ENETUNREACH",
+  "EHOSTUNREACH",
+]);
 
 const refuse = (status: number, error: string) =>
   Response.json({ error }, { status, headers: { [EGRESS_ERROR_HEADER]: "1" } });
@@ -111,7 +120,8 @@ export function createEgressHandler(opts: EgressOptions): (request: Request) => 
     } catch {
       return refuse(400, `invalid url: ${request.headers.get(EGRESS_URL_HEADER) ?? ""}`);
     }
-    if (url.protocol !== "https:" && url.protocol !== "http:") return refuse(400, `unsupported protocol: ${url.protocol}`);
+    if (url.protocol !== "https:" && url.protocol !== "http:")
+      return refuse(400, `unsupported protocol: ${url.protocol}`);
     const headers = new Headers(request.headers);
     for (const name of [EGRESS_URL_HEADER, EGRESS_TOKEN_HEADER, "host", "content-length"]) headers.delete(name);
     const method = request.method;
@@ -133,18 +143,28 @@ export function createEgressHandler(opts: EgressOptions): (request: Request) => 
 }
 
 if (import.meta.main) {
-  const { values } = parseArgs({ options: { port: { type: "string" }, host: { type: "string" } } });
+  const { values } = parseArgs({
+    options: { port: { type: "string" }, host: { type: "string" }, "tcp-port": { type: "string" } },
+  });
   const token = process.env.SB_EGRESS_TOKEN ?? "";
   if (!token) {
     console.error("sproutboat egress: SB_EGRESS_TOKEN is required");
     process.exit(1);
   }
+  const allow = egressAllowList(process.env.SB_EGRESS_ALLOW);
+  const port = Number(values.port ?? process.env.PORT ?? 8070);
+  const tunnels = listenTunnelService(
+    createTcpTunnels({ token, allow, maxOpen: 256 }),
+    values.host ?? "127.0.0.1",
+    Number(values["tcp-port"] ?? port + 1),
+  );
+  console.log(`sproutboat egress tunnels listening on port ${tunnels.port}`);
   const server = Bun.serve({
     hostname: values.host ?? "127.0.0.1",
-    port: Number(values.port ?? process.env.PORT ?? 8070),
+    port,
     // A direct fetch has no idle cutoff either; the broker owns the deadline.
     idleTimeout: 0,
-    fetch: createEgressHandler({ token, allow: egressAllowList(process.env.SB_EGRESS_ALLOW) }),
+    fetch: createEgressHandler({ token, allow }),
   });
   console.log(`sproutboat egress listening on ${server.url}`);
 }
