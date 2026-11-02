@@ -29,3 +29,14 @@ test("a node: import specifier is still refused from the sockets date", () => {
   );
   expect(validateHttpSyncSource(withNode, SOCKETS_DATE).ok).toBe(false);
 });
+
+test("cloudflare:sockets needs the sockets date", () => {
+  const app =
+    'import { connect } from "cloudflare:sockets";\nexport default { fetch() { return new Response(String(typeof connect)); } };';
+  const before = validateHttpSyncSource(app, "2026-11-16");
+  expect(before.ok).toBe(false);
+  expect(before.ok ? [] : before.errors).toContain(
+    `cloudflare:sockets needs compatibility_date ${SOCKETS_DATE} or later`,
+  );
+  expect(validateHttpSyncSource(app, SOCKETS_DATE)).toEqual({ ok: true });
+});

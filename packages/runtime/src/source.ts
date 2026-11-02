@@ -93,6 +93,11 @@ export function validateHttpSyncSource(module: string, compatibilityDate?: strin
       "handler must default-export an object with fetch(request), scheduled() or queue(), or a WorkerEntrypoint class",
     );
   }
+  if (
+    /["']cloudflare:sockets["']/.test(module) &&
+    !(compatibilityDate !== undefined && compatibilityDate >= SOCKETS_DATE)
+  )
+    errors.push(`cloudflare:sockets needs compatibility_date ${SOCKETS_DATE} or later`);
   const guardedGlobals = compatibilityDate !== undefined && compatibilityDate >= GUARDED_GLOBALS_DATE;
   const sockets = compatibilityDate !== undefined && compatibilityDate >= SOCKETS_DATE;
   for (const [pattern, message] of alwaysForbidden) {

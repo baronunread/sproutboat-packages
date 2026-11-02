@@ -11,6 +11,8 @@ function __sbEnvValue() {
 // Setters, not bare assignments in the tail: the template and every app must compile the prelude identically.
 function __sbSetCompat(date) {
   __sbCompatNow = date;
+  // navigator.userAgent as workerd has it: pg picks its Workers socket code on exactly this string.
+  if (date >= "2026-11-17") navigator.userAgent = "Cloudflare-Workers";
   Request._cd = date;
   if (date >= "2026-11-15" && Error.captureStackTrace === undefined) Error.captureStackTrace = __sbCaptureStackTrace;
 }

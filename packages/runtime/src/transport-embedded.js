@@ -3392,23 +3392,10 @@ static int sb_wsc_frame(sb_wsc* c, int opcode, const char* data, size_t len, uns
 
 // --- the socket the I/O thread owns: plain, or TLS through BearSSL's engine ---
 typedef struct {
-  const br_x509_class* vtable;
-  br_x509_decoder_context dec;
-  int first;
-} sb_xnv;
-static void sb_xnv_start_chain(const br_x509_class** c, const char* name) { sb_xnv* x = (sb_xnv*)c; (void)name; br_x509_decoder_init(&x->dec, 0, 0); x->first = 1; }
-static void sb_xnv_start_cert(const br_x509_class** c, uint32_t len) { (void)c; (void)len; }
-static void sb_xnv_append(const br_x509_class** c, const unsigned char* b, size_t len) { sb_xnv* x = (sb_xnv*)c; if (x->first) br_x509_decoder_push(&x->dec, b, len); }
-static void sb_xnv_end_cert(const br_x509_class** c) { sb_xnv* x = (sb_xnv*)c; x->first = 0; }
-static unsigned sb_xnv_end_chain(const br_x509_class** c) { sb_xnv* x = (sb_xnv*)c; return br_x509_decoder_last_error(&x->dec); }
-static const br_x509_pkey* sb_xnv_get_pkey(const br_x509_class* const* c, unsigned* usages) { sb_xnv* x = (sb_xnv*)c; if (usages) *usages = BR_KEYTYPE_KEYX | BR_KEYTYPE_SIGN; return br_x509_decoder_get_pkey(&x->dec); }
-static const br_x509_class sb_xnv_vtable = { sizeof(sb_xnv), sb_xnv_start_chain, sb_xnv_start_cert, sb_xnv_append, sb_xnv_end_cert, sb_xnv_end_chain, sb_xnv_get_pkey };
-typedef struct {
   int fd, tls;
   br_ssl_client_context* sc;
   br_x509_minimal_context* xc;
   unsigned char* iobuf;
-  void* xnv;
 } sb_wsio;
 
 static int sb_wsio_wait(int fd, int wakefd, short events, int ms) {
@@ -3535,14 +3522,6 @@ static int sb_wsio_start_tls(sb_wsio* io, const char* host, char* why, size_t wh
   if (!io->sc || !io->xc || !io->iobuf) { snprintf(why, whylen, "out of memory setting up TLS for %s", host); return -1; }
   sb_init_anchors();
   br_ssl_client_init_full(io->sc, io->xc, sb_all_anchors, sb_all_anchor_count);
-  // SPIKE ONLY: SB_TCP_TLS_INSECURE=1 accepts any certificate (a local database with a self-signed cert).
-  if (getenv("SB_TCP_TLS_INSECURE")) {
-    sb_xnv* xnv = (sb_xnv*)calloc(1, sizeof(sb_xnv));
-    if (!xnv) { snprintf(why, whylen, "out of memory setting up TLS for %s", host); return -1; }
-    io->xnv = xnv;
-    xnv->vtable = &sb_xnv_vtable;
-    br_ssl_engine_set_x509(&io->sc->eng, &xnv->vtable);
-  }
   br_ssl_engine_set_buffer(&io->sc->eng, io->iobuf, BR_SSL_BUFSIZE_BIDI, 1);
   char bare[256];
   size_t hl = strlen(host);
@@ -3553,7 +3532,7 @@ static int sb_wsio_start_tls(sb_wsio* io, const char* host, char* why, size_t wh
 }
 static void sb_wsio_close(sb_wsio* io) {
   if (io->fd >= 0) close(io->fd);
-  free(io->sc); free(io->xc); free(io->iobuf); free(io->xnv);
+  free(io->sc); free(io->xc); free(io->iobuf);
   memset(io, 0, sizeof(*io));
   io->fd = -1;
 }
