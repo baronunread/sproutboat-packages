@@ -221,9 +221,9 @@
     }
   },
   "backpressure": {
-    "writesResolvedWithinWindow": 19,
+    "writesResolvedWithinWindow": 17,
     "stalled": true,
-    "bytesAccepted": 1245184,
+    "bytesAccepted": 1114112,
     "desiredSize": 0,
     "finite": true
   },

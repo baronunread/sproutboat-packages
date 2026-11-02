@@ -30,10 +30,26 @@
 import { timingSafeEqual } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import net, { isIP } from "node:net";
+import { readFileSync } from "node:fs";
 import tls from "node:tls";
 import { egressRefusal } from "@sproutboat/runtime";
 import type { Resolve } from "./egress";
 import { isSafeInteger, isString, jsonObject, parseJsonValue, type JsonObject, type JsonValue } from "./json";
+
+/**
+ * The TLS options for an origin. Like the embedded transport's `SB_CA_BUNDLE`, a PEM file named in
+ * the environment adds roots to the built-in set; it never removes any or disables verification.
+ */
+function tlsTrust(given: tls.ConnectionOptions | undefined): tls.ConnectionOptions {
+  if (given?.ca !== undefined) return given;
+  const path = process.env.SB_CA_BUNDLE;
+  if (!path) return given ?? {};
+  try {
+    return { ...given, ca: [...tls.rootCertificates, readFileSync(path, "utf8")] };
+  } catch {
+    return given ?? {};
+  }
+}
 
 export const TCP_DATA = 1;
 export const TCP_START_TLS = 2;
@@ -177,7 +193,7 @@ export function createTcpTunnels(opts: TcpOptions): TcpTunnels {
       const name = isIP(servername.replace(/^\[|\]$/g, "")) ? undefined : servername;
       let socket: net.Socket;
       if (opts.connect) socket = opts.connect({ host, port, servername: name, tls: secure });
-      else if (secure) socket = tls.connect({ ...options, servername: name, ...opts.tls });
+      else if (secure) socket = tls.connect({ ...options, servername: name, ...tlsTrust(opts.tls) });
       else socket = net.connect(options);
       const timer = setTimeout(() => {
         socket.destroy();
@@ -347,7 +363,7 @@ export function createTcpTunnels(opts: TcpOptions): TcpTunnels {
       raw.removeAllListeners();
       raw.on("error", () => {});
       const name = isIP(servername.replace(/^\[|\]$/g, "")) ? undefined : servername;
-      const secure = tls.connect({ socket: raw, servername: name, ...opts.tls });
+      const secure = tls.connect({ socket: raw, servername: name, ...tlsTrust(opts.tls) });
       bind(secure);
       secure.once("secureConnect", () => send(typedFrame(TCP_TLS_DONE)));
     }

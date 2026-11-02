@@ -1,7 +1,7 @@
 export default {
   ignorePatterns: [
     ".agent/**",
-    "docs/spikes/**",
+    "docs/sockets/**",
     ".agents/**",
     ".claude/**",
     ".codex/**",

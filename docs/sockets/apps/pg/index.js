@@ -105,6 +105,13 @@ export default {
       }
     });
     await t("after-error", async () => (await client.query("select 2 as two")).rows[0].two);
+    await t("prepared", async () => {
+      const q = { name: "plus-one", text: "select $1::int + 1 as v", values: [41] };
+      const a = (await client.query(q)).rows[0].v;
+      q.values = [99];
+      const b = (await client.query(q)).rows[0].v;
+      return a + "," + b;
+    });
     if (n > 0) {
       const t0 = performance.now();
       for (let i = 0; i < n; i++) await client.query("select $1::int as i", [i]);
