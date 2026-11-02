@@ -40,6 +40,7 @@ import { matchRedirect, resolveAssetKey, type AssetManifest } from "@sproutboat/
 import { egressAllowList } from "@sproutboat/runtime";
 import { EGRESS_ERROR_HEADER, EGRESS_TOKEN_HEADER, EGRESS_URL_HEADER, resolveAll, vettedFetch } from "./egress";
 import { isSafeInteger } from "./json";
+import { createTcpTunnels, parseTcpOpen, type TcpOptions, type TcpTunnels, type Tunnel } from "./tcp";
 import { isString, jsonObject, parseJsonValue, type JsonObject, type JsonValue } from "./json";
 
 export type Bindings = {
@@ -163,6 +164,11 @@ export type BrokerOptions = {
    *  connecting directly. Defaults to `SB_EGRESS_URL` / `SB_EGRESS_TOKEN`. */
   egressUrl?: string;
   egressToken?: string;
+  /** The egress service's tunnel endpoint (`host:port`) that `connect()` sockets relay to when
+   *  `egressUrl` is set. Defaults to `SB_EGRESS_TCP`, else the egress URL's host and port + 1. */
+  egressTcp?: string;
+  /** `connect()` tunnel overrides: limits, and (tests only) TLS trust and the connector. */
+  tcp?: Partial<Pick<TcpOptions, "maxOpen" | "connectTimeoutMs" | "tls" | "connect">>;
 };
 
 type R2Row = {
@@ -231,6 +237,8 @@ export type Broker = {
   ): Promise<Buffer>;
   /** Serve one reserved direct R2 upload or download request. */
   transfer(request: Request): Promise<Response>;
+  /** `connect()` tunnels: the listener hands a connection that opened with `tcp.open` to this. */
+  tcp: TcpTunnels;
   close(): void;
 };
 
@@ -309,6 +317,16 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
   const egressAllow = opts.egressAllow ?? egressAllowList(process.env.SB_EGRESS_ALLOW);
   const egressUrl = opts.egressUrl ?? process.env.SB_EGRESS_URL ?? "";
   const egressToken = opts.egressToken ?? process.env.SB_EGRESS_TOKEN ?? "";
+
+  const tcp = createTcpTunnels({
+    ...opts.tcp,
+    token,
+    allow: egressAllow,
+    resolve: resolveHost,
+    relay: egressUrl
+      ? egressTunnelEndpoint(egressUrl, opts.egressTcp ?? process.env.SB_EGRESS_TCP, egressToken)
+      : undefined,
+  });
 
   const dbPath = opts.db ?? ":memory:";
   const inMemory = dbPath === ":memory:" || dbPath === "";
@@ -2532,8 +2550,10 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     handlePayload,
     handleFrame,
     transfer,
+    tcp,
     close: () => {
       closed = true;
+      tcp.closeAll();
       for (const delivery of deliveries) delivery.abort();
       for (const t of timers) clearInterval(t);
       d1Session?.close();
@@ -2578,6 +2598,16 @@ export function encodeFrame(obj: Frame): Buffer {
   frame.writeUInt32LE(body.length, 0);
   body.copy(frame, 4);
   return frame;
+}
+
+/** Where `connect()` tunnels go when the egress service does the connecting. */
+function egressTunnelEndpoint(egressUrl: string, explicit: string | undefined, token: string) {
+  if (explicit) {
+    const at = explicit.lastIndexOf(":");
+    return { host: explicit.slice(0, at) || "127.0.0.1", port: Number(explicit.slice(at + 1)), token };
+  }
+  const url = new URL(egressUrl);
+  return { host: url.hostname, port: Number(url.port || (url.protocol === "https:" ? 443 : 80)) + 1, token };
 }
 
 /** The bound TCP listener: the port actually assigned, and its shutdown handle. */
@@ -2680,6 +2710,8 @@ export function listen(broker: Broker, hostname: string, port: number): BrokerSe
     abort: AbortController;
     /** The request body a streamed-body request on this connection is reading, if any. */
     sink: BodySink | null;
+    /** Set once the connection opened with `tcp.open`: it is a `connect()` tunnel from then on. */
+    tunnel: Tunnel | null;
   };
   const flush = (socket: Bun.Socket<SocketState>): void => {
     const state = socket.data;
@@ -2721,12 +2753,17 @@ export function listen(broker: Broker, hostname: string, port: number): BrokerSe
           written: null,
           abort: new AbortController(),
           sink: null,
+          tunnel: null,
         };
       },
-      drain: flush,
+      drain(socket) {
+        if (socket.data.tunnel) socket.data.tunnel.drain();
+        else flush(socket);
+      },
       close(socket) {
         const state = socket.data;
         state.closed = true;
+        state.tunnel?.close();
         state.abort.abort();
         state.chunks = [];
         state.size = 0;
@@ -2738,6 +2775,10 @@ export function listen(broker: Broker, hostname: string, port: number): BrokerSe
       },
       async data(socket, chunk) {
         const state = socket.data;
+        if (state.tunnel) {
+          state.tunnel.data(chunk);
+          return;
+        }
         state.chunks.push(chunk);
         state.size += chunk.length;
         if (state.processing) return;
@@ -2763,6 +2804,14 @@ export function listen(broker: Broker, hostname: string, port: number): BrokerSe
             const rest = buf.subarray(4 + len);
             state.chunks = rest.length ? [Buffer.from(rest)] : [];
             state.size = rest.length;
+            // A connect() socket: this connection carries its bytes from here on.
+            const tcpHead = parseTcpOpen(payload);
+            if (tcpHead) {
+              state.chunks = [];
+              state.size = 0;
+              state.tunnel = broker.tcp.accept(socket, tcpHead, Buffer.from(rest));
+              return;
+            }
             // A frame of a streamed request body: to its request's stream.
             if (payload.length > 0 && payload[0] === FRAME_V1_MORE) {
               state.sink?.frame(payload);

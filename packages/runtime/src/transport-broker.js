@@ -786,10 +786,13 @@ const char* sb_async_reply_json(u32 id, size_t* len) {
   return sb_async_current->json;
 }
 
+// Set by the TCP block below (a constructor there): fires the parked timers of connect() sockets.
+static void (*sb_wsc_drain_hook)(void) = 0;
 // Host, on its loop: fires the callback for each reply frame, oldest first. Its
 // bytes go where __sbTakeBin reads them. A final frame also drops the placeholder
 // timer; an earlier frame of a streamed response leaves it for the next one.
 void sb_async_drain(void) {
+  if (sb_wsc_drain_hook) sb_wsc_drain_hook();
   pthread_mutex_lock(&sb_async_lock);
   sb_async_delivery* ready = sb_async_ready;
   sb_async_ready = 0;
@@ -816,6 +819,474 @@ void sb_async_drain(void) {
     free(d);
   }
 }
+// TCP:BEGIN
+// cloudflare:sockets connect() (compatibility date 2026-11-17) through the broker. One detached
+// I/O thread per socket opens a second loopback connection to the broker, sends a tcp.open frame
+// (token, host, port, mode, server name) and, once the broker has acked it, exchanges typed
+// frames [u8 type][u32 LE length][payload] with it; the broker resolves and vets the address,
+// connects and does the TLS (see wire/src/tcp.ts). The JS side speaks the same ops as the
+// embedded transport (sb_wsc_hook; ids here have the top bit set): 'T' open, 'b' queue bytes
+// (returns how many are still unsent), 'S' start TLS, 'H' shut the write side, 'p' 'i' take an
+// event, 'k' acknowledge bytes dispatched, 'w' park a timer for the next event, 'r' release.
+// Event kinds: 1 data, 3 error (data is the reason), 4 connected, 6 end of input, 8 send queue
+// drained, 9 TLS handshake done. Threads touch only their own malloc'd state, never the JS heap;
+// the loop is woken through the host's waker and sb_async_drain() fires the parked timers.
+// Backpressure is TCP's: the thread stops reading the broker while the JS side is behind, and a
+// broker that cannot write to the origin stops reading from the thread, so the thread's writes
+// block in the kernel and 'b' reports a growing unsent count.
+#define SB_TC_BIT 0x80000000u
+#define SB_TC_MAX 16
+#define SB_TC_WINDOW (256u << 10)
+#define SB_TC_FRAME (64u << 10)
+#define SB_TC_MAXFRAME (16u << 20)
+typedef struct sb_tc_ev { struct sb_tc_ev* next; int kind; size_t len; char* data; } sb_tc_ev;
+typedef struct sb_tc {
+  struct sb_tc* next;
+  unsigned id;
+  pthread_mutex_t lock;
+  int wake[2];
+  sb_tc_ev *evh, *evt;
+  unsigned waiter;
+  int wake_pending;
+  size_t unacked, unsent;
+  unsigned char* outq; size_t outq_len, outq_cap;
+  size_t starttls_at;
+  int released, finished, starttls_req, shutdown_req, want_drain;
+  int port, mode;
+  char *host;
+  char sni[256];
+  char token[256];
+} sb_tc;
+static pthread_mutex_t sb_tc_lock = PTHREAD_MUTEX_INITIALIZER;
+static sb_tc* sb_tcs = 0;
+static unsigned sb_tc_next = 0;
+
+static void sb_tc_signal(void) { if (sb_async_waker) sb_async_waker(); }
+static void sb_tc_push(sb_tc* c, int kind, const char* data, size_t len) {
+  sb_tc_ev* e = (sb_tc_ev*)calloc(1, sizeof(sb_tc_ev));
+  if (!e) return;
+  e->kind = kind; e->len = len;
+  if (len) {
+    e->data = (char*)malloc(len);
+    if (!e->data) { free(e); return; }
+    memcpy(e->data, data, len);
+  }
+  pthread_mutex_lock(&c->lock);
+  if (c->evt) c->evt->next = e; else c->evh = e;
+  c->evt = e;
+  if (kind == 1) c->unacked += len;
+  if (c->waiter) c->wake_pending = 1;
+  pthread_mutex_unlock(&c->lock);
+  sb_tc_signal();
+}
+static void sb_tc_wake_thread(sb_tc* c) {
+  char one = 1;
+  while (write(c->wake[1], &one, 1) < 0 && errno == EINTR) {}
+}
+static void sb_tc_free(sb_tc* c) {
+  while (c->evh) { sb_tc_ev* e = c->evh; c->evh = e->next; free(e->data); free(e); }
+  free(c->outq); free(c->host);
+  if (c->wake[0] >= 0) close(c->wake[0]);
+  if (c->wake[1] >= 0) close(c->wake[1]);
+  pthread_mutex_destroy(&c->lock);
+  free(c);
+}
+static void sb_tc_unlink(sb_tc* c) {
+  pthread_mutex_lock(&sb_tc_lock);
+  for (sb_tc** at = &sb_tcs; *at; at = &(*at)->next) if (*at == c) { *at = c->next; break; }
+  pthread_mutex_unlock(&sb_tc_lock);
+}
+
+// Appends one typed frame to the thread's write buffer.
+static int sb_tc_put(unsigned char** wb, size_t* len, size_t* cap, int type, const unsigned char* data, size_t n) {
+  if (*len + 5 + n > *cap) {
+    size_t grown = *cap ? *cap : 4096;
+    while (grown < *len + 5 + n) grown *= 2;
+    unsigned char* more = (unsigned char*)realloc(*wb, grown);
+    if (!more) return -1;
+    *wb = more; *cap = grown;
+  }
+  unsigned char* at = *wb + *len;
+  at[0] = (unsigned char)type;
+  at[1] = (unsigned char)(n & 0xff); at[2] = (unsigned char)((n >> 8) & 0xff);
+  at[3] = (unsigned char)((n >> 16) & 0xff); at[4] = (unsigned char)((n >> 24) & 0xff);
+  if (n) memcpy(at + 5, data, n);
+  *len += 5 + n;
+  return 0;
+}
+
+// s as the inside of a JSON string.
+static size_t sb_tc_json(char* out, const char* s) {
+  size_t o = 0;
+  for (; *s; s++) {
+    unsigned char ch = (unsigned char)*s;
+    if (ch == '"' || ch == '\\') { out[o++] = '\\'; out[o++] = (char)ch; }
+    else if (ch < 0x20) o += (size_t)sprintf(out + o, "\\u%04x", ch);
+    else out[o++] = (char)ch;
+  }
+  out[o] = 0;
+  return o;
+}
+
+// The opening frame: [u32 length][0x01][u32 json length][json]. Returns its length.
+static unsigned char* sb_tc_open_frame(sb_tc* c, size_t* out_len) {
+  size_t cap = 512 + (strlen(c->host) + strlen(c->sni) + strlen(c->token)) * 6;
+  char* json = (char*)malloc(cap);
+  if (!json) return 0;
+  size_t o = (size_t)sprintf(json, "{\"v\":1,\"token\":\"");
+  o += sb_tc_json(json + o, c->token);
+  o += (size_t)sprintf(json + o, "\",\"op\":\"tcp.open\",\"host\":\"");
+  o += sb_tc_json(json + o, c->host);
+  o += (size_t)sprintf(json + o, "\",\"port\":%d,\"mode\":\"%s\",\"servername\":\"", c->port, c->mode == 1 ? "on" : c->mode == 2 ? "starttls" : "off");
+  o += sb_tc_json(json + o, c->sni[0] ? c->sni : c->host);
+  o += (size_t)sprintf(json + o, "\"}");
+  unsigned char* frame = (unsigned char*)malloc(9 + o);
+  if (!frame) { free(json); return 0; }
+  size_t payload = 5 + o;
+  frame[0] = (unsigned char)(payload & 0xff); frame[1] = (unsigned char)((payload >> 8) & 0xff);
+  frame[2] = (unsigned char)((payload >> 16) & 0xff); frame[3] = (unsigned char)((payload >> 24) & 0xff);
+  frame[4] = 1;
+  frame[5] = (unsigned char)(o & 0xff); frame[6] = (unsigned char)((o >> 8) & 0xff);
+  frame[7] = (unsigned char)((o >> 16) & 0xff); frame[8] = (unsigned char)((o >> 24) & 0xff);
+  memcpy(frame + 9, json, o);
+  free(json);
+  *out_len = 9 + o;
+  return frame;
+}
+
+static void* sb_tc_thread(void* arg) {
+  sb_tc* c = (sb_tc*)arg;
+  int fd = -1;
+  unsigned char *wb = 0, *rb = 0;
+  size_t wb_len = 0, wb_cap = 0, woff = 0, rb_len = 0, rb_cap = 0;
+  int acked = 0, connected = 0, eof = 0, shut = 0;
+  long long started = sb_now_ms();
+  char why[300] = "";
+  fd = sb_broker_open();
+  if (fd < 0) { snprintf(why, sizeof(why), "could not reach the broker (%d)", fd); sb_tc_push(c, 3, why, strlen(why)); goto finish; }
+  sb_io_nonblock(fd);
+  {
+    size_t flen = 0;
+    unsigned char* frame = sb_tc_open_frame(c, &flen);
+    if (!frame) { snprintf(why, sizeof(why), "out of memory"); sb_tc_push(c, 3, why, strlen(why)); goto finish; }
+    wb = frame; wb_len = flen; wb_cap = flen;
+  }
+  for (;;) {
+    pthread_mutex_lock(&c->lock);
+    int rel = c->released;
+    size_t window = c->unacked;
+    int st = c->starttls_req; c->starttls_req = 0;
+    size_t st_at = c->starttls_at;
+    int sh = c->shutdown_req;
+    char sni[256]; memcpy(sni, c->sni, sizeof(sni));
+    unsigned char* chunk = c->outq; size_t chunk_len = c->outq_len;
+    c->outq = 0; c->outq_len = c->outq_cap = 0;
+    c->unsent = (wb_len - woff) + chunk_len;
+    pthread_mutex_unlock(&c->lock);
+    // Frame what the JS side queued; START_TLS sits where it was asked for among the bytes.
+    {
+      size_t at = 0;
+      if (st && st_at > chunk_len) st_at = chunk_len;
+      while (at < chunk_len || st) {
+        if (st && at >= st_at) { sb_tc_put(&wb, &wb_len, &wb_cap, 2, (const unsigned char*)sni, strlen(sni)); st = 0; continue; }
+        size_t stop = st ? st_at : chunk_len;
+        size_t n = stop - at < SB_TC_FRAME ? stop - at : SB_TC_FRAME;
+        if (sb_tc_put(&wb, &wb_len, &wb_cap, 1, chunk + at, n) != 0) { free(chunk); snprintf(why, sizeof(why), "out of memory"); sb_tc_push(c, 3, why, strlen(why)); goto finish; }
+        at += n;
+      }
+      free(chunk);
+    }
+    if (sh && !shut) { shut = 1; sb_tc_put(&wb, &wb_len, &wb_cap, 3, 0, 0); }
+    if (rel) {
+      // close(): what was queued still goes out before the connection does
+      sb_tc_put(&wb, &wb_len, &wb_cap, 7, 0, 0);
+      long long give_up = sb_now_ms() + 5000;
+      while (woff < wb_len && sb_now_ms() < give_up) {
+        ssize_t n = write(fd, wb + woff, wb_len - woff);
+        if (n > 0) { woff += (size_t)n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { struct pollfd p; p.fd = fd; p.events = POLLOUT; p.revents = 0; poll(&p, 1, 200); continue; }
+        break;
+      }
+      goto finish;
+    }
+    struct pollfd p[2];
+    // Nothing to read or write: leave the socket out, or its HUP would spin the loop.
+    short want = (short)(((!eof && window < SB_TC_WINDOW) ? POLLIN : 0) | (woff < wb_len ? POLLOUT : 0));
+    p[0].fd = want ? fd : -1; p[0].events = want; p[0].revents = 0;
+    p[1].fd = c->wake[0]; p[1].events = POLLIN; p[1].revents = 0;
+    int rc;
+    do { rc = poll(p, 2, connected ? -1 : 1000); } while (rc < 0 && errno == EINTR);
+    if (rc < 0) { snprintf(why, sizeof(why), "poll failed"); sb_tc_push(c, 3, why, strlen(why)); goto finish; }
+    if (!connected && !eof && sb_now_ms() - started > 40000) { snprintf(why, sizeof(why), "the broker did not answer"); sb_tc_push(c, 3, why, strlen(why)); goto finish; }
+    if (p[1].revents & POLLIN) { char buf[64]; while (read(c->wake[0], buf, sizeof(buf)) > 0) {} }
+    if (p[0].revents & POLLOUT) {
+      ssize_t n = write(fd, wb + woff, wb_len - woff);
+      if (n > 0) woff += (size_t)n;
+      else if (n < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) { if (!eof) { eof = 1; if (connected) sb_tc_push(c, 6, "", 0); else { snprintf(why, sizeof(why), "the broker closed the connection"); sb_tc_push(c, 3, why, strlen(why)); goto finish; } } wb_len = woff = 0; }
+      if (woff == wb_len) {
+        woff = wb_len = 0;
+        if (wb_cap > (1u << 20)) { free(wb); wb = 0; wb_cap = 0; }
+      }
+    }
+    if (p[0].revents & (POLLIN | POLLHUP | POLLERR)) {
+      if (rb_len + 65536 > rb_cap) {
+        size_t grown = rb_cap ? rb_cap : 131072;
+        while (grown < rb_len + 65536) grown *= 2;
+        unsigned char* more = (unsigned char*)realloc(rb, grown);
+        if (!more) { snprintf(why, sizeof(why), "out of memory"); sb_tc_push(c, 3, why, strlen(why)); goto finish; }
+        rb = more; rb_cap = grown;
+      }
+      if (!eof && window < SB_TC_WINDOW) {
+        ssize_t n = read(fd, rb + rb_len, rb_cap - rb_len);
+        if (n > 0) rb_len += (size_t)n;
+        else if (n == 0 || (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)) {
+          // the broker is gone
+          if (!connected) { snprintf(why, sizeof(why), "the broker closed the connection"); sb_tc_push(c, 3, why, strlen(why)); goto finish; }
+          sb_tc_push(c, 6, "", 0);
+          goto finish;
+        }
+      }
+    }
+    // Parse what has arrived.
+    {
+      size_t at = 0;
+      for (;;) {
+        if (!acked) {
+          if (rb_len - at < 4) break;
+          size_t len = (size_t)rb[at] | ((size_t)rb[at + 1] << 8) | ((size_t)rb[at + 2] << 16) | ((size_t)rb[at + 3] << 24);
+          if (len > 65536) { snprintf(why, sizeof(why), "bad reply from the broker"); sb_tc_push(c, 3, why, strlen(why)); goto finish; }
+          if (rb_len - at < 4 + len) break;
+          char* json = (char*)malloc(len + 1);
+          if (!json) goto finish;
+          memcpy(json, rb + at + 4, len); json[len] = 0;
+          at += 4 + len;
+          if (strstr(json, "\"ok\":true")) acked = 1;
+          else {
+            const char* e = strstr(json, "\"error\":\"");
+            size_t w = 0;
+            if (e) { e += 9; while (*e && *e != '"' && w + 1 < sizeof(why)) { if (*e == '\\' && e[1]) e++; why[w++] = *e++; } }
+            why[w] = 0;
+            if (!w) snprintf(why, sizeof(why), "the broker refused the connection");
+            free(json);
+            sb_tc_push(c, 3, why, strlen(why));
+            goto finish;
+          }
+          free(json);
+          continue;
+        }
+        if (rb_len - at < 5) break;
+        int type = rb[at];
+        size_t len = (size_t)rb[at + 1] | ((size_t)rb[at + 2] << 8) | ((size_t)rb[at + 3] << 16) | ((size_t)rb[at + 4] << 24);
+        if (len > SB_TC_MAXFRAME) { snprintf(why, sizeof(why), "bad frame from the broker"); sb_tc_push(c, 3, why, strlen(why)); goto finish; }
+        if (rb_len - at < 5 + len) {
+          if (5 + len > rb_cap - at) {
+            // a frame bigger than the buffer: make room for all of it
+            size_t need = at + 5 + len;
+            size_t grown = rb_cap;
+            while (grown < need) grown *= 2;
+            unsigned char* more = (unsigned char*)realloc(rb, grown);
+            if (!more) { snprintf(why, sizeof(why), "out of memory"); sb_tc_push(c, 3, why, strlen(why)); goto finish; }
+            rb = more; rb_cap = grown;
+          }
+          break;
+        }
+        const unsigned char* payload = rb + at + 5;
+        at += 5 + len;
+        if (type == 1) sb_tc_push(c, 1, (const char*)payload, len);
+        else if (type == 4) { sb_tc_push(c, 3, (const char*)payload, len); goto finish; }
+        else if (type == 5) { connected = 1; sb_tc_push(c, 4, "", 0); }
+        else if (type == 6) sb_tc_push(c, 9, "", 0);
+        else if (type == 8) { if (!eof) { eof = 1; sb_tc_push(c, 6, "", 0); } }
+        else if (type == 7) { if (!eof) { eof = 1; sb_tc_push(c, 6, "", 0); } goto finish; }
+      }
+      if (at > 0) {
+        if (at < rb_len) memmove(rb, rb + at, rb_len - at);
+        rb_len -= at;
+      }
+    }
+    int drained = 0;
+    pthread_mutex_lock(&c->lock);
+    c->unsent = wb_len - woff;
+    if (c->want_drain && c->outq_len + c->unsent == 0) { c->want_drain = 0; drained = 1; }
+    pthread_mutex_unlock(&c->lock);
+    if (drained) sb_tc_push(c, 8, "", 0);
+  }
+finish:
+  if (fd >= 0) close(fd);
+  free(wb); free(rb);
+  pthread_mutex_lock(&c->lock);
+  c->finished = 1;
+  int rel2 = c->released;
+  int wanted = c->want_drain; c->want_drain = 0;
+  pthread_mutex_unlock(&c->lock);
+  if (wanted) sb_tc_push(c, 8, "", 0);
+  if (rel2) {
+    sb_tc_unlink(c);
+    sb_tc_free(c);
+  }
+  return 0;
+}
+
+static sb_tc* sb_tc_find(unsigned id) {
+  pthread_mutex_lock(&sb_tc_lock);
+  sb_tc* c = sb_tcs;
+  while (c && c->id != id) c = c->next;
+  pthread_mutex_unlock(&sb_tc_lock);
+  return c;
+}
+
+// Host: fires the timers parked for sockets that have events.
+static void sb_tc_drain(void) {
+  for (;;) {
+    unsigned timer = 0;
+    pthread_mutex_lock(&sb_tc_lock);
+    for (sb_tc* c = sb_tcs; c; c = c->next) {
+      pthread_mutex_lock(&c->lock);
+      if (c->waiter && (c->wake_pending || c->evh)) { timer = c->waiter; c->waiter = 0; c->wake_pending = 0; }
+      pthread_mutex_unlock(&c->lock);
+      if (timer) break;
+    }
+    pthread_mutex_unlock(&sb_tc_lock);
+    if (!timer) return;
+    porf_native_fetch_timer_clear(timer);
+    porf_native_fetch_fire_timer(timer);
+  }
+}
+
+// The JS side's ops. data is borrowed for the call.
+static long long sb_tc_op(int op, unsigned id, const char* data, size_t len, size_t n, char* out, size_t cap) {
+  if (op == 'T') {
+    // data: host \n port \n mode (0 off, 1 on, 2 starttls) \n servername
+    sb_tc* c = (sb_tc*)calloc(1, sizeof(sb_tc));
+    if (!c) return 0;
+    c->wake[0] = c->wake[1] = -1;
+    char* copy = (char*)malloc(len + 1);
+    if (!copy) { free(c); return 0; }
+    memcpy(copy, data, len); copy[len] = 0;
+    char* parts[4]; char* cur = copy;
+    for (int i = 0; i < 4; i++) {
+      parts[i] = cur;
+      char* nl = strchr(cur, '\n');
+      if (nl) { *nl = 0; cur = nl + 1; } else cur += strlen(cur);
+    }
+    c->host = strdup(parts[0]); c->port = atoi(parts[1]); c->mode = atoi(parts[2]);
+    snprintf(c->sni, sizeof(c->sni), "%s", parts[3]);
+    const char* tok = getenv("SB_BROKER_TOKEN");
+    snprintf(c->token, sizeof(c->token), "%s", tok ? tok : "");
+    c->starttls_at = 0;
+    free(copy);
+    if (!c->host || pipe(c->wake) != 0) { sb_tc_free(c); return 0; }
+    for (int k = 0; k < 2; k++) { fcntl(c->wake[k], F_SETFD, FD_CLOEXEC); fcntl(c->wake[k], F_SETFL, fcntl(c->wake[k], F_GETFL) | O_NONBLOCK); }
+    pthread_mutex_init(&c->lock, 0);
+    pthread_mutex_lock(&sb_tc_lock);
+    int live = 0;
+    for (sb_tc* k = sb_tcs; k; k = k->next) live++;
+    if (live >= SB_TC_MAX) { pthread_mutex_unlock(&sb_tc_lock); sb_tc_free(c); return 0; }
+    sb_tc_next = (sb_tc_next + 1) & 0x7fffffffu;
+    if (!sb_tc_next) sb_tc_next = 1;
+    c->id = sb_tc_next | SB_TC_BIT;
+    c->next = sb_tcs; sb_tcs = c;
+    pthread_mutex_unlock(&sb_tc_lock);
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&attr, 256 * 1024);
+    pthread_t thread;
+    int failed = pthread_create(&thread, &attr, sb_tc_thread, c);
+    pthread_attr_destroy(&attr);
+    if (failed) { sb_tc_unlink(c); sb_tc_free(c); return 0; }
+    return (long long)c->id;
+  }
+  // Outbound WebSockets are not carried on this transport.
+  if (op == 'u') return 0;
+  sb_tc* c = sb_tc_find(id);
+  if (!c) return op == 'p' || op == 'k' || op == 'w' || op == 'r' ? 0 : -1;
+  switch (op) {
+    case 'b': {
+      pthread_mutex_lock(&c->lock);
+      if (c->finished) { pthread_mutex_unlock(&c->lock); return 0; }
+      size_t need = c->outq_len + len;
+      if (need > c->outq_cap) {
+        size_t grown = c->outq_cap ? c->outq_cap : 4096;
+        while (grown < need) grown *= 2;
+        unsigned char* more = (unsigned char*)realloc(c->outq, grown);
+        if (!more) { pthread_mutex_unlock(&c->lock); return -1; }
+        c->outq = more; c->outq_cap = grown;
+      }
+      memcpy(c->outq + c->outq_len, data, len);
+      c->outq_len += len;
+      size_t queued = c->outq_len + c->unsent;
+      if (queued > SB_TC_WINDOW) c->want_drain = 1;
+      pthread_mutex_unlock(&c->lock);
+      sb_tc_wake_thread(c);
+      return (long long)queued;
+    }
+    case 'S':
+      pthread_mutex_lock(&c->lock);
+      snprintf(c->sni, sizeof(c->sni), "%.*s", (int)(len < sizeof(c->sni) - 1 ? len : sizeof(c->sni) - 1), data ? data : "");
+      c->starttls_req = 1;
+      c->starttls_at = c->outq_len;
+      pthread_mutex_unlock(&c->lock);
+      sb_tc_wake_thread(c);
+      return 0;
+    case 'H':
+      pthread_mutex_lock(&c->lock);
+      c->shutdown_req = 1;
+      pthread_mutex_unlock(&c->lock);
+      sb_tc_wake_thread(c);
+      return 0;
+    case 'p': {
+      if (!out || !cap) return -1;
+      out[0] = 0;
+      pthread_mutex_lock(&c->lock);
+      if (c->evh) snprintf(out, cap, "%d %zu %u", c->evh->kind, c->evh->len, 0u);
+      pthread_mutex_unlock(&c->lock);
+      return 0;
+    }
+    case 'i': {
+      pthread_mutex_lock(&c->lock);
+      sb_tc_ev* e = c->evh;
+      if (!e) { pthread_mutex_unlock(&c->lock); return -1; }
+      c->evh = e->next; if (!c->evh) c->evt = 0;
+      pthread_mutex_unlock(&c->lock);
+      size_t got = e->len < cap ? e->len : cap;
+      if (got) memcpy(out, e->data, got);
+      free(e->data); free(e);
+      return (long long)got;
+    }
+    case 'k':
+      pthread_mutex_lock(&c->lock);
+      c->unacked -= n < c->unacked ? n : c->unacked;
+      pthread_mutex_unlock(&c->lock);
+      sb_tc_wake_thread(c);
+      return 0;
+    case 'w':
+      pthread_mutex_lock(&c->lock);
+      c->waiter = (unsigned)n;
+      if (c->evh) c->wake_pending = 1;
+      pthread_mutex_unlock(&c->lock);
+      if (c->evh) sb_tc_signal();
+      return 0;
+    case 'r': {
+      pthread_mutex_lock(&c->lock);
+      c->released = 1;
+      int done = c->finished;
+      pthread_mutex_unlock(&c->lock);
+      if (done) { sb_tc_unlink(c); sb_tc_free(c); }
+      else sb_tc_wake_thread(c);
+      return 0;
+    }
+  }
+  return -1;
+}
+// 1 when something will run the loop when an event arrives (the host's waker).
+static int sb_tc_wakeable(void) { return sb_async_waker != 0; }
+extern long long (*sb_wsc_hook)(int op, unsigned int id, const char* data, size_t length, size_t n, char* out, size_t cap);
+extern int (*sb_wsc_wakeable_hook)(void);
+static void sb_tc_install(void) __attribute__((constructor));
+static void sb_tc_install(void) { sb_wsc_drain_hook = sb_tc_drain; sb_wsc_hook = sb_tc_op; sb_wsc_wakeable_hook = sb_tc_wakeable; }
+// TCP:END
 `;
 
 // One request string in, one reply string out. `reqJson` is a parameter, so the
