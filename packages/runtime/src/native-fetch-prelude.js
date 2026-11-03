@@ -11,6 +11,8 @@ function __sbEnvValue() {
 // Setters, not bare assignments in the tail: the template and every app must compile the prelude identically.
 function __sbSetCompat(date) {
   __sbCompatNow = date;
+  // navigator.userAgent as workerd has it: pg picks its Workers socket code on exactly this string.
+  if (date >= "2026-11-17") navigator.userAgent = "Cloudflare-Workers";
   Request._cd = date;
   if (date >= "2026-11-15" && Error.captureStackTrace === undefined) Error.captureStackTrace = __sbCaptureStackTrace;
 }
@@ -14162,7 +14164,7 @@ function __sbWsOp(op, id, data, n) {
     const unsigned int __id = id.type == 1 && id.val > 0 ? (unsigned int)id.val : 0;
     const size_t __n = n.type == 1 && n.val > 0 ? (size_t)n.val : 0;
     char __r[64]; __r[0] = 0;
-    if (__op == 'u' || __op == 'W' || (__id & 0x80000000u)) {
+    if (__op == 'u' || __op == 'T' || __op == 'W' || (__id & 0x80000000u)) {
       long long __w = -1;
       if (!sb_wsc_hook) snprintf(__r, sizeof(__r), "0");
       else if (__op == 'W') snprintf(__r, sizeof(__r), "%d", sb_wsc_wakeable_hook && sb_wsc_wakeable_hook() ? 1 : 0);
@@ -14181,7 +14183,7 @@ function __sbWsOp(op, id, data, n) {
         const char* __d = 0; size_t __dl = 0;
         if (porf_native_fetch_read_raw_bytes(data, &__d, &__dl) == 0) __w = sb_wsc_hook('b', __id, __d, __dl, 0, 0, 0);
         snprintf(__r, sizeof(__r), "%lld", __w);
-      } else if (__op == 't' || __op == 'c' || __op == 'u') {
+      } else if (__op == 't' || __op == 'c' || __op == 'u' || __op == 'T' || __op == 'S') {
         const char* __d; size_t __dl; char* __do = 0;
         porf_native_fetch_read_value(data, &__d, &__dl, &__do);
         __w = sb_wsc_hook(__op, __id, __d, __dl, __n, 0, 0);
@@ -14572,6 +14574,289 @@ function __sbWsPump(ws) {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// cloudflare:sockets connect(), from compatibility date 2026-11-17. A socket is a host
+// socket in the outbound WebSocket table (sb_wsc, raw mode); this end speaks the __sbWsOp ops:
+// "T" open (host, port, secureTransport mode, server name), "b" queue bytes (returns how many
+// are still unsent), "S" start TLS, "H" shut the write side, "p" "i" take an event, "k" ack,
+// "w" park a timer, "r" release. Events: 1 data, 3 error, 4 connected, 6 end of input,
+// 8 send queue drained, 9 TLS handshake done.
+const __SB_SOCKETS_DATE = "2026-11-17";
+const __SB_TCP_HWM = 262144;
+let __sbTcpOpen = 0;
+
+function __sbTcpBadInt() {
+  return new TypeError("The value cannot be converted because it is not an integer.");
+}
+function __sbTcpTarget(address) {
+  let host;
+  let port;
+  if (__sbIsStr(address)) {
+    let rest = address;
+    let cut;
+    if (rest.charAt(0) === "[") {
+      const close = rest.indexOf("]");
+      cut = close >= 0 && rest.charAt(close + 1) === ":" ? close + 1 : -1;
+    } else cut = rest.lastIndexOf(":");
+    if (cut < 0) {
+      if (rest === "") throw new TypeError("Specified address is missing hostname.");
+      throw new TypeError("Specified address is missing port.");
+    }
+    host = rest.slice(0, cut);
+    port = rest.slice(cut + 1);
+  } else if (address != null && __sbIsObj(address)) {
+    host = address.hostname;
+    port = address.port;
+    if (host === undefined || host === "") throw new TypeError("Specified address is missing hostname.");
+    if (port === undefined) throw new TypeError("Specified address is missing port.");
+  } else throw new TypeError("connect() takes an address string or { hostname, port }.");
+  const n = Number(port);
+  if (!(Number.isInteger(n)) || String(port).trim() === "") throw __sbTcpBadInt();
+  if (n < 0 || n > 65535) throw new RangeError("Port out of range.");
+  return { host: String(host), port: n };
+}
+
+function __sbTcpChunk(chunk) {
+  if (__sbIsStr(chunk)) return new TextEncoder().encode(chunk);
+  if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
+  if (ArrayBuffer.isView(chunk)) return new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+  throw new TypeError("This TransformStream is being used as a byte stream, but received an object of non-ArrayBuffer/ArrayBufferView type on its writable side.");
+}
+
+// Takes every event the host has, then parks a timer (or polls, where nothing can wake the loop).
+function __sbTcpPump(st) {
+  if (st.id === 0) return;
+  for (;;) {
+    const head = __sbWsOp("p", st.id, "", 0);
+    if (head === "") {
+      if (st.id === 0) return;
+      if (__sbWsCanWake()) {
+        st.timer = setTimeout(() => __sbTcpPump(st), 2147483647);
+        __sbWsOp("w", st.id, "", st.timer);
+      } else st.timer = setTimeout(() => __sbTcpPump(st), 10);
+      return;
+    }
+    const parts = head.split(" ");
+    const kind = Number(parts[0]);
+    const length = Number(parts[1]);
+    const bytes = new Uint8Array(length);
+    if (length > 0) __sbWsOp("i", st.id, bytes, 0);
+    else __sbWsOp("i", st.id, new Uint8Array(0), 0);
+    if (kind === 1) {
+      st.inbox.push(bytes);
+    } else if (kind === 4 || kind === 9) {
+      if (st.opening) {
+        const o = st.opening;
+        st.opening = null;
+        o.resolve({ remoteAddress: st.host + ":" + st.port, localAddress: null });
+      }
+    } else if (kind === 6) {
+      st.eof = true;
+      if (!st.allowHalfOpen) st.writeEnd = true;
+    } else if (kind === 8) {
+      const d = st.drain;
+      st.drain = null;
+      if (d) d();
+    } else if (kind === 3) {
+      // workerd words every connect failure the same; the host's reason stays on st.reason
+      st.reason = new TextDecoder().decode(bytes);
+      st.failed = new Error("proxy request failed, cannot connect to the specified address");
+      st.eof = true;
+    }
+    __sbTcpSettle(st);
+    if (st.id === 0) return;
+  }
+}
+
+// Applies state changes to the streams and promises.
+function __sbTcpSettle(st) {
+  if (st.opening && st.failed) {
+    const o = st.opening;
+    st.opening = null;
+    o.reject(st.failed);
+  }
+  const wake = st.pullWake;
+  if (wake && (st.inbox.length > 0 || st.eof)) {
+    st.pullWake = null;
+    wake();
+  }
+  if (st.eof && st.inbox.length === 0 && !st.settled) {
+    if (st.failed) {
+      st.settled = true;
+      st.closedReject(st.failed);
+      st.release();
+    } else if (!st.allowHalfOpen) {
+      st.settled = true;
+      st.closedResolve(undefined);
+      if (st.writableController) st.writableController.error(new TypeError("This WritableStream has been closed."));
+      st.release();
+    }
+  }
+}
+
+function __sbTcpRelease(st) {
+  const id = st.id;
+  if (id === 0) return;
+  st.id = 0;
+  if (st.timer !== undefined) clearTimeout(st.timer);
+  __sbWsOp("r", id, "", 0);
+  __sbTcpOpen--;
+}
+
+// One socket facade over a host connection. `st` is shared with the socket startTls() returns.
+function __sbTcpFacade(st, mode) {
+  const closed = new Promise((resolve, reject) => {
+    st.closedResolve = resolve;
+    st.closedReject = reject;
+  });
+  // A rejected `closed` nobody awaits must not surface as an unhandled rejection.
+  closed.catch(() => {});
+  const opened = new Promise((resolve, reject) => {
+    st.opening = { resolve, reject };
+  });
+  opened.catch(() => {});
+  const readable = new ReadableStream(
+    {
+      start(controller) {
+        st.readableController = controller;
+      },
+      pull(controller) {
+        if (st.inbox.length > 0) {
+          const chunk = st.inbox.shift();
+          controller.enqueue(chunk);
+          if (st.id !== 0) __sbWsOp("k", st.id, "", chunk.length);
+          return undefined;
+        }
+        if (st.eof) {
+          if (st.failed && !st.closedByUser) {
+            // a failed connect reads as an empty stream, as in workerd
+          }
+          controller.close();
+          return undefined;
+        }
+        return new Promise((resolve) => {
+          st.pullWake = () => {
+            if (st.inbox.length > 0) {
+              const chunk = st.inbox.shift();
+              controller.enqueue(chunk);
+              if (st.id !== 0) __sbWsOp("k", st.id, "", chunk.length);
+            } else controller.close();
+            resolve();
+          };
+        });
+      },
+      cancel() {
+        return undefined;
+      },
+    },
+    { highWaterMark: 0 },
+  );
+  const writable = new WritableStream(
+    {
+      start(controller) {
+        st.writableController = controller;
+      },
+      write(chunk) {
+        const bytes = __sbTcpChunk(chunk);
+        if (st.id === 0) throw new TypeError("This WritableStream has been closed.");
+        const queued = Number(__sbWsOp("b", st.id, __sbToBytes(bytes), 0));
+        if (queued > __SB_TCP_HWM) return new Promise((resolve) => (st.drain = resolve));
+        return undefined;
+      },
+      close() {
+        if (st.id !== 0) __sbWsOp("H", st.id, "", 0);
+        st.writeClosed = true;
+        return undefined;
+      },
+      abort() {
+        return undefined;
+      },
+    },
+    { highWaterMark: 1 },
+  );
+  const socket = {
+    readable,
+    writable,
+    opened,
+    closed,
+    upgraded: false,
+    secureTransport: mode,
+    close() {
+      st.closedByUser = true;
+      if (st.writableController) st.writableController.error(new TypeError("This WritableStream belongs to an object that is closing."));
+      const wake = st.pullWake;
+      st.pullWake = null;
+      if (!st.settled) {
+        st.settled = true;
+        st.closedResolve(undefined);
+      }
+      st.inbox.length = 0;
+      st.eof = true;
+      if (wake && st.readableController) st.readableController.error(new TypeError("This socket has been closed."));
+      __sbTcpRelease(st);
+      return Promise.resolve();
+    },
+    startTls(options) {
+      if (mode !== "starttls" || st.upgradedOnce)
+        throw new TypeError(st.upgradedOnce ? "The connection was closed before startTls could be started." : "The `secureTransport` socket option must be set to 'starttls' for startTls to be used.");
+      if (readable.locked || writable.locked) throw new TypeError("Cannot startTls while the streams are locked.");
+      st.upgradedOnce = true;
+      let sni = st.host;
+      if (options != null && options.expectedServerHostname != null) sni = String(options.expectedServerHostname);
+      __sbWsOp("S", st.id, sni, 0);
+      // the old socket ends once the upgrade is under way (workerd resolves its `closed`)
+      const oldResolve = st.closedResolve;
+      const next = __sbTcpFacade(st, "on");
+      setTimeout(() => oldResolve(undefined), 0);
+      return next;
+    },
+  };
+  return socket;
+}
+
+function __sbConnect(address, options) {
+  if (__sbCompatDate() < __SB_SOCKETS_DATE)
+    throw new Error("connect() needs compatibility_date " + __SB_SOCKETS_DATE + " or later");
+  const target = __sbTcpTarget(address);
+  let mode = "off";
+  let allowHalfOpen = false;
+  if (options != null) {
+    if (options.secureTransport !== undefined) {
+      mode = String(options.secureTransport);
+      if (mode !== "off" && mode !== "on" && mode !== "starttls")
+        throw new TypeError("Unsupported secureTransport value: " + mode);
+    }
+    allowHalfOpen = options.allowHalfOpen === true;
+  }
+  const st = {
+    id: 0, host: target.host, port: target.port, inbox: [], eof: false, failed: null, settled: false,
+    allowHalfOpen, pullWake: null, drain: null, timer: undefined, opening: null, upgradedOnce: false,
+    closedByUser: false, writableController: null, readableController: null, reason: "", writeClosed: false, writeEnd: false,
+    release: null, closedResolve: null, closedReject: null,
+  };
+  st.release = () => __sbTcpRelease(st);
+  const socket = __sbTcpFacade(st, mode);
+  if (target.port === 25) {
+    st.failed = new Error("proxy request failed, cannot connect to the specified address");
+    st.eof = true;
+    setTimeout(() => __sbTcpSettle(st), 0);
+    return socket;
+  }
+  const spec = target.host + "\n" + target.port + "\n" + (mode === "on" ? "1" : mode === "starttls" ? "2" : "0") + "\n" + target.host;
+  const id = __sbTcpOpen >= 16 ? 0 : Number(__sbWsOp("T", 0, spec, 0));
+  if (!(id > 0)) {
+    st.failed = new Error(__sbTcpOpen >= 16 ? "Too many open connections" : "TCP sockets are not available on this host");
+    st.eof = true;
+    setTimeout(() => __sbTcpSettle(st), 0);
+    return socket;
+  }
+  st.id = id;
+  __sbTcpOpen++;
+  __sbTcpPump(st);
+  return socket;
+}
+globalThis.__sbSockets = { connect: __sbConnect };
 
 // ---------------------------------------------------------------------------
 // Outbound WebSockets, from compatibility date 2026-11-01: new WebSocket(url, protocols) and

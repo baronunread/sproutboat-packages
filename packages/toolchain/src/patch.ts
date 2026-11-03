@@ -1990,6 +1990,26 @@ export async function patchSplitGlobals(root: string): Promise<void> {
   await writeFile(file, src);
 }
 
+// A JS binding named like a libc macro (`S_IRWXG`, `S_IFMT`, `EINVAL`, `PATH_MAX`) became a C
+// declaration the preprocessor rewrote, so the generated C did not compile. pgpass, which `pg`
+// bundles, declares exactly those. Every all-caps name gets a `js_` prefix: no macro starts with it.
+const MACRO_NAMES_MARKER = "sproutboat: all-caps names are prefixed";
+const MACRO_NAMES_ANCHOR = "  while (cReservedNames.has(out) || sanitizeUsed.has(out)) out = '_' + out;\n";
+const MACRO_NAMES_INJECT =
+  "  // " +
+  MACRO_NAMES_MARKER +
+  ", so none is expanded as a libc macro\n" +
+  "  if (/^[A-Z][A-Z0-9_]+$/.test(out)) out = 'js_' + out;\n";
+
+export async function patchMacroNames(root: string): Promise<void> {
+  const file = resolve(root, "compiler/render.js");
+  const src = await readFile(file, "utf8");
+  if (src.includes(MACRO_NAMES_MARKER)) return;
+  if (src.split(MACRO_NAMES_ANCHOR).length !== 2)
+    throw new Error(`could not patch Porffor's macro-named bindings: anchor not found in ${file}`);
+  await writeFile(file, src.replace(MACRO_NAMES_ANCHOR, MACRO_NAMES_INJECT + MACRO_NAMES_ANCHOR));
+}
+
 // A typed array that has an underlying object (a subclass instance, a custom prototype, own
 // properties) can shadow a builtin method: `class Buffer extends Uint8Array { toString(enc) {} }`
 // or Node's Buffer, whose toString(encoding), indexOf and fill replace the typed array ones. The
@@ -2011,6 +2031,74 @@ export async function patchTypedArrayShadow(root: string): Promise<void> {
   if (src.split(TA_SHADOW_ANCHOR).length !== 2)
     throw new Error(`could not patch Porffor's typed array method dispatch: anchor not found in ${file}`);
   await writeFile(file, src.replace(TA_SHADOW_ANCHOR, TA_SHADOW_INJECT));
+}
+
+// A JS identifier argument is read when the call is made, not when the argument list reaches it,
+// so `f(i, i += n)` passed the updated `i` as the first argument: postgres's
+// `x.toString("utf8", index, index += length)` read every column as "". When a later argument
+// assigns, calls or updates and an earlier one is not a literal, the earlier ones are copied into
+// temporaries first, which fixes the order JS requires.
+const ARG_ORDER_MARKER = "sproutboat: call arguments are evaluated in order";
+const ARG_ORDER_ANCHOR = "const generateCall = (scope, decl) => {\n";
+const ARG_ORDER_INJECT =
+  "const generateCall = (scope, decl) => {\n" +
+  "  // " +
+  ARG_ORDER_MARKER +
+  "\n" +
+  "  if (!decl._argsOrdered && !globalThis.precompile && decl.arguments.length > 1) {\n" +
+  "    const fxAst = n => {\n" +
+  "      if (n === null || typeof n !== 'object') return false;\n" +
+  "      if (Array.isArray(n)) return n.some(fxAst);\n" +
+  "      if (n.type === 'AssignmentExpression' || n.type === 'UpdateExpression' || n.type === 'CallExpression' || n.type === 'NewExpression' || n.type === 'AwaitExpression') return true;\n" +
+  "      if (isFuncType(n.type)) return false;\n" +
+  "      for (const key in n) if (key !== 'loc' && key !== 'range' && key[0] !== '_' && fxAst(n[key])) return true;\n" +
+  "      return false;\n" +
+  "    };\n" +
+  "    let lastFx = -1;\n" +
+  "    decl.arguments.forEach((a, i) => { if (fxAst(a)) lastFx = i; });\n" +
+  "    if (lastFx > 0) {\n" +
+  "      const ordered = decl.arguments.map((a, i) => {\n" +
+  "        if (i >= lastFx || a == null || a.type === 'SpreadElement' || isFuncType(a.type) || a.type === 'Literal') return a;\n" +
+  "        const v = generate(scope, a);\n" +
+  "        return { type: 'Identifier', name: tmp(scope, v[N_TYPE], v)[N_A] };\n" +
+  "      });\n" +
+  "      decl = { ...decl, arguments: ordered, _argsOrdered: true };\n" +
+  "    }\n" +
+  "  }\n";
+
+export async function patchCallArgOrder(root: string): Promise<void> {
+  const file = resolve(root, "compiler/codegen.js");
+  const src = await readFile(file, "utf8");
+  if (src.includes(ARG_ORDER_MARKER)) return;
+  if (src.split(ARG_ORDER_ANCHOR).length !== 2)
+    throw new Error(`could not patch Porffor's call argument order: anchor not found in ${file}`);
+  await writeFile(
+    file,
+    src.replace(ARG_ORDER_ANCHOR, () => ARG_ORDER_INJECT),
+  );
+}
+
+// navigator.userAgent is a frozen "Porffor/<version>". workerd's is "Cloudflare-Workers", and pg
+// chooses its Workers socket code on that exact string, so the prelude sets it from the compatibility
+// date that has connect() (__sbSetCompat). That needs the property to be writable.
+const NAVIGATOR_MARKER = "sproutboat: navigator is writable";
+const NAVIGATOR_ANCHOR =
+  "      writable: false,\n      enumerable: true,\n      configurable: false\n    }, {\n      userAgent:";
+const NAVIGATOR_INJECT =
+  "      writable: true, // " +
+  NAVIGATOR_MARKER +
+  "\n      enumerable: true,\n      configurable: true\n    }, {\n      userAgent:";
+
+export async function patchNavigatorWritable(root: string): Promise<void> {
+  const file = resolve(root, "compiler/builtins.js");
+  const src = await readFile(file, "utf8");
+  if (src.includes(NAVIGATOR_MARKER)) return;
+  if (src.split(NAVIGATOR_ANCHOR).length !== 2)
+    throw new Error(`could not patch Porffor's navigator: anchor not found in ${file}`);
+  await writeFile(
+    file,
+    src.replace(NAVIGATOR_ANCHOR, () => NAVIGATOR_INJECT),
+  );
 }
 
 // The conservative scanner must recognize the encoded f64 form used by BigInt builtins.
@@ -2382,7 +2470,10 @@ export async function ensurePorfforPatched(root: string): Promise<void> {
   await patchCaseMapping(root);
   await patchZeroDelayTimers(root);
   await patchSplitGlobals(root);
+  await patchMacroNames(root);
   await patchTypedArrayShadow(root);
+  await patchCallArgOrder(root);
+  await patchNavigatorWritable(root);
   await patchStreamingRequests(root);
   await patchWebSockets(root);
   // After every patch that edits write_response_value (streaming, raw bodies, WebSockets).

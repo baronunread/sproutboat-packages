@@ -65,6 +65,8 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
       "  }\n" +
       "  return -1;\n" +
       "}\n" +
+      // patchMacroNames' anchor.
+      "  while (cReservedNames.has(out) || sanitizeUsed.has(out)) out = '_' + out;\n" +
       // patchSplitGlobals' anchors.
       "  const st = split ? '' : 'static ';\n" +
       "      case K.Global:\n        cur.globals[node[N_A]] = true;\n      case K.Local:\n        return [sanitize(node[N_A]), P_PRIM];\n" +
@@ -222,9 +224,13 @@ async function fixture(): Promise<{ archive: string; sha256: string }> {
     "compiler/builtins/console.ts":
       "export const __Porffor_consolePrint = (arg: any): void => {\n  __Porffor_print(arg);\n};\n",
     "compiler/builtins.js":
+      // patchNavigatorWritable's anchor.
+      "      writable: false,\n      enumerable: true,\n      configurable: false\n    }, {\n      userAgent: 'x'\n" +
       "        const sync = [];\n        if (name === 'globalThis') globalThisUserSync(Box(getPtr, Const(T.i32, TYPES.object)), sync);\n" +
       "        out.push(BlockStmt(sync));\n",
     "compiler/codegen.js":
+      // patchCallArgOrder's anchor.
+      "const generateCall = (scope, decl) => {\n" +
       "        const call = owner === 'RegExp' && shadowable ? shadowed : () => generate(scope, builtinCallNode);\n" +
       "  Reinterpret, Box, JvType, JvNum, JvPtr, JvIsNum,\n" +
       "  globalThisUserSync: (objJv, sync) => {\n    const finalizer = () => {\n      sync.length = 0;\n      const seen = new Set();\n      const push = (key, value) => {\n        seen.add(key);\n        sync.push(builtinCall(scope, '__Porffor_object_set', [ objJv, makeString(scope, key), value ]));\n      };\n" +
