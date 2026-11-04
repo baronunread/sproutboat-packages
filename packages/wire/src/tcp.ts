@@ -98,15 +98,27 @@ export function openFrame(head: JsonObject): Buffer {
   return out;
 }
 
-/** The head of a `tcp.open` payload (marker, json length, json), or null when it is another frame. */
+/** The largest opening frame (the head's length prefix excluded) a listener accepts. */
+export const MAX_TCP_HEAD = 64 * 1024;
+
+/**
+ * The head of a `tcp.open` payload (marker, json length, json), or null when it is another frame
+ * or not a well-formed head. This runs on bytes nobody has authenticated yet, so it never throws:
+ * JSON that does not parse (or nests too deep for the parser) is "not a head", like any other
+ * frame, and the caller answers it.
+ */
 export function parseTcpOpen(payload: Buffer): JsonObject | null {
   if (payload.length < 5 || payload[0] !== V1) return null;
   const jsonLen = payload.readUInt32LE(1);
   if (5 + jsonLen > payload.length) return null;
   const text = payload.subarray(5, 5 + jsonLen).toString("utf8");
   if (!text.includes('"op":"tcp.open"')) return null;
-  const msg = jsonObject(parseJsonValue(text));
-  return msg && msg.op === "tcp.open" ? msg : null;
+  try {
+    const msg = jsonObject(parseJsonValue(text));
+    return msg && msg.op === "tcp.open" ? msg : null;
+  } catch {
+    return null;
+  }
 }
 
 /** What a tunnel needs of the sprout's connection; a `Bun.Socket` is one. */
@@ -494,7 +506,7 @@ export function createTcpTunnels(opts: TcpOptions): TcpTunnels {
   };
 }
 
-type ServiceState = { head: Buffer; tunnel: Tunnel | null };
+type ServiceState = { head: Buffer; tunnel: Tunnel | null; rejected: boolean };
 
 /**
  * The egress service's tunnel endpoint: a raw TCP listener whose first frame is the broker's
@@ -506,7 +518,7 @@ export function listenTunnelService(tunnels: TcpTunnels, hostname: string, port:
     port,
     socket: {
       open(socket) {
-        socket.data = { head: Buffer.alloc(0), tunnel: null };
+        socket.data = { head: Buffer.alloc(0), tunnel: null, rejected: false };
       },
       data(socket, chunk) {
         const state = socket.data;
@@ -514,16 +526,22 @@ export function listenTunnelService(tunnels: TcpTunnels, hostname: string, port:
           state.tunnel.data(chunk);
           return;
         }
+        // Refused already: whatever else arrives before the close is dropped, never buffered.
+        if (state.rejected) return;
         state.head = Buffer.concat([state.head, chunk]);
         if (state.head.length < 4) return;
         const len = state.head.readUInt32LE(0);
-        if (len > 64 * 1024) {
+        if (len > MAX_TCP_HEAD) {
+          state.rejected = true;
+          state.head = Buffer.alloc(0);
           socket.end();
           return;
         }
         if (state.head.length < 4 + len) return;
         const open = parseTcpOpen(state.head.subarray(4, 4 + len));
         if (!open) {
+          state.rejected = true;
+          state.head = Buffer.alloc(0);
           socket.write(typedFrame(TCP_ERROR, Buffer.from("expected tcp.open")));
           socket.end();
           return;
