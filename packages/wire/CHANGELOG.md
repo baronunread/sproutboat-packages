@@ -1,5 +1,15 @@
 # @sproutboat/wire
 
+## 0.22.1
+
+### Patch Changes
+
+- cf519dd: Outbound TCP sockets now set `TCP_NODELAY`. Without it, Nagle's algorithm and the peer's delayed ACK stalled every fresh HTTPS `fetch()` by about 44 ms on Linux (each small TLS handshake flight waited for an ACK). This covers `fetch()`, outbound WebSockets and `connect()` from `cloudflare:sockets` on the embedded transport (standalone binaries, including sockets handed over by `SB_EGRESS_FD`), and the egress tunnel's connections to origins in `wire`. No compatibility date: only latency changes, no result, header or error does.
+- c5262bf: The `connect()` tunnel no longer throws on an opening frame it cannot parse. A `tcp.open` head whose JSON was malformed used to raise out of the egress service's (and the broker's) socket handler before the token was checked, which ended the egress process for every app. The egress service now answers it with an `expected tcp.open` error frame and closes only that connection, like any other first frame that is not a `tcp.open`; the broker answers it as a bad request. A refused head also stops buffering whatever the client keeps sending.
+- Updated dependencies [dbba349]
+- Updated dependencies [cf519dd]
+  - @sproutboat/runtime@0.42.1
+
 ## 0.22.0
 
 ### Minor Changes
