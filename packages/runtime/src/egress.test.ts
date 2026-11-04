@@ -2,13 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-  blockedRange,
-  egressAllowList,
-  egressRefusal,
-  parseAddress,
-  spliceEgressTable,
-} from "./egress";
+import { blockedRange, egressAllowList, egressRefusal, parseAddress, spliceEgressTable } from "./egress";
 import { validateHttpSyncSource } from "./source";
 import { wrapNativeFetchHandler } from "./wrap";
 
@@ -58,19 +52,15 @@ const PUBLIC = [
 const ALLOW = "8.8.4.4, 10.9.9.9";
 
 test("private and reserved addresses are blocked, public ones are not", () => {
-  for (const address of BLOCKED)
-    expect([address, blockedRange(address)]).not.toEqual([address, null]);
-  for (const address of PUBLIC)
-    expect([address, blockedRange(address)]).toEqual([address, null]);
+  for (const address of BLOCKED) expect([address, blockedRange(address)]).not.toEqual([address, null]);
+  for (const address of PUBLIC) expect([address, blockedRange(address)]).toEqual([address, null]);
   expect(blockedRange("::ffff:127.0.0.1")).toBe("127.0.0.0/8");
   expect(blockedRange("64:ff9b::a00:1")).toBe("10.0.0.0/8");
 });
 
 test("the operator allow list lets an exact address or everything through", () => {
   expect(egressRefusal("db", "10.9.9.9", egressAllowList(ALLOW))).toBeNull();
-  expect(egressRefusal("db", "10.9.9.8", egressAllowList(ALLOW))).toContain(
-    "SB_EGRESS_ALLOW=10.9.9.8",
-  );
+  expect(egressRefusal("db", "10.9.9.8", egressAllowList(ALLOW))).toContain("SB_EGRESS_ALLOW=10.9.9.8");
   expect(egressRefusal("db", "127.0.0.1", ["*"])).toBeNull();
   expect(egressRefusal("x", "169.254.169.254", [])).toBe(
     "fetch() refused: x resolves to 169.254.169.254, a private or reserved address (169.254.0.0/16). An operator can allow it with SB_EGRESS_ALLOW=169.254.169.254",
@@ -78,15 +68,7 @@ test("the operator allow list lets an exact address or everything through", () =
 });
 
 test("parseAddress rejects what is not an address", () => {
-  for (const bad of [
-    "",
-    "1.2.3",
-    "256.1.1.1",
-    "example.com",
-    "1::2::3",
-    "1:2:3:4:5:6:7:8:9",
-    "12345::",
-  ])
+  for (const bad of ["", "1.2.3", "256.1.1.1", "example.com", "1::2::3", "1:2:3:4:5:6:7:8:9", "12345::"])
     expect([bad, parseAddress(bad)]).toEqual([bad, null]);
 });
 
@@ -99,10 +81,7 @@ test("the C table in transport-embedded.js is generated from this one (bun run g
 
 test("the C check gives the same answer and message as the TS one", () => {
   const source = readFileSync(transportFile, "utf8");
-  const block = source.slice(
-    source.indexOf("// EGRESS:BEGIN"),
-    source.indexOf("// EGRESS:END"),
-  );
+  const block = source.slice(source.indexOf("// EGRESS:BEGIN"), source.indexOf("// EGRESS:END"));
   const dir = mkdtempSync(join(tmpdir(), "sb-egress-"));
   try {
     writeFileSync(
@@ -130,23 +109,14 @@ int main(int argc, char** argv) {
 }
 `,
     );
-    const cc = Bun.spawnSync([
-      "cc",
-      "-Wall",
-      "-Werror",
-      "-o",
-      join(dir, "check"),
-      join(dir, "check.c"),
-    ]);
+    const cc = Bun.spawnSync(["cc", "-Wall", "-Werror", "-o", join(dir, "check"), join(dir, "check.c")]);
     expect(cc.stderr.toString()).toBe("");
     const addresses = [...BLOCKED, ...PUBLIC, "10.9.9.9"];
     const run = Bun.spawnSync([join(dir, "check"), ...addresses], {
       env: { ...process.env, SB_EGRESS_ALLOW: ALLOW },
     });
     const fromC = run.stdout.toString().trimEnd().split("\n");
-    const fromTs = addresses.map(
-      (a) => egressRefusal("h", a, egressAllowList(ALLOW)) ?? "ok",
-    );
+    const fromTs = addresses.map((a) => egressRefusal("h", a, egressAllowList(ALLOW)) ?? "ok");
     expect(fromC).toEqual(fromTs);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -156,21 +126,13 @@ int main(int argc, char** argv) {
 test("#174: fetch() needs no config, so every sprout gets it", () => {
   const handler = `export default { async fetch() { return await fetch("https://api.example.com/"); } };`;
   expect(validateHttpSyncSource(handler)).toEqual({ ok: true });
-  const prelude = readFileSync(
-    new URL("./native-fetch-prelude.js", import.meta.url),
-    "utf8",
-  );
-  expect(wrapNativeFetchHandler(handler, prelude)).toContain(
-    "__sbInstallFetch();",
-  );
+  const prelude = readFileSync(new URL("./native-fetch-prelude.js", import.meta.url), "utf8");
+  expect(wrapNativeFetchHandler(handler, prelude)).toContain("__sbInstallFetch();");
 });
 
 test("SB_EGRESS_FD: the host connects, the sprout gets the socket", () => {
   const source = readFileSync(transportFile, "utf8");
-  const block = source.slice(
-    source.indexOf("// EGRESS-FD:BEGIN"),
-    source.indexOf("// EGRESS-FD:END"),
-  );
+  const block = source.slice(source.indexOf("// EGRESS-FD:BEGIN"), source.indexOf("// EGRESS-FD:END"));
   const dir = mkdtempSync(join(tmpdir(), "sb-egress-fd-"));
   try {
     // A fake host on one end of a socketpair: "up" gets a socket whose peer says
@@ -263,16 +225,9 @@ int main(void) {
 
 test("the Host header carries a non-default port", () => {
   const source = readFileSync(transportFile, "utf8");
-  const between = (from: string, to: string) =>
-    source.slice(source.indexOf(from), source.indexOf(to));
-  const buffer = between(
-    "typedef struct { char* p; size_t len; size_t cap; } sb_buf;",
-    "static void sb_putjson(",
-  );
-  const builder = between(
-    "// body_len, not strlen(body)",
-    "// Turn a whole raw response",
-  );
+  const between = (from: string, to: string) => source.slice(source.indexOf(from), source.indexOf(to));
+  const buffer = between("typedef struct { char* p; size_t len; size_t cap; } sb_buf;", "static void sb_putjson(");
+  const builder = between("// body_len, not strlen(body)", "// Turn a whole raw response");
   const dir = mkdtempSync(join(tmpdir(), "sb-host-"));
   try {
     writeFileSync(
@@ -318,10 +273,7 @@ int main(void) { show(80, 80); show(8080, 80); show(443, 443); show(8443, 443); 
 
 test("async fetch: requests run on threads and come back through the host", () => {
   const source = readFileSync(transportFile, "utf8");
-  const block = source.slice(
-    source.indexOf("// ASYNC:BEGIN"),
-    source.indexOf("// ASYNC:END"),
-  );
+  const block = source.slice(source.indexOf("// ASYNC:BEGIN"), source.indexOf("// ASYNC:END"));
   const dir = mkdtempSync(join(tmpdir(), "sb-async-"));
   try {
     // Stand-ins: a client that takes 200 ms, and a host that records which timers fire.
@@ -385,13 +337,8 @@ int main(void) {
       .trimEnd()
       .split("\n");
     // 16 requests of 200 ms on 8 threads: two rounds, not sixteen.
-    expect(lines.slice(0, 16).sort()).toEqual(
-      Array.from({ length: 16 }, (_, i) => `${i + 1} h/${i + 1} body`).sort(),
-    );
-    expect(lines.slice(16)).toEqual([
-      "elapsed overlapped",
-      "outside a callback nothing",
-    ]);
+    expect(lines.slice(0, 16).sort()).toEqual(Array.from({ length: 16 }, (_, i) => `${i + 1} h/${i + 1} body`).sort());
+    expect(lines.slice(16)).toEqual(["elapsed overlapped", "outside a callback nothing"]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
