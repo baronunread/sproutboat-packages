@@ -660,3 +660,168 @@ test("egress service: a broker with the wrong token gets an error frame, and an 
   await b.ack();
   expect((await b.next()).type).toBe(TCP_ERROR);
 });
+
+// --- unauthenticated input on the egress service ----------------------------
+
+/** A raw client: writes `bytes`, returns everything the service sent until it closed (or `ms` passed). */
+async function rawExchange(port: number, bytes: Uint8Array[], ms = 3000) {
+  const received: Uint8Array[] = [];
+  let ended: () => void = () => {};
+  const done = new Promise<void>((resolve) => (ended = resolve));
+  const socket = await Bun.connect({
+    hostname: "127.0.0.1",
+    port,
+    socket: {
+      data(_s, chunk) {
+        received.push(Buffer.from(chunk));
+      },
+      close: () => ended(),
+      end: () => ended(),
+      error: () => ended(),
+      drain() {},
+    },
+  });
+  for (const b of bytes) socket.write(b);
+  const timer = setTimeout(ended, ms);
+  await done;
+  clearTimeout(timer);
+  socket.end();
+  return Buffer.concat(received).toString("hex");
+}
+
+/** A head as the broker writes it, but with the JSON text given verbatim. */
+function headWith(json: Buffer | string): Buffer {
+  const body = Buffer.isBuffer(json) ? json : Buffer.from(json, "utf8");
+  const out = Buffer.allocUnsafe(9 + body.length);
+  out.writeUInt32LE(5 + body.length, 0);
+  out.writeUInt8(1, 4);
+  out.writeUInt32LE(body.length, 5);
+  body.copy(out, 9);
+  return out;
+}
+
+const expectedTcpOpen = typedFrame(TCP_ERROR, Buffer.from("expected tcp.open")).toString("hex");
+const unauthorized = typedFrame(TCP_ERROR, Buffer.from("unauthorized")).toString("hex");
+
+function serviceOn() {
+  const service = listenTunnelService(createTcpTunnels({ token: "egress-secret" }), "127.0.0.1", 0);
+  stops.push(() => service.stop());
+  return service;
+}
+
+/** The service still does its job: a good head with the wrong token is answered, not dropped. */
+async function expectAlive(port: number) {
+  const reply = await rawExchange(port, [openFrame({ token: "nope", op: "tcp.open", ...target(80) })]);
+  expect(reply).toBe(unauthorized);
+}
+
+test("egress service: a malformed tcp.open head is an error frame and the service lives on", async () => {
+  const service = serviceOn();
+  const heads = [
+    '{"op":"tcp.open",', // truncated
+    '{"op":"tcp.open","token":}', // broken value
+    '{"op":"tcp.open"} trailing', // trailing garbage
+    '"op":"tcp.open"', // not an object at all
+    '["op","tcp.open"] "op":"tcp.open"',
+    `${"[".repeat(60_000)}"op":"tcp.open"`, // nesting deep enough to overflow a parser's stack
+    '{"op":"tcp.open","host":"\uD800"}'.slice(0, -3), // cut inside a string
+    '{"op":"tcp.open"}'.replace("{", "["), // an array
+  ];
+  for (const text of heads) {
+    expect(await rawExchange(service.port, [headWith(text)])).toBe(expectedTcpOpen);
+    await expectAlive(service.port);
+  }
+});
+
+test("egress service: a head that is not UTF-8 or has no marker gets the same error frame", async () => {
+  const service = serviceOn();
+  const marker = Buffer.from('"op":"tcp.open"');
+  const bad = [
+    Buffer.concat([
+      Buffer.from("{"),
+      Buffer.from([0xff, 0xfe, 0xc3, 0x28]),
+      Buffer.from(","),
+      marker,
+      Buffer.from("}"),
+    ]),
+    Buffer.from([0xff, 0xff, 0xff]),
+    Buffer.from("{}"),
+    Buffer.alloc(0),
+  ];
+  for (const body of bad) expect(await rawExchange(service.port, [headWith(body)])).toBe(expectedTcpOpen);
+  await expectAlive(service.port);
+});
+
+test("egress service: bad lengths, short payloads and a wrong marker byte are answered or closed, never thrown", async () => {
+  const service = serviceOn();
+  const u32 = (n: number) => {
+    const b = Buffer.alloc(4);
+    b.writeUInt32LE(n);
+    return b;
+  };
+  // payload shorter than the 5-byte inner header
+  expect(await rawExchange(service.port, [Buffer.concat([u32(2), Buffer.from([1, 0])])])).toBe(expectedTcpOpen);
+  // inner json length larger than the payload
+  expect(
+    await rawExchange(service.port, [Buffer.concat([u32(6), Buffer.from([1]), u32(0xffffffff), Buffer.from("x")])]),
+  ).toBe(expectedTcpOpen);
+  // marker byte is not 1
+  const wrong = headWith('{"op":"tcp.open"}');
+  wrong[4] = 2;
+  expect(await rawExchange(service.port, [wrong])).toBe(expectedTcpOpen);
+  // a length of zero
+  expect(await rawExchange(service.port, [u32(0)])).toBe(expectedTcpOpen);
+  await expectAlive(service.port);
+});
+
+test("egress service: a head over 64 KiB is closed without a reply, and bytes after it are not buffered", async () => {
+  const service = serviceOn();
+  const over = Buffer.alloc(4);
+  over.writeUInt32LE(64 * 1024 + 1);
+  expect((await rawExchange(service.port, [over])).length).toBe(0);
+  // the full oversized head, and then more, sent in pieces
+  const pieces = [over, ...Array.from({ length: 8 }, () => Buffer.alloc(32 * 1024, 0x41))];
+  expect((await rawExchange(service.port, pieces)).length).toBe(0);
+  // exactly the limit is still a head (here, a malformed one)
+  const limit = Buffer.alloc(4 + 64 * 1024, 0x20);
+  limit.writeUInt32LE(64 * 1024, 0);
+  expect(await rawExchange(service.port, [limit])).toBe(expectedTcpOpen);
+  await expectAlive(service.port);
+});
+
+test("egress service: a head split across writes, and a client that vanishes mid-head, are handled", async () => {
+  const service = serviceOn();
+  const head = openFrame({ token: "nope", op: "tcp.open", ...target(80) });
+  const reply = await rawExchange(service.port, [head.subarray(0, 3), head.subarray(3, 12), head.subarray(12)]);
+  expect(reply).toBe(unauthorized);
+  await rawExchange(service.port, [head.subarray(0, 10)], 200); // half a head, then gone
+  await expectAlive(service.port);
+});
+
+test("egress service: a well-formed head with odd field types is refused, not thrown", async () => {
+  const service = serviceOn();
+  const odd: JsonObject[] = [
+    { token: 5 },
+    { token: ["egress-secret"] },
+    { token: "egress-secret", host: 7, port: "80", mode: 3 },
+    { token: "egress-secret", host: "a".repeat(300), port: 80, mode: "off" },
+    { token: "egress-secret", host: "example.com", port: 1e300, mode: "off" },
+    { token: "egress-secret", host: "example.com", port: -1, mode: "off" },
+    { token: "egress-secret", host: "example.com", port: 80, mode: { x: 1 }, servername: [] },
+    { token: null, host: null, port: null, mode: null },
+  ];
+  for (const head of odd) {
+    const reply = await rawExchange(service.port, [openFrame({ op: "tcp.open", ...head })]);
+    expect(reply.slice(0, 2)).toBe("04");
+  }
+  await expectAlive(service.port);
+});
+
+test("the broker answers a malformed tcp.open head on its own listener and keeps serving", async () => {
+  const { server } = brokerOn();
+  const reply = await rawExchange(server.port, [headWith('{"op":"tcp.open",')]);
+  // length-prefixed v1 or plain JSON error reply, and the connection ends or stays open: either way the broker lives
+  expect(reply.length).toBeGreaterThan(0);
+  const t = await openTunnel(server.port, target(1, { port: 25 }));
+  expect((await t.ack()).error).toContain("port 25");
+});
