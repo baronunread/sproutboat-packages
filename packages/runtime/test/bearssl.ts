@@ -1,16 +1,14 @@
-import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { BEARSSL_SHA256, BEARSSL_URLS, BEARSSL_VERSION } from "../../toolchain/src/deps";
+import { fetchPinned } from "../../toolchain/src/fetch-pinned";
 
 // The prelude carries crypto.subtle's native half on every transport, so a test that compiles a
 // handler using crypto.subtle needs BearSSL on the include path and link line, as the CLI arranges
 // for a build. Same pinned source as the CLI's src/bearssl.ts; built once into the toolchain cache.
-const COMMIT = "7bea48e5e850ab4cafbe68d3765cdaba13a86d6f";
-const VERSION = COMMIT.slice(0, 7);
-const URL_ = `https://bearssl.org/gitweb/?p=BearSSL;a=snapshot;h=${COMMIT};sf=tgz`;
-const SHA256 = "ed397832b1613582737d9c1ce01c1af74ad6a9e9c52a341e24433987cda0f372";
+const VERSION = BEARSSL_VERSION;
 
 const walk = async (dir: string): Promise<string[]> =>
   (
@@ -34,10 +32,13 @@ export async function bearsslEnv(): Promise<{ SB_EXTRA_CFLAGS: string; SB_EXTRA_
   const marker = join(objects, ".complete");
   if (!existsSync(marker)) {
     await mkdir(root, { recursive: true });
-    const response = await fetch(URL_);
-    if (!response.ok) throw new Error(`could not download ${URL_}: HTTP ${response.status}`);
-    const bytes = Buffer.from(await response.arrayBuffer());
-    if (createHash("sha256").update(bytes).digest("hex") !== SHA256) throw new Error("BearSSL checksum mismatch");
+    // Mirror list, bounded retry and sha256 pin: see toolchain/src/deps.ts. The verified tarball is also kept
+    // in a cache that CI restores by hash, so a cold build cache does not depend on any server being up.
+    const bytes = await fetchPinned({
+      urls: BEARSSL_URLS,
+      sha256: BEARSSL_SHA256,
+      cachePath: join(dirname(root), "deps", `bearssl-src-${BEARSSL_SHA256}.tar.gz`),
+    });
     await writeFile(join(root, "bearssl.tar.gz"), bytes);
     await rm(tree, { recursive: true, force: true });
     const untar = Bun.spawnSync(["tar", "xzf", join(root, "bearssl.tar.gz"), "-C", root]);

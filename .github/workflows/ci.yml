@@ -66,6 +66,13 @@ jobs:
             ~/.cache/sproutboat/porffor-*
             ~/.cache/porffor/deps
           key: porffor-${{ runner.os }}-${{ hashFiles('packages/toolchain/package.json', 'packages/toolchain/src/*.ts', 'packages/toolchain/vendor/**') }}
+      # The BearSSL source tarball (packages/toolchain/src/deps.ts), keyed by its sha256, so a
+      # cold build cache and a bearssl.org outage (502 for hours on 2026-11-04) do not fail the job.
+      # Bump the key with BEARSSL_SHA256; a unit test checks they agree.
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/sproutboat/deps
+          key: bearssl-src-ed397832b1613582737d9c1ce01c1af74ad6a9e9c52a341e24433987cda0f372
       # Every test:native-* script, 4 at a time (scripts/test-native.ts).
       - run: bun run test:native
 
