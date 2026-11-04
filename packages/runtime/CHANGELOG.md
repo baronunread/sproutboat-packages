@@ -1,5 +1,12 @@
 # @sproutboat/runtime
 
+## 0.42.1
+
+### Patch Changes
+
+- dbba349: fetch() and connect() now also refuse reserved space that carries no public service: AS112 and the old IPv4 anycast blocks (`192.31.196.0/24`, `192.52.193.0/24`, `192.88.99.0/24`, `192.175.48.0/24`), SIIT (`::ffff:0:0:0/96`), IETF protocol assignments including Teredo (`2001::/23`), `3fff::/20` and SRv6 (`5f00::/16`). Applies to the broker, the egress service and the standalone client alike; `SB_EGRESS_ALLOW` still overrides.
+- cf519dd: Outbound TCP sockets now set `TCP_NODELAY`. Without it, Nagle's algorithm and the peer's delayed ACK stalled every fresh HTTPS `fetch()` by about 44 ms on Linux (each small TLS handshake flight waited for an ACK). This covers `fetch()`, outbound WebSockets and `connect()` from `cloudflare:sockets` on the embedded transport (standalone binaries, including sockets handed over by `SB_EGRESS_FD`), and the egress tunnel's connections to origins in `wire`. No compatibility date: only latency changes, no result, header or error does.
+
 ## 0.42.0
 
 ### Minor Changes
