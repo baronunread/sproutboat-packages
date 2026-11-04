@@ -41,6 +41,18 @@ export const BLOCKED_RANGES = [
   "fe80::/10",
   "fec0::/10",
   "ff00::/8",
+  // Reserved space that carries no public service: AS112 and the IETF's old anycast
+  // blocks, SIIT (`::ffff:0:0:0/96`, which embeds an IPv4 address the mapped rule
+  // above does not see), IETF protocol assignments (includes Teredo, `2001::/32`),
+  // the second documentation block and SRv6 SIDs.
+  "192.31.196.0/24",
+  "192.52.193.0/24",
+  "192.88.99.0/24",
+  "192.175.48.0/24",
+  "::ffff:0:0:0/96",
+  "2001::/23",
+  "3fff::/20",
+  "5f00::/16",
 ] as const;
 
 /** Parse an IPv4 or IPv6 literal to its bytes; `null` when it is neither. */
@@ -123,11 +135,7 @@ export function egressAllowList(raw: string | undefined): string[] {
 
 /** Why `fetch()` may not connect to `address`, or `null` when it may. The
  *  message is identical in the C client; keep the two in step. */
-export function egressRefusal(
-  host: string,
-  address: string,
-  allow: readonly string[],
-): string | null {
+export function egressRefusal(host: string, address: string, allow: readonly string[]): string | null {
   if (allow.includes("*") || allow.includes(address)) return null;
   const range = blockedRange(address);
   if (range === null) return null;
@@ -149,8 +157,5 @@ const TABLE_BEGIN = /( *\/\/ EGRESS-TABLE:BEGIN[^\n]*\n)[\s\S]*?( *\/\/ EGRESS-T
 /** `source` with the generated table between its EGRESS-TABLE markers replaced. */
 export function spliceEgressTable(source: string): string {
   if (!TABLE_BEGIN.test(source)) throw new Error("EGRESS-TABLE markers not found");
-  return source.replace(
-    TABLE_BEGIN,
-    (_, begin: string, end: string) => `${begin}${egressRangesC()}\n${end}`,
-  );
+  return source.replace(TABLE_BEGIN, (_, begin: string, end: string) => `${begin}${egressRangesC()}\n${end}`);
 }
