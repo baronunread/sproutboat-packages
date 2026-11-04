@@ -50,7 +50,9 @@ test("globalThis shows function bindings and follows var bindings, however often
     console.log(globalThis.added, "added" in globalThis, "f0" in globalThis);
   `);
   expect(out.trim().split("\n")).toEqual(["function 7 39", "1 m", "5", "9 9", "3 true true"]);
-});
+  // A native compile, not a unit test: whichever test file compiles first in a run also builds the cached native
+  // dependencies (uSockets and the rest) on a cold runner, which took over bun's default 5 s on two CI runs.
+}, 120_000);
 
 test("reading globalThis does not rewrite every top-level function", async () => {
   const out = await run(`

@@ -2,8 +2,8 @@ import { expect, test } from "bun:test";
 import { readdir } from "node:fs/promises";
 import { PATCH_FINGERPRINT, PATCH_SOURCES, RELEASED_FINGERPRINT, sourceFingerprint } from "./fingerprint";
 
-// Not part of the patched compiler: acquisition, the barrel, generators and this module.
-const NOT_PATCH_SOURCES = new Set(["acquire.ts", "index.ts", "fingerprint.ts"]);
+// Not part of the patched compiler: acquisition, pinned dependency fetching, the barrel, generators and this module.
+const NOT_PATCH_SOURCES = new Set(["acquire.ts", "index.ts", "fingerprint.ts", "deps.ts", "fetch-pinned.ts"]);
 
 test("the patch fingerprint covers every toolchain module that shapes the compiler", async () => {
   const modules = (await readdir(import.meta.dir)).filter(

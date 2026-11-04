@@ -66,6 +66,8 @@ jobs:
             ~/.cache/sproutboat/porffor-*
             ~/.cache/porffor/deps
           key: porffor-${{ runner.os }}-${{ hashFiles('packages/toolchain/package.json', 'packages/toolchain/src/*.ts', 'packages/toolchain/vendor/**') }}
+      # BearSSL is read from vendor/bearssl (sha256-pinned in packages/toolchain/src/deps.ts), so this
+      # job needs no network for it; bearssl.org is only a fallback.
       # Every test:native-* script, 4 at a time (scripts/test-native.ts).
       - run: bun run test:native
 

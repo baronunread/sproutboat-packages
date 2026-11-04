@@ -10,3 +10,5 @@
 export * from "./pin";
 export * from "./patch";
 export * from "./acquire";
+export * from "./deps";
+export * from "./fetch-pinned";
