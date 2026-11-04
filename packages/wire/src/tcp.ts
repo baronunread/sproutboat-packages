@@ -199,6 +199,8 @@ export function createTcpTunnels(opts: TcpOptions): TcpTunnels {
         socket.destroy();
         fail(new Error("connect timed out"));
       }, ms);
+      // Nagle plus the origin's delayed ACK stalls small writes (about 44 ms per TLS flight): send at once.
+      socket.setNoDelay(true);
       const ready = secure ? "secureConnect" : "connect";
       socket.once(ready, () => {
         clearTimeout(timer);

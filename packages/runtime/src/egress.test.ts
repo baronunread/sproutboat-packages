@@ -146,6 +146,8 @@ test("SB_EGRESS_FD: the host connects, the sprout gets the socket", () => {
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 ${block}
@@ -218,6 +220,71 @@ int main(void) {
         "fd no",
       ].sort(),
     );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("sb_tcp_connect sets TCP_NODELAY on the socket it returns", () => {
+  // Nagle plus the peer's delayed ACK stalled every fresh HTTPS fetch about 44 ms on Linux (a TLS
+  // handshake writes small flights). Timing is flaky on CI and loopback on macOS does not show
+  // it, so ask the kernel: connect to a local listener and read the option back.
+  const source = readFileSync(transportFile, "utf8");
+  const between = (from: string, to: string) => source.slice(source.indexOf(from), source.indexOf(to));
+  const dir = mkdtempSync(join(tmpdir(), "sb-nodelay-"));
+  try {
+    writeFileSync(
+      join(dir, "check.c"),
+      `#include <errno.h>
+#include <pthread.h>
+#include <netdb.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/uio.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+${between("// EGRESS:BEGIN", "// EGRESS:END")}
+${between("// EGRESS-FD:BEGIN", "// EGRESS-FD:END")}
+${between("// TCP-CONNECT:BEGIN", "// TCP-CONNECT:END")}
+int main(void) {
+  int listener = socket(AF_INET, SOCK_STREAM, 0);
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (bind(listener, (struct sockaddr*)&addr, sizeof(addr)) || listen(listener, 1)) return 2;
+  socklen_t len = sizeof(addr);
+  getsockname(listener, (struct sockaddr*)&addr, &len);
+  char refused[512] = "";
+  int fd = sb_tcp_connect("127.0.0.1", ntohs(addr.sin_port), refused, sizeof(refused));
+  int value = -1;
+  socklen_t vlen = sizeof(value);
+  if (fd >= 0) getsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &value, &vlen);
+  printf("fd %s nodelay %s\\n", fd >= 0 ? "yes" : "no", value > 0 ? "on" : "off");
+  return 0;
+}
+`,
+    );
+    const cc = Bun.spawnSync([
+      "cc",
+      "-Wall",
+      "-Werror",
+      "-Wno-unused-function",
+      "-Wno-unused-result",
+      "-o",
+      join(dir, "check"),
+      join(dir, "check.c"),
+    ]);
+    expect(cc.stderr.toString()).toBe("");
+    const run = Bun.spawnSync([join(dir, "check")], {
+      env: { ...process.env, SB_EGRESS_ALLOW: "127.0.0.1", SB_EGRESS_FD: "" },
+    });
+    expect(run.stdout.toString().trim()).toBe("fd yes nodelay on");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

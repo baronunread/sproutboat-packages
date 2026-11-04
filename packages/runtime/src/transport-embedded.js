@@ -20,6 +20,8 @@ Porffor.c`
 #include <stdint.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <string.h>
@@ -2653,6 +2655,14 @@ static int sb_egress_refused(const char* host, const struct sockaddr* sa, char* 
 // EGRESS:END
 
 // EGRESS-FD:BEGIN
+// TCP_NODELAY on an outbound socket. Without it Nagle holds a small write until the peer ACKs the
+// last one, and the peer delays that ACK: about 44 ms per TLS handshake flight on Linux. A unix
+// socket (an fd handed over by sproutd) refuses the option, which is fine: only TCP needs it.
+static void sb_tcp_nodelay(int fd) {
+  int one = 1;
+  setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+}
+
 // SB_EGRESS_FD=N: a sandboxed host (sproutd) opens outbound connections for the
 // sprout, which may not open sockets itself. Ask on unix socket N with
 // "HOST PORT\n"; the host resolves, applies its policy and answers "ok\n" with the
@@ -2699,6 +2709,7 @@ static int sb_egress_fd_ask(int via, const char* host, int port, char* refused, 
   if (!strcmp(answer, "ok") && fd >= 0) {
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    sb_tcp_nodelay(fd);
     return fd;
   }
   if (fd >= 0) close(fd);
@@ -2707,6 +2718,7 @@ static int sb_egress_fd_ask(int via, const char* host, int port, char* refused, 
 }
 // EGRESS-FD:END
 
+// TCP-CONNECT:BEGIN
 // refused gets the first refusal; a caller reports it when nothing connected.
 static int sb_tcp_connect(const char* host, int port, char* refused, size_t refused_len) {
   const char* via = getenv("SB_EGRESS_FD");
@@ -2739,13 +2751,14 @@ static int sb_tcp_connect(const char* host, int port, char* refused, size_t refu
     struct timeval tv; tv.tv_sec = 30; tv.tv_usec = 0;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    if (connect(fd, it->ai_addr, it->ai_addrlen) == 0) break;
+    if (connect(fd, it->ai_addr, it->ai_addrlen) == 0) { sb_tcp_nodelay(fd); break; }
     close(fd);
     fd = -1;
   }
   freeaddrinfo(res);
   return fd;
 }
+// TCP-CONNECT:END
 
 // body_len, not strlen(body): a binary body can contain NUL bytes (#232).
 // Host carries the port unless it is the scheme's default (RFC 9110 7.2).
