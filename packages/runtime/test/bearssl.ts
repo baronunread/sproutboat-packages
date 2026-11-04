@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { mkdir, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { BEARSSL_SHA256, BEARSSL_URLS, BEARSSL_VERSION } from "../../toolchain/src/deps";
+import { BEARSSL_SHA256, BEARSSL_URLS, BEARSSL_VENDORED_PATH, BEARSSL_VERSION } from "../../toolchain/src/deps";
 import { fetchPinned } from "../../toolchain/src/fetch-pinned";
 
 // The prelude carries crypto.subtle's native half on every transport, so a test that compiles a
@@ -32,9 +32,10 @@ export async function bearsslEnv(): Promise<{ SB_EXTRA_CFLAGS: string; SB_EXTRA_
   const marker = join(objects, ".complete");
   if (!existsSync(marker)) {
     await mkdir(root, { recursive: true });
-    // Mirror list, bounded retry and sha256 pin: see toolchain/src/deps.ts. The verified tarball is also kept
-    // in a cache that CI restores by hash, so a cold build cache does not depend on any server being up.
+    // Vendored tarball first (vendor/bearssl), then bearssl.org with bounded retry; both sha256-pinned: see
+    // toolchain/src/deps.ts. A downloaded copy is cached so a later run needs no network.
     const bytes = await fetchPinned({
+      localPath: BEARSSL_VENDORED_PATH,
       urls: BEARSSL_URLS,
       sha256: BEARSSL_SHA256,
       cachePath: join(dirname(root), "deps", `bearssl-src-${BEARSSL_SHA256}.tar.gz`),

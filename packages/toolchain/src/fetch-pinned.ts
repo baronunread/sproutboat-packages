@@ -6,7 +6,9 @@ import { dirname } from "node:path";
 type Fetcher = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
 export type FetchPinnedOptions = {
-  /** Ordered mirrors: our own copy first, the upstream last. Every one must serve the same bytes. */
+  /** A vendored copy read from disk before any network source. Used only if its hash matches. */
+  localPath?: string;
+  /** Ordered download sources, tried after the vendored copy. Every one must serve the same bytes. */
   urls: readonly string[];
   /** Lowercase hex sha256 of the exact bytes. A source that serves anything else is rejected. */
   sha256: string;
@@ -27,10 +29,10 @@ const sha256Hex = (bytes: Uint8Array): string => createHash("sha256").update(byt
 class Permanent extends Error {}
 
 /**
- * Download a build-time dependency from an ordered mirror list and return its bytes, only if they
- * hash to the pinned sha256. The pin is what makes a mirror safe: a mirror that serves different
- * bytes is skipped, whoever runs it, so the list can only improve availability, never change what
- * gets built. A 5xx or a network error is retried with exponential backoff (bounded); a 4xx or a
+ * Return a build-time dependency's bytes, only if they hash to the pinned sha256: first the vendored
+ * file (`localPath`), then the ordered download list. The pin is what makes every source safe: one
+ * that has different bytes (a tampered vendored file included) is skipped, so the list can only
+ * improve availability, never change what gets built. A 5xx or a network error is retried with exponential backoff (bounded); a 4xx or a
  * hash mismatch moves straight on to the next source.
  */
 export async function fetchPinned(options: FetchPinnedOptions): Promise<Buffer> {
@@ -38,6 +40,13 @@ export async function fetchPinned(options: FetchPinnedOptions): Promise<Buffer> 
   const fetcher: Fetcher = options.fetcher ?? fetch;
   const attempts = Math.max(1, options.attempts ?? 3);
   const sleep = options.sleep ?? ((ms: number) => Bun.sleep(ms));
+  if (options.localPath && existsSync(options.localPath)) {
+    const vendored = await readFile(options.localPath);
+    if (sha256Hex(vendored) === sha256) return vendored;
+    console.warn(
+      `fetchPinned: vendored ${options.localPath} does not match the pinned sha256, falling back to download`,
+    );
+  }
   if (options.cachePath && existsSync(options.cachePath)) {
     const cached = await readFile(options.cachePath);
     if (sha256Hex(cached) === sha256) return cached;

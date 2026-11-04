@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
-import { BEARSSL_SHA256, BEARSSL_URLS } from "./deps";
+import { BEARSSL_SHA256, BEARSSL_URLS, BEARSSL_VENDORED_PATH } from "./deps";
 import { fetchPinned } from "./fetch-pinned";
 
 const body = Buffer.from("pinned bytes");
@@ -125,12 +125,51 @@ test("a corrupt cache entry is discarded and refetched", async () => {
   }
 });
 
-test("BearSSL pin: our release first, bearssl.org as fallback, CI cache keyed by the sha256", async () => {
-  expect(BEARSSL_URLS[0]).toBe(
-    "https://github.com/baronunread/sproutboat-packages/releases/download/deps-bearssl-7bea48e5/bearssl-7bea48e.tar.gz",
-  );
-  expect(BEARSSL_URLS.at(-1)).toContain("https://bearssl.org/");
+test("vendored file present: read locally, no network", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "fetch-pinned-"));
+  try {
+    const localPath = join(dir, "v.tar.gz");
+    await writeFile(localPath, body);
+    const s = server({ "https://up/a": [new Response(body)] });
+    expect(await fetchPinned({ localPath, urls: ["https://up/a"], sha256, fetcher: s.fetcher, sleep })).toEqual(body);
+    expect(s.calls).toEqual([]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("vendored file tampered: rejected, falls back to the download", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "fetch-pinned-"));
+  const warn = console.warn;
+  console.warn = () => {};
+  try {
+    const localPath = join(dir, "v.tar.gz");
+    await writeFile(localPath, "tampered");
+    const s = server({ "https://up/a": [new Response(body)] });
+    expect(await fetchPinned({ localPath, urls: ["https://up/a"], sha256, fetcher: s.fetcher, sleep })).toEqual(body);
+    expect(s.calls).toEqual(["https://up/a"]);
+    const none = server({});
+    await expect(fetchPinned({ localPath, urls: [], sha256, fetcher: none.fetcher, sleep })).rejects.toThrow();
+  } finally {
+    console.warn = warn;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("vendored file missing: falls back to the download", async () => {
+  const s = server({ "https://up/a": [new Response(body)] });
+  const localPath = join(tmpdir(), "fetch-pinned-does-not-exist.tar.gz");
+  expect(await fetchPinned({ localPath, urls: ["https://up/a"], sha256, fetcher: s.fetcher, sleep })).toEqual(body);
+  expect(s.calls).toEqual(["https://up/a"]);
+});
+
+test("BearSSL pin: the vendored tarball matches the sha256, bearssl.org is the only download, no GitHub release", async () => {
   expect(BEARSSL_SHA256).toMatch(/^[0-9a-f]{64}$/);
-  const ci = await Bun.file(join(import.meta.dir, "../../../.github/workflows/ci.yml")).text();
-  expect(ci).toContain(`bearssl-src-${BEARSSL_SHA256}`);
+  expect(
+    createHash("sha256")
+      .update(await readFile(BEARSSL_VENDORED_PATH))
+      .digest("hex"),
+  ).toBe(BEARSSL_SHA256);
+  expect(BEARSSL_URLS.length).toBe(1);
+  expect(BEARSSL_URLS[0]).toContain("https://bearssl.org/");
 });
