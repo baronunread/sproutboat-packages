@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { Duplex } from "node:stream";
 import tls from "node:tls";
 import { ensurePorffor } from "../../toolchain/src/acquire";
 import { createBroker, listen } from "../../wire/src/broker";
@@ -81,6 +82,31 @@ export default {
         const echoed = await withTimeout(readN(r2, 8), 5000, "tls echo");
         await secure.close();
         return Response.json({ greeting, go, echoed, upgraded: s.upgraded });
+      }
+      if (url.pathname === "/starttls-race") {
+        const s = connect("127.0.0.1:" + port, { secureTransport: "starttls" });
+        const w = s.writable.getWriter();
+        const r = s.readable.getReader();
+        await withTimeout(readN(r, 11), 5000, "greeting");
+        await w.write(enc.encode("STARTTLS\\r\\n"));
+        await withTimeout(readN(r, 4), 5000, "go");
+        r.releaseLock();
+        w.releaseLock();
+        const secure = s.startTls({ expectedServerHostname: "localhost" });
+        const w2 = secure.writable.getWriter();
+        const r2 = secure.readable.getReader();
+        w2.write(enc.encode("secret-1"));
+        w2.write(enc.encode("secret-2"));
+        w2.write(enc.encode("secret-3"));
+        await withTimeout(secure.opened, 5000, "tls");
+        let echoed = "";
+        while (!echoed.includes("secret-3")) {
+          const chunk = await withTimeout(r2.read(), 5000, "tls echo");
+          if (chunk.done) break;
+          echoed += dec.decode(chunk.value);
+        }
+        await secure.close();
+        return Response.json({ echoed });
       }
       if (url.pathname === "/tls") {
         const host = q.get("host") || "localhost";
@@ -271,6 +297,34 @@ const starttlsPort = listenOn(
     });
   }),
 );
+// Every raw byte the recording origin receives after it sent "go", TLS records included.
+const rawAfterGo: Buffer[] = [];
+const starttlsRecordingPort = listenOn(
+  net.createServer((s) => {
+    // a TLSSocket over a net.Socket reads the handle directly, so the TLS side runs over a tap
+    // that replays the bytes this listener saw
+    const tap = new Duplex({
+      read() {},
+      write(chunk, _enc, done) {
+        s.write(chunk, done);
+      },
+    });
+    let afterGo = false;
+    s.prependListener("data", (c: Buffer) => {
+      if (!afterGo) return;
+      rawAfterGo.push(Buffer.from(c));
+      tap.push(c);
+    });
+    s.write("220 hello\r\n");
+    s.once("data", () => {
+      afterGo = true;
+      s.write("go\r\n");
+      const secure = new tls.TLSSocket(tap, { isServer: true, key, cert });
+      secure.on("data", (c) => secure.write(Buffer.concat([Buffer.from("tls:"), c])));
+      secure.on("error", () => {});
+    });
+  }),
+);
 const tlsPort = listenOn(
   tls.createServer({ key, cert }, (s) => {
     s.on("data", (c) => s.write(c));
@@ -385,6 +439,14 @@ try {
     upgraded: false,
   });
   console.log("startTls upgrades in the broker, verified against the expected host name");
+
+  const race = await get(`/starttls-race?port=${starttlsRecordingPort}`);
+  const echoedRace = String(race.echoed);
+  for (const part of ["secret-1", "secret-2", "secret-3"]) assert.ok(echoedRace.includes(part), `echoed ${part}`);
+  const rawBytes = Buffer.concat(rawAfterGo);
+  assert.equal(rawBytes[0], 0x16, "the first bytes after the upgrade are a TLS handshake record");
+  assert.equal(rawBytes.includes("secret"), false, "no application bytes reached the origin in plaintext");
+  console.log("startTls: writes issued before the handshake finished only reach the origin inside TLS");
 
   assert.deepEqual(await get(`/tls?port=${tlsPort}`), { got: "secret" });
   const wrongName = await get(`/tls?port=${tlsPort}&host=127.0.0.1`);

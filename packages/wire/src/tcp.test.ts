@@ -1,6 +1,7 @@
 import { afterEach, beforeAll, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import net from "node:net";
+import { Duplex } from "node:stream";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import tls from "node:tls";
@@ -442,6 +443,59 @@ test("startTls: plaintext greeting, then the upgrade is verified and the rest is
   t.send(TCP_DATA, Buffer.from("ping"));
   expect((await t.read(8)).toString()).toBe("tls:ping");
   expect(wire).toEqual(["STARTTLS\r\n"]);
+});
+
+test("startTls: data frames sent in the same chunk as START_TLS, before TLS_DONE, only reach the origin encrypted", async () => {
+  const raw: Buffer[] = [];
+  const o = origin((socket) => {
+    // attached before the TLS wrap so it sees every raw byte; a TLSSocket over a net.Socket reads
+    // the handle directly, so the TLS side runs over a tap that replays what this listener saw
+    const tap = new Duplex({
+      read() {},
+      write(chunk, _enc, done) {
+        socket.write(chunk, done);
+      },
+    });
+    let tapped = false;
+    socket.prependListener("data", (c: Buffer) => {
+      raw.push(Buffer.from(c));
+      if (tapped) tap.push(c);
+    });
+    socket.once("data", () => {
+      socket.write("go\r\n");
+      tapped = true;
+      const secure = new tls.TLSSocket(tap, { isServer: true, key, cert });
+      secure.on("data", (c) => secure.write(Buffer.concat([Buffer.from("tls:"), c])));
+      secure.on("error", () => {});
+    });
+  });
+  const { server } = brokerOn({ tcp: { tls: { ca: cert } } });
+  const t = await openTunnel(
+    server.port,
+    target(o.port(), { mode: "starttls", host: "localhost", servername: "localhost" }),
+  );
+  await t.ack();
+  expect((await t.next()).type).toBe(TCP_CONNECTED);
+  t.send(TCP_DATA, Buffer.from("STARTTLS\r\n"));
+  expect((await t.read(4)).toString()).toBe("go\r\n");
+  // one write, so the broker parses the upgrade and the data frames from the same chunk
+  t.socket.write(
+    Buffer.concat([
+      typedFrame(TCP_START_TLS, Buffer.from("localhost")),
+      typedFrame(TCP_DATA, Buffer.from("secret-1")),
+      typedFrame(TCP_DATA, Buffer.from("secret-2")),
+      typedFrame(TCP_DATA, Buffer.from("secret-3")),
+    ]),
+  );
+  expect((await t.next()).type).toBe(TCP_TLS_DONE);
+  const text = "secret-1secret-2secret-3";
+  const echoed = (await t.read(4 + text.length)).toString();
+  expect(echoed.startsWith("tls:")).toBe(true);
+  expect(echoed.replaceAll("tls:", "")).toBe(text);
+  const wire = Buffer.concat(raw);
+  expect(wire.subarray(0, 10).toString()).toBe("STARTTLS\r\n");
+  expect(wire[10]).toBe(0x16);
+  expect(wire.includes("secret")).toBe(false);
 });
 
 test("startTls with a name the certificate does not carry fails", async () => {

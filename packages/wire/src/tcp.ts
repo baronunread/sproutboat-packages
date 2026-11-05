@@ -379,6 +379,10 @@ export function createTcpTunnels(opts: TcpOptions): TcpTunnels {
       const name = isIP(servername.replace(/^\[|\]$/g, "")) ? undefined : servername;
       const secure = tls.connect({ socket: raw, servername: name, ...tlsTrust(opts.tls) });
       bind(secure);
+      // What the plain socket still had buffered goes out ahead of the handshake in its own
+      // order; its drain listener is gone with the rest, so the sprout must not stay paused on it.
+      awaitingOriginDrain = false;
+      resumePeer();
       secure.once("secureConnect", () => send(typedFrame(TCP_TLS_DONE)));
     }
 
