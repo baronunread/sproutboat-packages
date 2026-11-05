@@ -13,13 +13,16 @@
  *
  * Every edit is anchored on exact source text that must occur exactly once, marker-guarded so
  * the chain is idempotent, and re-applied on every build (never a `postinstall`).
+ *
+ * Alpha 22 (pin.ts) runs the same chain: every pass anchors unchanged on it, plus P8 for the
+ * shared dispatch functions its codegen introduces (135fda29).
  */
 import { readFile, realpath, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { patchCaseMapping, patchRepeatDoubling, patchReplaceAll } from "../patch";
 import { patchRegexReplace } from "../strings";
 import { A21_PATCH_FINGERPRINT } from "./fingerprint";
-import { PORFFOR_A21_COMMIT_FULL } from "./pin";
+import { channelOfTree, pinOfTree } from "./pin";
 import { version as TOOLCHAIN_VERSION } from "../../package.json" with { type: "json" };
 
 type Edit = readonly [anchor: string, replacement: string];
@@ -324,6 +327,48 @@ export async function patchStableEntryPath(root: string): Promise<void> {
       "          if (node.name === '__porffor_entry_file' && mod.file.startsWith(RUNTIME_ROOT)) return literal(typeof Prefs.sbEntryFile === 'string' ? Prefs.sbEntryFile : entryFile); // " +
         P7_MARKER +
         "\n",
+    ],
+  ]);
+}
+
+/**
+ * P8 (alpha 22 only; 135fda29 "codegen: share dispatch on unknown receivers"): a call or indexed
+ * read on a receiver of unknown type is routed through a small synthetic function, one per method
+ * and argument count, that alpha 22 generates on first use into unit `main` under the name
+ * `#anonymous_1` (then `_1_`, `_1__`, ... in creation order). In the shared-template model that
+ * puts an app-created function into the common prefix: the first app to call `r.foo(x)` on an
+ * untyped `r` grows K by one and renames every later one, so no two apps agree on the runtime
+ * ABI (probe: 2026-11-05, a two-line app moved two functions into porf__main.c). After this pass
+ * the function belongs to the unit of the site that asked for it (one copy per unit, deduplicated
+ * within the unit, so an app's land in the app module and the prelude's in the prelude unit) and
+ * is named after the method and argument count (`#shared_push_1`, `#shared_get`), so its symbol
+ * does not depend on creation order.
+ */
+const P8_MARKER = "sproutboat P8: shared dispatch functions belong to the asking unit";
+export async function patchSharedDispatchUnit(root: string): Promise<void> {
+  await editOnce(resolve(root, "compiler/codegen.js"), "shared dispatch functions per unit (P8)", P8_MARKER, [
+    [
+      "let sharedFuncs;\nconst sharedFunc = src => {\n  if (sharedFuncs.has(src)) return sharedFuncs.get(src);\n  const fn = semantic(parse(src)).body[0].expression;\n  fn.body._sharedDispatch = true;\n  fn.strict = true;\n  fn._noClosureEnv = true;\n  const [ func ] = generateFunc({}, fn, true);\n  func.generate();\n  sharedFuncs.set(src, func);\n  return func;\n};\n",
+      "let sharedFuncs;\n// " +
+        P8_MARKER +
+        ", named by method and arity\n" +
+        "const sharedFunc = (src, scope, label) => {\n" +
+        "  const unit = scope?.internal ? 'builtins' : scope?.unit ?? classUnit ?? 'main';\n" +
+        "  const key = unit + '\\0' + src;\n" +
+        "  if (sharedFuncs.has(key)) return sharedFuncs.get(key);\n" +
+        "  const fn = semantic(parse(src)).body[0].expression;\n" +
+        "  fn.body._sharedDispatch = true;\n  fn.strict = true;\n  fn._noClosureEnv = true;\n" +
+        "  fn.id = { type: 'Identifier', name: '#shared_' + label.replace(/[^A-Za-z0-9_]/g, c => '_' + c.charCodeAt(0).toString(16)) };\n" +
+        "  if (unit !== 'main') fn._unit = unit;\n" +
+        "  const [ func ] = generateFunc({}, fn, true);\n  func.generate();\n  sharedFuncs.set(key, func);\n  return func;\n};\n",
+    ],
+    [
+      "        const func = sharedFunc(`((${[ 'r', ...params ].join(', ')}) => r.${protoName}(${params.join(', ')}))`);\n",
+      "        const func = sharedFunc(`((${[ 'r', ...params ].join(', ')}) => r.${protoName}(${params.join(', ')}))`, scope, protoName + '_' + params.length);\n",
+    ],
+    [
+      "      const func = sharedFunc('((o, k) => o[k])');\n",
+      "      const func = sharedFunc('((o, k) => o[k])', scope, 'get');\n",
     ],
   ]);
 }
@@ -684,7 +729,7 @@ async function patchedByThisVersion(root: string): Promise<boolean> {
       patchFingerprint?: string;
     };
     return (
-      manifest.commit === PORFFOR_A21_COMMIT_FULL &&
+      manifest.commit === pinOfTree(root).commitFull &&
       manifest.toolchainVersion === TOOLCHAIN_VERSION &&
       manifest.patchFingerprint === A21_PATCH_FINGERPRINT
     );
@@ -693,7 +738,7 @@ async function patchedByThisVersion(root: string): Promise<boolean> {
   }
 }
 
-/** Every pass, in order, on a pristine alpha 21 tree at `root`. Idempotent. */
+/** Every pass, in order, on a pristine alpha 21 or alpha 22 tree at `root` (pin.ts channelOfTree). Idempotent. */
 export async function ensurePorfforPatchedA21(root: string): Promise<void> {
   if (done.has(root)) return;
   if (await patchedByThisVersion(root)) {
@@ -711,6 +756,7 @@ export async function ensurePorfforPatchedA21(root: string): Promise<void> {
   await patchAppModuleIds(root);
   await patchPreludeOwnedGlobals(root);
   await patchClassUnit(root);
+  if (channelOfTree(root) === "alpha-22") await patchSharedDispatchUnit(root); // after P1: it reads classUnit
   await patchStableNames(root);
   await patchUnitLayout(root);
   await patchStableEntryPath(root);
