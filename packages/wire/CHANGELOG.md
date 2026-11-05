@@ -1,5 +1,13 @@
 # @sproutboat/wire
 
+## 0.22.2
+
+### Patch Changes
+
+- 5ef3159: Security fix: on the embedded transport, a `connect()` socket opened with `secureTransport: "starttls"` could send application data in plaintext after `startTls()`. The I/O thread moved everything the app had queued, including writes issued after the upgrade call, into its write buffer and flushed it in the clear before switching the socket to TLS, so a write that raced the upgrade (about 7% of connections in a loopback test) left unencrypted. The host now records the queue position at the upgrade and only flushes the bytes queued before it in plaintext; everything after waits for the TLS engine, which only emits application data once the handshake is done. On the JS side, `startTls()` closes the plaintext socket's writable (its queued writes still go out, new writes are refused, as in workerd), and the new socket's writes are held until the upgrade is queued behind them. The I/O thread also reports a drained send queue right after flushing instead of after the next input, so a write past the high-water mark no longer waits on the peer. The broker tunnel, which already orders the upgrade among the data frames, no longer stays paused on the plain socket's drain when the upgrade happens under backpressure. Regression tests on both transports record the raw bytes at the origin and refuse anything but a TLS handshake record after the plaintext phase. No compatibility date: `connect()` ships from `2026-11-17`, and the old behaviour was never correct.
+- Updated dependencies [5ef3159]
+  - @sproutboat/runtime@0.42.2
+
 ## 0.22.1
 
 ### Patch Changes
