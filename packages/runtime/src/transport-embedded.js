@@ -3325,6 +3325,7 @@ typedef struct sb_wsc {
   int port, tls;
   // Raw TCP (cloudflare:sockets connect()): no WebSocket framing, bytes both ways.
   int raw, starttls_req, shutdown_req, want_drain;
+  size_t starttls_at;  // outq bytes queued before the "S" op: the last ones allowed out in the clear
   size_t unsent, window;
   char sni[256];
 } sb_wsc;
@@ -3458,10 +3459,13 @@ static int sb_wsio_raw_write(sb_wsio* io, const unsigned char* buf, size_t len) 
 // connection ends (-1). out/outlen is application data to send first. With may_read false (the
 // reader is far behind) it only sends, and waits for the wake pipe.
 static long sb_wsio_pump(sb_wsc* c, sb_wsio* io, unsigned char* buf, size_t cap, unsigned char* out, size_t* outlen, int may_read, int ms) {
+  // Returns right after application bytes went out (0, as for a wake) instead of waiting for
+  // input: the caller reports the drain then, which a write past the high-water mark waits on.
   if (!io->tls) {
     if (*outlen) {
       if (sb_wsio_raw_write(io, out, *outlen) != 0) return -1;
       *outlen = 0;
+      return 0;
     }
     for (;;) {
       if (may_read) {
@@ -3478,6 +3482,7 @@ static long sb_wsio_pump(sb_wsc* c, sb_wsio* io, unsigned char* buf, size_t cap,
     }
   }
   br_ssl_engine_context* eng = &io->sc->eng;
+  int wrote = 0;
   for (;;) {
     unsigned st = br_ssl_engine_current_state(eng);
     if (st & BR_SSL_CLOSED) return -1;
@@ -3501,9 +3506,10 @@ static long sb_wsio_pump(sb_wsc* c, sb_wsio* io, unsigned char* buf, size_t cap,
       br_ssl_engine_sendapp_ack(eng, n);
       memmove(out, out + n, *outlen - n);
       *outlen -= n;
-      if (*outlen == 0) br_ssl_engine_flush(eng, 0);
+      if (*outlen == 0) { br_ssl_engine_flush(eng, 0); wrote = 1; }
       continue;
     }
+    if (wrote) return 0;
     // Handshaking, or waiting for the peer: read records while the reader may; else only wake.
     int reading = (st & BR_SSL_RECVREC) && (may_read || !(st & BR_SSL_SENDAPP));
     if (reading) {
@@ -3812,15 +3818,30 @@ static void* sb_tcp_thread(void* arg) {
     int st = c->starttls_req; c->starttls_req = 0;
     int sh = c->shutdown_req;
     char sni[256]; memcpy(sni, c->sni, sizeof(sni));
-    if (c->outq_len) {
-      if (wq_len + c->outq_len > wq_cap) {
+    // A pending startTls() splits the queue: only what the app queued before the "S" op may
+    // leave in the clear. The rest stays here until the TLS engine owns the socket, so a write
+    // that races the upgrade can only ever go out inside a TLS record.
+    size_t take = c->outq_len;
+    if (st && c->starttls_at < take) take = c->starttls_at;
+    if (take) {
+      if (wq_len + take > wq_cap) {
         size_t cap = wq_cap ? wq_cap : 4096;
-        while (cap < wq_len + c->outq_len) cap *= 2;
+        while (cap < wq_len + take) cap *= 2;
         unsigned char* grown = (unsigned char*)realloc(wq, cap);
         if (grown) { wq = grown; wq_cap = cap; }
       }
-      if (wq_len + c->outq_len <= wq_cap) { memcpy(wq + wq_len, c->outq, c->outq_len); wq_len += c->outq_len; c->outq_len = 0; }
+      if (wq_len + take <= wq_cap) {
+        memcpy(wq + wq_len, c->outq, take);
+        wq_len += take;
+        if (take < c->outq_len) memmove(c->outq, c->outq + take, c->outq_len - take);
+        c->outq_len -= take;
+      } else if (st) {
+        // no room to move the plaintext part: retry the upgrade on the next pass
+        c->starttls_req = 1;
+        st = 0;
+      }
     }
+    if (st) c->starttls_at = 0;
     c->unsent = wq_len;
     pthread_mutex_unlock(&c->lock);
     if (rel) {
@@ -3828,7 +3849,14 @@ static void* sb_tcp_thread(void* arg) {
       goto finish;
     }
     if (st && !io.tls) {
-      if (wq_len) sb_wsio_pump(c, &io, buf, sizeof(buf), wq, &wq_len, 0, 0);
+      // Everything queued before startTls() is written in the clear here (the plain write path
+      // blocks until the kernel took it all); the socket then belongs to the TLS engine, which
+      // only emits application data once the handshake is done (BR_SSL_SENDAPP).
+      if (wq_len && sb_wsio_pump(c, &io, buf, sizeof(buf), wq, &wq_len, 0, 0) < 0) {
+        snprintf(why, sizeof(why), "connection closed before the TLS handshake");
+        sb_wsc_push(c, 3, 0, why, strlen(why));
+        goto finish;
+      }
       if (sb_wsio_start_tls(&io, sni[0] ? sni : c->host, why, sizeof(why)) != 0) { sb_wsc_push(c, 3, 0, why, strlen(why)); goto finish; }
       tls_waiting = 1;
     }
@@ -4023,6 +4051,7 @@ static long long sb_wsc_op(int op, unsigned id, const char* data, size_t len, si
       pthread_mutex_lock(&c->lock);
       snprintf(c->sni, sizeof(c->sni), "%.*s", (int)(len < sizeof(c->sni) - 1 ? len : sizeof(c->sni) - 1), data ? data : "");
       c->starttls_req = 1;
+      c->starttls_at = c->outq_len;
       pthread_mutex_unlock(&c->lock);
       sb_wsc_wake_thread(c);
       return 0;

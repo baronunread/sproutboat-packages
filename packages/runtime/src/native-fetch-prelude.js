@@ -14704,8 +14704,18 @@ function __sbTcpRelease(st) {
   __sbTcpOpen--;
 }
 
-// One socket facade over a host connection. `st` is shared with the socket startTls() returns.
-function __sbTcpFacade(st, mode) {
+// Queues bytes for the host; a write past the high-water mark settles when the queue drains.
+function __sbTcpQueue(st, bytes) {
+  if (st.id === 0) throw new TypeError("This WritableStream has been closed.");
+  const queued = Number(__sbWsOp("b", st.id, __sbToBytes(bytes), 0));
+  if (queued > __SB_TCP_HWM) return new Promise((resolve) => (st.drain = resolve));
+  return undefined;
+}
+
+// One socket facade over a host connection. `st` is shared with the socket startTls() returns;
+// that socket gets `upgrade`, whose `pending` promise holds its writes back until the "S" op
+// is queued behind everything the plaintext socket had already accepted.
+function __sbTcpFacade(st, mode, upgrade) {
   const closed = new Promise((resolve, reject) => {
     st.closedResolve = resolve;
     st.closedReject = reject;
@@ -14759,12 +14769,15 @@ function __sbTcpFacade(st, mode) {
       },
       write(chunk) {
         const bytes = __sbTcpChunk(chunk);
-        if (st.id === 0) throw new TypeError("This WritableStream has been closed.");
-        const queued = Number(__sbWsOp("b", st.id, __sbToBytes(bytes), 0));
-        if (queued > __SB_TCP_HWM) return new Promise((resolve) => (st.drain = resolve));
-        return undefined;
+        if (upgrade !== null && upgrade.pending !== null) return upgrade.pending.then(() => __sbTcpQueue(st, bytes));
+        return __sbTcpQueue(st, bytes);
       },
       close() {
+        if (st.upgrading) {
+          // startTls() closed this stream: its queued writes are out, the write side stays open for TLS
+          st.upgrading = false;
+          return undefined;
+        }
         if (st.id !== 0) __sbWsOp("H", st.id, "", 0);
         st.writeClosed = true;
         return undefined;
@@ -14804,10 +14817,36 @@ function __sbTcpFacade(st, mode) {
       st.upgradedOnce = true;
       let sni = st.host;
       if (options != null && options.expectedServerHostname != null) sni = String(options.expectedServerHostname);
-      __sbWsOp("S", st.id, sni, 0);
+      // This socket's streams end here, as workerd detaches them. Its writable is closed first:
+      // what a writer had already queued still goes out in the clear, then the "S" op marks the
+      // queue position after which only TLS records leave the host; the new socket's writes wait
+      // on that (upgrade.pending), so no write issued after startTls() can precede the handshake.
+      const upgrade = { pending: null };
+      upgrade.pending = new Promise((resolve) => {
+        const request = () => {
+          st.upgrading = false;
+          if (st.id !== 0) __sbWsOp("S", st.id, sni, 0);
+          upgrade.pending = null;
+          resolve(undefined);
+        };
+        if (st.writeClosed) request();
+        else {
+          st.upgrading = true;
+          writable.close().then(request, request);
+        }
+      });
+      st.pullWake = null;
+      const oldReadable = st.readableController;
+      if (oldReadable !== null) {
+        try {
+          oldReadable.close();
+        } catch {
+          // already closed or errored
+        }
+      }
       // the old socket ends once the upgrade is under way (workerd resolves its `closed`)
       const oldResolve = st.closedResolve;
-      const next = __sbTcpFacade(st, "on");
+      const next = __sbTcpFacade(st, "on", upgrade);
       setTimeout(() => oldResolve(undefined), 0);
       return next;
     },
@@ -14832,11 +14871,11 @@ function __sbConnect(address, options) {
   const st = {
     id: 0, host: target.host, port: target.port, inbox: [], eof: false, failed: null, settled: false,
     allowHalfOpen, pullWake: null, drain: null, timer: undefined, opening: null, upgradedOnce: false,
-    closedByUser: false, writableController: null, readableController: null, reason: "", writeClosed: false, writeEnd: false,
+    closedByUser: false, writableController: null, readableController: null, reason: "", writeClosed: false, writeEnd: false, upgrading: false,
     release: null, closedResolve: null, closedReject: null,
   };
   st.release = () => __sbTcpRelease(st);
-  const socket = __sbTcpFacade(st, mode);
+  const socket = __sbTcpFacade(st, mode, null);
   if (target.port === 25) {
     st.failed = new Error("proxy request failed, cannot connect to the specified address");
     st.eof = true;
