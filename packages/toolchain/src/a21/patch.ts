@@ -310,6 +310,24 @@ export async function patchUnitLayout(root: string): Promise<void> {
   ]);
 }
 
+/**
+ * P7: the entry file's absolute path, which `node:process` bakes into its unit as `entryFile`
+ * (and `argv[1]`), is replaced by the `--sb-entry-file=PATH` pref when given. Every sproutd
+ * app compiles in its own directory; without this any template that anchors `process` would
+ * differ from every app in the process unit's data.
+ */
+const P7_MARKER = "sproutboat P7: stable entry path";
+export async function patchStableEntryPath(root: string): Promise<void> {
+  await editOnce(resolve(root, "compiler/modules.js"), "a stable entry path (P7)", P7_MARKER, [
+    [
+      "          if (node.name === '__porffor_entry_file' && mod.file.startsWith(RUNTIME_ROOT)) return literal(entryFile);\n",
+      "          if (node.name === '__porffor_entry_file' && mod.file.startsWith(RUNTIME_ROOT)) return literal(typeof Prefs.sbEntryFile === 'string' ? Prefs.sbEntryFile : entryFile); // " +
+        P7_MARKER +
+        "\n",
+    ],
+  ]);
+}
+
 // --- group 3: alpha 21 runtime gaps the corpus hits ---
 
 /**
@@ -398,6 +416,7 @@ export async function ensurePorfforPatchedA21(root: string): Promise<void> {
   await patchClassUnit(root);
   await patchStableNames(root);
   await patchUnitLayout(root);
+  await patchStableEntryPath(root);
   // Group 3: runtime gaps.
   await patchReservedSelect(root);
   await patchResponseStatics(root);

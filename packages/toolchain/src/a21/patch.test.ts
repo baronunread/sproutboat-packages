@@ -9,6 +9,7 @@ import {
   patchPreludeOwnedGlobals,
   patchReservedSelect,
   patchResponseStatics,
+  patchStableEntryPath,
   patchUnitLayout,
 } from "./patch";
 import { PORFFOR_A21_ARCHIVE_SHA256, PORFFOR_A21_COMMIT_FULL } from "./pin";
@@ -73,6 +74,7 @@ test("the alpha 21 chain applies to the pinned tree, once, and the second run ch
     ["compiler/codegen.js", "sproutboat P6: inits of app-module globals"],
     ["compiler/modules.js", "sproutboat P6: app-owned modules"],
     ["compiler/modules.js", "sproutboat P4: prelude-declared names override runtime globals"],
+    ["compiler/modules.js", "sproutboat P7: stable entry path"],
     ["compiler/render.js", "sproutboat P2: app units last, pinned ABI regions"],
     ["compiler/render.js", "sproutboat P3: a unit's segments by content"],
     ["compiler/render.js", "sproutboat P6: app-module globals last"],
@@ -157,6 +159,7 @@ test("P1, P2 and P4 edits are anchored on exact alpha 21 text", async () => {
   await expect(patchUnitLayout(root)).rejects.toThrow("unit layout (P2, P3, P6)");
   await writeFile(join(root, "compiler/modules.js"), "nothing\n");
   await expect(patchPreludeOwnedGlobals(root)).rejects.toThrow("prelude-owned globals (P4)");
+  await expect(patchStableEntryPath(root)).rejects.toThrow("a stable entry path (P7)");
   await writeFile(join(root, "runtime/node/internal/fetch.js"), "class Response {}\n");
   await expect(patchResponseStatics(root)).rejects.toThrow("Response.redirect");
 });
