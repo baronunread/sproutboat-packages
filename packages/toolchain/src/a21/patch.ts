@@ -439,6 +439,20 @@ export async function patchGcHooks(root: string): Promise<void> {
         "  if (porf_gc_is_block_start(body)) {\n    // skip header reads for old or already-marked blocks\n    const u32 g = porf_gc_gran(body);\n",
         "  if (porf_gc_is_block_start(body)) {\n    if (porf_gc_template_top != 0 && (u32)body < porf_gc_template_top && (porf_gc_pages[(u32)body >> PORF_GC_SPAGE_SHIFT].flags & PORF_GC_PF_SEALED) != 0u) return;\n    // skip header reads for old or already-marked blocks\n    const u32 g = porf_gc_gran(body);\n",
       ],
+      // a kind or mark already in place is not stored again: a same-value store still copies a template
+      // metadata page into the worker (the template's cards are rescanned by every collection)
+      [
+        "  } else return;\n  porf_gc_kinds[porf_gc_gran(body)] = (u8)kind;\n}\n",
+        "  } else return;\n  if (porf_gc_kinds[porf_gc_gran(body)] != (u8)kind) porf_gc_kinds[porf_gc_gran(body)] = (u8)kind;\n}\n",
+      ],
+      [
+        "static inline void porf_gc_set_marked_type(i32 body, i32 type) {\n  porf_gc_bit_set(PORF_GC_B_MARK, porf_gc_gran(body));\n  porf_gc_kinds[porf_gc_gran(body)] = (u8)type;\n}\n",
+        "static inline void porf_gc_set_marked_type(i32 body, i32 type) {\n  if (porf_gc_bit(PORF_GC_B_MARK, porf_gc_gran(body)) == 0u) porf_gc_bit_set(PORF_GC_B_MARK, porf_gc_gran(body));\n  if (porf_gc_kinds[porf_gc_gran(body)] != (u8)type) porf_gc_kinds[porf_gc_gran(body)] = (u8)type;\n}\n",
+      ],
+      [
+        "  } else return;\n  porf_gc_kinds[p >> 4] = (u8)type;\n}\n",
+        "  } else return;\n  if (porf_gc_kinds[p >> 4] != (u8)type) porf_gc_kinds[p >> 4] = (u8)type;\n}\n",
+      ],
       // minor collections keep the template's cards
       [
         "      porf_gc_cards[c] = porf_gc_scan_young_seen;\n",
