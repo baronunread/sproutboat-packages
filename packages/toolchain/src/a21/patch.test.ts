@@ -12,22 +12,23 @@ import {
   patchStableEntryPath,
   patchUnitLayout,
 } from "./patch";
-import { PORFFOR_A21_ARCHIVE_SHA256, PORFFOR_A21_COMMIT_FULL } from "./pin";
+import { PORFFOR_A21_COMMIT_FULL, PORFFOR_A21_PINS, channelOfTree, pinOfTree, type PorfforA21Channel } from "./pin";
 
 const temporary: string[] = [];
 afterAll(async () => {
   await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
-/** A pristine alpha 21 tree from the vendored archive, in a fresh directory. */
-async function pristine(): Promise<string> {
+/** A pristine alpha 21 (or alpha 22) tree from the vendored archive, in a fresh directory. */
+async function pristine(channel: PorfforA21Channel = "alpha-21"): Promise<string> {
   // Canonical: a module's unit is named by its path relative to the entry directory, and macOS's
   // /var -> /private/var symlink would otherwise give it the absolute path.
   const root = await realpath(await mkdtemp(join(tmpdir(), "sb-a21-")));
   temporary.push(root);
-  const archive = resolve(import.meta.dir, "../../vendor/porffor-1f8d148.tar.gz");
+  const pin = PORFFOR_A21_PINS[channel];
+  const archive = resolve(import.meta.dir, "../../vendor", pin.vendoredArchive);
   const digest = new Bun.CryptoHasher("sha256").update(await readFile(archive)).digest("hex");
-  expect(digest).toBe(PORFFOR_A21_ARCHIVE_SHA256);
+  expect(digest).toBe(pin.archiveSha256);
   const tar = Bun.spawnSync(["tar", "-xzf", archive, "-C", root, "--strip-components=1"], { stderr: "pipe" });
   expect(tar.exitCode, new TextDecoder().decode(tar.stderr)).toBe(0);
   return root;
@@ -196,3 +197,98 @@ test("the alpha 21 fingerprint covers its sources and is as released", async () 
     actual,
   );
 });
+
+test("the alpha 22 pin is the alpha 21 chain plus P8, applied once, and the tree tells its own channel", async () => {
+  const root = await pristine("alpha-22");
+  expect(channelOfTree(root)).toBe("alpha-22");
+  expect(pinOfTree(root).commitFull).toBe("a081ebd71177b898b2859298376e3191f088af32");
+  await ensurePorfforPatchedA21(root);
+  expect(channelOfTree(root)).toBe("alpha-22");
+  const codegen = await readFile(join(root, "compiler/codegen.js"), "utf8");
+  for (const marker of [
+    "sproutboat P1: class functions stay in their module's unit",
+    "sproutboat P5: stable derived names",
+    "sproutboat P8: shared dispatch functions belong to the asking unit",
+    "sharedFunc('((o, k) => o[k])', scope, 'get')",
+  ])
+    expect(codegen, marker).toContain(marker);
+  const render = await readFile(join(root, "compiler/render.js"), "utf8");
+  for (const marker of [
+    "sproutboat P2: app units last, pinned ABI regions",
+    "sproutboat: collector hooks for the fork template",
+    "sproutboat: per-request cpu",
+    "sproutboat: glibc select",
+  ])
+    expect(render, marker).toContain(marker);
+  expect(await readFile(join(root, "compiler/builtins_precompiled.js"), "utf8")).toContain("icFreezeMega");
+  // An alpha 21 tree never gets P8 (its codegen has no shared dispatch).
+  const a21 = await pristine("alpha-21");
+  expect(channelOfTree(a21)).toBe("alpha-21");
+  await ensurePorfforPatchedA21(a21);
+  expect(await readFile(join(a21, "compiler/codegen.js"), "utf8")).not.toContain("sproutboat P8");
+  // Idempotent on alpha 22 too.
+  const first = await readFile(join(root, "compiler/codegen.js"), "utf8");
+  const { ensurePorfforPatchedA21: again } = await import(`./patch.ts?a22-${Date.now()}`);
+  await again(root);
+  expect(await readFile(join(root, "compiler/codegen.js"), "utf8")).toBe(first);
+}, 180_000);
+
+test("P8: alpha 22's shared dispatch functions sit in the unit that asked, under stable names", async () => {
+  const root = await pristine("alpha-22");
+  await ensurePorfforPatchedA21(root);
+  const work = join(root, "work");
+  await mkdir(work);
+  // The prelude dispatches trim and padStart on an untyped receiver; the app dispatches four methods, two of them the same.
+  await writeFile(
+    join(work, "shared-prelude.js"),
+    "const fetch = () => { throw new Error('fetch: host transport'); };\nglobalThis.fetch = fetch;\n" +
+      "export const pre = r => r.trim() + r.padStart(3);\nglobalThis.__sbPre = pre;\nexport {};\n",
+  );
+  await writeFile(
+    join(work, "worker.js"),
+    "import './shared-prelude.js';\nconst app = r => r.toUpperCase() + r.trim() + r.padStart(4) + r.slice(1, 2);\n" +
+      "console.log(app('ab'), globalThis.__sbPre(' c '), [1, 2].map(x => x + 1).join(','));\nglobalThis.__forkHandler = app;\n",
+  );
+  await writeFile(join(work, "app.js"), "import './worker.js';\n");
+  const out = join(work, "out");
+  const compile = Bun.spawnSync(["bun", join(root, "runtime/index.js"), "c", join(work, "app.js"), "-o", out], {
+    cwd: work,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  expect(compile.exitCode, new TextDecoder().decode(compile.stderr)).toBe(0);
+  const units = await readdir(out);
+  const prelude = await readFile(
+    join(
+      out,
+      units.find((f) => f.startsWith("shared-prelude.js."))!,
+    ),
+    "utf8",
+  );
+  const worker = await readFile(
+    join(
+      out,
+      units.find((f) => f.startsWith("worker.js."))!,
+    ),
+    "utf8",
+  );
+  const main = await readFile(join(out, "porf__main.c"), "utf8");
+  // Stock alpha 22 put every one of these into porf__main.c as p__main__23anonymous_1, _1_, _1__, ...
+  expect(main).not.toMatch(/^jsval p__main__23anonymous_1_*\(/m);
+  expect(main).not.toMatch(/^jsval p__main__23shared_/m);
+  expect(prelude).toMatch(/^jsval p_\w+__23shared_trim_0\(jsval r\) \{$/m);
+  expect(prelude).toMatch(/^jsval p_\w+__23shared_padStart_1\(jsval r, jsval a0\) \{$/m);
+  for (const name of ["trim_0", "padStart_1", "toUpperCase_0", "slice_2"])
+    expect(worker).toMatch(new RegExp(`^jsval p_\\w+__23shared_${name}\\(`, "m"));
+  // One copy per unit: the app unit's trim is its own, not a call into the prelude's.
+  const preludeUnit = /^jsval (p_\w+?)__23shared_trim_0/m.exec(prelude)![1];
+  const workerUnit = /^jsval (p_\w+?)__23shared_trim_0/m.exec(worker)![1];
+  expect(workerUnit).not.toBe(preludeUnit);
+  const run = Bun.spawnSync(["bun", join(root, "runtime/index.js"), join(work, "app.js")], {
+    cwd: work,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  expect(run.exitCode, new TextDecoder().decode(run.stderr)).toBe(0);
+  expect(new TextDecoder().decode(run.stdout).trim()).toBe("ABab  abb c c  2,3");
+}, 180_000);
