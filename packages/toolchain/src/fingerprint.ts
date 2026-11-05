@@ -11,7 +11,7 @@ export const PATCH_SOURCES = ["case-map.ts", "native-bytes.ts", "patch.ts", "pin
  * patch.ts as the module patch.ts is everywhere else. Kept current by fingerprint.test.ts
  * (UPDATE_FINGERPRINT=1 bun test packages/toolchain/src/fingerprint.test.ts).
  */
-export const RELEASED_FINGERPRINT = "443255e5247e";
+export const RELEASED_FINGERPRINT = "b0764c37fb2d";
 
 /** The fingerprint of the sources in dir, or null where they are not on disk. */
 export function sourceFingerprint(dir: string): string | null {

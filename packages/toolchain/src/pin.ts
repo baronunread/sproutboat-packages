@@ -14,8 +14,7 @@
 export const PORFFOR_CHANNEL = "alpha-20";
 export const PORFFOR_COMMIT_FULL = "a7cbcf995f10d5ffddb878d67bf680cc26b2a6c3";
 export const PORFFOR_COMMIT = PORFFOR_COMMIT_FULL.slice(0, 7);
-export const PORFFOR_ARCHIVE_SHA256 =
-  "c9d2af54b5100ef0850339b74df640444b63a6b458e7b874111f99353d677875";
+export const PORFFOR_ARCHIVE_SHA256 = "c9d2af54b5100ef0850339b74df640444b63a6b458e7b874111f99353d677875";
 export const PORFFOR_ARCHIVE_URL = `https://codeload.github.com/CanadaHonk/porffor/tar.gz/${PORFFOR_COMMIT_FULL}`;
 
 /** A compact identity string for a manifest / report (`alpha-20 (a7cbcf9)`). */

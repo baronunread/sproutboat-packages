@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { copyFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { ensurePorffor } from "./acquire";
@@ -37,8 +37,9 @@ for (const name of probes) {
     const dir = await mkdtemp(resolve(tmpdir(), `sb-probe-${name}-`));
     try {
       const porffor = await ensurePorffor();
-      const input = resolve(import.meta.dir, `../test/probes/${name}.js`);
+      const input = resolve(dir, `${name}.js`);
       const binary = resolve(dir, name);
+      await copyFile(resolve(import.meta.dir, `../test/probes/${name}.js.txt`), input);
       const compile = Bun.spawnSync(
         ["bun", resolve(porffor, "runtime/index.js"), "native", input, "-o", binary, "-s"],
         { stdout: "pipe", stderr: "pipe" },
