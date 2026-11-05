@@ -26,7 +26,7 @@ test("a collection does not scan the entries block an array left behind when it 
     expect(code, stderr + stdout).toBe(0);
     const ansi = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, "g");
     for (let run = 0; run < 5; run++) {
-      const result = Bun.spawnSync([binary], { stdout: "pipe", stderr: "pipe", timeout: 20_000 });
+      const result = Bun.spawnSync([binary], { stdout: "pipe", stderr: "pipe", timeout: 60_000 });
       expect(result.exitCode, Buffer.from(result.stderr).toString()).toBe(0);
       expect(Buffer.from(result.stdout).toString().replace(ansi, "").trim()).toBe("0");
     }

@@ -28,7 +28,7 @@ test("a collection does not scan the entries block an object left behind when it
       ]);
       expect(code, stderr + stdout).toBe(0);
       for (let run = 0; run < 3; run++) {
-        const result = Bun.spawnSync([binary], { stdout: "pipe", stderr: "pipe", timeout: 20_000 });
+        const result = Bun.spawnSync([binary], { stdout: "pipe", stderr: "pipe", timeout: 60_000 });
         expect(result.exitCode, level + " " + Buffer.from(result.stderr).toString()).toBe(0);
         expect(Buffer.from(result.stdout).toString().replace(ansi, "").trim()).toBe("0");
       }

@@ -1,0 +1,14 @@
+const log = (...a) => console.log(...a);
+const h = new Headers([["a","1"],["B","2"]]); log("hdr", [...h].join("|"), h.get("b"));
+const r = new Response("hi"); log("ct", r.headers.get("content-type"));
+const r2 = new Response(new Uint8Array([1,2,3]), {status:201}); r2.arrayBuffer().then(b=>log("bytes", b.byteLength, r2.status));
+const bl = new Blob(["é", new Uint8Array([65])]); log("blob", bl.size, bl.type); bl.text().then(t=>log("blobtext", t));
+const f = new File(["x"], "n.txt", {type:"text/plain"}); log("file", f.name, f.size);
+const q = new Request("http://x.test/p?q=1", {method:"POST", body:"b", headers:{"X-A":"1"}}); log("req", q.method, q.url, q.headers.get("x-a")); q.text().then(t=>log("reqtext", t));
+const u = new URL("../z?a=1#h", "http://ex.com/a/b/c"); log("url", u.href, u.origin, u.hash, u.search, u.host); u.pathname="/n"; u.search="?k=v"; u.hash="#t"; log(u.href); log(new URL("http://ex.com/a b").pathname, u.searchParams.get("k"));
+const d = new TextDecoder("utf-8"); log("dec", d.decode(new Uint8Array([0xc3,0xa9,0xf0,0x9f,0x98,0x80])), new TextDecoder("utf-16le").decode(new Uint8Array([0x41,0,0x42,0])), new TextDecoder("latin1").decode(new Uint8Array([0xe9])));
+const td = new TextDecoder(); const st = td.decode(new Uint8Array([0xc3]), {stream:true}) + td.decode(new Uint8Array([0xa9])); log("stream", st);
+const fd = new FormData(); fd.append("a","1"); log("fd", [...fd].join(","));
+log(typeof structuredClone, typeof crypto?.subtle, typeof AbortController, typeof URLSearchParams, typeof ReadableStream, typeof atob, typeof setImmediate);
+const rs = new Response(new ReadableStream({start(c){c.enqueue(new TextEncoder().encode("s1"));c.enqueue(new TextEncoder().encode("s2"));c.close()}})); rs.text().then(t=>log("stream-resp", t));
+Response.json({a:1}).text().then(t=>log("json", t));

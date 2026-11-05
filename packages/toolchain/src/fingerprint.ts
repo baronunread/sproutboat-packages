@@ -3,23 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 /** Every module that shapes the patched compiler. fingerprint.test.ts fails when one is missing. */
-export const PATCH_SOURCES = [
-  "async-context.ts",
-  "case-map.ts",
-  "fetch-classes.ts",
-  "headers-class.ts",
-  "native-bytes.ts",
-  "patch.ts",
-  "pin.ts",
-  "request-streaming.ts",
-  "restart.ts",
-  "streaming.ts",
-  "strings.ts",
-  "text-decoder.ts",
-  "unicode.ts",
-  "url-class.ts",
-  "websockets.ts",
-] as const;
+export const PATCH_SOURCES = ["case-map.ts", "native-bytes.ts", "patch.ts", "pin.ts", "strings.ts"] as const;
 
 /**
  * The fingerprint of the sources as released. A compiled CLI (`bun build --compile`) has
@@ -27,7 +11,7 @@ export const PATCH_SOURCES = [
  * patch.ts as the module patch.ts is everywhere else. Kept current by fingerprint.test.ts
  * (UPDATE_FINGERPRINT=1 bun test packages/toolchain/src/fingerprint.test.ts).
  */
-export const RELEASED_FINGERPRINT = "38ad0e09788b";
+export const RELEASED_FINGERPRINT = "443255e5247e";
 
 /** The fingerprint of the sources in dir, or null where they are not on disk. */
 export function sourceFingerprint(dir: string): string | null {
