@@ -184,8 +184,10 @@ export async function patchAppModuleIds(root: string): Promise<void> {
 }
 
 /**
- * P4: a name the shared prelude declares at its top level (`const fetch = ...`, its own timers
- * and web classes) is the prelude's own global, so the runtime's is not installed. Restricted to
+ * P4: a name the shared prelude declares at its top level (`const fetch = ...`) or assigns on
+ * `globalThis` anywhere in its body (`globalThis.setTimeout = ...` in an installer it calls at
+ * init; the assignment binds every free reference program-wide at run time, checked on alpha 21)
+ * is the prelude's own global, so the runtime's is not installed. Restricted to
  * `shared-prelude.js`: an app declaring `const process` must not hide the real one from the
  * modules beside it. Without this any free `fetch(` in app code links fetch-client, http, net,
  * dns, uws and libuv into the worker.
@@ -199,9 +201,16 @@ export async function patchPreludeOwnedGlobals(root: string): Promise<void> {
         "    // " +
         P4_MARKER +
         "\n" +
-        "    for (const mod of modules.values()) if (/(^|\\/)shared-prelude\\.js$/.test(mod.rel) && !mod.file.startsWith(RUNTIME_ROOT))\n" +
+        "    for (const mod of modules.values()) if (/(^|\\/)shared-prelude\\.js$/.test(mod.rel) && !mod.file.startsWith(RUNTIME_ROOT)) {\n" +
         "      for (const st of mod.body) for (const d of st.type === 'VariableDeclaration' ? st.declarations : st.type === 'FunctionDeclaration' || st.type === 'ClassDeclaration' ? [ st ] : [])\n" +
-        "        if (d.id?.type === 'Identifier') used.delete(d.id.name.replace(/#m\\w+$/, ''));\n",
+        "        if (d.id?.type === 'Identifier') used.delete(d.id.name.replace(/#m\\w+$/, ''));\n" +
+        "      // a name the prelude assigns on globalThis anywhere (globalThis.fetch = ..., in an installer it calls at init) is\n" +
+        "      // the prelude's too: the assignment binds every free reference to it at run time\n" +
+        "      const owned = new Set(); const walk = n => { if (n == null || typeof n !== 'object') return; if (Array.isArray(n)) { for (const x of n) walk(x); return; }\n" +
+        "        if (n.type === 'AssignmentExpression' && n.left.type === 'MemberExpression' && !n.left.computed && n.left.object.type === 'Identifier' && n.left.object.name === 'globalThis') owned.add(n.left.property.name);\n" +
+        "        for (const k in n) if (k !== 'loc' && k !== 'range') walk(n[k]); };\n" +
+        "      walk(mod.body); for (const name of owned) used.delete(name);\n" +
+        "    }\n",
     ],
   ]);
 }
