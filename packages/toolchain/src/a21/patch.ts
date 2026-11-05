@@ -328,6 +328,44 @@ export async function patchStableEntryPath(root: string): Promise<void> {
   ]);
 }
 
+/**
+ * sproutd's two collector hooks (sproutd #32, #287 on alpha 19): `porf_gc_quiet` is alpha 21's idle
+ * collection on demand (the built-in `porf_gc_idle` only runs after an allocation-triggered cycle,
+ * and the worker bridge collects on its own cadence), and `porf_gc_seal_heap` closes every open
+ * allocation window and drops the partial-page lists before the template forks, so a child
+ * allocates into fresh pages instead of copy-on-write copies of the template's.
+ */
+const GC_HOOKS_MARKER = "sproutboat: collector hooks for the fork template";
+export async function patchGcHooks(root: string): Promise<void> {
+  await editOnce(resolve(root, "compiler/render.js"), "the collector hooks (quiet, seal)", GC_HOOKS_MARKER, [
+    [
+      "${st}void porf_gc_idle(void) {\n  if (!porf_gc_busy) return;\n  porf_gc_busy = 0;\n  porf_gc_nursery_bytes = 1048576u;\n  porf_gc_collect(0);\n  porf_gc_discard_free_runs(1u);\n}\n",
+      "${st}void porf_gc_idle(void) {\n  if (!porf_gc_busy) return;\n  porf_gc_busy = 0;\n  porf_gc_nursery_bytes = 1048576u;\n  porf_gc_collect(0);\n  porf_gc_discard_free_runs(1u);\n}\n" +
+        "// " +
+        GC_HOOKS_MARKER +
+        "\n" +
+        "${st}void porf_gc_quiet(void) {\n  porf_gc_busy = 0;\n  porf_gc_nursery_bytes = 1048576u;\n  porf_gc_collect(0);\n  porf_gc_discard_free_runs(1u);\n}\n" +
+        "${st}void porf_gc_seal_heap(void) {\n" +
+        "  for (i32 ci = 0; ci < PORF_GC_NCLASSES; ci++) {\n" +
+        "    struct porf_gc_window* w = &porf_gc_active[ci];\n" +
+        "    if (w->end != 0) porf_gc_publish_window(ci);\n" +
+        "    w->cur = w->end = w->lo = 0;\n" +
+        "    while (porf_gc_partial[ci] != 0) {\n" +
+        "      struct porf_gc_page* m = &porf_gc_pages[porf_gc_partial[ci] - 1u];\n" +
+        "      porf_gc_partial[ci] = m->aux;\n" +
+        "      m->aux = 0;\n" +
+        "      m->flags &= (u8)~PORF_GC_PF_PARTIAL;\n" +
+        "    }\n" +
+        "  }\n" +
+        "}\n",
+    ],
+    [
+      "${st}i64 porf_gc_idle_due(void) { return -1; }\n${st}void porf_gc_idle(void) {}\n",
+      "${st}i64 porf_gc_idle_due(void) { return -1; }\n${st}void porf_gc_idle(void) {}\n${st}void porf_gc_quiet(void) {}\n${st}void porf_gc_seal_heap(void) {}\n",
+    ],
+  ]);
+}
+
 // --- group 3: alpha 21 runtime gaps the corpus hits ---
 
 /**
@@ -374,6 +412,32 @@ export async function patchResponseStatics(root: string): Promise<void> {
   ]);
 }
 
+/**
+ * `node:process` reads `porf_argv[i]` and `environ[i]` at its init with no null check: a host that
+ * starts the runtime with no argv, or that cleared its environment (sproutd's fork template runs
+ * after clearenv(), so `environ` is NULL), crashes before the first module runs.
+ */
+const PROCESS_TABLES_MARKER = "sproutboat: null argv and environ";
+export async function patchProcessNullTables(root: string): Promise<void> {
+  await editOnce(
+    resolve(root, "runtime/node/process.js"),
+    "null argv and environ in node:process",
+    PROCESS_TABLES_MARKER,
+    [
+      [
+        "  Porffor.c`out = porf_argv[(i32)porf_jv_val(i)] ? porf_node_cstr(porf_argv[(i32)porf_jv_val(i)]) : JV_UNDEFINED;`;\n",
+        "  Porffor.c`out = porf_argv && porf_argv[(i32)porf_jv_val(i)] ? porf_node_cstr(porf_argv[(i32)porf_jv_val(i)]) : JV_UNDEFINED;`; // " +
+          PROCESS_TABLES_MARKER +
+          "\n",
+      ],
+      [
+        "  Porffor.c`out = environ[(i32)porf_jv_val(i)] ? porf_node_cstr(environ[(i32)porf_jv_val(i)]) : JV_UNDEFINED;`;\n",
+        "  Porffor.c`out = environ && environ[(i32)porf_jv_val(i)] ? porf_node_cstr(environ[(i32)porf_jv_val(i)]) : JV_UNDEFINED;`;\n",
+      ],
+    ],
+  );
+}
+
 // --- the chain ---
 
 const done = new Set<string>();
@@ -417,9 +481,11 @@ export async function ensurePorfforPatchedA21(root: string): Promise<void> {
   await patchStableNames(root);
   await patchUnitLayout(root);
   await patchStableEntryPath(root);
+  await patchGcHooks(root);
   // Group 3: runtime gaps.
   await patchReservedSelect(root);
   await patchResponseStatics(root);
+  await patchProcessNullTables(root);
   // Last: the precompile picks up the builtin edits above.
   await precompileBuiltinsA21(root);
   done.add(root);
