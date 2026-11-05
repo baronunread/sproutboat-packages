@@ -432,6 +432,13 @@ export async function patchGcHooks(root: string): Promise<void> {
         "  if (porf_gc_minor_mode && porf_gc_bit(PORF_GC_B_YOUNG, g) == 0u) return;\n  porf_gc_bit_set(PORF_GC_B_MARK, g);\n}\n",
         "  if (porf_gc_minor_mode && porf_gc_bit(PORF_GC_B_YOUNG, g) == 0u) return;\n  if (porf_gc_bit(PORF_GC_B_MARK, g) == 0u) porf_gc_bit_set(PORF_GC_B_MARK, g);\n}\n",
       ],
+      // marking stops at a sealed template block: it is immortal and its references into the worker come
+      // through its cards, so neither its kind nor its mark bit is rewritten (an object referenced under
+      // another type than its recorded kind would otherwise be reclassified, and its metadata page copied)
+      [
+        "  if (porf_gc_is_block_start(body)) {\n    // skip header reads for old or already-marked blocks\n    const u32 g = porf_gc_gran(body);\n",
+        "  if (porf_gc_is_block_start(body)) {\n    if (porf_gc_template_top != 0 && (u32)body < porf_gc_template_top && (porf_gc_pages[(u32)body >> PORF_GC_SPAGE_SHIFT].flags & PORF_GC_PF_SEALED) != 0u) return;\n    // skip header reads for old or already-marked blocks\n    const u32 g = porf_gc_gran(body);\n",
+      ],
       // minor collections keep the template's cards
       [
         "      porf_gc_cards[c] = porf_gc_scan_young_seen;\n",
