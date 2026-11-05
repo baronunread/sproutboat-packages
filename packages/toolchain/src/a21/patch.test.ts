@@ -66,6 +66,7 @@ test("the alpha 21 chain applies to the pinned tree, once, and the second run ch
     "compiler/builtins/promise.ts",
     "compiler/builtins/string.ts",
     "compiler/builtins/regexp.ts",
+    "compiler/builtins/_internal_object.ts",
     "compiler/builtins_precompiled.js",
   ];
   const first: Record<string, string> = {};
@@ -78,6 +79,8 @@ test("the alpha 21 chain applies to the pinned tree, once, and the second run ch
     ["compiler/modules.js", "sproutboat P4: prelude-declared names override runtime globals"],
     ["compiler/modules.js", "sproutboat P7: stable entry path"],
     ["compiler/render.js", "sproutboat: collector hooks for the fork template"],
+    ["compiler/render.js", "static void porf_gc_scan_template_cards(void)"],
+    ["compiler/builtins/_internal_object.ts", "sproutboat: frozen megamorphic cache"],
     ["compiler/render.js", "sproutboat: per-request cpu"],
     ["compiler/builtins/promise.ts", "sproutboat: per-request cpu"],
     ["compiler/render.js", "sproutboat P2: app units last, pinned ABI regions"],
@@ -97,6 +100,7 @@ test("the alpha 21 chain applies to the pinned tree, once, and the second run ch
     expect(first[f], `${marker} in ${f}`).toContain(marker);
   // The precompile ran after the builtin edits: the table carries the replaceAll rewrite.
   expect(first["compiler/builtins_precompiled.js"]).toContain("replaceAll");
+  expect(first["compiler/builtins_precompiled.js"]).toContain("icFreezeMega");
   // Idempotent: a fresh chain on the patched tree (no manifest, so every pass runs) is a no-op.
   const { ensurePorfforPatchedA21: again } = await import(`./patch.ts?${Date.now()}`);
   await again(root);
