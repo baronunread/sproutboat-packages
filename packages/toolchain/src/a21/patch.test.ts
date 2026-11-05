@@ -62,6 +62,7 @@ test("the alpha 21 chain applies to the pinned tree, once, and the second run ch
     "compiler/index.js",
     "compiler/builtins.js",
     "runtime/node/internal/fetch.js",
+    "runtime/node/process.js",
     "compiler/builtins/string.ts",
     "compiler/builtins/regexp.ts",
     "compiler/builtins_precompiled.js",
