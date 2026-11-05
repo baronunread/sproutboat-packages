@@ -438,6 +438,88 @@ export async function patchProcessNullTables(root: string): Promise<void> {
   );
 }
 
+/**
+ * Per-request CPU (sproutd design 02, the alpha 19 toolchain's async-context.ts): the thread CPU
+ * time each request has used, summed over the slices in which it ran. The current request is a
+ * small id (slot and generation) that rides with the async context alpha 21 already keeps: a
+ * promise reaction records it when it is made (a new u32 at offset 48, so a reaction is 56
+ * bytes) and it becomes current when the reaction runs; the queue running dry resets it. The
+ * prelude's timers record and restore it themselves (build/a21/prelude-preamble.js). The clock
+ * is read only when the request changes.
+ */
+const CPU_MARKER = "sproutboat: per-request cpu";
+const CPU_DEFS =
+  "#define PORF_CPU_SLOTS 256\n" +
+  "static u32 porf_cpu_cur = 0;\n" +
+  "static double porf_cpu_last_ns = 0;\n" +
+  "static double porf_cpu_acc[PORF_CPU_SLOTS];\n" +
+  "static u16 porf_cpu_gen[PORF_CPU_SLOTS];\n" +
+  "static u8 porf_cpu_used[PORF_CPU_SLOTS];\n" +
+  "static u16 porf_cpu_next_gen = 0;\n" +
+  "static u32 porf_cpu_next_slot = 0;\n" +
+  "static inline double porf_cpu_now_ns(void) { struct timespec ts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts); return (double)ts.tv_sec * 1e9 + (double)ts.tv_nsec; }\n" +
+  "static inline int porf_cpu_live(u32 id) { const u32 i = id & 255u; return id != 0 && porf_cpu_used[i] && porf_cpu_gen[i] == (u16)(id >> 8); }\n" +
+  "static void porf_cpu_switch(u32 next) {\n" +
+  "  if (next == porf_cpu_cur) return;\n" +
+  "  const double t = porf_cpu_now_ns();\n" +
+  "  if (porf_cpu_live(porf_cpu_cur)) porf_cpu_acc[porf_cpu_cur & 255u] += t - porf_cpu_last_ns;\n" +
+  "  porf_cpu_last_ns = t;\n" +
+  "  porf_cpu_cur = next;\n" +
+  "}\n" +
+  "static u32 porf_cpu_begin(void) {\n" +
+  "  for (u32 k = 0; k < PORF_CPU_SLOTS; k++) {\n" +
+  "    const u32 i = (porf_cpu_next_slot + k) & 255u;\n" +
+  "    if (porf_cpu_used[i]) continue;\n" +
+  "    porf_cpu_next_slot = i + 1u;\n" +
+  "    if (++porf_cpu_next_gen == 0) porf_cpu_next_gen = 1;\n" +
+  "    porf_cpu_used[i] = 1; porf_cpu_gen[i] = porf_cpu_next_gen; porf_cpu_acc[i] = 0;\n" +
+  "    const u32 id = i | ((u32)porf_cpu_next_gen << 8);\n" +
+  "    porf_cpu_switch(id);\n" +
+  "    return id;\n" +
+  "  }\n" +
+  "  return 0;\n" +
+  "}\n" +
+  "static double porf_cpu_read_ms(u32 id) {\n" +
+  "  if (!porf_cpu_live(id)) return -1.0;\n" +
+  "  if (porf_cpu_cur == id) { const double t = porf_cpu_now_ns(); porf_cpu_acc[id & 255u] += t - porf_cpu_last_ns; porf_cpu_last_ns = t; }\n" +
+  "  return porf_cpu_acc[id & 255u] / 1e6;\n" +
+  "}\n" +
+  "static void porf_cpu_end(u32 id) {\n" +
+  "  if (!porf_cpu_live(id)) return;\n" +
+  "  if (porf_cpu_cur == id) porf_cpu_switch(0);\n" +
+  "  porf_cpu_used[id & 255u] = 0;\n" +
+  "}\n" +
+  "static inline u32 porf_cpu_current(void) { return porf_cpu_cur; }\n";
+export async function patchCpuStamp(root: string): Promise<void> {
+  await editOnce(resolve(root, "compiler/render.js"), "the per-request cpu stamp (render)", CPU_MARKER, [
+    [
+      "#define PORF_REACTION_CONTEXT 40\n#define PORF_REACTION_SIZE 48\n",
+      "#define PORF_REACTION_CONTEXT 40\n#define PORF_REACTION_CPU 48\n#define PORF_REACTION_SIZE 56\n",
+    ],
+    [
+      "static jsbits porf_async_context = JV_UNDEFINED_BITS;\n",
+      "static jsbits porf_async_context = JV_UNDEFINED_BITS;\n// " + CPU_MARKER + "\n" + CPU_DEFS,
+    ],
+    // the coroutine reaction constructor in C
+    [
+      "  *(jsbits*)(MEM + reaction + PORF_REACTION_CONTEXT) = porf_async_context;\n  porf_gc_barrier(reaction, PORF_GC_KIND_PROMISE_REACTION);\n  return reaction;\n",
+      "  *(jsbits*)(MEM + reaction + PORF_REACTION_CONTEXT) = porf_async_context;\n  *(u32*)(MEM + reaction + PORF_REACTION_CPU) = porf_cpu_cur;\n  porf_gc_barrier(reaction, PORF_GC_KIND_PROMISE_REACTION);\n  return reaction;\n",
+    ],
+    // dequeue: the job's request becomes current; an empty queue resets it
+    [
+      "static u32 porf_promise_dequeue_job(void) {\n  if (porf_promise_job_len == 0) return 0;\n  const u32 reaction = porf_promise_job_queue[porf_promise_job_head];\n",
+      "static u32 porf_promise_dequeue_job(void) {\n  if (porf_promise_job_len == 0) { porf_cpu_switch(0); return 0; }\n  const u32 reaction = porf_promise_job_queue[porf_promise_job_head];\n  porf_cpu_switch(*(u32*)(MEM + reaction + PORF_REACTION_CPU));\n",
+    ],
+  ]);
+  await editOnce(resolve(root, "compiler/builtins/promise.ts"), "the per-request cpu stamp (promise)", CPU_MARKER, [
+    ["  const out: i32 = Porffor.malloc(48);\n", "  const out: i32 = Porffor.malloc(56); // " + CPU_MARKER + "\n"],
+    [
+      "  Porffor.c`*(jsbits*)(MEM + (u32)out + PORF_REACTION_CONTEXT) = porf_async_context;\n",
+      "  Porffor.c`*(jsbits*)(MEM + (u32)out + PORF_REACTION_CONTEXT) = porf_async_context;\n*(u32*)(MEM + (u32)out + PORF_REACTION_CPU) = porf_cpu_cur;\n",
+    ],
+  ]);
+}
+
 // --- the chain ---
 
 const done = new Set<string>();
@@ -482,6 +564,7 @@ export async function ensurePorfforPatchedA21(root: string): Promise<void> {
   await patchUnitLayout(root);
   await patchStableEntryPath(root);
   await patchGcHooks(root);
+  await patchCpuStamp(root);
   // Group 3: runtime gaps.
   await patchReservedSelect(root);
   await patchResponseStatics(root);
