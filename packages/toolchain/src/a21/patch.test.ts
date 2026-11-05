@@ -1,0 +1,185 @@
+import { afterAll, expect, test } from "bun:test";
+import { mkdtemp, readFile, readdir, realpath, rm, writeFile, mkdir } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { A21_PATCH_FINGERPRINT, A21_RELEASED_FINGERPRINT, a21SourceFingerprint } from "./fingerprint";
+import {
+  ensurePorfforPatchedA21,
+  patchClassUnit,
+  patchPreludeOwnedGlobals,
+  patchReservedSelect,
+  patchResponseStatics,
+  patchUnitLayout,
+} from "./patch";
+import { PORFFOR_A21_ARCHIVE_SHA256, PORFFOR_A21_COMMIT_FULL } from "./pin";
+
+const temporary: string[] = [];
+afterAll(async () => {
+  await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+});
+
+/** A pristine alpha 21 tree from the vendored archive, in a fresh directory. */
+async function pristine(): Promise<string> {
+  // Canonical: a module's unit is named by its path relative to the entry directory, and macOS's
+  // /var -> /private/var symlink would otherwise give it the absolute path.
+  const root = await realpath(await mkdtemp(join(tmpdir(), "sb-a21-")));
+  temporary.push(root);
+  const archive = resolve(import.meta.dir, "../../vendor/porffor-1f8d148.tar.gz");
+  const digest = new Bun.CryptoHasher("sha256").update(await readFile(archive)).digest("hex");
+  expect(digest).toBe(PORFFOR_A21_ARCHIVE_SHA256);
+  const tar = Bun.spawnSync(["tar", "-xzf", archive, "-C", root, "--strip-components=1"], { stderr: "pipe" });
+  expect(tar.exitCode, new TextDecoder().decode(tar.stderr)).toBe(0);
+  return root;
+}
+
+test("a pass that finds its anchor twice or not at all stops with the pass's name", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sb-a21-anchor-"));
+  temporary.push(root);
+  await mkdir(join(root, "compiler"), { recursive: true });
+  await writeFile(join(root, "compiler/render.js"), "x\n");
+  await expect(patchReservedSelect(root)).rejects.toThrow("the reserved name select");
+  await writeFile(
+    join(root, "compiler/render.js"),
+    "const cReservedNames = new Set([\nconst cReservedNames = new Set([\n",
+  );
+  await expect(patchReservedSelect(root)).rejects.toThrow("anchor not found once");
+  await writeFile(join(root, "compiler/render.js"), "const cReservedNames = new Set([\n  'auto',\n");
+  await patchReservedSelect(root);
+  const once = await readFile(join(root, "compiler/render.js"), "utf8");
+  expect(once).toContain("'select', // sproutboat: glibc select");
+  await patchReservedSelect(root);
+  expect(await readFile(join(root, "compiler/render.js"), "utf8")).toBe(once);
+});
+
+test("the alpha 21 chain applies to the pinned tree, once, and the second run changes nothing", async () => {
+  const root = await pristine();
+  await ensurePorfforPatchedA21(root);
+  const files = [
+    "compiler/codegen.js",
+    "compiler/modules.js",
+    "compiler/render.js",
+    "compiler/index.js",
+    "compiler/builtins.js",
+    "runtime/node/internal/fetch.js",
+    "compiler/builtins/string.ts",
+    "compiler/builtins/regexp.ts",
+    "compiler/builtins_precompiled.js",
+  ];
+  const first: Record<string, string> = {};
+  for (const f of files) first[f] = await readFile(join(root, f), "utf8");
+  for (const [f, marker] of [
+    ["compiler/codegen.js", "sproutboat P1: class functions stay in their module's unit"],
+    ["compiler/codegen.js", "sproutboat P5: stable derived names"],
+    ["compiler/codegen.js", "sproutboat P6: inits of app-module globals"],
+    ["compiler/modules.js", "sproutboat P6: app-owned modules"],
+    ["compiler/modules.js", "sproutboat P4: prelude-declared names override runtime globals"],
+    ["compiler/render.js", "sproutboat P2: app units last, pinned ABI regions"],
+    ["compiler/render.js", "sproutboat P3: a unit's segments by content"],
+    ["compiler/render.js", "sproutboat P6: app-module globals last"],
+    ["compiler/render.js", "sproutboat: glibc select"],
+    ["compiler/index.js", "SB_EXTRA_LINK"],
+    ["compiler/index.js", "SB_EXTRA_CFLAGS"],
+    ["compiler/builtins.js", "sproutboat: navigator is writable"],
+    ["runtime/node/internal/fetch.js", "sproutboat: Response.redirect and Response.error"],
+    ["compiler/builtins/string.ts", "sproutboat #237: pieces joined once"],
+    ["compiler/builtins/string.ts", "sproutboat B16: doubling repeat"],
+    ["compiler/builtins/string.ts", "sproutboat: Unicode case mapping"],
+    ["compiler/builtins/regexp.ts", "export const __Porffor_regex_replaceCallback = "],
+  ] as const)
+    expect(first[f], `${marker} in ${f}`).toContain(marker);
+  // The precompile ran after the builtin edits: the table carries the replaceAll rewrite.
+  expect(first["compiler/builtins_precompiled.js"]).toContain("replaceAll");
+  // Idempotent: a fresh chain on the patched tree (no manifest, so every pass runs) is a no-op.
+  const { ensurePorfforPatchedA21: again } = await import(`./patch.ts?${Date.now()}`);
+  await again(root);
+  for (const f of files) expect(await readFile(join(root, f), "utf8"), f).toBe(first[f]);
+}, 120_000);
+
+test("a shared prelude owns fetch and the timers: the worker compile links no network stack", async () => {
+  const root = await pristine();
+  await ensurePorfforPatchedA21(root);
+  const work = join(root, "work");
+  await mkdir(work);
+  // sproutd's compile shape: the entry imports the app unit, which imports the prelude first.
+  await writeFile(
+    join(work, "shared-prelude.js"),
+    "const fetch = () => { throw new Error('fetch: host transport'); };\nglobalThis.fetch = fetch;\n" +
+      "class Probe { constructor(x) { this.x = x; } get double() { return this.x * 2; } }\nglobalThis.__sbProbe = Probe;\nexport {};\n",
+  );
+  await writeFile(
+    join(work, "worker.js"),
+    "import './shared-prelude.js';\nclass AppThing { twice(y) { return y + y; } }\n" +
+      "export const r = Response.redirect('http://example.com/x', 301);\n" +
+      "console.log(r.status, r.headers.get('location'), new AppThing().twice(2), new globalThis.__sbProbe(4).double, typeof fetch);\n",
+  );
+  await writeFile(join(work, "app.js"), "import './worker.js';\n");
+  const out = join(work, "out");
+  const compile = Bun.spawnSync(["bun", join(root, "runtime/index.js"), "c", join(work, "app.js"), "-o", out], {
+    cwd: work,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  expect(compile.exitCode, new TextDecoder().decode(compile.stderr)).toBe(0);
+  const units = (await readdir(out)).filter((f) => f.endsWith(".c"));
+  expect(
+    units.some((f) => /fetch-client|internal_uv|uws|node_net|node_http|node_dns/.test(f)),
+    units.join(" "),
+  ).toBe(false);
+  expect(
+    units.some((f) => f.startsWith("worker.js.")),
+    units.join(" "),
+  ).toBe(true);
+  const header = await readFile(join(out, "porf.h"), "utf8");
+  expect(header).not.toContain("uv.h");
+  // P1: the app's class method lives in the app unit, not in main; the prelude's in the prelude unit.
+  const appUnit = await readFile(
+    join(
+      out,
+      units.find((f) => f.startsWith("worker.js."))!,
+    ),
+    "utf8",
+  );
+  expect(appUnit).toContain("twice");
+  const main = await readFile(join(out, "porf__main.c"), "utf8");
+  expect(main).not.toMatch(/^jsval p_\w*__23twice/m);
+  // P2: the function-record and name regions sit at the pinned offsets (the image is sparse between them).
+  expect(main).toContain("porf_fnrecs");
+}, 120_000);
+
+test("P1, P2 and P4 edits are anchored on exact alpha 21 text", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sb-a21-p-"));
+  temporary.push(root);
+  await mkdir(join(root, "compiler"), { recursive: true });
+  await mkdir(join(root, "runtime/node/internal"), { recursive: true });
+  await writeFile(join(root, "compiler/codegen.js"), "const declareClass = (scope, decl) => {\n");
+  await expect(patchClassUnit(root)).rejects.toThrow("class functions in their module's unit (P1)");
+  await writeFile(join(root, "compiler/render.js"), "  unitOrder.push('main');\n");
+  await expect(patchUnitLayout(root)).rejects.toThrow("unit layout (P2, P3, P6)");
+  await writeFile(join(root, "compiler/modules.js"), "nothing\n");
+  await expect(patchPreludeOwnedGlobals(root)).rejects.toThrow("prelude-owned globals (P4)");
+  await writeFile(join(root, "runtime/node/internal/fetch.js"), "class Response {}\n");
+  await expect(patchResponseStatics(root)).rejects.toThrow("Response.redirect");
+});
+
+test("the alpha 21 fingerprint covers its sources and is as released", async () => {
+  expect(A21_PATCH_FINGERPRINT).toMatch(/^[0-9a-f]{12}$/);
+  expect(A21_PATCH_FINGERPRINT).toBe(a21SourceFingerprint(import.meta.dir)!);
+  expect(a21SourceFingerprint("/nonexistent")).toBeNull();
+  expect(PORFFOR_A21_COMMIT_FULL).toMatch(/^[0-9a-f]{40}$/);
+  const actual = a21SourceFingerprint(import.meta.dir)!;
+  if (process.env.UPDATE_FINGERPRINT && actual !== A21_RELEASED_FINGERPRINT) {
+    const file = `${import.meta.dir}/fingerprint.ts`;
+    const text = await Bun.file(file).text();
+    await Bun.write(
+      file,
+      text.replace(
+        `A21_RELEASED_FINGERPRINT = "${A21_RELEASED_FINGERPRINT}"`,
+        `A21_RELEASED_FINGERPRINT = "${actual}"`,
+      ),
+    );
+    return;
+  }
+  expect(A21_RELEASED_FINGERPRINT, "run UPDATE_FINGERPRINT=1 bun test packages/toolchain/src/a21/patch.test.ts").toBe(
+    actual,
+  );
+});
