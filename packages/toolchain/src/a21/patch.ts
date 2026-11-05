@@ -329,41 +329,192 @@ export async function patchStableEntryPath(root: string): Promise<void> {
 }
 
 /**
- * sproutd's two collector hooks (sproutd #32, #287 on alpha 19): `porf_gc_quiet` is alpha 21's idle
+ * sproutd's collector hooks (sproutd #32, #287 on alpha 19). `porf_gc_quiet` is alpha 21's idle
  * collection on demand (the built-in `porf_gc_idle` only runs after an allocation-triggered cycle,
- * and the worker bridge collects on its own cadence), and `porf_gc_seal_heap` closes every open
- * allocation window and drops the partial-page lists before the template forks, so a child
- * allocates into fresh pages instead of copy-on-write copies of the template's.
+ * and the worker bridge collects on its own cadence). `porf_gc_seal_heap` closes every open
+ * allocation window, drops the partial-page lists and seals every page the template filled
+ * before it forks, so a child allocates into fresh pages instead of copy-on-write copies of the
+ * template's.
+ *
+ * A sealed page is immortal in the worker (M6 fix, 2026-11-05): the seal copies the allocation
+ * bits into the mark bits of every sealed page and records the template's heap top, and a
+ * worker's full collection neither clears nor sets a sealed page's bits nor sweeps it (an object
+ * there is "already marked", so marking stops at it). What a template object comes to reference in
+ * the worker is found through the card table instead: the write barrier marks the card of an old
+ * block it stores into, cards below the template top are never cleared, and every collection scans
+ * them (a full one too). Without this every worker's first full collection rewrote the metadata of
+ * the whole template heap (56 KiB per worker on a 1.5 MiB template, M6 cause 4), and before the
+ * sealed flag the first full collection reopened template pages for allocation (cause 1).
  */
 const GC_HOOKS_MARKER = "sproutboat: collector hooks for the fork template";
 export async function patchGcHooks(root: string): Promise<void> {
-  await editOnce(resolve(root, "compiler/render.js"), "the collector hooks (quiet, seal)", GC_HOOKS_MARKER, [
+  await editOnce(
+    resolve(root, "compiler/render.js"),
+    "the collector hooks (quiet, seal, immortal template)",
+    GC_HOOKS_MARKER,
     [
-      "${st}void porf_gc_idle(void) {\n  if (!porf_gc_busy) return;\n  porf_gc_busy = 0;\n  porf_gc_nursery_bytes = 1048576u;\n  porf_gc_collect(0);\n  porf_gc_discard_free_runs(1u);\n}\n",
-      "${st}void porf_gc_idle(void) {\n  if (!porf_gc_busy) return;\n  porf_gc_busy = 0;\n  porf_gc_nursery_bytes = 1048576u;\n  porf_gc_collect(0);\n  porf_gc_discard_free_runs(1u);\n}\n" +
-        "// " +
-        GC_HOOKS_MARKER +
-        "\n" +
-        "${st}void porf_gc_quiet(void) {\n  porf_gc_busy = 0;\n  porf_gc_nursery_bytes = 1048576u;\n  porf_gc_collect(0);\n  porf_gc_discard_free_runs(1u);\n}\n" +
-        "${st}void porf_gc_seal_heap(void) {\n" +
-        "  for (i32 ci = 0; ci < PORF_GC_NCLASSES; ci++) {\n" +
-        "    struct porf_gc_window* w = &porf_gc_active[ci];\n" +
-        "    if (w->end != 0) porf_gc_publish_window(ci);\n" +
-        "    w->cur = w->end = w->lo = 0;\n" +
-        "    while (porf_gc_partial[ci] != 0) {\n" +
-        "      struct porf_gc_page* m = &porf_gc_pages[porf_gc_partial[ci] - 1u];\n" +
-        "      porf_gc_partial[ci] = m->aux;\n" +
-        "      m->aux = 0;\n" +
-        "      m->flags &= (u8)~PORF_GC_PF_PARTIAL;\n" +
-        "    }\n" +
-        "  }\n" +
-        "}\n",
+      [
+        "${st}void porf_gc_idle(void) {\n  if (!porf_gc_busy) return;\n  porf_gc_busy = 0;\n  porf_gc_nursery_bytes = 1048576u;\n  porf_gc_collect(0);\n  porf_gc_discard_free_runs(1u);\n}\n",
+        "${st}void porf_gc_idle(void) {\n  if (!porf_gc_busy) return;\n  porf_gc_busy = 0;\n  porf_gc_nursery_bytes = 1048576u;\n  porf_gc_collect(0);\n  porf_gc_discard_free_runs(1u);\n}\n" +
+          "// " +
+          GC_HOOKS_MARKER +
+          "\n" +
+          "${st}void porf_gc_quiet(void) {\n  porf_gc_busy = 0;\n  porf_gc_nursery_bytes = 1048576u;\n  porf_gc_collect(0);\n  porf_gc_discard_free_runs(1u);\n}\n" +
+          "${st}void porf_gc_seal_heap(void) {\n" +
+          "  if (porf_heap_base == 0) return;\n" +
+          "  porf_gc_quiet();\n" +
+          "  for (i32 ci = 0; ci < PORF_GC_NCLASSES; ci++) {\n" +
+          "    struct porf_gc_window* w = &porf_gc_active[ci];\n" +
+          "    if (w->end != 0) porf_gc_publish_window(ci);\n" +
+          "    w->cur = w->end = w->lo = 0;\n" +
+          "    while (porf_gc_partial[ci] != 0) {\n" +
+          "      struct porf_gc_page* m = &porf_gc_pages[porf_gc_partial[ci] - 1u];\n" +
+          "      porf_gc_partial[ci] = m->aux;\n" +
+          "      m->aux = 0;\n" +
+          "      m->flags &= (u8)~PORF_GC_PF_PARTIAL;\n" +
+          "    }\n" +
+          "  }\n" +
+          "  // every page in use is sealed (tails too) and its live objects stay marked for the life of every worker\n" +
+          "  const u32 top = porf_heap_top >> PORF_GC_SPAGE_SHIFT;\n" +
+          "  for (u32 pg = porf_heap_base >> PORF_GC_SPAGE_SHIFT; pg < top; pg++) {\n" +
+          "    const u8 k = porf_gc_page_kind[pg];\n" +
+          "    if (k == 0u) continue;\n" +
+          "    porf_gc_pages[pg].flags |= PORF_GC_PF_SEALED;\n" +
+          "    if (k == PORF_GC_PK_SMALL) {\n" +
+          "      if ((porf_gc_pages[pg].flags & PORF_GC_PF_TAIL) != 0u) continue;\n" +
+          "      u64* blk = porf_gc_meta + ((size_t)pg << 5);\n" +
+          "      const u32 npg = porf_gc_cls_pages[porf_gc_pages[pg].cidx];\n" +
+          "      for (u32 w = 0; w < npg * 8u; w++) blk[((size_t)w << 2) + PORF_GC_B_MARK] = blk[((size_t)w << 2) + PORF_GC_B_ALLOC];\n" +
+          "    } else if (k == PORF_GC_PK_SPAN) porf_gc_bit_set(PORF_GC_B_MARK, porf_gc_gran(pg << PORF_GC_SPAGE_SHIFT));\n" +
+          "  }\n" +
+          "  porf_gc_template_top = porf_heap_top;\n" +
+          "  porf_gc_template_live = porf_gc_last_live_bytes;\n" +
+          "}\n" +
+          "// cards below the template top are sticky (never cleared): every collection scans them\n" +
+          "static void porf_gc_scan_template_cards(void) {\n" +
+          "  const u32 c_lo = porf_heap_base >> 9;\n" +
+          "  const u32 c_hi = porf_gc_template_top >> 9;\n" +
+          "  for (u32 cw = c_lo & ~7u; cw < c_hi; cw += 8u) {\n" +
+          "    u64 w8;\n" +
+          "    memcpy(&w8, porf_gc_cards + cw, 8);\n" +
+          "    if (w8 == 0) continue;\n" +
+          "    for (u32 j = 0; j < 8u; j++) {\n" +
+          "      const u32 c = cw + j;\n" +
+          "      if (c < c_lo || c >= c_hi || porf_gc_cards[c] == 0) continue;\n" +
+          "      porf_gc_scan_card(c);\n" +
+          "      porf_gc_drain_mark_queue();\n" +
+          "    }\n" +
+          "  }\n" +
+          "}\n",
+      ],
+      // A sealed page (every page the template filled) is never reopened for allocation: a worker's
+      // objects go to fresh pages instead of copy-on-write copies of template pages that hold a few
+      // free slots (alpha 19's PORF_GC_PF_SEALED, sproutd #32). Without it the worker's first full
+      // collection rebuilt the partial lists from the template's pages and every request after that
+      // copied one template page per size class (measured 2026-11-05 on romeo: 140 KiB of a worker's
+      // 332 KiB private arena after 21 requests). A page a worker claims resets its flags
+      // (refill_window, span_alloc), so a sealed page whose objects all die is released like any other.
+      ["#define PORF_GC_PF_TAIL 8u\n", "#define PORF_GC_PF_TAIL 8u\n#define PORF_GC_PF_SEALED 16u\n"],
+      [
+        "static u32 porf_gc_partial[PORF_GC_NCLASSES];\n",
+        "static u32 porf_gc_partial[PORF_GC_NCLASSES];\n// the fork template's heap top and live bytes at the seal (0: no template)\nstatic u32 porf_gc_template_top = 0;\nstatic u64 porf_gc_template_live = 0;\n",
+      ],
+      [
+        "static int porf_gc_install_run(i32 ci, u32 pg) {\n",
+        "static int porf_gc_install_run(i32 ci, u32 pg) {\n  if ((porf_gc_pages[pg].flags & PORF_GC_PF_SEALED) != 0u) return 0;\n",
+      ],
+      [
+        "static void porf_gc_partial_push(u32 pg) {\n  struct porf_gc_page* m = &porf_gc_pages[pg];\n  if ((m->flags & PORF_GC_PF_PARTIAL) != 0u) return;",
+        "static void porf_gc_partial_push(u32 pg) {\n  struct porf_gc_page* m = &porf_gc_pages[pg];\n  if ((m->flags & (PORF_GC_PF_PARTIAL | PORF_GC_PF_SEALED)) != 0u) return;",
+      ],
+      // a raw mark of an already-marked (template) block must not write its metadata page
+      [
+        "  if (porf_gc_minor_mode && porf_gc_bit(PORF_GC_B_YOUNG, g) == 0u) return;\n  porf_gc_bit_set(PORF_GC_B_MARK, g);\n}\n",
+        "  if (porf_gc_minor_mode && porf_gc_bit(PORF_GC_B_YOUNG, g) == 0u) return;\n  if (porf_gc_bit(PORF_GC_B_MARK, g) == 0u) porf_gc_bit_set(PORF_GC_B_MARK, g);\n}\n",
+      ],
+      // marking stops at a sealed template block: it is immortal and its references into the worker come
+      // through its cards, so neither its kind nor its mark bit is rewritten (an object referenced under
+      // another type than its recorded kind would otherwise be reclassified, and its metadata page copied)
+      [
+        "  if (porf_gc_is_block_start(body)) {\n    // skip header reads for old or already-marked blocks\n    const u32 g = porf_gc_gran(body);\n",
+        "  if (porf_gc_is_block_start(body)) {\n    if (porf_gc_template_top != 0 && (u32)body < porf_gc_template_top && (porf_gc_pages[(u32)body >> PORF_GC_SPAGE_SHIFT].flags & PORF_GC_PF_SEALED) != 0u) return;\n    // skip header reads for old or already-marked blocks\n    const u32 g = porf_gc_gran(body);\n",
+      ],
+      // a kind or mark already in place is not stored again: a same-value store still copies a template
+      // metadata page into the worker (the template's cards are rescanned by every collection)
+      [
+        "  } else return;\n  porf_gc_kinds[porf_gc_gran(body)] = (u8)kind;\n}\n",
+        "  } else return;\n  if (porf_gc_kinds[porf_gc_gran(body)] != (u8)kind) porf_gc_kinds[porf_gc_gran(body)] = (u8)kind;\n}\n",
+      ],
+      [
+        "static inline void porf_gc_set_marked_type(i32 body, i32 type) {\n  porf_gc_bit_set(PORF_GC_B_MARK, porf_gc_gran(body));\n  porf_gc_kinds[porf_gc_gran(body)] = (u8)type;\n}\n",
+        "static inline void porf_gc_set_marked_type(i32 body, i32 type) {\n  if (porf_gc_bit(PORF_GC_B_MARK, porf_gc_gran(body)) == 0u) porf_gc_bit_set(PORF_GC_B_MARK, porf_gc_gran(body));\n  if (porf_gc_kinds[porf_gc_gran(body)] != (u8)type) porf_gc_kinds[porf_gc_gran(body)] = (u8)type;\n}\n",
+      ],
+      [
+        "  } else return;\n  porf_gc_kinds[p >> 4] = (u8)type;\n}\n",
+        "  } else return;\n  if (porf_gc_kinds[p >> 4] != (u8)type) porf_gc_kinds[p >> 4] = (u8)type;\n}\n",
+      ],
+      // minor collections keep the template's cards
+      [
+        "      porf_gc_cards[c] = porf_gc_scan_young_seen;\n",
+        "      porf_gc_cards[c] = c < (porf_gc_template_top >> 9) ? 1u : porf_gc_scan_young_seen;\n",
+      ],
+      // a full collection: sealed pages keep their marks; the rest of the heap clears page by page below the template top and by range above it
+      [
+        "    if (porf_gc_alias_lo < porf_heap_top && porf_gc_alias_hi > porf_heap_base) {\n      porf_gc_clear_marks(porf_heap_base, porf_gc_alias_lo);\n      porf_gc_clear_marks(porf_gc_alias_hi, porf_heap_top);\n    } else porf_gc_clear_marks(porf_heap_base, porf_heap_top);\n",
+        "    const u32 clear_lo = porf_gc_template_top != 0 && porf_gc_template_top < porf_heap_top ? porf_gc_template_top : porf_gc_template_top != 0 ? porf_heap_top : porf_heap_base;\n" +
+          "    for (u32 pg = porf_heap_base >> PORF_GC_SPAGE_SHIFT; pg < (clear_lo >> PORF_GC_SPAGE_SHIFT); pg++)\n" +
+          "      if (porf_gc_page_kind[pg] != 0u && (porf_gc_pages[pg].flags & PORF_GC_PF_SEALED) == 0u) porf_gc_clear_marks(pg << PORF_GC_SPAGE_SHIFT, (pg + 1u) << PORF_GC_SPAGE_SHIFT);\n" +
+          "    if (porf_gc_alias_lo < porf_heap_top && porf_gc_alias_hi > clear_lo) {\n      if (porf_gc_alias_lo > clear_lo) porf_gc_clear_marks(clear_lo, porf_gc_alias_lo);\n      porf_gc_clear_marks(porf_gc_alias_hi, porf_heap_top);\n    } else porf_gc_clear_marks(clear_lo, porf_heap_top);\n",
+      ],
+      [
+        "  porf_gc_mark_global_roots();\n  porf_gc_drain_mark_queue();\n  if (minor) porf_gc_scan_cards();\n",
+        "  porf_gc_mark_global_roots();\n  porf_gc_drain_mark_queue();\n  if (minor) porf_gc_scan_cards();\n  else if (porf_gc_template_top != 0) porf_gc_scan_template_cards();\n",
+      ],
+      // the full sweep skips sealed pages (all live, never reopened) and counts the template's live bytes once
+      [
+        "      if (k == PORF_GC_PK_SMALL) {\n        if ((porf_gc_pages[pg].flags & PORF_GC_PF_TAIL) != 0u) continue;\n        porf_gc_sweep_page_small(pg, 0, &promoted, &live_bytes);\n      } else if (k == PORF_GC_PK_SPAN) porf_gc_sweep_span(pg, 0, &promoted, &live_bytes);\n    }\n    porf_gc_last_live_bytes = live_bytes;\n",
+        "      if ((porf_gc_pages[pg].flags & PORF_GC_PF_SEALED) != 0u) continue;\n      if (k == PORF_GC_PK_SMALL) {\n        if ((porf_gc_pages[pg].flags & PORF_GC_PF_TAIL) != 0u) continue;\n        porf_gc_sweep_page_small(pg, 0, &promoted, &live_bytes);\n      } else if (k == PORF_GC_PK_SPAN) porf_gc_sweep_span(pg, 0, &promoted, &live_bytes);\n    }\n    live_bytes += porf_gc_template_live;\n    porf_gc_last_live_bytes = live_bytes;\n",
+      ],
+      // the template's cards stay
+      [
+        "    memset(porf_gc_cards + (porf_heap_base >> 9), 0, (size_t)((porf_heap_top - porf_heap_base) >> 9) + 1);\n",
+        "    if (porf_gc_template_top < porf_heap_top) memset(porf_gc_cards + ((porf_gc_template_top > porf_heap_base ? porf_gc_template_top : porf_heap_base) >> 9), 0, (size_t)((porf_heap_top - (porf_gc_template_top > porf_heap_base ? porf_gc_template_top : porf_heap_base)) >> 9) + 1);\n",
+      ],
+      [
+        "${st}i64 porf_gc_idle_due(void) { return -1; }\n${st}void porf_gc_idle(void) {}\n",
+        "${st}i64 porf_gc_idle_due(void) { return -1; }\n${st}void porf_gc_idle(void) {}\n${st}void porf_gc_quiet(void) {}\n${st}void porf_gc_seal_heap(void) {}\n",
+      ],
     ],
+  );
+}
+
+/**
+ * The shared megamorphic inline cache (`icMega`, 4,096 entries of 20 bytes, hashed by shape and
+ * key) is a zero-filled 80 KiB block the template allocates; a worker's misses write entries all
+ * over it, so the first request copied most of its 20 pages per worker (M6 cause 3). The template
+ * freezes it after its warm-up (build/a21/prelude-dispatch.js `__sbTemplateWarm`): workers read
+ * the template's entries and never write one. A frozen miss costs what alpha 19 paid at every
+ * site: the hash lookup.
+ */
+const IC_MEGA_MARKER = "sproutboat: frozen megamorphic cache";
+export async function patchIcMegaFreeze(root: string): Promise<void> {
+  await editOnce(
+    resolve(root, "compiler/builtins/_internal_object.ts"),
+    "the megamorphic cache freeze",
+    IC_MEGA_MARKER,
     [
-      "${st}i64 porf_gc_idle_due(void) { return -1; }\n${st}void porf_gc_idle(void) {}\n",
-      "${st}i64 porf_gc_idle_due(void) { return -1; }\n${st}void porf_gc_idle(void) {}\n${st}void porf_gc_quiet(void) {}\n${st}void porf_gc_seal_heap(void) {}\n",
+      [
+        "let icMega: i32 = 0;\n",
+        "let icMega: i32 = 0;\n// " +
+          IC_MEGA_MARKER +
+          "\nlet icMegaFrozen: i32 = 0;\nexport const __Porffor_object_icFreezeMega = (): void => {\n  icMegaFrozen = 1;\n};\n",
+      ],
+      [
+        "export const __Porffor_object_icStoreMega = (shape: i32, hash: i32, holder: i32, i: i32, epoch: i32): void => {\n  if (icMega == 0) {\n",
+        "export const __Porffor_object_icStoreMega = (shape: i32, hash: i32, holder: i32, i: i32, epoch: i32): void => {\n  if (icMegaFrozen != 0) return;\n  if (icMega == 0) {\n",
+      ],
     ],
-  ]);
+  );
 }
 
 // --- group 3: alpha 21 runtime gaps the corpus hits ---
@@ -565,6 +716,7 @@ export async function ensurePorfforPatchedA21(root: string): Promise<void> {
   await patchStableEntryPath(root);
   await patchGcHooks(root);
   await patchCpuStamp(root);
+  await patchIcMegaFreeze(root);
   // Group 3: runtime gaps.
   await patchReservedSelect(root);
   await patchResponseStatics(root);
