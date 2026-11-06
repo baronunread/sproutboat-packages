@@ -31,6 +31,7 @@ import { closeSync, mkdtempSync, openSync, readFileSync, rmSync, statSync } from
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { ensurePorffor } from "../packages/toolchain/src/acquire";
+import { ensurePorfforA21 } from "../packages/toolchain/src/a21/acquire";
 
 const ROOT = resolve(import.meta.dir, "..");
 const PREFIX = "test:native-";
@@ -79,7 +80,15 @@ const timeoutMs = positiveInteger(process.env.NATIVE_TEST_TIMEOUT_MS, 600_000, "
 const scripts = nativeScripts(process.argv.slice(2));
 const env = { ...process.env };
 
-if (!env.SPROUTBOAT_PORFFOR_DIR && env.NATIVE_TEST_FRESH_PORFFOR !== "1") {
+if (env.SPROUTBOAT_PORFFOR_CHANNEL === "alpha-22") {
+  // SPROUTBOAT_PORFFOR_DIR overrides the alpha 22 compiler as well as the alpha 19 one (the standalone
+  // channel needs both trees), so pointing it at the alpha 19 tree would render with the wrong
+  // compiler. Warm both trees in the normal cache instead and let every script find them there.
+  const started = performance.now();
+  await ensurePorffor();
+  await ensurePorfforA21("alpha-22");
+  console.log(`Porffor alpha 19 and alpha 22 trees ready in ${seconds(started).toFixed(1)}s`);
+} else if (!env.SPROUTBOAT_PORFFOR_DIR && env.NATIVE_TEST_FRESH_PORFFOR !== "1") {
   const started = performance.now();
   env.SPROUTBOAT_PORFFOR_DIR = await ensurePorffor();
   console.log(`Porffor ready in ${seconds(started).toFixed(1)}s: ${env.SPROUTBOAT_PORFFOR_DIR}`);

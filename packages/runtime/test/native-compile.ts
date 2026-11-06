@@ -41,6 +41,8 @@ type UwsModule = {
   ensureUSocketsBuilt: (dir: string) => void;
 };
 
+let renderQueue: Promise<void> = Promise.resolve();
+
 type Channel = "alpha-19" | "alpha-22";
 
 const channel = (): Channel => {
@@ -122,16 +124,31 @@ export async function compileNative(input: NativeCompileInput): Promise<void> {
   await rm(work, { recursive: true, force: true });
   await mkdir(work, { recursive: true });
   const composed = composeStandaloneA21(await readFile(input.generated, "utf8"), alpha19);
-  await writeFile(join(work, SHARED_PRELUDE_FILE), composed.sharedPrelude);
-  const entry = join(work, "entry.a22.js");
-  await writeFile(entry, composed.entry);
-  const unitsDir = join(work, "units");
-  const render = Bun.spawn(
-    [bun, resolve(alpha22, "runtime/index.js"), "c", entry, "-o", `${unitsDir}/`, ...STANDALONE_A21_COMPILE_FLAGS],
-    { cwd: work, env: { ...process.env, ...input.env }, stdout: "pipe", stderr: "pipe" },
-  );
-  const rendered = await drain(render);
+  // Beside the generated module: its relative imports (a handler's sibling helper files) resolve from the
+  // directory of the file they were written in, and the shared prelude carries the module's body. The
+  // chain recognises the prelude by its file name, so a test that compiles several variants from one
+  // directory at once (native-websockets) takes turns: the render is the only step that reads it.
+  const source = dirname(resolve(input.generated));
+  const entry = join(source, "entry.a22.js");
+  const turn = renderQueue;
+  let release = () => {};
+  renderQueue = new Promise<void>((done) => (release = done));
+  await turn;
+  let rendered: Awaited<ReturnType<typeof drain>>;
+  try {
+    await writeFile(join(source, SHARED_PRELUDE_FILE), composed.sharedPrelude);
+    await writeFile(entry, composed.entry);
+    const unitsDir = join(work, "units");
+    const render = Bun.spawn(
+      [bun, resolve(alpha22, "runtime/index.js"), "c", entry, "-o", `${unitsDir}/`, ...STANDALONE_A21_COMPILE_FLAGS],
+      { cwd: work, env: { ...process.env, ...input.env }, stdout: "pipe", stderr: "pipe" },
+    );
+    rendered = await drain(render);
+  } finally {
+    release();
+  }
   if (rendered.exitCode !== 0) throw new Error(`${failure} (alpha 22 render):\n${rendered.stderr}\n${rendered.stdout}`);
+  const unitsDir = join(work, "units");
   await rm(input.binary, { force: true });
   await buildStandaloneA21({
     unitsDir,

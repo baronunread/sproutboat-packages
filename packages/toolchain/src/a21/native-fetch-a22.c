@@ -201,9 +201,13 @@ void sb_response_complete_js(f64 pending, f64 status, jsval head, jsval body, f6
   char* owned = NULL; const char* body_data = NULL;
   const int k = (int)kind;
   if (k == 2) {
-    // a Uint8Array over its whole buffer: [length, buffer] then the buffer\x27s [byteLength, bytes]
-    const u32 view = (u32)body.val; const u32 buffer = *(u32*)(MEM + view + 4);
-    body_data = (const char*)(MEM + buffer + 4); body_len = (size_t)*(u32*)(MEM + buffer);
+    // a Uint8Array (alpha 22 layout: [length, dataPtr, byteOffset, fixedLength]; dataPtr is the buffer
+    // object + 4 + byteOffset, and the buffer object is [byteLength, flags, bytes]). A length-tracking view
+    // stores -1 for its length: the bytes then run to the end of the buffer.
+    const u32 view = (u32)body.val; const u32 data = *(u32*)(MEM + view + 4), offset = *(u32*)(MEM + view + 8);
+    u32 length = *(u32*)(MEM + view);
+    if (length == 0xffffffffu) length = *(u32*)(MEM + (data - 4 - offset)) - offset;
+    body_data = (const char*)(MEM + data + 4); body_len = (size_t)length;
   } else if (raw) { owned = narrow(body, &body_len); body_data = owned; }
   else { if (read_fast(body, &body_data, &body_len, &owned) != 0) { body_data = ""; body_len = 0; } }
   porf_native_fetch_response_complete_flat((void*)(uintptr_t)pending, (i32)status, blob, blob_len, body_data, body_len, 0);
