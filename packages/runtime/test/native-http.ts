@@ -188,6 +188,13 @@ async function suite(port: number, label: string) {
     assert.equal(got[0].body.toString(), "n=close");
   }
 
+  // #236: an HTTP/1.0 request line (nginx's default proxy_http_version) is answered, not refused with 505.
+  {
+    const got = await exchange(port, [Buffer.from("GET /n/old HTTP/1.0\r\nHost: t\r\n\r\n")], 1);
+    assert.equal(got[0].status, 200, `${label}: HTTP/1.0 request status`);
+    assert.equal(got[0].body.toString(), "n=old", `${label}: HTTP/1.0 request body`);
+  }
+
   // 150 connections at once, 4 pipelined requests each, with garbage-heavy requests mixed in.
   {
     const results = await Promise.all(
