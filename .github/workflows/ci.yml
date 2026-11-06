@@ -45,8 +45,17 @@ jobs:
       - run: bun run test
 
   native:
+    name: native (${{ matrix.channel }})
     if: github.head_ref != 'changeset-release/main'
     runs-on: ubuntu-latest
+    # Standalone builds default to Porffor alpha 22; alpha 19 stays a fallback pin for one release
+    # (SPROUTBOAT_PORFFOR_CHANNEL=alpha-19), so both are tested until it is dropped.
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [alpha-22, alpha-19]
+    env:
+      SPROUTBOAT_PORFFOR_CHANNEL: ${{ matrix.channel }}
     steps:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
@@ -65,7 +74,7 @@ jobs:
           path: |
             ~/.cache/sproutboat/porffor-*
             ~/.cache/porffor/deps
-          key: porffor-${{ runner.os }}-${{ hashFiles('packages/toolchain/package.json', 'packages/toolchain/src/*.ts', 'packages/toolchain/vendor/**') }}
+          key: porffor-${{ matrix.channel }}-${{ runner.os }}-${{ hashFiles('packages/toolchain/package.json', 'packages/toolchain/src/**/*.ts', 'packages/toolchain/src/**/*.c', 'packages/toolchain/src/**/*.js', 'packages/toolchain/vendor/**') }}
       # BearSSL is read from vendor/bearssl (sha256-pinned in packages/toolchain/src/deps.ts), so this
       # job needs no network for it; bearssl.org is only a fallback.
       # Every test:native-* script, 4 at a time (scripts/test-native.ts).

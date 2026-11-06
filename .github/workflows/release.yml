@@ -53,6 +53,10 @@ jobs:
       # used to run one by one. Running all of them is also what lets ci.yml skip
       # the "Version Packages" PR this job opens.
       - run: bun run test:native
+      # The alpha 19 fallback pin for standalone builds (alpha 22 is the default), for one release.
+      - run: bun run test:native
+        env:
+          SPROUTBOAT_PORFFOR_CHANNEL: alpha-19
       - name: Version or publish
         uses: changesets/action@v1
         with:

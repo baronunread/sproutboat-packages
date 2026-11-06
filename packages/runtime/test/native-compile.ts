@@ -10,6 +10,7 @@ import {
   STANDALONE_A21_COMPILE_FLAGS,
 } from "../../toolchain/src/a21/standalone";
 import { buildStandaloneA21 } from "../../toolchain/src/a21/standalone-build";
+import { standaloneChannel } from "../../toolchain/src/a21/standalone-channel";
 import { bearsslEnv } from "./bearssl";
 
 export type NativeCompileInput = {
@@ -43,14 +44,7 @@ type UwsModule = {
 
 let renderQueue: Promise<void> = Promise.resolve();
 
-type Channel = "alpha-19" | "alpha-22";
-
-const channel = (): Channel => {
-  const raw = process.env.SPROUTBOAT_PORFFOR_CHANNEL;
-  if (!raw || raw === "alpha-19") return "alpha-19";
-  if (raw === "alpha-22") return "alpha-22";
-  throw new Error(`SPROUTBOAT_PORFFOR_CHANNEL=${raw}: expected alpha-19 or alpha-22`);
-};
+const channel = () => standaloneChannel();
 
 const split = (flags: string | undefined): string[] => (flags ?? "").split(" ").filter(Boolean);
 
@@ -83,7 +77,7 @@ async function uwsDirectory(alpha19: string): Promise<string> {
   return dir;
 }
 
-/** Compile a generated module into a native binary on the channel `SPROUTBOAT_PORFFOR_CHANNEL` names. */
+/** Compile a generated module into a native binary on the standalone channel (alpha 22 by default, `SPROUTBOAT_PORFFOR_CHANNEL=alpha-19` for the fallback). */
 export async function compileNative(input: NativeCompileInput): Promise<void> {
   const which = channel();
   const dir = input.dir ?? dirname(input.binary);

@@ -32,6 +32,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { ensurePorffor } from "../packages/toolchain/src/acquire";
 import { ensurePorfforA21 } from "../packages/toolchain/src/a21/acquire";
+import { standaloneChannel } from "../packages/toolchain/src/a21/standalone-channel";
 
 const ROOT = resolve(import.meta.dir, "..");
 const PREFIX = "test:native-";
@@ -80,7 +81,7 @@ const timeoutMs = positiveInteger(process.env.NATIVE_TEST_TIMEOUT_MS, 600_000, "
 const scripts = nativeScripts(process.argv.slice(2));
 const env = { ...process.env };
 
-if (env.SPROUTBOAT_PORFFOR_CHANNEL === "alpha-22") {
+if (standaloneChannel(env) === "alpha-22") {
   // SPROUTBOAT_PORFFOR_DIR overrides the alpha 22 compiler as well as the alpha 19 one (the standalone
   // channel needs both trees), so pointing it at the alpha 19 tree would render with the wrong
   // compiler. Warm both trees in the normal cache instead and let every script find them there.
