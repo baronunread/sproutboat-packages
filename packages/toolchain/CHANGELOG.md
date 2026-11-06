@@ -1,5 +1,21 @@
 # @sproutboat/toolchain
 
+## 0.24.0
+
+### Minor Changes
+
+- 0fec619: toolchain: a Porffor alpha 21 channel (`@sproutboat/toolchain/a21`: pin, patch chain, fingerprint) beside the alpha 19 default. Nothing changes for existing callers; sproutd's alpha 21 generation is the first user. The chain keeps the 7 alpha 19 passes that still have a failing case on stock alpha 21, adds the determinism passes P1 to P6 from the alpha 21 gates (class functions stay in their module's unit, app units last with pinned ABI regions, content-ordered data with string-tie dedupe, prelude-declared names override runtime globals, stable derived names, app-owned globals and inits last), `Response.redirect` and `Response.error`, and `select` as a reserved C name.
+- bbc1e12: toolchain: standalone binaries now build with Porffor alpha 22 by default. Binaries are about 5% smaller (hello 6.58 to 6.27 MB, linux-x64, static musl), and apps using jose, yaml, supabase-js and Neon (HTTP and `Pool` over WebSocket) work in a standalone binary on alpha 22, checked route by route against the same apps on alpha 19 and on Bun. Measured against alpha 19 on the same box: idle memory 3 to 7% lower, requests per second 5 to 15% lower, p50 latency 3 to 8% higher, p95 up to about 30% (5 to 8 µs) higher on a request-heavy app.
+  
+  The compiler changes, so every app is rebuilt on its next build. **Fallback:** `SPROUTBOAT_PORFFOR_CHANNEL=alpha-19` builds with the previous alpha 19 compiler for one more release; it will then be removed. `standaloneChannel()` in `@sproutboat/toolchain/a21` resolves the channel (default `alpha-22`); the root export's pin stays alpha 19 for its other callers.
+  
+  How it is built: the generated module is composed in sproutd's worker shape (`composeStandaloneA21`: preamble, the alpha 19 web classes, the dispatch shim; no Node runtime module is linked, and Node's `process`, `setImmediate` and `global` stay absent as on alpha 19), served by the alpha 19 uWebSockets shim over an alpha 22 native-fetch bridge (`native-fetch-a22.c`, request headers built and response read in place), and built by `buildStandaloneA21` (host or zig musl, LTO); `compileStandaloneHostA21` does a host build for tests and tools. The bridge sends the right `Content-Length` for a `Uint8Array` response body. The a21 chain gains P9: `JSON.parse` of a large document with non-Latin-1 strings no longer exhausts the heap.
+
+### Patch Changes
+
+- 8b52acf: toolchain a21: the fork template's heap is immortal in its workers. `porf_gc_seal_heap` now seals every page the template filled (small and span), pre-sets their mark bits and records the template top; a worker's full collection neither clears nor sets a sealed page's bits nor sweeps it, finds what template objects came to reference through sticky cards (never cleared below the template top, scanned by every collection), and a raw mark no longer writes an already-set bit. The megamorphic inline cache can be frozen (`__Porffor_object_icFreezeMega`, called by sproutd's template after its warm-up) so workers read the template's entries and never write one. Measured on sproutd's alpha 21 generation (M6 density gate): a worker's private memory after its first request and collection drops from 660 to 448 KiB. Nothing changes for the alpha 19 channel.
+- 8e1097d: toolchain a21: the Porffor alpha 22 pin (`PORFFOR_A21_PINS["alpha-22"]`, commit a081ebd7, codeload tarball sha256 b32ed03a…) runs through the same chain; the pin a tree is on is read from the tree (`channelOfTree`), so alpha 21 stays reproducible from its archive. Every alpha 21 pass anchors unchanged on alpha 22; one pass is new and alpha 22 only, P8: the shared dispatch functions alpha 22's codegen generates for calls and indexed reads on untyped receivers (135fda29) belong to the unit that asked for them and are named by method and arity, instead of landing in `main` as `#anonymous_1`, `_1_`, … in creation order, which put every app's first use of a method into the shared prefix. Nothing changes for the alpha 19 channel or for alpha 21 trees.
+
 ## 0.23.1
 
 ### Patch Changes
