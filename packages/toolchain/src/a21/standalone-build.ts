@@ -73,6 +73,18 @@ export type StandaloneBuildInput = {
   log?: (line: string) => void;
 };
 
+export const HTTP10_SHIM_STAMP = "sproutboat #236 (alpha 22): compiled against an HttpParser.h that accepts HTTP/1.0";
+
+/** Apply the alpha 19 tree's HTTP/1.0 edit (#236) to a uWebSockets checkout; a no-op once it is applied. */
+export async function patchUwsHttp10(alpha19Root: string, uwsDir: string): Promise<void> {
+  const helper = join(alpha19Root, "compiler/sb-http10.js");
+  if (!existsSync(helper)) throw new Error(`no ${helper}: the alpha 19 tree is not patched for HTTP/1.0 (#236)`);
+  // SAFETY: compiler/sb-http10.js is written by the toolchain's own patch chain (patch.ts HTTP10_HELPER)
+  // and exports sbPatchHttp10(uwsDir); its presence was checked above.
+  const mod = (await import(helper)) as { sbPatchHttp10: (dir: string) => void };
+  mod.sbPatchHttp10(uwsDir);
+}
+
 const sha = (s: string) => createHash("sha256").update(s).digest("hex").slice(0, 16);
 
 async function run(argv: string[], cwd?: string): Promise<void> {
@@ -145,7 +157,16 @@ export async function buildStandaloneA21(input: StandaloneBuildInput): Promise<v
   // sources: the compiler's units, the bridge, the shim
   const unitFiles = (await readdir(units)).filter((f) => f.endsWith(".c")).sort();
   await writeFile(join(units, "porf_native_fetch_a22.c"), bridgeSource);
-  await writeFile(join(units, "porf_server.cpp"), await standaloneShimSource(input.alpha19Root));
+  // sproutboat #236: uWebSockets answers an HTTP/1.0 request line with 505 unless HttpParser.h is
+  // edited. The alpha 19 compiler makes that edit inside its own native-fetch compile, which this build
+  // never runs, so it applies the same marker-guarded edit (the patched tree's compiler/sb-http10.js) to
+  // the checkout it compiles against. Objects are stamped by their own text, not by the headers they
+  // include, so the shim names the edit: a shim compiled against an unedited header is not reused.
+  await patchUwsHttp10(input.alpha19Root, input.uwsDir);
+  await writeFile(
+    join(units, "porf_server.cpp"),
+    `// ${HTTP10_SHIM_STAMP}\n` + (await standaloneShimSource(input.alpha19Root)),
+  );
   const sources = [
     ...unitFiles.map((f) => join(units, f)),
     join(units, "porf_native_fetch_a22.c"),
