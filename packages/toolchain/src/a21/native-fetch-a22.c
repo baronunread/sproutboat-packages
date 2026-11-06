@@ -131,43 +131,98 @@ void porf_native_fetch_drain_microtasks(void) {
   SB_LEAVE
 }
 
-// --- the request: the shim's flat parts go to the dispatch shim; the reply comes back below ---
+// --- the request: the shim\x27s flat parts go to the dispatch shim; the reply comes back below ---
+// The headers arrive as one name\0value\0 blob and become the flat [name, value, ...] list the alpha 19
+// Headers class keeps (Headers._entries), built here rather than split in JS. The array and its strings
+// are reachable from this frame (the conservative scan runs from the stack pointer to the anchor), so a
+// collection inside one of these allocations keeps them.
+static jsval header_list(const char* head, size_t head_len) {
+  i32 n = 0;
+  for (size_t i = 0; i < head_len; i++) if (!head[i]) n++;
+  const u32 a = porf_arr_new(n, n);
+  size_t at = 0;
+  for (i32 i = 0; i < n && at < head_len; i++) {
+    const char* s = head + at;
+    const size_t len = strnlen(s, head_len - at);
+    porf_arr_set(a, (u32)i, porf_bstr_of(s, (u32)len));
+    at += len + 1;
+  }
+  return (jsval){ (f64)a, 72 };
+}
 void porf_native_fetch_dispatch_flat(void* pending, const char* method, size_t method_len, const char* url, size_t url_len, const char* head, size_t head_len, const char* body, size_t body_len) {
   SB_ENTER
-  jsval m = porf_bstr_of(method, (u32)method_len), u = porf_bstr_of(url, (u32)url_len), h = porf_bstr_of(head, (u32)head_len), b = porf_bstr_of(body, (u32)body_len);
+  jsval m = porf_bstr_of(method, (u32)method_len), u = porf_bstr_of(url, (u32)url_len), h = header_list(head, head_len), b = porf_bstr_of(body, (u32)body_len);
   jsbits argv[5] = { porf_pack(porf_box_num((f64)(uintptr_t)pending)), porf_pack(m), porf_pack(u), porf_pack(h), porf_pack(b) };
   (void)porf_call_dynamic(sb_dispatch_fn, JV_UNDEFINED, JV_UNDEFINED, 5, argv);
   activity();
   SB_LEAVE
 }
-// The shim's response parts (standalone-dispatch.js __sbComplete): status, a name\0value\0 head and a
-// body that is a string to send as UTF-8 (kind 0), a Latin-1 string whose characters are the bytes
-// (kind 1, x-sb-raw-body) or a Uint8Array (kind 2). The server borrows the data until it returns.
+// A string read for the reply: an ASCII bytestring where it lies (valid until the next allocation; the
+// server copies before any), anything else UTF-8 encoded into a malloc the caller frees (alpha 19\x27s
+// sb_read_value_fast, moved from the shim into the bridge).
+static int read_fast(jsval v, const char** out, size_t* len, char** owned) {
+  *owned = NULL;
+  if (v.type == 195) {
+    const u32 ptr = (u32)v.val;
+    const size_t n = (size_t)*(u32*)(MEM + ptr);
+    const unsigned char* units = (const unsigned char*)(MEM + ptr + 4);
+    size_t i = 0;
+    for (; i < n; i++) if (units[i] >= 0x80) break;
+    if (i == n) { *out = (const char*)units; *len = n; return 0; }
+  }
+  return porf_native_fetch_read_value(v, out, len, owned);
+}
+static int name_is(const char* s, size_t n, const char* lit) { const size_t l = strlen(lit); return n == l && memcmp(s, lit, l) == 0; }
+// The dispatch shim\x27s response parts (standalone-dispatch.js __sbComplete): status, the flat header
+// list and a body that is a string (kind 0; Latin-1 bytes when the list carries x-sb-raw-body) or a
+// Uint8Array (kind 2). The hop-by-hop names and the internal x-sb-raw-body never reach the wire. The
+// server borrows the data until it returns.
 void sb_response_complete_js(f64 pending, f64 status, jsval head, jsval body, f64 kind) {
   SB_ENTER
-  size_t head_len = 0, body_len = 0;
-  char* head_text = narrow(head, &head_len);
+  const u32 list = (u32)head.val;
+  const u32 n = head.type == 72 ? (u32)PORF_ARR_LEN(list) : 0;
+  size_t cap = 256, blob_len = 0;
+  char* blob = (char*)malloc(cap);
+  if (!blob) abort();
+  int raw = 0;
+  for (u32 i = 0; i + 1 < n; i += 2) {
+    const char* name; size_t name_len; char* name_owned;
+    const char* value; size_t value_len; char* value_owned;
+    if (read_fast(porf_arr_get(list, i), &name, &name_len, &name_owned) != 0) continue;
+    if (name_is(name, name_len, "x-sb-raw-body")) { raw = 1; free(name_owned); continue; }
+    if (name_is(name, name_len, "connection") || name_is(name, name_len, "content-length") || name_is(name, name_len, "transfer-encoding")) { free(name_owned); continue; }
+    if (read_fast(porf_arr_get(list, i + 1), &value, &value_len, &value_owned) != 0) { free(name_owned); continue; }
+    if (blob_len + name_len + value_len + 2 > cap) { while (blob_len + name_len + value_len + 2 > cap) cap *= 2; blob = (char*)realloc(blob, cap); if (!blob) abort(); }
+    memcpy(blob + blob_len, name, name_len); blob_len += name_len; blob[blob_len++] = 0;
+    memcpy(blob + blob_len, value, value_len); blob_len += value_len; blob[blob_len++] = 0;
+    free(name_owned); free(value_owned);
+  }
+  size_t body_len = 0;
   char* owned = NULL; const char* body_data = NULL;
   const int k = (int)kind;
   if (k == 2) {
-    // a Uint8Array over its whole buffer: [length, buffer] then the buffer's [byteLength, bytes]
+    // a Uint8Array over its whole buffer: [length, buffer] then the buffer\x27s [byteLength, bytes]
     const u32 view = (u32)body.val; const u32 buffer = *(u32*)(MEM + view + 4);
     body_data = (const char*)(MEM + buffer + 4); body_len = (size_t)*(u32*)(MEM + buffer);
-  } else if (k == 1) { owned = narrow(body, &body_len); body_data = owned; }
-  else { if (porf_native_fetch_read_value(body, &body_data, &body_len, &owned) != 0) { body_data = ""; body_len = 0; } }
-  porf_native_fetch_response_complete_flat((void*)(uintptr_t)pending, (i32)status, head_text, head_len, body_data, body_len, 0);
-  free(owned); free(head_text);
+  } else if (raw) { owned = narrow(body, &body_len); body_data = owned; }
+  else { if (read_fast(body, &body_data, &body_len, &owned) != 0) { body_data = ""; body_len = 0; } }
+  porf_native_fetch_response_complete_flat((void*)(uintptr_t)pending, (i32)status, blob, blob_len, body_data, body_len, 0);
+  free(owned); free(blob);
   activity();
   SB_LEAVE
 }
 
 // --- collections, paced by the shim (every N replies, a 50 ms idle tick, a 500 ms quiet timer) ---
 void porf_native_fetch_collect_normal(void) { porf_gc_collect(1); }
+static int gc_debug = -1;
+static unsigned normal_collections;
 void porf_native_fetch_collect_normal_from(void* stack_top) {
   void* prev = porf_c_stack_top;
   if (!prev) porf_c_stack_top = stack_top;
   porf_gc_collect(1);
   porf_c_stack_top = prev;
+  if (gc_debug < 0) gc_debug = getenv("SB_GC_DEBUG") != NULL;
+  if (gc_debug && (++normal_collections % 64u) == 1u) fprintf(stderr, "sb gc: collection %u: live %llu bytes, free pages %u, heap top %u\n", normal_collections, (unsigned long long)porf_gc_last_live_bytes, porf_gc_free_page_count, porf_heap_top);
 }
 #ifndef SB_QUIET_IDLE_MS
 #define SB_QUIET_IDLE_MS 400
@@ -176,16 +231,16 @@ int porf_native_fetch_needs_quiet_collect(void) { return 1; }
 // The full collection that gives free pages back (the toolchain's porf_gc_quiet), once the server has
 // had no request, timer or reply for SB_QUIET_IDLE_MS: run between requests under steady load it made
 // every request fault back the pages the previous tick returned (sproutd #32).
-static int gc_debug = -1;
 void porf_native_fetch_collect_quiet_from(void* stack_top) {
   if (gc_debug < 0) gc_debug = getenv("SB_GC_DEBUG") != NULL;
   const long long q = quiet_ms();
   if (q < SB_QUIET_IDLE_MS) { if (gc_debug) fprintf(stderr, "sb gc: quiet skipped (%lld ms since the last request)\n", q); return; }
   void* prev = porf_c_stack_top;
   if (!prev) porf_c_stack_top = stack_top;
+  const u64 live0 = porf_gc_last_live_bytes, free0 = porf_gc_free_page_count;
   porf_gc_quiet();
   porf_c_stack_top = prev;
-  if (gc_debug) fprintf(stderr, "sb gc: quiet collection (%lld ms since the last request)\n", q);
+  if (gc_debug) fprintf(stderr, "sb gc: quiet collection (%lld ms since the last request): live %llu -> %llu bytes, free pages %llu -> %llu, heap top %u base %u\n", q, (unsigned long long)live0, (unsigned long long)porf_gc_last_live_bytes, (unsigned long long)free0, (unsigned long long)porf_gc_free_page_count, porf_heap_top, porf_heap_base);
 }
 int porf_native_fetch_should_collect(void) { return 0; }
 

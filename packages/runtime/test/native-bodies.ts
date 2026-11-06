@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import { ensurePorffor } from "../../toolchain/src/acquire";
+import { join } from "node:path";
+import { compileNative } from "./native-compile";
 import { preludePath, TRANSPORT_MARKER, transportPath, wrapNativeFetchHandler } from "../src/wrap";
 
 // Bodies on the wire and the Fetch classes, against Bun: byte bodies go out as their bytes
@@ -80,14 +80,7 @@ function freePort(): number {
 const workdir = await mkdtemp(join(tmpdir(), "sb-native-bodies-"));
 let server: ReturnType<typeof Bun.spawn> | undefined;
 try {
-  const porffor = await ensurePorffor();
-  const node = Bun.which("node");
-  if (!node) throw new Error("native streams test needs node on PATH");
-
-  const [core, broker] = await Promise.all([
-    readFile(preludePath, "utf8"),
-    readFile(transportPath("broker"), "utf8"),
-  ]);
+  const [core, broker] = await Promise.all([readFile(preludePath, "utf8"), readFile(transportPath("broker"), "utf8")]);
   assert(core.includes(TRANSPORT_MARKER), "runtime prelude is missing its transport marker");
   const prelude = core.replace(TRANSPORT_MARKER, broker);
   const generated = join(workdir, "bodies.generated.js");
@@ -95,18 +88,7 @@ try {
   await writeFile(generated, wrapNativeFetchHandler(handler, prelude, undefined, undefined, undefined, "2026-10-21"));
   await rm(binary, { force: true });
 
-  const compile = Bun.spawn([node, resolve(porffor, "runtime/index.js"), "native", generated, "-o", binary, "-s", "-O0"], {
-    cwd: workdir,
-    env: process.env,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const [exitCode, stdout, stderr] = await Promise.all([
-    compile.exited,
-    new Response(compile.stdout).text(),
-    new Response(compile.stderr).text(),
-  ]);
-  assert.equal(exitCode, 0, `Porffor native compile failed:\n${stderr}\n${stdout}`);
+  await compileNative({ generated, binary, dir: workdir });
 
   const port = freePort();
   server = Bun.spawn([binary], {
@@ -142,7 +124,9 @@ try {
   const form = await fetch(`http://127.0.0.1:${port}/form`);
   const boundary = (form.headers.get("content-type") || "").split("boundary=")[1];
   assert(boundary, "multipart content type");
-  const parsed = await new Response(await form.arrayBuffer(), { headers: { "content-type": `multipart/form-data; boundary=${boundary}` } }).formData();
+  const parsed = await new Response(await form.arrayBuffer(), {
+    headers: { "content-type": `multipart/form-data; boundary=${boundary}` },
+  }).formData();
   assert.equal(parsed.get("a"), "1");
   const file = parsed.get("f");
   assert(file instanceof File, "the file part parses back as a File");
@@ -153,11 +137,20 @@ try {
   const got = JSON.parse(await (await fetch(`http://127.0.0.1:${port}/cases`)).text()) as string[];
   const want: string[] = [];
   // SAFETY: CASE_SOURCES is the handler's own literal list of case functions.
-  const reference = new Function(`return (() => { ${CASE_SOURCES} return cases; })()`)() as Array<() => Promise<string> | string>;
+  const reference = new Function(`return (() => { ${CASE_SOURCES} return cases; })()`)() as Array<
+    () => Promise<string> | string
+  >;
   for (const run of reference) {
-    try { want.push(String(await run())); } catch (e) { want.push("THROWS " + (e instanceof Error ? e.name : String(e))); }
+    try {
+      want.push(String(await run()));
+    } catch (e) {
+      want.push("THROWS " + (e instanceof Error ? e.name : String(e)));
+    }
   }
-  assert.deepEqual(got, want.map((w) => (w.startsWith("workerd:") ? "workerd:TypeError" : w)));
+  assert.deepEqual(
+    got,
+    want.map((w) => (w.startsWith("workerd:") ? "workerd:TypeError" : w)),
+  );
   console.log(`Native bodies are sent as bytes and ${want.length} Fetch class cases match Bun`);
 } finally {
   if (server) {

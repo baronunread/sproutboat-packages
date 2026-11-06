@@ -11,17 +11,21 @@ function __sbBuildRequest(method, url, headersBlob, body) {
   request.url = url;
   request.method = method;
   const headers = Object.create(Headers.prototype);
-  const entries = [];
-  let i = 0;
-  const n = headersBlob.length;
-  while (i < n) {
-    const a = headersBlob.indexOf("\0", i);
-    const b = headersBlob.indexOf("\0", a + 1);
-    entries.push(headersBlob.slice(i, a));
-    entries.push(headersBlob.slice(a + 1, b));
-    i = b + 1;
-  }
-  headers._entries = entries;
+  // The standalone bridge (native-fetch-a22.c) builds the flat [name, value, ...] list in C; a host
+  // that passes one name\0value\0 blob (sproutd, the naive host) gets it split here.
+  if (typeof headersBlob === "string") {
+    const entries = [];
+    let i = 0;
+    const n = headersBlob.length;
+    while (i < n) {
+      const a = headersBlob.indexOf("\0", i);
+      const b = headersBlob.indexOf("\0", a + 1);
+      entries.push(headersBlob.slice(i, a));
+      entries.push(headersBlob.slice(a + 1, b));
+      i = b + 1;
+    }
+    headers._entries = entries;
+  } else headers._entries = headersBlob;
   request.headers = headers;
   request.body = body;
   return request;
@@ -31,10 +35,12 @@ function __sbCompleteNative(pending, status, head, body, kind) {
   // oxlint-disable-next-line no-unused-expressions -- inline C.
   Porffor.c`sb_response_complete_js(SB_NUM(pending), SB_NUM(status), head, body, SB_NUM(kind));`;
 }
-// kind: 0 a string sent as UTF-8, 1 a Latin-1 string whose characters are the bytes, 2 a Uint8Array.
+// head: the response headers as the flat [name, value, ...] list (the bridge reads it in place, drops
+// x-sb-raw-body and the hop-by-hop names, and treats a string body as Latin-1 bytes when x-sb-raw-body
+// is set); kind: 0 a string, 2 a Uint8Array.
 function __sbSerialize(value, rejected) {
   let status = 500;
-  let head = "";
+  let head = [];
   let body = "compiled app promise rejected";
   let kind = 0;
   if (!rejected) {
@@ -43,16 +49,7 @@ function __sbSerialize(value, rejected) {
       status = response.status | 0;
       let entries = response.headers._entries;
       if (typeof entries === "function") entries = entries.call(response.headers);
-      let raw = false;
-      for (let i = 0; i < entries.length; i += 2) {
-        const name = entries[i];
-        if (name === "x-sb-raw-body") {
-          raw = true;
-          continue;
-        }
-        if (name === "connection" || name === "content-length" || name === "transfer-encoding") continue;
-        head += name + "\0" + entries[i + 1] + "\0";
-      }
+      head = entries;
       let b = response._bodyInit !== undefined ? response._bodyInit : response.body;
       if (b instanceof ArrayBuffer) {
         body = new Uint8Array(b);
@@ -66,11 +63,11 @@ function __sbSerialize(value, rejected) {
         kind = 2;
       } else {
         body = b == null ? "" : String(b);
-        kind = raw ? 1 : 0;
+        kind = 0;
       }
     } catch (error) {
       status = 500;
-      head = "";
+      head = [];
       body = "Internal Server Error: " + (error && error.message ? error.message : String(error));
       kind = 0;
     }

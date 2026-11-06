@@ -9,3 +9,4 @@ export * from "./acquire";
 export * from "./standalone";
 export * from "./standalone-shim";
 export * from "./standalone-build";
+export * from "./standalone-host";

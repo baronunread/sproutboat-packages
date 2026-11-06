@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import { ensurePorffor } from "../../toolchain/src/acquire";
+import { join } from "node:path";
+import { compileNative } from "./native-compile";
 import { preludePath, TRANSPORT_MARKER, transportPath, wrapNativeFetchHandler } from "../src/wrap";
 
 // URL as WHATWG defines it (Bun's URL is the reference): base URLs, setters on every
@@ -84,14 +84,7 @@ function freePort(): number {
 const workdir = await mkdtemp(join(tmpdir(), "sb-native-url-"));
 let server: ReturnType<typeof Bun.spawn> | undefined;
 try {
-  const porffor = await ensurePorffor();
-  const node = Bun.which("node");
-  if (!node) throw new Error("native streams test needs node on PATH");
-
-  const [core, broker] = await Promise.all([
-    readFile(preludePath, "utf8"),
-    readFile(transportPath("broker"), "utf8"),
-  ]);
+  const [core, broker] = await Promise.all([readFile(preludePath, "utf8"), readFile(transportPath("broker"), "utf8")]);
   assert(core.includes(TRANSPORT_MARKER), "runtime prelude is missing its transport marker");
   const prelude = core.replace(TRANSPORT_MARKER, broker);
   const generated = join(workdir, "url.generated.js");
@@ -99,18 +92,7 @@ try {
   await writeFile(generated, wrapNativeFetchHandler(handler, prelude));
   await rm(binary, { force: true });
 
-  const compile = Bun.spawn([node, resolve(porffor, "runtime/index.js"), "native", generated, "-o", binary, "-s", "-O0"], {
-    cwd: workdir,
-    env: process.env,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const [exitCode, stdout, stderr] = await Promise.all([
-    compile.exited,
-    new Response(compile.stdout).text(),
-    new Response(compile.stderr).text(),
-  ]);
-  assert.equal(exitCode, 0, `Porffor native compile failed:\n${stderr}\n${stdout}`);
+  await compileNative({ generated, binary, dir: workdir });
 
   const port = freePort();
   server = Bun.spawn([binary], {
@@ -133,9 +115,17 @@ try {
   // SAFETY: the handler above is the only producer of this body: a JSON array with one
   // string per case; the comparison below reports any entry that differs.
   const got = JSON.parse(await (await fetch(`http://127.0.0.1:${port}/`)).text()) as string[];
-  const diffs = CASES.flatMap((c, i) => (got[i] === want[i] ? [] : [`${c}\n    want ${JSON.stringify(want[i])}\n    got  ${JSON.stringify(got[i])}`]));
-  assert.deepEqual(diffs, [], `URL differs from WHATWG in ${diffs.length} of ${CASES.length} cases:\n${diffs.join("\n")}`);
-  console.log(`Native URL matches WHATWG URL in all ${CASES.length} cases: base URLs, setters, hash, ports, dot segments, encoding, searchParams`);
+  const diffs = CASES.flatMap((c, i) =>
+    got[i] === want[i] ? [] : [`${c}\n    want ${JSON.stringify(want[i])}\n    got  ${JSON.stringify(got[i])}`],
+  );
+  assert.deepEqual(
+    diffs,
+    [],
+    `URL differs from WHATWG in ${diffs.length} of ${CASES.length} cases:\n${diffs.join("\n")}`,
+  );
+  console.log(
+    `Native URL matches WHATWG URL in all ${CASES.length} cases: base URLs, setters, hash, ports, dot segments, encoding, searchParams`,
+  );
 } finally {
   if (server) {
     server.kill(9);

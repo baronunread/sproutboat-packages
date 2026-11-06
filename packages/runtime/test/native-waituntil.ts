@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import { ensurePorffor } from "../../toolchain/src/acquire";
+import { join } from "node:path";
+import { compileNative } from "./native-compile";
 import { preludePath, TRANSPORT_MARKER, transportPath, wrapNativeFetchHandler } from "../src/wrap";
 
 // ctx.waitUntil work runs after the response, as in workerd: the response does not wait
@@ -32,14 +32,7 @@ function freePort(): number {
 const workdir = await mkdtemp(join(tmpdir(), "sb-native-waituntil-"));
 let server: ReturnType<typeof Bun.spawn> | undefined;
 try {
-  const porffor = await ensurePorffor();
-  const node = Bun.which("node");
-  if (!node) throw new Error("native streams test needs node on PATH");
-
-  const [core, broker] = await Promise.all([
-    readFile(preludePath, "utf8"),
-    readFile(transportPath("broker"), "utf8"),
-  ]);
+  const [core, broker] = await Promise.all([readFile(preludePath, "utf8"), readFile(transportPath("broker"), "utf8")]);
   assert(core.includes(TRANSPORT_MARKER), "runtime prelude is missing its transport marker");
   const prelude = core.replace(TRANSPORT_MARKER, broker);
   const generated = join(workdir, "waituntil.generated.js");
@@ -47,18 +40,7 @@ try {
   await writeFile(generated, wrapNativeFetchHandler(handler, prelude, undefined, undefined, undefined, "2026-10-01"));
   await rm(binary, { force: true });
 
-  const compile = Bun.spawn([node, resolve(porffor, "runtime/index.js"), "native", generated, "-o", binary, "-s", "-O0"], {
-    cwd: workdir,
-    env: process.env,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const [exitCode, stdout, stderr] = await Promise.all([
-    compile.exited,
-    new Response(compile.stdout).text(),
-    new Response(compile.stderr).text(),
-  ]);
-  assert.equal(exitCode, 0, `Porffor native compile failed:\n${stderr}\n${stdout}`);
+  await compileNative({ generated, binary, dir: workdir });
 
   const port = freePort();
   server = Bun.spawn([binary], {
@@ -97,7 +79,9 @@ try {
   assert.equal(await cron.text(), "");
   assert.equal(await (await fetch(`http://127.0.0.1:${port}/cron`)).text(), "*/5 * * * *");
   assert.equal(server.exitCode, null, "the server exited after a scheduled trigger");
-  console.log(`Native waitUntil runs after the response (${Math.round(elapsed)} ms) and completes; scheduled() answers 204`);
+  console.log(
+    `Native waitUntil runs after the response (${Math.round(elapsed)} ms) and completes; scheduled() answers 204`,
+  );
 } finally {
   if (server) {
     server.kill(9);

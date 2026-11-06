@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import { ensurePorffor } from "../../toolchain/src/acquire";
+import { join } from "node:path";
+import { compileNative } from "./native-compile";
 import { createBroker, listen } from "../../wire/src/broker";
 import { EMPTY_BINDINGS, preludePath, TRANSPORT_MARKER, transportPath, wrapNativeFetchHandler } from "../src/wrap";
 
@@ -54,10 +54,6 @@ const broker = createBroker({
 const brokerServer = listen(broker, "127.0.0.1", 0);
 let server: ReturnType<typeof Bun.spawn> | undefined;
 try {
-  const porffor = await ensurePorffor({ cacheRoot: workdir });
-  const node = Bun.which("node");
-  if (!node) throw new Error("native UTF-8 test needs node on PATH");
-
   const [core, transport] = await Promise.all([
     readFile(preludePath, "utf8"),
     readFile(transportPath("broker"), "utf8"),
@@ -65,20 +61,12 @@ try {
   assert(core.includes(TRANSPORT_MARKER), "runtime prelude is missing its transport marker");
   const generated = join(workdir, "utf8.generated.js");
   const binary = join(workdir, "utf8-native");
-  await writeFile(generated, wrapNativeFetchHandler(handler, core.replace(TRANSPORT_MARKER, transport), {}, bindings, undefined, "2026-10-21"));
+  await writeFile(
+    generated,
+    wrapNativeFetchHandler(handler, core.replace(TRANSPORT_MARKER, transport), {}, bindings, undefined, "2026-10-21"),
+  );
 
-  const compile = Bun.spawn([node, resolve(porffor, "runtime/index.js"), "native", generated, "-o", binary, "-s", "-O0"], {
-    cwd: workdir,
-    env: process.env,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const [exitCode, stdout, stderr] = await Promise.all([
-    compile.exited,
-    new Response(compile.stdout).text(),
-    new Response(compile.stderr).text(),
-  ]);
-  assert.equal(exitCode, 0, `Porffor native compile failed:\n${stderr}\n${stdout}`);
+  await compileNative({ generated, binary, dir: workdir, cacheRoot: workdir });
 
   const port = freePort();
   server = Bun.spawn([binary], {
@@ -121,8 +109,14 @@ try {
   assert.match(body.error, /tabellà/);
   assert.equal(body.url, "shadowed");
   const stored = await (await fetch(`http://127.0.0.1:${port}/`, { method: "POST", body: "uploaded é" })).json();
-  assert.deepEqual(stored, { r2: "uploaded é", kv: "uploaded é", stream: "uploaded é" }, "put(key, request.body) stores the request body, and body reads as UTF-8");
-  console.log("Non-ASCII KV, D1 and error text round-trip through the broker; a handler-level URL stays scoped; put(key, request.body) stores the body");
+  assert.deepEqual(
+    stored,
+    { r2: "uploaded é", kv: "uploaded é", stream: "uploaded é" },
+    "put(key, request.body) stores the request body, and body reads as UTF-8",
+  );
+  console.log(
+    "Non-ASCII KV, D1 and error text round-trip through the broker; a handler-level URL stays scoped; put(key, request.body) stores the body",
+  );
 } finally {
   if (server) {
     server.kill(9);
