@@ -134,3 +134,18 @@ __Porffor_promise_setRejectionHook(function (reason, promise) {
   if (typeof hook === "function") hook(reason, promise);
   else console.error("Uncaught (in promise)", reason);
 });
+
+// Node's globals stay absent, as on alpha 19 (whose compiler has no process, setImmediate,
+// clearImmediate or global). Alpha 22 links its node runtime's versions for any such name the app
+// uses and the prelude does not own: an app then sees a Node `process` (libraries take their Node
+// paths) whose nextTick queue and immediates only the node loop drains, which a standalone binary
+// never runs (the neon Pool hung on a nextTick). Assigning a name here makes it the prelude's (P4);
+// deleting it leaves it undefined, so `typeof process` is "undefined" on both generations.
+globalThis.process = undefined;
+globalThis.setImmediate = undefined;
+globalThis.clearImmediate = undefined;
+globalThis.global = undefined;
+delete globalThis.process;
+delete globalThis.setImmediate;
+delete globalThis.clearImmediate;
+delete globalThis.global;
