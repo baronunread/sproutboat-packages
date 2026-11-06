@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import { ensurePorffor } from "../../toolchain/src/acquire";
+import { join } from "node:path";
+import { compileNative } from "./native-compile";
 import { createBroker, listen } from "../../wire/src/broker";
 import { EMPTY_BINDINGS, preludePath, TRANSPORT_MARKER, transportPath, wrapNativeFetchHandler } from "../src/wrap";
 
@@ -182,7 +182,11 @@ const edge = Bun.serve({
       });
     }
     if (url.pathname === "/typed") {
-      return Response.json({ method: request.method, type: request.headers.get("content-type"), body: await request.text() });
+      return Response.json({
+        method: request.method,
+        type: request.headers.get("content-type"),
+        body: await request.text(),
+      });
     }
     if (url.pathname === "/redirect") {
       const status = Number(url.searchParams.get("status"));
@@ -246,9 +250,6 @@ const get = async (path: string) => {
   return { status: res.status, text: await res.text(), ms: performance.now() - t0 };
 };
 try {
-  const porffor = await ensurePorffor({ cacheRoot: workdir });
-  const node = Bun.which("node");
-  if (!node) throw new Error("native service-binding test needs node on PATH");
   const [core, transport] = await Promise.all([
     readFile(preludePath, "utf8"),
     readFile(transportPath("broker"), "utf8"),
@@ -256,20 +257,12 @@ try {
   assert(core.includes(TRANSPORT_MARKER), "runtime prelude is missing its transport marker");
   const generated = join(workdir, "services.generated.js");
   const binary = join(workdir, "services-native");
-  await writeFile(generated, wrapNativeFetchHandler(handler, core.replace(TRANSPORT_MARKER, transport), {}, bindings, undefined, "2026-10-22"));
+  await writeFile(
+    generated,
+    wrapNativeFetchHandler(handler, core.replace(TRANSPORT_MARKER, transport), {}, bindings, undefined, "2026-10-22"),
+  );
 
-  const compile = Bun.spawn([node, resolve(porffor, "runtime/index.js"), "native", generated, "-o", binary, "-s", "-O0"], {
-    cwd: workdir,
-    env: process.env,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const [exitCode, stdout, stderr] = await Promise.all([
-    compile.exited,
-    new Response(compile.stdout).text(),
-    new Response(compile.stderr).text(),
-  ]);
-  assert.equal(exitCode, 0, `Porffor native compile failed:\n${stderr}\n${stdout}`);
+  await compileNative({ generated, binary, dir: workdir, cacheRoot: workdir });
 
   server = Bun.spawn([binary], {
     cwd: workdir,
@@ -329,7 +322,10 @@ try {
   const t0 = performance.now();
   const all = await Promise.all(Array.from({ length: 8 }, () => get("/slow?ms=500")));
   const total = performance.now() - t0;
-  assert(all.every((r) => r.text === "slow done"), JSON.stringify(all));
+  assert(
+    all.every((r) => r.text === "slow done"),
+    JSON.stringify(all),
+  );
   assert(total < 1500, `8 concurrent 500 ms calls took ${Math.round(total)} ms`);
 
   // Cancellation: an aborted signal rejects at once, and the abort reaches the upstream
@@ -337,7 +333,11 @@ try {
   const abandonedBefore = slowAbandoned;
   const aborts = await get("/abort");
   assert.equal(aborts.status, 200, aborts.text);
-  assert.deepEqual(JSON.parse(aborts.text), { aborted: "AbortError fast", timedOut: "TimeoutError fast", already: "AbortError fast" });
+  assert.deepEqual(JSON.parse(aborts.text), {
+    aborted: "AbortError fast",
+    timedOut: "TimeoutError fast",
+    already: "AbortError fast",
+  });
   await Bun.sleep(300);
   assert.equal(slowAbandoned - abandonedBefore, 2, "both in-flight calls were stopped upstream");
 
@@ -375,7 +375,11 @@ try {
     context: { env: true, waitUntil: true },
   });
   // A client cannot call a method: without the edge's vouching, x-sb-rpc is just a header.
-  const forgedRpc = await fetch(`http://127.0.0.1:${port}/ping`, { method: "POST", headers: { "x-sb-rpc": "fail" }, body: "[\"x\"]" });
+  const forgedRpc = await fetch(`http://127.0.0.1:${port}/ping`, {
+    method: "POST",
+    headers: { "x-sb-rpc": "fail" },
+    body: '["x"]',
+  });
   assert.equal(await forgedRpc.text(), "pong");
 
   // A deployment calling itself, 30 levels deep: every level waits on the next at once.
@@ -394,19 +398,41 @@ export default {
   const legacyPort = freePort();
   const legacySource = join(workdir, "legacy.generated.js");
   const legacyBinary = join(workdir, "legacy-native");
-  await writeFile(legacySource, wrapNativeFetchHandler(legacyHandler, core.replace(TRANSPORT_MARKER, transport), {}, bindings, undefined, "2026-10-21"));
-  const legacyCompile = Bun.spawnSync([node, resolve(porffor, "runtime/index.js"), "native", legacySource, "-o", legacyBinary, "-s", "-O0"], { cwd: workdir });
-  assert.equal(legacyCompile.exitCode, 0, `legacy compile failed:\n${legacyCompile.stderr}`);
+  await writeFile(
+    legacySource,
+    wrapNativeFetchHandler(
+      legacyHandler,
+      core.replace(TRANSPORT_MARKER, transport),
+      {},
+      bindings,
+      undefined,
+      "2026-10-21",
+    ),
+  );
+  await compileNative({
+    generated: legacySource,
+    binary: legacyBinary,
+    dir: workdir,
+    cacheRoot: workdir,
+    failure: "legacy compile failed",
+  });
   legacy = Bun.spawn([legacyBinary], {
     cwd: workdir,
-    env: { ...process.env, PORT: String(legacyPort), SB_BROKER_PORT: String(brokerServer.port), SB_BROKER_TOKEN: "native-services" },
+    env: {
+      ...process.env,
+      PORT: String(legacyPort),
+      SB_BROKER_PORT: String(brokerServer.port),
+      SB_BROKER_TOKEN: "native-services",
+    },
     stdout: "ignore",
     stderr: "inherit",
   });
   let legacyText = "";
   for (let attempt = 0; attempt < 50 && !legacyText; attempt++) {
     try {
-      legacyText = await (await fetch(`http://127.0.0.1:${legacyPort}/`, { signal: AbortSignal.timeout(20_000) })).text();
+      legacyText = await (
+        await fetch(`http://127.0.0.1:${legacyPort}/`, { signal: AbortSignal.timeout(20_000) })
+      ).text();
     } catch {
       await Bun.sleep(100);
     }

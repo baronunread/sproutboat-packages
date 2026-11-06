@@ -3,8 +3,8 @@ import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { connect } from "node:net";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import { ensurePorffor } from "../../toolchain/src/acquire";
+import { join } from "node:path";
+import { compileNative } from "./native-compile";
 import { preludePath, TRANSPORT_MARKER, transportPath, wrapNativeFetchHandler } from "../src/wrap";
 
 // The native HTTP server's wire behaviour with raw sockets: keep-alive, pipelining (responses in
@@ -210,9 +210,6 @@ async function suite(port: number, label: string) {
 const workdir = await mkdtemp(join(tmpdir(), "sb-native-http-"));
 const servers: Array<ReturnType<typeof Bun.spawn>> = [];
 try {
-  const porffor = await ensurePorffor();
-  const node = Bun.which("node");
-  if (!node) throw new Error("native http test needs node on PATH");
   const [core, broker] = await Promise.all([readFile(preludePath, "utf8"), readFile(transportPath("broker"), "utf8")]);
   assert(core.includes(TRANSPORT_MARKER), "runtime prelude is missing its transport marker");
   const generated = join(workdir, "http.generated.js");
@@ -228,21 +225,7 @@ try {
       "2026-10-21",
     ),
   );
-  const compile = Bun.spawn(
-    [node, resolve(porffor, "runtime/index.js"), "native", generated, "-o", binary, "-s", "-O0"],
-    {
-      cwd: workdir,
-      env: process.env,
-      stdout: "pipe",
-      stderr: "pipe",
-    },
-  );
-  const [exitCode, stdout, stderr] = await Promise.all([
-    compile.exited,
-    new Response(compile.stdout).text(),
-    new Response(compile.stderr).text(),
-  ]);
-  assert.equal(exitCode, 0, `Porffor native compile failed:\n${stderr}\n${stdout}`);
+  await compileNative({ generated, binary, dir: workdir });
 
   for (const every of ["1", "8"]) {
     const port = freePort();

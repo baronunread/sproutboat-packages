@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import { ensurePorffor } from "../../toolchain/src/acquire";
+import { join } from "node:path";
+import { compileNative } from "./native-compile";
 import { preludePath, TRANSPORT_MARKER, transportPath, wrapNativeFetchHandler } from "../src/wrap";
 
 // sproutd #22: __sbFromUtf8 and __sbToBytes run in C (__sbFromUtf8Native, __sbToBytesNative).
@@ -92,28 +92,12 @@ function freePort(): number {
 const workdir = await mkdtemp(join(tmpdir(), "sb-native-byte-text-"));
 let server: ReturnType<typeof Bun.spawn> | undefined;
 try {
-  const porffor = await ensurePorffor();
-  const node = Bun.which("node");
-  if (!node) throw new Error("native byte-text test needs node on PATH");
   const broker = await readFile(transportPath("broker"), "utf8");
   assert(core.includes(TRANSPORT_MARKER), "runtime prelude is missing its transport marker");
   const generated = join(workdir, "bytes.generated.js");
   const binary = join(workdir, "bytes-native");
   await writeFile(generated, wrapNativeFetchHandler(handler, core.replace(TRANSPORT_MARKER, broker)));
-  const compile = Bun.spawn(
-    [node, resolve(porffor, "runtime/index.js"), "native", generated, "-o", binary, "-s", "-O0"],
-    {
-      cwd: workdir,
-      stdout: "pipe",
-      stderr: "pipe",
-    },
-  );
-  const [exitCode, stdout, stderr] = await Promise.all([
-    compile.exited,
-    new Response(compile.stdout).text(),
-    new Response(compile.stderr).text(),
-  ]);
-  assert.equal(exitCode, 0, `Porffor native compile failed:\n${stderr}\n${stdout}`);
+  await compileNative({ generated, binary, dir: workdir });
 
   const port = freePort();
   // Peak RSS: /proc's high-water mark on Linux, time(1) on macOS.

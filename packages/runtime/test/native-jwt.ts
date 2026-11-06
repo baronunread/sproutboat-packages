@@ -2,9 +2,8 @@ import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import { ensurePorffor } from "../../toolchain/src/acquire";
-import { bearsslEnv } from "./bearssl";
+import { join } from "node:path";
+import { compileNative } from "./native-compile";
 import { preludePath, TRANSPORT_MARKER, transportPath, wrapNativeFetchHandler } from "../src/wrap";
 
 // The pieces of a JWT check (base64url decode, TextEncoder, HMAC verify) against values that do
@@ -276,10 +275,6 @@ assert.equal(
 const workdir = await mkdtemp(join(tmpdir(), "sb-native-jwt-"));
 let server: ReturnType<typeof Bun.spawn> | undefined;
 try {
-  const porffor = await ensurePorffor();
-  const node = Bun.which("node");
-  if (!node) throw new Error("native jwt test needs node on PATH");
-
   const [core, broker] = await Promise.all([readFile(preludePath, "utf8"), readFile(transportPath("broker"), "utf8")]);
   assert(core.includes(TRANSPORT_MARKER), "runtime prelude is missing its transport marker");
   const prelude = core.replace(TRANSPORT_MARKER, broker);
@@ -287,21 +282,7 @@ try {
   const binary = join(workdir, "jwt-native");
   await writeFile(generated, wrapNativeFetchHandler(handler, prelude));
 
-  const compile = Bun.spawn(
-    [node, resolve(porffor, "runtime/index.js"), "native", generated, "-o", binary, "-s", "-O0"],
-    {
-      cwd: workdir,
-      env: { ...process.env, ...(await bearsslEnv()) },
-      stdout: "pipe",
-      stderr: "pipe",
-    },
-  );
-  const [exitCode, stdout, stderr] = await Promise.all([
-    compile.exited,
-    new Response(compile.stdout).text(),
-    new Response(compile.stderr).text(),
-  ]);
-  assert.equal(exitCode, 0, `Porffor native compile failed:\n${stderr}\n${stdout}`);
+  await compileNative({ generated, binary, dir: workdir, bearssl: true });
 
   const port = freePort();
   server = Bun.spawn([binary], {

@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import { ensurePorffor } from "../../toolchain/src/acquire";
+import { join } from "node:path";
+import { compileNative } from "./native-compile";
 import { preludePath, TRANSPORT_MARKER, transportPath, wrapNativeFetchHandler } from "../src/wrap";
 
 // Per-request CPU (design 02): x-sb-cpu-ms counts the thread CPU time of the slices in which one
@@ -43,9 +43,6 @@ function freePort(): number {
 const workdir = await mkdtemp(join(tmpdir(), "sb-native-cpu-requests-"));
 const servers: ReturnType<typeof Bun.spawn>[] = [];
 async function build(date: string): Promise<number> {
-  const porffor = await ensurePorffor();
-  const node = Bun.which("node");
-  if (!node) throw new Error("native cpu test needs node on PATH");
   const [core, broker] = await Promise.all([readFile(preludePath, "utf8"), readFile(transportPath("broker"), "utf8")]);
   assert(core.includes(TRANSPORT_MARKER), "runtime prelude is missing its transport marker");
   const generated = join(workdir, `cpu-${date}.generated.js`);
@@ -54,21 +51,7 @@ async function build(date: string): Promise<number> {
     generated,
     wrapNativeFetchHandler(handler, core.replace(TRANSPORT_MARKER, broker), undefined, undefined, undefined, date),
   );
-  const compile = Bun.spawn(
-    [node, resolve(porffor, "runtime/index.js"), "native", generated, "-o", binary, "-s", "-O0"],
-    {
-      cwd: workdir,
-      env: process.env,
-      stdout: "pipe",
-      stderr: "pipe",
-    },
-  );
-  const [exitCode, stdout, stderr] = await Promise.all([
-    compile.exited,
-    new Response(compile.stdout).text(),
-    new Response(compile.stderr).text(),
-  ]);
-  assert.equal(exitCode, 0, `Porffor native compile failed:\n${stderr}\n${stdout}`);
+  await compileNative({ generated, binary, dir: workdir });
   const port = freePort();
   const server = Bun.spawn([binary], {
     cwd: workdir,

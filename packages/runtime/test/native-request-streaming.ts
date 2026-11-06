@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import { ensurePorffor } from "../../toolchain/src/acquire";
+import { join } from "node:path";
+import { compileNative } from "./native-compile";
 import { preludePath, TRANSPORT_MARKER, transportPath, wrapNativeFetchHandler } from "../src/wrap";
 
 // Streamed request bodies, from compatibility date 2026-10-27: the handler runs once the
@@ -79,9 +79,6 @@ const expectedSum = (total: number) => {
 const workdir = await mkdtemp(join(tmpdir(), "sb-native-request-streaming-"));
 let server: ReturnType<typeof Bun.spawn> | undefined;
 try {
-  const porffor = await ensurePorffor();
-  const node = Bun.which("node");
-  if (!node) throw new Error("native request-streaming test needs node on PATH");
   const [core, broker] = await Promise.all([readFile(preludePath, "utf8"), readFile(transportPath("broker"), "utf8")]);
   assert(core.includes(TRANSPORT_MARKER), "runtime prelude is missing its transport marker");
   const generated = join(workdir, "stream.generated.js");
@@ -95,20 +92,7 @@ try {
     "2026-10-27",
   );
   await writeFile(generated, source);
-  const compile = Bun.spawn(
-    [node, resolve(porffor, "runtime/index.js"), "native", generated, "-o", binary, "-s", "-O0"],
-    {
-      cwd: workdir,
-      stdout: "pipe",
-      stderr: "pipe",
-    },
-  );
-  const [exitCode, stdout, stderr] = await Promise.all([
-    compile.exited,
-    new Response(compile.stdout).text(),
-    new Response(compile.stderr).text(),
-  ]);
-  assert.equal(exitCode, 0, `Porffor native compile failed:\n${stderr}\n${stdout}`);
+  await compileNative({ generated, binary, dir: workdir });
 
   const port = freePort();
   const linux = process.platform === "linux";

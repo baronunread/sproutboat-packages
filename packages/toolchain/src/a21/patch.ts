@@ -609,6 +609,35 @@ export async function patchResponseStatics(root: string): Promise<void> {
 }
 
 /**
+ * P9: `JSON.parse` of a string with a character past Latin-1 (or a `\u` escape past it) allocates
+ * its UTF-16 output as `(len - start) * 2` bytes, where `len` is the length of the whole document, not
+ * of the string: every wide string in a 400 KB document asks for 800 KB, and a document with a few
+ * thousand of them dies (signal 138/139 on alpha 22, pristine and patched; `naïve 中文` in 6,000
+ * objects of a 316 KB document reproduces it, Latin-1-only documents of any size do not). The string
+ * is scanned to its closing quote first and the output sized by that. Found by the standalone port
+ * (sproutd-alpha22-standalone-port.md); upstream proposal (g) drafted there.
+ */
+const JSON_WIDE_MARKER = "sproutboat P9: a wide JSON string is sized by its own length";
+export async function patchJsonWideStringBound(root: string): Promise<void> {
+  await editOnce(resolve(root, "compiler/builtins/json.ts"), "JSON.parse wide string bound", JSON_WIDE_MARKER, [
+    [
+      "export const __Porffor_json_parseWideString = (text: bytestring, start: i32, posPtr: i32, len: i32): string => {\n  const out: string = Porffor.malloc(6 + (len - start) * 2);\n",
+      "export const __Porffor_json_parseWideString = (text: bytestring, start: i32, posPtr: i32, len: i32): string => {\n" +
+        "  // " +
+        JSON_WIDE_MARKER +
+        "\n" +
+        "  let end: i32 = start;\n" +
+        "  while (end < len) {\n" +
+        "    const c: i32 = text.charCodeAt(end);\n" +
+        "    if (c == 34) break;\n" +
+        "    end += c == 92 ? 2 : 1;\n" +
+        "  }\n" +
+        "  const out: string = Porffor.malloc(6 + (end - start) * 2);\n",
+    ],
+  ]);
+}
+
+/**
  * `node:process` reads `porf_argv[i]` and `environ[i]` at its init with no null check: a host that
  * starts the runtime with no argv, or that cleared its environment (sproutd's fork template runs
  * after clearenv(), so `environ` is NULL), crashes before the first module runs.
@@ -767,6 +796,7 @@ export async function ensurePorfforPatchedA21(root: string): Promise<void> {
   await patchReservedSelect(root);
   await patchResponseStatics(root);
   await patchProcessNullTables(root);
+  await patchJsonWideStringBound(root);
   // Last: the precompile picks up the builtin edits above.
   await precompileBuiltinsA21(root);
   done.add(root);

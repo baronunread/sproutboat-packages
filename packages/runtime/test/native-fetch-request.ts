@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import { ensurePorffor } from "../../toolchain/src/acquire";
+import { join } from "node:path";
+import { compileNative } from "./native-compile";
 import { createBroker, listen } from "../../wire/src/broker";
 import { EMPTY_BINDINGS, preludePath, TRANSPORT_MARKER, transportPath, wrapNativeFetchHandler } from "../src/wrap";
 
@@ -124,21 +124,18 @@ const brokerServer = listen(broker, "127.0.0.1", 0);
 const servers: ReturnType<typeof Bun.spawn>[] = [];
 
 // Compiles the handler at `date` and starts it; resolves to a GET helper for it.
-async function start(porffor: string, node: string, source: string, date: string) {
+async function start(source: string, date: string) {
   const port = freePort();
   const generated = join(workdir, `fetch-request-${date}.generated.js`);
   const binary = join(workdir, `fetch-request-${date}`);
   await writeFile(generated, wrapNativeFetchHandler(handler, source, {}, EMPTY_BINDINGS, undefined, date));
-  const compile = Bun.spawn(
-    [node, resolve(porffor, "runtime/index.js"), "native", generated, "-o", binary, "-s", "-O0"],
-    {
-      cwd: workdir,
-      stdout: "pipe",
-      stderr: "pipe",
-    },
-  );
-  const [exitCode, stderr] = await Promise.all([compile.exited, new Response(compile.stderr).text()]);
-  assert.equal(exitCode, 0, `Porffor native compile at ${date} failed:\n${stderr}`);
+  await compileNative({
+    generated,
+    binary,
+    dir: workdir,
+    cacheRoot: workdir,
+    failure: `Porffor native compile at ${date} failed`,
+  });
   const server = Bun.spawn([binary], {
     cwd: workdir,
     env: {
@@ -174,19 +171,13 @@ async function start(porffor: string, node: string, source: string, date: string
 }
 
 try {
-  const porffor = await ensurePorffor({ cacheRoot: workdir });
-  const node = Bun.which("node");
-  if (!node) throw new Error("native fetch-request test needs node on PATH");
   const [core, transport] = await Promise.all([
     readFile(preludePath, "utf8"),
     readFile(transportPath("broker"), "utf8"),
   ]);
   assert(core.includes(TRANSPORT_MARKER), "runtime prelude is missing its transport marker");
   const source = core.replace(TRANSPORT_MARKER, transport);
-  const [strict, legacy] = await Promise.all([
-    start(porffor, node, source, "2026-10-23"),
-    start(porffor, node, source, "2026-10-22"),
-  ]);
+  const [strict, legacy] = await Promise.all([start(source, "2026-10-23"), start(source, "2026-10-22")]);
 
   const echo = (method: string, from: string | null, type: string | null, body: string) => ({
     method,

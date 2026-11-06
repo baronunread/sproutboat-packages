@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { Duplex } from "node:stream";
 import tls from "node:tls";
-import { ensurePorffor } from "../../toolchain/src/acquire";
+import { compileNative } from "./native-compile";
 import { createBroker, listen } from "../../wire/src/broker";
 import { EMPTY_BINDINGS, preludePath, TRANSPORT_MARKER, transportPath, wrapNativeFetchHandler } from "../src/wrap";
 
@@ -364,9 +364,6 @@ const get = async (path: string, base = port) => {
 };
 
 try {
-  const porffor = await ensurePorffor({ cacheRoot: workdir });
-  const node = Bun.which("node");
-  if (!node) throw new Error("native sockets test needs node on PATH");
   const [core, transport] = await Promise.all([
     readFile(preludePath, "utf8"),
     readFile(transportPath("broker"), "utf8"),
@@ -385,21 +382,7 @@ try {
       "2026-11-17",
     ),
   );
-  const compile = Bun.spawn(
-    [node, resolve(porffor, "runtime/index.js"), "native", generated, "-o", binary, "-s", "-O0"],
-    {
-      cwd: workdir,
-      env: process.env,
-      stdout: "pipe",
-      stderr: "pipe",
-    },
-  );
-  const [exitCode, stdout, stderr] = await Promise.all([
-    compile.exited,
-    new Response(compile.stdout).text(),
-    new Response(compile.stderr).text(),
-  ]);
-  assert.equal(exitCode, 0, `Porffor native compile failed:\n${stderr}\n${stdout}`);
+  await compileNative({ generated, binary, dir: workdir, cacheRoot: workdir });
 
   const start = async (listening: number, brokerPort: number) => {
     const child = Bun.spawn([binary], {

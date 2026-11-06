@@ -221,6 +221,9 @@ test("the alpha 22 pin is the alpha 21 chain plus P8, applied once, and the tree
   ])
     expect(render, marker).toContain(marker);
   expect(await readFile(join(root, "compiler/builtins_precompiled.js"), "utf8")).toContain("icFreezeMega");
+  expect(await readFile(join(root, "compiler/builtins/json.ts"), "utf8")).toContain(
+    "sproutboat P9: a wide JSON string is sized by its own length",
+  );
   // An alpha 21 tree never gets P8 (its codegen has no shared dispatch).
   const a21 = await pristine("alpha-21");
   expect(channelOfTree(a21)).toBe("alpha-21");
@@ -291,4 +294,34 @@ test("P8: alpha 22's shared dispatch functions sit in the unit that asked, under
   });
   expect(run.exitCode, new TextDecoder().decode(run.stderr)).toBe(0);
   expect(new TextDecoder().decode(run.stdout).trim()).toBe("ABab  abb c c  2,3");
+}, 180_000);
+
+test("P9: JSON.parse of a large document with wide strings runs on patched alpha 22", async () => {
+  const root = await pristine("alpha-22");
+  await ensurePorfforPatchedA21(root);
+  const work = join(root, "work-p9");
+  await mkdir(work);
+  await writeFile(
+    join(work, "wide.js"),
+    [
+      "const items = [];",
+      'for (let i = 0; i < 12000; i++) items.push({ id: i, name: "naïve 中文 x" + i, tags: ["a", "b"] });',
+      "const doc = JSON.stringify(items);",
+      "const back = JSON.parse(doc);",
+      "console.log(doc.length, back.length, back[11999].name);",
+    ].join("\n"),
+  );
+  const compile = Bun.spawn(
+    ["bun", join(root, "runtime/index.js"), "native", join(work, "wide.js"), "-o", join(work, "wide"), "-O0"],
+    {
+      cwd: work,
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
+  expect(await compile.exited, await new Response(compile.stderr).text()).toBe(0);
+  const run = Bun.spawn([join(work, "wide")], { stdout: "pipe", stderr: "pipe" });
+  const [code, out] = await Promise.all([run.exited, new Response(run.stdout).text()]);
+  expect(code).toBe(0);
+  expect(out.trim()).toBe("637781 12000 naïve 中文 x11999");
 }, 180_000);
