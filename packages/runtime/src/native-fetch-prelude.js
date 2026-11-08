@@ -11561,6 +11561,7 @@ function __sbMakeQueue(binding) {
 
 globalThis.__sbInstallBindings = function (target, bindings) {
   if (!target) return;
+  __sbLogSecretNames = bindings.secrets || [];
 
   __sbQueueSetup(bindings);
 
@@ -13992,7 +13993,7 @@ function __sbTrustedProxyHeader(request, name) {
 // own.
 const __SB_WAITUNTIL_TIMEOUT_MS = 25000;
 
-async function __sbDrainWaitUntil(tasks) {
+async function __sbDrainWaitUntil(tasks, logRec) {
   if (!tasks.length) return;
   const pending = tasks.splice(0, tasks.length);
   // Clear the cap's timer once the tasks finish: a pending timer kept the process
@@ -14001,16 +14002,17 @@ async function __sbDrainWaitUntil(tasks) {
   const cap = new Promise((resolve) => {
     timer = setTimeout(resolve, __SB_WAITUNTIL_TIMEOUT_MS);
   });
-  await Promise.race([__sbDrainAll(pending), cap]);
+  await Promise.race([__sbDrainAll(pending, logRec), cap]);
   clearTimeout(timer);
 }
 
-async function __sbDrainAll(pending) {
+async function __sbDrainAll(pending, logRec) {
   for (let i = 0; i < pending.length; i++) {
     try {
       await pending[i];
-    } catch {
-      /* a background task's rejection must not fail the response */
+    } catch (error) {
+      /* a background task's rejection must not fail the response; with SB_LOG=json it is recorded (#268) */
+      if (__sbLogJson()) __sbLogError("waitUntil", error, logRec);
     }
   }
 }
@@ -15332,8 +15334,9 @@ function __sbInstallWebSockets() {
   globalThis.WebSocketRequestResponsePair = __SbWebSocketRequestResponsePair;
 }
 
-async function __sbFetchWithDrain(res, tasks, bindingCall, rethrow, top, cpuCell) {
+async function __sbFetchWithDrain(res, tasks, bindingCall, rethrow, top, cpuCell, logRec) {
   let r;
+  let threw = 0;
   try {
     r = res && __sbIsFn(res.then) ? await res : res;
     if (top && __sbHasWebSocket(r)) r = __sbWsHostResponse(r);
@@ -15348,7 +15351,8 @@ async function __sbFetchWithDrain(res, tasks, bindingCall, rethrow, top, cpuCell
       throw error;
     }
     // #179 — a rejected handler promise must not take the process down with it.
-    r = __sbErrorResponse(error, bindingCall);
+    threw = 1;
+    r = __sbErrorResponse(error, bindingCall, logRec);
   }
   // From 2026-11-02 an async handler reports its CPU too: the thread time of the slices in which this
   // request ran, not its neighbours' (before it, only a handler that answered synchronously did).
@@ -15359,7 +15363,8 @@ async function __sbFetchWithDrain(res, tasks, bindingCall, rethrow, top, cpuCell
   // The response goes out now and ctx.waitUntil work keeps running after it, as in
   // workerd; it was awaited first, so a 1.5 s background task delayed the response by
   // 1.5 s. The 25 s cap still bounds it. Not called for no tasks: an async call is a coroutine and a promise.
-  if (tasks.length) __sbDrainWaitUntil(tasks);
+  if (logRec) __sbLogRequest(logRec, r, threw);
+  if (tasks.length) __sbDrainWaitUntil(tasks, logRec);
   return r;
 }
 
@@ -15367,8 +15372,8 @@ async function __sbFetchWithDrain(res, tasks, bindingCall, rethrow, top, cpuCell
 // propagate past __sbEntry and crash the whole server. Logged first, the way a
 // Worker logs "Uncaught Error: ...": a swallowed exception left a 500 with
 // nothing on stderr, which hid #168 entirely.
-function __sbErrorResponse(error, bindingCall) {
-  __sbLogUncaught("fetch", error);
+function __sbErrorResponse(error, bindingCall, logRec) {
+  __sbLogUncaught("fetch", error, logRec);
   // Untyped, as workerd sends it: the text/plain default is for handlers' bodies.
   const response = new Response("Internal Server Error", { status: 500 });
   response.headers.delete("content-type");
@@ -15438,13 +15443,124 @@ function __sbHeader(headers, name) {
   return count > 1 ? headers.get(name) : found;
 }
 
-function __sbLogUncaught(where, error) {
+function __sbLogUncaught(where, error, logRec) {
+  if (__sbLogJson()) {
+    __sbLogError(where, error, logRec);
+    return;
+  }
   try {
     let text = "";
     if (error && error.stack) text = String(error.stack);
     else if (error && error.message != null) text = (error.name || "Error") + ": " + error.message;
     else text = String(error);
     console.error("Uncaught (in " + where + ") " + text);
+  } catch {
+    /* logging must never turn a handled error into a crash */
+  }
+}
+
+// #268 — structured request and error records for a standalone binary. Off unless SB_LOG=json, so
+// nothing an app can observe changes and the per-request cost of "off" is one cached boolean. On, every
+// request writes one JSON line to stderr after its response is built, and every uncaught error (in a
+// handler, scheduled(), queue(), an alarm, a WebSocket handler, a rejected promise or a waitUntil task)
+// writes one more, in place of the plain "Uncaught (in ...)" text, so the stream stays parseable.
+//
+// What is never written: request or response bodies, headers (cookies and authorization among them), the
+// query string (it is where tokens end up), the client address, and the value of any declared secret (the
+// ones the message or stack happens to contain are replaced). Output is bounded: fields are cut to fixed
+// lengths and at most 200 lines a second go out; the rest are counted and reported by one "dropped" line
+// when the next second starts. A record's "id" ties a request line to the errors of the same request;
+// background work has id null.
+let __sbLogOn;
+let __sbLogSecretNames = [];
+let __sbLogSeq = 0;
+let __sbLogWindow = 0;
+let __sbLogCount = 0;
+let __sbLogDropped = 0;
+const __SB_LOG_PER_SECOND = 200;
+function __sbLogJson() {
+  if (__sbLogOn === undefined) __sbLogOn = __sbEnv("SB_LOG") === "json";
+  return __sbLogOn;
+}
+// Tests turn the records on without an environment, like __sbSetCompat.
+function __sbSetLog(on) {
+  __sbLogOn = on;
+}
+function __sbLogCut(text, max) {
+  const s = String(text);
+  return s.length > max ? s.slice(0, max) + "..." : s;
+}
+function __sbLogRedact(text) {
+  let out = text;
+  for (let i = 0; i < __sbLogSecretNames.length; i++) {
+    const raw = __sbEnv(__sbLogSecretNames[i]);
+    if (!raw || raw.length < 4) continue;
+    out = out.split(raw).join("[redacted]");
+    const decoded = __sbFromUtf8(raw);
+    if (decoded !== raw && decoded.length >= 4) out = out.split(decoded).join("[redacted]");
+  }
+  return out;
+}
+function __sbLogWrite(record) {
+  const now = Date.now();
+  const second = Math.floor(now / 1000);
+  if (second !== __sbLogWindow) {
+    if (__sbLogDropped > 0) {
+      console.error(JSON.stringify({ type: "dropped", v: 1, timestamp: now, count: __sbLogDropped, reason: "rate" }));
+      __sbLogDropped = 0;
+    }
+    __sbLogWindow = second;
+    __sbLogCount = 0;
+  }
+  if (__sbLogCount >= __SB_LOG_PER_SECOND) {
+    __sbLogDropped++;
+    return;
+  }
+  __sbLogCount++;
+  console.error(JSON.stringify(record));
+}
+function __sbLogBegin(request) {
+  __sbLogSeq++;
+  let path = "/";
+  try {
+    path = new URL(request.url).pathname;
+  } catch {
+    /* a request without a parseable URL is logged as "/" */
+  }
+  return { id: String(Math.floor(Date.now() / 1000)) + "-" + __sbLogSeq, t0: Date.now(), method: String(request.method), path: __sbLogCut(path, 256) };
+}
+function __sbLogRequest(rec, response, threw) {
+  try {
+    __sbLogWrite({
+      type: "request",
+      v: 1,
+      id: rec.id,
+      timestamp: rec.t0,
+      method: __sbLogCut(rec.method, 16),
+      path: rec.path,
+      status: response && response.status ? response.status : 0,
+      durationMs: Date.now() - rec.t0,
+      outcome: threw === 1 ? "exception" : "ok",
+    });
+  } catch {
+    /* logging must never turn a served request into a crash */
+  }
+}
+function __sbLogError(where, error, rec) {
+  try {
+    const name = error && error.name ? String(error.name) : "Error";
+    const message = error && error.message != null ? String(error.message) : String(error);
+    const record = {
+      type: "error",
+      v: 1,
+      id: rec ? rec.id : null,
+      timestamp: Date.now(),
+      source: __sbLogCut(where, 40),
+      name: __sbLogCut(name, 100),
+      message: __sbLogCut(__sbLogRedact(message), 1000),
+    };
+    if (error && error.stack) record.stack = __sbLogCut(__sbLogRedact(String(error.stack)), 2000);
+    __sbLogWrite(record);
   } catch {
     /* logging must never turn a handled error into a crash */
   }
@@ -15785,6 +15901,8 @@ globalThis.__sbEntry = function (handlers, request) {
     // async handlers (see LogEvent in services/edge) — that is this.
     const __cpuCell = __sbCpuBegin();
     const __t0 = __cpuCell ? 0 : __sbCpuMs();
+    // #268 — one record per request when SB_LOG=json; null (and no work at all) otherwise.
+    const __logRec = __sbLogJson() ? __sbLogBegin(request) : null;
     const __sbTasks = [];
     const ctx = {
       waitUntil(p) {
@@ -15807,19 +15925,24 @@ globalThis.__sbEntry = function (handlers, request) {
       // #179 — a synchronous throw anywhere in the handler must not take the
       // whole process (and every other in-flight request) down with it.
       __sbCpuEnd(__cpuCell);
-      return __sbErrorResponse(error, bindingCall);
+      const __failed = __sbErrorResponse(error, bindingCall, __logRec);
+      if (__logRec) __sbLogRequest(__logRec, __failed, 1);
+      return __failed;
     }
     // Same promise-identity rule as above applies to `__sbFetchWithDrain`'s
     // own return, which is why it's tail-called rather than chained on here.
-    if (__sbTasks.length || (__res && __sbIsFn(__res.then)) || __sbHasStreamBody(__res)) return __sbFetchWithDrain(__res, __sbTasks, bindingCall, false, true, __cpuCell);
+    if (__sbTasks.length || (__res && __sbIsFn(__res.then)) || __sbHasStreamBody(__res)) return __sbFetchWithDrain(__res, __sbTasks, bindingCall, false, true, __cpuCell, __logRec);
     // A WebSocket handshake answer (from 2026-10-30): its client end becomes the host socket.
     if (__sbHasWebSocket(__res)) {
       __sbCpuEnd(__cpuCell);
-      return __sbWsHostResponse(__res);
+      const __ws = __sbWsHostResponse(__res);
+      if (__logRec) __sbLogRequest(__logRec, __ws, 0);
+      return __ws;
     }
     // The request ran alone from start to here: its own slices, or the process delta where no slot was free.
     const __cpu = __cpuCell ? __sbCpuTake(__cpuCell) : __sbCpuMs() - __t0;
     __sbCpuEnd(__cpuCell);
+    if (__logRec) __sbLogRequest(__logRec, __res, 0);
     return __sbTagCpu(__res, __cpu);
   }
   if (!__sbTriggerAuthed(request)) return new Response("forbidden", { status: 403 });
