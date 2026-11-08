@@ -745,6 +745,121 @@ export async function patchCpuStamp(root: string): Promise<void> {
   ]);
 }
 
+/**
+ * P10: a method call on a receiver of unknown type goes through a dispatch function shared per method
+ * and argument count (alpha 22), and the call site hands the argument expressions straight to the C
+ * call, where their order is unspecified. `x.toString("utf8", index, index += length)` (postgres.js
+ * decodes every DataRow value this way) read `index` after the increment on arm64 and returned "". The
+ * direct-call paths already evaluate each argument into a local first; this one now does too.
+ */
+const ARG_ORDER_MARKER = "sproutboat P10: shared dispatch arguments are evaluated in order";
+export async function patchDispatchArgOrder(root: string): Promise<void> {
+  await editOnce(resolve(root, "compiler/codegen.js"), "shared dispatch argument order (P10)", ARG_ORDER_MARKER, [
+    [
+      "        return Call(func.index, [ targetTmp, ...args.map(x => coerceValue(generate(scope, x), T.jsval)) ], func.retType);\n",
+      "        // " +
+        ARG_ORDER_MARKER +
+        "\n        return Call(func.index, [ targetTmp, ...args.map(x => reuse(scope, coerceValue(generate(scope, x), T.jsval))) ], func.retType);\n",
+    ],
+  ]);
+}
+
+/**
+ * P11: a class declaration that is assigned to (`class SQL {}; (SQL || (SQL = {}))`, TypeScript's
+ * namespace merge, which drizzle-orm's sql.js uses) reads its own binding to build the class, but
+ * unlike a function declaration never stored the class in it first: the binding stayed null and the
+ * program died with "Cannot get property of null" (or read back undefined). A written class is now
+ * stored in its binding before the class body runs, as `case 'FunctionDeclaration'` does.
+ */
+const CLASS_WRITE_MARKER = "sproutboat P11: a written class declaration initialises its binding";
+export async function patchClassBindingWrite(root: string): Promise<void> {
+  await editOnce(resolve(root, "compiler/codegen.js"), "a reassigned class declaration (P11)", CLASS_WRITE_MARKER, [
+    [
+      "  const classRoot = reuseNamed(scope, decl._writes ? generate(scope, root) : materializeFunctionValue(scope, func));\n",
+      "  // " +
+        CLASS_WRITE_MARKER +
+        "\n  if (!expr && decl._writes) {\n" +
+        "    const global = scope.topLevel;\n" +
+        "    allocVar(scope, name, global);\n" +
+        "    func.referenced = true;\n" +
+        "    setLocalWithType(scope, name, global, materializeFunctionValue(scope, func, false), false, TYPES.function);\n" +
+        "    const capture = scope.closureOwnLocals?.[name];\n" +
+        "    if (capture && closureBindingNeedsSlot(capture)) mirrorToClosureEnv(scope, name, closureLocalReadNode(name, false));\n" +
+        "  }\n" +
+        "  const classRoot = reuseNamed(scope, decl._writes ? generate(scope, root) : materializeFunctionValue(scope, func));\n",
+    ],
+  ]);
+}
+
+/**
+ * P12: `Date.parse` / `new Date(s)` take only `+HH:mm` offsets in the date-time form. Postgres sends
+ * timestamptz text as `2026-11-08 14:48:19.097+00` and drivers send `+0000`; V8 and Bun accept both
+ * (and `+HH`), Porffor returned NaN, which breaks drizzle-orm's timestamp mapping. The offset is now
+ * `[+-]HH`, `[+-]HHmm` or `[+-]HH:mm`; anything else is still NaN.
+ */
+const DATE_OFFSET_MARKER = "sproutboat P12: UTC offsets without a colon";
+export async function patchDateOffsets(root: string): Promise<void> {
+  await editOnce(resolve(root, "compiler/builtins/date.ts"), "colonless Date offsets (P12)", DATE_OFFSET_MARKER, [
+    [
+      "      if (Porffor.IR.loadU8(ptr + 3, 4) != 58) return NaN; // :\n" +
+        "      const offsetH: number = __Porffor_date_digits(ptr + 1, 2, endPtr);\n" +
+        "      const offsetM: number = __Porffor_date_digits(ptr + 4, 2, endPtr);\n" +
+        "      if (Porffor.fastOr(offsetH > 23, offsetM > 59)) return NaN;\n" +
+        "      const offset: number = offsetH * 60 + offsetM;\n" +
+        "      if (chr == 43) min -= offset;\n" +
+        "        else min += offset;\n" +
+        "      local = false;\n" +
+        "      ptr += 6;\n",
+      "      // " +
+        DATE_OFFSET_MARKER +
+        ": +HH, +HHmm and +HH:mm\n" +
+        "      const offsetH: number = __Porffor_date_digits(ptr + 1, 2, endPtr);\n" +
+        "      let offsetM: number = 0;\n" +
+        "      ptr += 3;\n" +
+        "      if (Porffor.fastAnd(ptr < endPtr, Porffor.IR.loadU8(ptr, 4) == 58)) { // :\n" +
+        "        offsetM = __Porffor_date_digits(ptr + 1, 2, endPtr);\n" +
+        "        ptr += 3;\n" +
+        "      } else if (ptr < endPtr) {\n" +
+        "        const next: i32 = Porffor.IR.loadU8(ptr, 4);\n" +
+        "        if (Porffor.fastAnd(next >= 48, next <= 57)) {\n" +
+        "          offsetM = __Porffor_date_digits(ptr, 2, endPtr);\n" +
+        "          ptr += 2;\n" +
+        "        }\n" +
+        "      }\n" +
+        "      if (Porffor.fastOr(offsetH > 23, offsetM > 59)) return NaN;\n" +
+        "      const offset: number = offsetH * 60 + offsetM;\n" +
+        "      if (chr == 43) min -= offset;\n" +
+        "        else min += offset;\n" +
+        "      local = false;\n",
+    ],
+  ]);
+}
+
+/**
+ * P13: the right operand of `||`, `&&` and `??` runs conditionally, but its assignments updated the
+ * compile-time type of a local as if it always ran (the `if` and ternary paths scope them as a branch).
+ * In a function, `let o = 1; o || (o = {}); typeof o` answered "object", and the namespace-merge
+ * pattern `class SQL {}; (SQL || (SQL = {}))` inside any function (every bundled app body is one)
+ * left SQL typed as an object while it held the class: "Cannot get property of null" at startup.
+ * The right operand is now generated as a branch.
+ */
+const LOGIC_BRANCH_MARKER = "sproutboat P13: the right operand of a logical expression is a branch";
+export async function patchLogicalBranchInference(root: string): Promise<void> {
+  await editOnce(
+    resolve(root, "compiler/codegen.js"),
+    "logical expression branch inference (P13)",
+    LOGIC_BRANCH_MARKER,
+    [
+      [
+        "  emitIf(scope, check(scope, res, getNodeType(scope, decl.left)), () => {\n    if (valueUnused) exprStmt(scope, generate(scope, decl.right, undefined, true));\n      else assign(scope, res, coerceValue(generate(scope, decl.right), T.jsval));\n  });\n",
+        "  emitIf(scope, check(scope, res, getNodeType(scope, decl.left)), () => {\n    // " +
+          LOGIC_BRANCH_MARKER +
+          "\n    inferBranchStart(scope);\n    if (valueUnused) exprStmt(scope, generate(scope, decl.right, undefined, true));\n      else assign(scope, res, coerceValue(generate(scope, decl.right), T.jsval));\n    inferBranchEnd(scope);\n  });\n",
+      ],
+    ],
+  );
+}
+
 // --- the chain ---
 
 const done = new Set<string>();
@@ -797,6 +912,10 @@ export async function ensurePorfforPatchedA21(root: string): Promise<void> {
   await patchResponseStatics(root);
   await patchProcessNullTables(root);
   await patchJsonWideStringBound(root);
+  if (channelOfTree(root) === "alpha-22") await patchDispatchArgOrder(root); // alpha 21 has no shared dispatch
+  await patchClassBindingWrite(root);
+  await patchLogicalBranchInference(root);
+  await patchDateOffsets(root);
   // Last: the precompile picks up the builtin edits above.
   await precompileBuiltinsA21(root);
   done.add(root);
