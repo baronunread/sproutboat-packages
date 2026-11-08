@@ -783,6 +783,8 @@ export async function patchClassBindingWrite(root: string): Promise<void> {
         "    allocVar(scope, name, global);\n" +
         "    func.referenced = true;\n" +
         "    setLocalWithType(scope, name, global, materializeFunctionValue(scope, func, false), false, TYPES.function);\n" +
+        "    const capture = scope.closureOwnLocals?.[name];\n" +
+        "    if (capture && closureBindingNeedsSlot(capture)) mirrorToClosureEnv(scope, name, closureLocalReadNode(name, false));\n" +
         "  }\n" +
         "  const classRoot = reuseNamed(scope, decl._writes ? generate(scope, root) : materializeFunctionValue(scope, func));\n",
     ],

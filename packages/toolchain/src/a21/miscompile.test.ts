@@ -96,11 +96,13 @@ Swapped = { z: 4 };
 console.log(old.z, Swapped.z);
 function scoped() { class L { static v = 5; } (L || (L = {})); return L.v; }
 console.log(scoped());
+const captured = (() => { class C { static w = 6; } C || (C = {}); return { f() { return typeof C + C.w; } }; })();
+console.log(captured.f());
 (function (Q) { Q.extra = 9; })(SQL || (SQL = {}));
 console.log(SQL.extra);
 `,
   );
-  expect(lines).toEqual(["function 1 hi true", "function 2", "3 4", "5", "9"]);
+  expect(lines).toEqual(["function 1 hi true", "function 2", "3 4", "5", "function6", "9"]);
 }, 60_000);
 
 test("an assignment on the right of || / && / ?? does not retype the left operand", async () => {
