@@ -102,3 +102,19 @@ console.log(SQL.extra);
   );
   expect(lines).toEqual(["function 1 hi true", "function 2", "3 4", "5", "9"]);
 }, 60_000);
+
+test("an assignment on the right of || / && / ?? does not retype the left operand", async () => {
+  // the compile-time type of a local followed the assignment although the branch may not run
+  const lines = await run(
+    "logicinfer",
+    `const a = (() => { let o = 1; o || (o = {}); return typeof o; })();
+const b = (() => { let o = 0; o || (o = "s"); return typeof o; })();
+const c = (() => { let o = 1; o && (o = "t"); return typeof o; })();
+const d = (() => { let o = 1; o ?? (o = {}); return typeof o; })();
+const e = (() => { let o = 1; const r = o || (o = {}); return typeof o + typeof r; })();
+const f = (() => { class L { static v = 5; } L || (L = {}); const t = typeof L; return t + L.v + new L().constructor.name; })();
+console.log([a, b, c, d, e, f].join(" "));
+`,
+  );
+  expect(lines).toEqual(["number string string number numbernumber function5L"]);
+}, 60_000);

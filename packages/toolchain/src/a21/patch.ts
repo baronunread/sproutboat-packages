@@ -833,6 +833,31 @@ export async function patchDateOffsets(root: string): Promise<void> {
   ]);
 }
 
+/**
+ * P13: the right operand of `||`, `&&` and `??` runs conditionally, but its assignments updated the
+ * compile-time type of a local as if it always ran (the `if` and ternary paths scope them as a branch).
+ * In a function, `let o = 1; o || (o = {}); typeof o` answered "object", and the namespace-merge
+ * pattern `class SQL {}; (SQL || (SQL = {}))` inside any function (every bundled app body is one)
+ * left SQL typed as an object while it held the class: "Cannot get property of null" at startup.
+ * The right operand is now generated as a branch.
+ */
+const LOGIC_BRANCH_MARKER = "sproutboat P13: the right operand of a logical expression is a branch";
+export async function patchLogicalBranchInference(root: string): Promise<void> {
+  await editOnce(
+    resolve(root, "compiler/codegen.js"),
+    "logical expression branch inference (P13)",
+    LOGIC_BRANCH_MARKER,
+    [
+      [
+        "  emitIf(scope, check(scope, res, getNodeType(scope, decl.left)), () => {\n    if (valueUnused) exprStmt(scope, generate(scope, decl.right, undefined, true));\n      else assign(scope, res, coerceValue(generate(scope, decl.right), T.jsval));\n  });\n",
+        "  emitIf(scope, check(scope, res, getNodeType(scope, decl.left)), () => {\n    // " +
+          LOGIC_BRANCH_MARKER +
+          "\n    inferBranchStart(scope);\n    if (valueUnused) exprStmt(scope, generate(scope, decl.right, undefined, true));\n      else assign(scope, res, coerceValue(generate(scope, decl.right), T.jsval));\n    inferBranchEnd(scope);\n  });\n",
+      ],
+    ],
+  );
+}
+
 // --- the chain ---
 
 const done = new Set<string>();
@@ -887,6 +912,7 @@ export async function ensurePorfforPatchedA21(root: string): Promise<void> {
   await patchJsonWideStringBound(root);
   if (channelOfTree(root) === "alpha-22") await patchDispatchArgOrder(root); // alpha 21 has no shared dispatch
   await patchClassBindingWrite(root);
+  await patchLogicalBranchInference(root);
   await patchDateOffsets(root);
   // Last: the precompile picks up the builtin edits above.
   await precompileBuiltinsA21(root);

@@ -98,7 +98,8 @@ export const STREAM_FLAG_ANCHOR = "  bool raw_body = false;\n";
 export const STREAM_FLAG_INJECT = "  bool raw_body = false;\n  u32 stream_id = 0; // sproutboat B19\n";
 
 export const STREAM_CORK_ANCHOR = "    res->cork([res, status, headers_entries_ptr, body_buf, body_len]() {\n";
-export const STREAM_CORK_INJECT = "    res->cork([res, status, headers_entries_ptr, body_buf, body_len, stream_id]() {\n";
+export const STREAM_CORK_INJECT =
+  "    res->cork([res, status, headers_entries_ptr, body_buf, body_len, stream_id]() {\n";
 
 export const STREAM_END_ANCHOR = "      res->end(std::string_view(body_buf, body_len));\n";
 export const STREAM_END_INJECT =
