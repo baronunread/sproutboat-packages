@@ -67,7 +67,8 @@
     "test:native-concurrent-requests": "bun packages/runtime/test/native-concurrent-requests.ts",
     "test:native-async-local-storage": "bun packages/runtime/test/native-async-local-storage.ts",
     "test:native-cpu-requests": "bun packages/runtime/test/native-cpu-requests.ts",
-    "test:native-subtle": "bun packages/runtime/test/native-subtle.ts"
+    "test:native-subtle": "bun packages/runtime/test/native-subtle.ts",
+    "test:native-request-log": "bun packages/runtime/test/native-request-log.ts"
   },
   "devDependencies": {
     "@changesets/cli": "^3.0.2",
