@@ -1,5 +1,11 @@
 # @sproutboat/runtime
 
+## 0.43.0
+
+### Minor Changes
+
+- 201f8ff: runtime: with `SB_LOG=json` in its environment a binary writes structured records to stderr, one JSON line each (#268). A request writes `{"type":"request","v":1,"id","timestamp","method","path","status","durationMs","outcome"}` once its response is built, and every uncaught error (a handler, `scheduled()`, `queue()`, an alarm, a WebSocket handler, a rejected promise or a `waitUntil` task) writes `{"type":"error","v":1,"id","timestamp","source","name","message","stack"}` in place of the plain `Uncaught (in ...)` text. An error raised while answering a request carries that request's `id`; background work has `id: null`. Bodies, headers, the query string and the client address are never written, and the value of a declared secret that appears in a message or stack is replaced with `[redacted]`. Output is bounded: fields are cut to fixed lengths and at most 200 lines a second are written; the rest are counted and reported by a `{"type":"dropped","count"}` line when the next second starts. Without `SB_LOG=json` nothing changes, so no compatibility date applies.
+
 ## 0.42.2
 
 ### Patch Changes
