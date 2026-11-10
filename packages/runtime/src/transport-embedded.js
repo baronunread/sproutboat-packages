@@ -5233,8 +5233,9 @@ function __sbEmbeddedDispatch(msg) {
       const key = String(pairs[i][0]).toLowerCase();
       // Host, Connection and Content-Length are ours to set.
       if (key === "host" || key === "connection" || key === "content-length") continue;
-      // The host's markers are its own: the caller's x-sb-* headers do not travel (x-sb-rpc names an RPC method).
-      if (service && key.slice(0, 5) === "x-sb-" && key !== "x-sb-rpc") continue;
+      // The host's markers are its own: the caller's x-sb-* headers do not travel. Only an RPC call (the prelude's
+      // __sbRpcCall, msg.rpc) sends x-sb-rpc, which names the method.
+      if (service && key.slice(0, 5) === "x-sb-" && !(msg.rpc === true && key === "x-sb-rpc")) continue;
       headerText += pairs[i][0] + ": " + pairs[i][1] + "\r\n";
     }
     const asyncId = msg.asyncId > 0 ? msg.asyncId : 0;

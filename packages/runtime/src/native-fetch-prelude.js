@@ -11970,6 +11970,8 @@ async function __sbRpcCall(binding, method, args) {
   const msg = {
     binding,
     url: "https://rpc.sproutboat.internal/" + method,
+    // Marks an RPC call for a transport that has to tell it from a fetch that carries an x-sb-rpc header of its own.
+    rpc: true,
     method: "POST",
     headers: [
       ["x-sb-rpc", method],
