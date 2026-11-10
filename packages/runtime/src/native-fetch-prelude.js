@@ -11174,6 +11174,31 @@ function __sbMakeR2(name) {
     resumeMultipartUpload(key, uploadId) {
       return upload(String(key), String(uploadId));
     },
+    // Direct transfer (a sproutboat extension, as on the legacy binding): a URL the client sends the bytes to or
+    // fetches them from without passing through the app. Promises, like the rest of this binding.
+    createUploadUrl(key, options) {
+      return attempt(() => {
+        const o = options || {};
+        const r = __sbRpc("r2.transfer.create", {
+          bucket: name,
+          key: String(key),
+          method: "upload",
+          maxBytes: o.maxBytes,
+          expiresIn: o.expiresIn,
+          sha256: o.sha256,
+          httpMetadata: o.httpMetadata || {},
+          customMetadata: o.customMetadata || {},
+        });
+        return { url: r.url, expiresAt: r.expiresAt };
+      });
+    },
+    createDownloadUrl(key, options) {
+      return attempt(() => {
+        const o = options || {};
+        const r = __sbRpc("r2.transfer.create", { bucket: name, key: String(key), method: "download", expiresIn: o.expiresIn });
+        return { url: r.url, expiresAt: r.expiresAt };
+      });
+    },
   };
 }
 
@@ -11970,6 +11995,8 @@ async function __sbRpcCall(binding, method, args) {
   const msg = {
     binding,
     url: "https://rpc.sproutboat.internal/" + method,
+    // Marks an RPC call for a transport that has to tell it from a fetch that carries an x-sb-rpc header of its own.
+    rpc: true,
     method: "POST",
     headers: [
       ["x-sb-rpc", method],

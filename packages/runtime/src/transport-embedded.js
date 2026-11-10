@@ -2679,6 +2679,8 @@ static void sb_tcp_nodelay(int fd) {
 // broken exchange closes N for good, so a late answer can never be taken for the
 // next one.
 static int sb_egress_fd_ask(int via, const char* host, int port, char* refused, size_t refused_len);
+// The ticket of the last service-binding connect on this thread ("" for any other connect).
+static __thread char sb_svc_ticket[72];
 static int sb_egress_fd_connect(int via, const char* host, int port, char* refused, size_t refused_len) {
   static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
   pthread_mutex_lock(&lock);
@@ -2714,7 +2716,16 @@ static int sb_egress_fd_ask(int via, const char* host, int port, char* refused, 
     return -1;
   }
   answer[got - 1] = 0;
+  // "ok TICKET" (a service-binding call, host "sbsvc.HEX"): the host connected us to itself and the
+  // ticket, which only it could mint, tells it who is calling. The request carries it as a header.
+  sb_svc_ticket[0] = 0;
+  if (!strncmp(answer, "ok ", 3) && fd >= 0 && strlen(answer + 3) > 0 && strlen(answer + 3) < sizeof(sb_svc_ticket)) {
+    snprintf(sb_svc_ticket, sizeof(sb_svc_ticket), "%s", answer + 3);
+    answer[2] = 0;
+  }
   if (!strcmp(answer, "ok") && fd >= 0) {
+    // A service call is bounded per hop at 30 s, as the callee's own wall limit is.
+    if (sb_svc_ticket[0]) tv.tv_sec = 30;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     sb_tcp_nodelay(fd);
@@ -2885,11 +2896,22 @@ static char* sb_error_json(const char* prefix, const char* detail) {
 static char* sb_http_plain(const char* host, int port, const char* path, const char* method,
                            const char* headers, const char* body, size_t body_len) {
   char refused[512] = "";
+  sb_svc_ticket[0] = 0;
   int fd = sb_tcp_connect(host, port, refused, sizeof(refused));
   if (fd < 0) return refused[0] ? sb_error_json(refused, 0) : sb_error_json("could not connect to ", host);
 
+  // A service-binding call: the ticket the host minted for it goes first among the headers.
+  sb_buf tagged = { 0, 0, 0 };
+  if (sb_svc_ticket[0]) {
+    sb_puts(&tagged, "x-sb-svc-ticket: ");
+    sb_puts(&tagged, sb_svc_ticket);
+    sb_puts(&tagged, "\r\n");
+    if (headers && *headers) sb_puts(&tagged, headers);
+    headers = tagged.p;
+  }
   sb_buf req = { 0, 0, 0 };
   sb_build_request(&req, host, port, 80, path, method, headers, body, body_len);
+  free(tagged.p);
   size_t sent = 0;
   while (sent < req.len) {
     long n = write(fd, req.p + sent, req.len - sent);
@@ -5154,24 +5176,73 @@ function __sbEmbeddedDispatch(msg) {
     return { ok: true, found: false, status: 404, body: "Not Found" };
   }
 
-  if (op === "fetch") {
-    const url = new URL(String(msg.url));
-    const tls = url.protocol === "https:";
-    if (!tls && url.protocol !== "http:") throw new Error("unsupported protocol: " + url.protocol);
+  // A service-binding call (compatibility date 2026-11-18): the host the app runs on routes it to the
+  // callee. The call is an HTTP request to the pseudo-host "sbsvc.HEX" (the binding's name in hex): the
+  // host sees the name on the egress socket the question came in on, finds the callee in its services
+  // map and answers "ok TICKET" with a connection to its own listener. __sbHttpRaw sends the ticket as
+  // a header (sb_http_plain) and the host's frontend, which alone mints tickets, delivers the request
+  // to the callee marked as a service-binding call. See sproutd's docs/bindings.md, "Service bindings".
+  if (op === "fetch" || op === "service.fetch") {
+    const service = op === "service.fetch";
+    let hostname;
+    let port;
+    let pathname;
+    let tls = false;
     let headerText = "";
+    if (service) {
+      if (__sbCompatDate() < "2026-11-18") {
+        throw new Error(
+          "service binding " + msg.binding + " needs compatibility_date 2026-11-18 or later to reach another app on this host",
+        );
+      }
+      if (!__sbEnv("SB_EGRESS_FD")) {
+        throw new Error(
+          "service binding " + msg.binding + " has no app to reach here: a standalone binary has no peer apps, only a platform host (sproutd) has",
+        );
+      }
+      const binding = String(msg.binding);
+      let hex = "";
+      for (let i = 0; i < binding.length; i++) {
+        const c = binding.charCodeAt(i);
+        if (c > 127) throw new Error("service binding names are ASCII: " + binding);
+        hex += (c < 16 ? "0" : "") + c.toString(16);
+      }
+      if (hex.length > 200) throw new Error("service binding name too long: " + binding);
+      hostname = "sbsvc." + hex;
+      port = "80";
+      // The callee sees the URL its caller passed (x-sb-url, vouched for by the host); the request line
+      // carries only its path.
+      try {
+        const parsed = new URL(String(msg.url));
+        pathname = parsed.pathname + parsed.search;
+        headerText += "x-sb-url: " + parsed.href + "\r\n";
+      } catch (e) {
+        const p = String(msg.url || "/");
+        pathname = p.charAt(0) === "/" ? p : "/" + p;
+      }
+    } else {
+      const url = new URL(String(msg.url));
+      tls = url.protocol === "https:";
+      if (!tls && url.protocol !== "http:") throw new Error("unsupported protocol: " + url.protocol);
+      hostname = url.hostname;
+      port = url.port ? url.port : tls ? "443" : "80";
+      pathname = url.pathname + url.search;
+    }
     const pairs = msg.headers || [];
     for (let i = 0; i < pairs.length; i++) {
       const key = String(pairs[i][0]).toLowerCase();
       // Host, Connection and Content-Length are ours to set.
       if (key === "host" || key === "connection" || key === "content-length") continue;
+      // The host's markers are its own: the caller's x-sb-* headers do not travel. Only an RPC call (the prelude's
+      // __sbRpcCall, msg.rpc) sends x-sb-rpc, which names the method.
+      if (service && key.slice(0, 5) === "x-sb-" && !(msg.rpc === true && key === "x-sb-rpc")) continue;
       headerText += pairs[i][0] + ": " + pairs[i][1] + "\r\n";
     }
-    const port = url.port ? url.port : tls ? "443" : "80";
     const asyncId = msg.asyncId > 0 ? msg.asyncId : 0;
     const raw = __sbHttpRaw(
-      url.hostname,
+      hostname,
       port,
-      url.pathname + url.search,
+      pathname,
       String(msg.method || "GET").toUpperCase(),
       headerText,
       msg.body == null ? "" : String(msg.body),

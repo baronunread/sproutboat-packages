@@ -242,6 +242,82 @@ int main(void) {
   }
 });
 
+test('SB_EGRESS_FD: a service-binding call\'s "ok TICKET" answer leaves the ticket for the request', () => {
+  const source = readFileSync(transportFile, "utf8");
+  const block = source.slice(source.indexOf("// EGRESS-FD:BEGIN"), source.indexOf("// EGRESS-FD:END"));
+  const dir = mkdtempSync(join(tmpdir(), "sb-egress-ticket-"));
+  try {
+    writeFileSync(
+      join(dir, "check.c"),
+      `#include <errno.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+${block}
+static void answer(int via, const char* text, int fd) {
+  union { struct cmsghdr align; char space[CMSG_SPACE(sizeof(int))]; } control;
+  struct iovec io = { (void*)text, strlen(text) };
+  struct msghdr msg;
+  memset(&msg, 0, sizeof(msg));
+  msg.msg_iov = &io; msg.msg_iovlen = 1;
+  if (fd >= 0) {
+    msg.msg_control = control.space; msg.msg_controllen = sizeof(control.space);
+    struct cmsghdr* c = CMSG_FIRSTHDR(&msg);
+    c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_RIGHTS; c->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(c), &fd, sizeof(fd));
+  }
+  sendmsg(via, &msg, 0);
+}
+int main(void) {
+  int pair[2];
+  socketpair(AF_UNIX, SOCK_STREAM, 0, pair);
+  if (fork() == 0) {
+    close(pair[0]);
+    char line[512];
+    int remote[2];
+    read(pair[1], line, sizeof(line) - 1);
+    socketpair(AF_UNIX, SOCK_STREAM, 0, remote);
+    answer(pair[1], "ok 0123abcd\\n", remote[0]);
+    read(pair[1], line, sizeof(line) - 1);
+    socketpair(AF_UNIX, SOCK_STREAM, 0, remote);
+    answer(pair[1], "ok\\n", remote[0]);
+    _exit(0);
+  }
+  close(pair[1]);
+  char refused[512] = "";
+  int fd = sb_egress_fd_connect(pair[0], "sbsvc.70", 80, refused, sizeof(refused));
+  printf("service %s ticket=%s\\n", fd >= 0 ? "yes" : "no", sb_svc_ticket);
+  fd = sb_egress_fd_connect(pair[0], "up.test", 80, refused, sizeof(refused));
+  printf("plain %s ticket=%s\\n", fd >= 0 ? "yes" : "no", sb_svc_ticket);
+  wait(0);
+  return 0;
+}
+`,
+    );
+    const cc = Bun.spawnSync([
+      "cc",
+      "-Wall",
+      "-Werror",
+      "-Wno-unused-result",
+      "-o",
+      join(dir, "check"),
+      join(dir, "check.c"),
+    ]);
+    expect(cc.stderr.toString()).toBe("");
+    const run = Bun.spawnSync([join(dir, "check")]);
+    expect(run.stdout.toString().trimEnd().split("\n")).toEqual(["service yes ticket=0123abcd", "plain yes ticket="]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("sb_tcp_connect sets TCP_NODELAY on the socket it returns", () => {
   // Nagle plus the peer's delayed ACK stalled every fresh HTTPS fetch about 44 ms on Linux (a TLS
   // handshake writes small flights). Timing is flaky on CI and loopback on macOS does not show
