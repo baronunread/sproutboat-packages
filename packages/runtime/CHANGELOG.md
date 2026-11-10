@@ -1,5 +1,15 @@
 # @sproutboat/runtime
 
+## 0.44.0
+
+### Minor Changes
+
+- 8e08bb2: runtime: service bindings between apps on a sproutd host. `env.PEER.fetch()` and RPC on a callee's `WorkerEntrypoint` (`env.PEER.method(...)`) now work from compatibility date 2026-11-18, where the embedded transport had no `service.fetch` op and a call failed with `unknown op`. The caller sends the call as an HTTP request to the pseudo-host `sbsvc.<binding name in hex>` over its egress socket (`SB_EGRESS_FD`). The host looks the binding up in the services map it holds for the caller, answers `ok TICKET` with a connection to its own listener, and the transport sends the ticket as an `x-sb-svc-ticket` header. The host, which alone mints tickets, then delivers the request to the callee marked as a vouched service-binding call, so the callee's existing ingress (`x-sb-binding-call`, `x-sb-edge-token`, `x-sb-url`, `x-sb-rpc`, `x-sb-uncaught`) works unchanged. A call is bounded at 30 seconds per hop, with no depth cap: a loop unwinds on that timeout. Before 2026-11-18 a call fails as before, with a clearer message. A standalone binary, which has no peer apps, reports that. An older host answers the pseudo-host as an unresolvable name.
+
+### Patch Changes
+
+- 8e08bb2: runtime: the promise-returning R2 binding (compatibility date 2026-10-26 and later) has `createUploadUrl()` and `createDownloadUrl()` again, with the semantics of the legacy binding (the same `r2.transfer.create` call, now returning promises). They were missing there, so an app that moved past 2026-10-26 lost direct transfer with a "not a function" error. No date gate: the methods did not exist at those dates, so nothing that worked changes.
+
 ## 0.43.0
 
 ### Minor Changes
