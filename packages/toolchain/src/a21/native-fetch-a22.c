@@ -190,8 +190,15 @@ void sb_response_complete_js(f64 pending, f64 status, jsval head, jsval body, f6
     const char* value; size_t value_len; char* value_owned;
     if (read_fast(porf_arr_get(list, i), &name, &name_len, &name_owned) != 0) continue;
     if (name_is(name, name_len, "x-sb-raw-body")) { raw = 1; free(name_owned); continue; }
-    if (name_is(name, name_len, "connection") || name_is(name, name_len, "content-length") || name_is(name, name_len, "transfer-encoding")) { free(name_owned); continue; }
+    if (name_is(name, name_len, "connection") || name_is(name, name_len, "transfer-encoding")) { free(name_owned); continue; }
     if (read_fast(porf_arr_get(list, i + 1), &value, &value_len, &value_owned) != 0) { free(name_owned); continue; }
+    // A length the app declared goes to the server as a number (the server uses it for a HEAD answer, which has no body to
+    // count, and drops it otherwise: it counts the body it sends).
+    if (name_is(name, name_len, "content-length")) {
+      int digits = value_len > 0 && value_len <= 15;
+      for (size_t k = 0; k < value_len && digits; k++) if (value[k] < '0' || value[k] > '9') digits = 0;
+      if (!digits) { free(name_owned); free(value_owned); continue; }
+    }
     if (blob_len + name_len + value_len + 2 > cap) { while (blob_len + name_len + value_len + 2 > cap) cap *= 2; blob = (char*)realloc(blob, cap); if (!blob) abort(); }
     memcpy(blob + blob_len, name, name_len); blob_len += name_len; blob[blob_len++] = 0;
     memcpy(blob + blob_len, value, value_len); blob_len += value_len; blob[blob_len++] = 0;

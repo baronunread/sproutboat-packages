@@ -1879,6 +1879,22 @@ static u32 sb_r2_get_c(const char* path, const char* bucket, const char* key, co
   return out;
 }
 
+// Reads at most CAP bytes at OFFSET of an object's file into OUT, and nothing else of it: a range read
+// (R2 get with a range) and each chunk of a streamed body come through here, so an object of any size is
+// never in memory whole. Returns the byte count (short at the end of the object), or -1 when the file
+// cannot be read. The file is named by the object's generation, which a put never rewrites.
+static long sb_r2_read_into_c(const char* path, const char* bucket, const char* key, const char* generation, size_t offset, char* out, size_t cap) {
+  char blobpath[1024];
+  sb_r2_blob_path(blobpath, sizeof(blobpath), path, bucket, key, generation);
+  FILE* f = fopen(blobpath, "rb");
+  if (!f) return -1;
+  if (offset && fseek(f, (long)offset, SEEK_SET) != 0) { fclose(f); return -1; }
+  size_t rd = cap ? fread(out, 1, cap, f) : 0;
+  int bad = ferror(f);
+  fclose(f);
+  return bad ? -1 : (long)rd;
+}
+
 // Best-effort: a metadata row deleted with no blob file (or vice versa) is
 // still a correct end state, so a missing file here is not an error.
 static void sb_r2_delete_blob(const char* path, const char* bucket, const char* key, const char* generation) {
@@ -2118,6 +2134,95 @@ size_t sb_r2_transfer_download_read(sb_r2_transfer_ctx* ctx, size_t offset, char
   return fread(out, 1, wanted, ctx->file);
 }
 void sb_r2_transfer_download_close(sb_r2_transfer_ctx* ctx) { if (ctx) { if (ctx->file) fclose(ctx->file); free(ctx); } }
+
+// A host whose workers serve transfer tickets themselves (sproutd: the frontend forwards /__sb/r2/transfer/...
+// like any request, with its body streamed) drives the same context from JavaScript, one step at a time.
+// The contexts live here, in a small table (a handle is its index plus one), so JavaScript never holds a
+// pointer; a handle is released by finishing, aborting or closing it. An upload step moves what the request
+// body has buffered (at most 1 MiB, in 64 KiB pieces from the stack) into the object's temporary file, and a
+// download read fills a Uint8Array from the object's file: object bytes are never strings or JSON.
+#define SB_XFER_MAX 16
+static sb_r2_transfer_ctx* sb_xfer[SB_XFER_MAX];
+static int sb_xfer_hold(sb_r2_transfer_ctx* ctx) {
+  for (int i = 0; i < SB_XFER_MAX; i++) if (!sb_xfer[i]) { sb_xfer[i] = ctx; return i + 1; }
+  return 0;
+}
+static sb_r2_transfer_ctx* sb_xfer_get(int handle) {
+  return handle >= 1 && handle <= SB_XFER_MAX ? sb_xfer[handle - 1] : 0;
+}
+extern long long sb_reqbody_poll(unsigned int);
+extern size_t sb_reqbody_take(unsigned int, char*, size_t);
+// Claims an upload ticket: the HTTP status (0: claimed, HANDLE set).
+static int sb_xfer_upload_open(const char* bucket, const char* token, size_t declared, int* handle) {
+  sb_r2_transfer_ctx* ctx = 0;
+  *handle = 0;
+  int status = sb_r2_transfer_open(bucket, token, declared, &ctx);
+  if (status != 0 || !ctx) return status ? status : 500;
+  *handle = sb_xfer_hold(ctx);
+  if (!*handle) { sb_r2_transfer_abort(ctx); return 503; }
+  return 0;
+}
+// One step of an upload from request body BODY: 'd' some bytes moved (*arg), 'w' none yet (wait for the
+// body's timer), 'e' the body ended (finish), 'f' the body failed (the client went away, abort), 's' a
+// status refused them (*arg; the ticket is released). A step stops after 1 MiB so other requests run.
+static char sb_xfer_upload_step(int handle, unsigned int body, long* arg) {
+  sb_r2_transfer_ctx* ctx = sb_xfer_get(handle);
+  *arg = 0;
+  if (!ctx) { *arg = 500; return 's'; }
+  char piece[65536];
+  long moved = 0;
+  while (moved < (1 << 20)) {
+    long long ready = sb_reqbody_poll(body);
+    if (ready == -1) { *arg = moved; return moved ? 'd' : 'e'; }
+    if (ready == -2) { *arg = moved; return moved ? 'd' : 'f'; }
+    if (ready == 0) { *arg = moved; return moved ? 'd' : 'w'; }
+    size_t n = sb_reqbody_take(body, piece, sizeof(piece));
+    if (!n) { *arg = moved; return moved ? 'd' : 'w'; }
+    int status = sb_r2_transfer_write(ctx, piece, n);
+    if (status != 0) { sb_r2_transfer_abort(ctx); sb_xfer[handle - 1] = 0; *arg = status; return 's'; }
+    moved += (long)n;
+  }
+  *arg = moved;
+  return 'd';
+}
+// A body that arrived whole (a request of a host that buffers it): written in one go.
+static int sb_xfer_upload_write(int handle, const char* bytes, size_t length) {
+  sb_r2_transfer_ctx* ctx = sb_xfer_get(handle);
+  if (!ctx) return 500;
+  int status = sb_r2_transfer_write(ctx, bytes, length);
+  if (status != 0) { sb_r2_transfer_abort(ctx); sb_xfer[handle - 1] = 0; }
+  return status;
+}
+static int sb_xfer_finish(int handle) {
+  sb_r2_transfer_ctx* ctx = sb_xfer_get(handle);
+  if (!ctx) return 500;
+  sb_xfer[handle - 1] = 0;
+  return sb_r2_transfer_finish(ctx);
+}
+static void sb_xfer_close(int handle) {
+  sb_r2_transfer_ctx* ctx = sb_xfer_get(handle);
+  if (!ctx) return;
+  sb_xfer[handle - 1] = 0;
+  sb_r2_transfer_abort(ctx);
+}
+// Claims a download ticket: the HTTP status (0: claimed, HANDLE, *size and *etag set).
+static int sb_xfer_download_open(const char* bucket, const char* token, int* handle, size_t* size, char* etag, size_t etag_cap) {
+  sb_r2_transfer_ctx* ctx = 0;
+  *handle = 0;
+  int status = sb_r2_transfer_download_open(bucket, token, &ctx);
+  if (status != 0 || !ctx) return status ? status : 500;
+  *handle = sb_xfer_hold(ctx);
+  if (!*handle) { sb_r2_transfer_download_close(ctx); return 503; }
+  *size = sb_r2_transfer_download_size(ctx);
+  snprintf(etag, etag_cap, "%s", sb_r2_transfer_download_etag(ctx));
+  return 0;
+}
+static void sb_xfer_download_close(int handle) {
+  sb_r2_transfer_ctx* ctx = sb_xfer_get(handle);
+  if (!ctx) return;
+  sb_xfer[handle - 1] = 0;
+  sb_r2_transfer_download_close(ctx);
+}
 
 // LTX capture (#141) failed after SQLite committed: the write is in the database but not in
 // the replication log, and the database refuses writes until the process restarts. Said as
@@ -4342,6 +4447,112 @@ function __sbR2GetRaw(path, bucket, key, blobId) {
   return res;
 }
 
+// R2 get without the whole object: fills VIEW (a fresh Uint8Array) with the bytes at OFFSET of the object's
+// file. Returns how many it read (fewer at the end of the object), or -1 when the file cannot be read.
+// oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
+function __sbR2ReadInto(path, bucket, key, blobId, offset, view) {
+  let got = -1;
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    const char* __p; size_t __pl; char* __po = 0;
+    porf_native_fetch_read_value(path, &__p, &__pl, &__po);
+    char* __path = (char*)malloc(__pl + 1); memcpy(__path, __p, __pl); __path[__pl] = 0;
+    if (__po) free(__po);
+
+    const char* __bk; size_t __bkl; char* __bko = 0;
+    porf_native_fetch_read_value(bucket, &__bk, &__bkl, &__bko);
+    char* __bucket = (char*)malloc(__bkl + 1); memcpy(__bucket, __bk, __bkl); __bucket[__bkl] = 0;
+    if (__bko) free(__bko);
+
+    const char* __k; size_t __kl; char* __ko = 0;
+    porf_native_fetch_read_value(key, &__k, &__kl, &__ko);
+    char* __key = (char*)malloc(__kl + 1); memcpy(__key, __k, __kl); __key[__kl] = 0;
+    if (__ko) free(__ko);
+
+    const char* __g; size_t __gl; char* __go = 0;
+    porf_native_fetch_read_value(blobId, &__g, &__gl, &__go);
+    char* __generation = (char*)malloc(__gl + 1); memcpy(__generation, __g, __gl); __generation[__gl] = 0;
+    if (__go) free(__go);
+
+    long __n = -1;
+    if (view.type == 81 && offset.type == 1 && offset.val >= 0) {
+      const u32 __ta = (u32)view.val;
+      const int32_t __len = *(int32_t*)(MEM + __ta);
+      const u32 __at = *(u32*)(MEM + __ta + 4) + 4;
+      if (__len >= 0) __n = sb_r2_read_into_c(__path, __bucket, __key, __generation, (size_t)offset.val, (char*)(MEM + __at), (size_t)__len);
+    }
+    free(__path); free(__bucket); free(__key); free(__generation);
+    got = (f64)__n;
+  `;
+  return got;
+}
+
+// Transfer tickets served by the worker (see sb_xfer_* above). op: "u" claim an upload ticket (a = bucket, b = token,
+// n = the declared length; "0 HANDLE" or "STATUS"), "s" a step of the upload from body id n ("d BYTES", "w", "e", "f"
+// or "s STATUS"), "b" write the bytestring in a (a buffered body; the status), "f" finish ("STATUS"), "x" release the
+// handle in n, "d" claim a download ticket ("0 HANDLE SIZE ETAG" or "STATUS"), "r" read the object's file at offset n
+// into the Uint8Array in view (handle in a; the count), "c" release a download handle. Returns a short string.
+// oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
+function __sbR2XferOp(op, a, b, n, view) {
+  let out = "";
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    const char* __o; size_t __ol; char* __oo = 0;
+    porf_native_fetch_read_value(op, &__o, &__ol, &__oo);
+    char __op = __ol ? __o[0] : 0;
+    if (__oo) free(__oo);
+
+    const char* __a; size_t __al; char* __ao = 0;
+    porf_native_fetch_read_value(a, &__a, &__al, &__ao);
+    char* __as = (char*)malloc(__al + 1); memcpy(__as, __a, __al); __as[__al] = 0;
+    if (__ao) free(__ao);
+    const char* __b; size_t __bl; char* __bo = 0;
+    porf_native_fetch_read_value(b, &__b, &__bl, &__bo);
+    char* __bs = (char*)malloc(__bl + 1); memcpy(__bs, __b, __bl); __bs[__bl] = 0;
+    if (__bo) free(__bo);
+
+    const double __n = n.type == 1 ? n.val : 0;
+    const int __handle = (int)strtol(__as, 0, 10);
+    char __r[160]; __r[0] = 0;
+    if (__op == 'u') {
+      int __h = 0;
+      int __s = sb_xfer_upload_open(__as, __bs, (size_t)__n, &__h);
+      if (__s == 0) snprintf(__r, sizeof(__r), "0 %d", __h); else snprintf(__r, sizeof(__r), "%d", __s);
+    } else if (__op == 's') {
+      long __moved = 0;
+      char __k = sb_xfer_upload_step(__handle, (unsigned int)__n, &__moved);
+      snprintf(__r, sizeof(__r), "%c %ld", __k, __moved);
+    } else if (__op == 'b') {
+      const char* __d = 0; size_t __dl = 0;
+      int __s = 500;
+      if (porf_native_fetch_read_raw_bytes(b, &__d, &__dl) == 0) __s = sb_xfer_upload_write(__handle, __d, __dl);
+      snprintf(__r, sizeof(__r), "%d", __s);
+    } else if (__op == 'f') snprintf(__r, sizeof(__r), "%d", sb_xfer_finish(__handle));
+    else if (__op == 'x') sb_xfer_close((int)__n);
+    else if (__op == 'd') {
+      int __h = 0; size_t __size = 0; char __etag[80]; __etag[0] = 0;
+      int __s = sb_xfer_download_open(__as, __bs, &__h, &__size, __etag, sizeof(__etag));
+      if (__s == 0) snprintf(__r, sizeof(__r), "0 %d %zu %s", __h, __size, __etag); else snprintf(__r, sizeof(__r), "%d", __s);
+    } else if (__op == 'r') {
+      long __got = -1;
+      sb_r2_transfer_ctx* __ctx = sb_xfer_get(__handle);
+      if (__ctx && view.type == 81) {
+        const u32 __ta = (u32)view.val;
+        const int32_t __len = *(int32_t*)(MEM + __ta);
+        const u32 __at = *(u32*)(MEM + __ta + 4) + 4;
+        if (__len >= 0) __got = (long)sb_r2_transfer_download_read(__ctx, (size_t)__n, (char*)(MEM + __at), (size_t)__len);
+      }
+      snprintf(__r, sizeof(__r), "%ld", __got);
+    } else if (__op == 'c') sb_xfer_download_close((int)__n);
+    free(__as); free(__bs);
+    out = porf_box((f64)porf_native_fetch_alloc_bytestring(__r, strlen(__r)), 195);
+  `;
+  return out;
+}
+// This transport's workers serve transfer tickets themselves, on a host that forwards the path (sproutd); a
+// standalone executable's native server answers them before JavaScript runs, and never gets here.
+__sbR2TransferOn = true;
+
 // R2 delete: also removes the object's own file, not just the metadata row
 // (#56 — sb_r2_delete_blob is best-effort, a missing file is not an error).
 // oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
@@ -5953,6 +6164,19 @@ globalThis.__sbR2Get = function (bucket, key) {
     object: meta.object,
     body: __sbR2GetRaw(__sbStore(), String(bucket), String(key), String(meta.blobId || "")),
   };
+};
+
+// The object's metadata and where its bytes are, without the bytes: get() reads them as the caller asks for them
+// (range windows and a body stream), through __sbR2ReadRange.
+globalThis.__sbR2Open = function (bucket, key) {
+  const meta = __sbEmbeddedDispatch({ op: "r2.head", bucket, key });
+  if (!meta.found) return { found: false };
+  return { found: true, object: meta.object, blobId: String(meta.blobId || "") };
+};
+
+// Fills the Uint8Array VIEW with the object's bytes from OFFSET; the count read, or -1.
+globalThis.__sbR2ReadRange = function (bucket, key, blobId, offset, view) {
+  return __sbR2ReadInto(__sbStore(), String(bucket), String(key), String(blobId), offset, view);
 };
 
 globalThis.__sbR2MultipartPut = function (bucket, key, uploadId, partNumber, body) {

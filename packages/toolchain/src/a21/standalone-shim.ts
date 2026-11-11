@@ -122,7 +122,7 @@ static bool sb_head_next(const std::string& head, size_t* at, std::string_view* 
 
 // sproutboat alpha 22: the response arrives flat from the bridge (status, the header blob, the body
 // bytes), already UTF-8 (or the raw bytes of an x-sb-raw-body response); nothing here reads the heap.
-static void write_response_value_flat(uWS::HttpResponse<false>* res, i32 status, const std::string& head, std::string_view body) {
+static void write_response_value_flat(uWS::HttpResponse<false>* res, i32 status, const std::string& head, std::string_view body, bool head_request) {
   sb_reqbody_responding(res);
   u32 stream_id = 0; // sproutboat B19
   u32 sb_ws_id = 0; // sproutboat: WebSockets
@@ -134,7 +134,15 @@ static void write_response_value_flat(uWS::HttpResponse<false>* res, i32 status,
       if (name == "x-sb-stream") stream_id = (u32)strtoul(std::string(value).c_str(), nullptr, 10);
     }
   }
-  res->cork([res, status, &head, body, stream_id, sb_ws_id]() {
+  // A HEAD answer has no body, so its length is the one the app declared (the Content-Length of the GET it stands for).
+  long long declared_length = -1;
+  if (head_request) {
+    size_t at = 0;
+    std::string_view name, value;
+    while (sb_head_next(head, &at, &name, &value))
+      if (name == "content-length") declared_length = strtoll(std::string(value).c_str(), nullptr, 10);
+  }
+  res->cork([res, status, &head, body, stream_id, sb_ws_id, head_request, declared_length]() {
     if (sb_ws_id || status == 101) { sb_ws_finish(res, sb_ws_id, head); return; }
     if (status != 200) res->writeStatus(lookup_status_line(status));
     size_t at = 0;
@@ -144,6 +152,7 @@ static void write_response_value_flat(uWS::HttpResponse<false>* res, i32 status,
     }
     if (sb_rs_closing) res->writeHeader("Connection", "close"); // sproutboat: draining
     if (stream_id) sb_stream_attach(stream_id, res); // sproutboat B19: the prelude pumps the body
+    else if (head_request) res->endWithoutBody(declared_length >= 0 ? (size_t)declared_length : body.size());
     else res->end(body);
   });
 }
@@ -154,6 +163,7 @@ const PENDING_RESPONSE = String.raw`struct PendingResponse {
   uWS::HttpResponse<false>* res = nullptr;
   bool aborted = false;
   bool finished = false;
+  bool head = false; // the request was a HEAD: its answer carries a length and no body
   explicit PendingResponse(uWS::HttpResponse<false>* res) : res(res) {}
 };
 // Every dispatched request until its reply: the reply may come after the client went away, and a
@@ -169,7 +179,7 @@ extern "C" void porf_native_fetch_response_complete_flat(void* raw_pending, i32 
       respond_with_error(pending->res, "500 Internal Server Error", "native fetch promise rejected", true);
     } else {
       const std::string head_blob(head, head_len);
-      write_response_value_flat(pending->res, status, head_blob, std::string_view(body, body_len));
+      write_response_value_flat(pending->res, status, head_blob, std::string_view(body, body_len), pending->head);
     }
   }
   sb_pending_live.erase(pending);
@@ -185,6 +195,7 @@ const HANDLE_REQUEST = String.raw`// Dispatches the request to the compiled hand
 static void handle_request(uWS::HttpResponse<false>* res, std::string_view method, const std::string& url, const std::string& head, std::string_view request_body, bool* aborted) {
   if (aborted && *aborted) return;
   auto* pending = new PendingResponse(res);
+  pending->head = method == "HEAD";
   sb_pending_live.insert(pending);
   res->onAborted([pending]() {
     if (pending->finished || pending->aborted) return;
