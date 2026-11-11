@@ -213,7 +213,39 @@ export async function patchPreludeOwnedGlobals(root: string): Promise<void> {
         "        if (n.type === 'AssignmentExpression' && n.left.type === 'MemberExpression' && !n.left.computed && n.left.object.type === 'Identifier' && n.left.object.name === 'globalThis') owned.add(n.left.property.name);\n" +
         "        for (const k in n) if (k !== 'loc' && k !== 'range') walk(n[k]); };\n" +
         "      walk(mod.body); for (const name of owned) used.delete(name);\n" +
+        "      // and the members of an owned object (process.stdin when the prelude owns process): the object is the prelude's\n" +
+        "      for (const name of owned) for (const dotted of [ ...used ]) if (dotted.startsWith(name + '.')) used.delete(dotted);\n" +
         "    }\n",
+    ],
+  ]);
+}
+
+/**
+ * P14 (sproutd issue 97; the label P10 was taken by `patchDispatchArgOrder`): the runtime globals an
+ * app may use are the ones the template installed, in the template's order. The compiler builds
+ * `node/internal/globals.js` from the names the program references, in first-use order, so a free
+ * `performance` in app code reordered its installs, and through their import edges the order of
+ * every node unit behind them: an `abi_rejected` for an ordinary program. With `SB_GLOBALS_PIN` set
+ * (a JSON array of the names, which sproutd's admission passes from the template's metadata) a name
+ * outside the array is an error, `<name> is not available in the shared generation`, and the module
+ * installs exactly the array, in its order, whatever the program uses. The names the program would
+ * install are always left in `globalThis.__sbGlobalsUsed`, which the template build records as the pin.
+ */
+const P14_MARKER = "sproutboat P14: runtime globals pinned to the template's";
+export async function patchGlobalsPin(root: string): Promise<void> {
+  await editOnce(resolve(root, "compiler/modules.js"), "the pinned runtime globals (P14)", P14_MARKER, [
+    [
+      "    if (used.size > 0) {\n      let src = '';\n",
+      "    // " +
+        P14_MARKER +
+        "\n" +
+        "    if (process.env.SB_GLOBALS_PIN) {\n" +
+        "      const pin = JSON.parse(process.env.SB_GLOBALS_PIN);\n" +
+        "      for (const name of used) if (!pin.includes(name)) throw new Error(`${name} is not available in the shared generation`);\n" +
+        "      used.clear(); for (const name of pin) used.add(name);\n" +
+        "    }\n" +
+        "    globalThis.__sbGlobalsUsed = [ ...used ];\n" +
+        "    if (used.size > 0) {\n      let src = '';\n",
     ],
   ]);
 }
@@ -899,6 +931,7 @@ export async function ensurePorfforPatchedA21(root: string): Promise<void> {
   // Group 2: determinism. modules.js first: codegen.js and render.js import appModuleIds from it.
   await patchAppModuleIds(root);
   await patchPreludeOwnedGlobals(root);
+  await patchGlobalsPin(root);
   await patchClassUnit(root);
   if (channelOfTree(root) === "alpha-22") await patchSharedDispatchUnit(root); // after P1: it reads classUnit
   await patchStableNames(root);
