@@ -6,6 +6,7 @@ import { A21_PATCH_FINGERPRINT, A21_RELEASED_FINGERPRINT, a21SourceFingerprint }
 import {
   ensurePorfforPatchedA21,
   patchClassUnit,
+  patchGlobalsPin,
   patchPreludeOwnedGlobals,
   patchReservedSelect,
   patchResponseStatics,
@@ -78,6 +79,7 @@ test("the alpha 21 chain applies to the pinned tree, once, and the second run ch
     ["compiler/codegen.js", "sproutboat P6: inits of app-module globals"],
     ["compiler/modules.js", "sproutboat P6: app-owned modules"],
     ["compiler/modules.js", "sproutboat P4: prelude-declared names override runtime globals"],
+    ["compiler/modules.js", "sproutboat P14: runtime globals pinned to the template's"],
     ["compiler/modules.js", "sproutboat P7: stable entry path"],
     ["compiler/render.js", "sproutboat: collector hooks for the fork template"],
     ["compiler/render.js", "static void porf_gc_scan_template_cards(void)"],
@@ -170,6 +172,7 @@ test("P1, P2 and P4 edits are anchored on exact alpha 21 text", async () => {
   await expect(patchUnitLayout(root)).rejects.toThrow("unit layout (P2, P3, P6)");
   await writeFile(join(root, "compiler/modules.js"), "nothing\n");
   await expect(patchPreludeOwnedGlobals(root)).rejects.toThrow("prelude-owned globals (P4)");
+  await expect(patchGlobalsPin(root)).rejects.toThrow("the pinned runtime globals (P14)");
   await expect(patchStableEntryPath(root)).rejects.toThrow("a stable entry path (P7)");
   await writeFile(join(root, "runtime/node/internal/fetch.js"), "class Response {}\n");
   await expect(patchResponseStatics(root)).rejects.toThrow("Response.redirect");
@@ -324,4 +327,58 @@ test("P9: JSON.parse of a large document with wide strings runs on patched alpha
   const [code, out] = await Promise.all([run.exited, new Response(run.stdout).text()]);
   expect(code).toBe(0);
   expect(out.trim()).toBe("637781 12000 naïve 中文 x11999");
+}, 180_000);
+
+test("P14: runtime globals are pinned to the template's set, and a free reference outside it is a compile error", async () => {
+  const root = await pristine("alpha-22");
+  await ensurePorfforPatchedA21(root);
+  // The shared prelude owns performance (an assignment) and process (a lazy accessor, `Object.defineProperty(globalThis, 'process', ...)`),
+  // both P4, the way sproutd's does; the template names MessageEvent.
+  const prelude =
+    "globalThis.performance = { now() { return 1; }, timeOrigin: 0 };\n" +
+    "Object.defineProperty(globalThis, 'process', { get() { return { env: {}, platform: 'linux' }; }, set(v) {}, configurable: true });\n" +
+    "globalThis.__sbAnchor = () => [ MessageEvent, global ];\nexport {};\n";
+  const compile = async (name: string, body: string, pin?: string[]) => {
+    const work = join(root, name);
+    await mkdir(work);
+    await writeFile(join(work, "shared-prelude.js"), prelude);
+    await writeFile(join(work, "worker.js"), `import './shared-prelude.js';\n${body}\n`);
+    await writeFile(join(work, "app.js"), "import './worker.js';\n");
+    const path = process.env.PATH ?? "";
+    const env = pin ? { PATH: path, SB_GLOBALS_PIN: JSON.stringify(pin) } : { PATH: path };
+    const out = join(work, "out");
+    const run = Bun.spawnSync(["bun", join(root, "runtime/index.js"), "c", join(work, "app.js"), "-o", out], {
+      cwd: work,
+      env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const text = new TextDecoder().decode(run.stderr) + new TextDecoder().decode(run.stdout);
+    const globals =
+      run.exitCode === 0 ? (await readdir(out)).find((f) => f.includes("internal_globals.js")) : undefined;
+    return { code: run.exitCode, text, globals: globals ? await readFile(join(out, globals), "utf8") : undefined };
+  };
+  // The template: its names, in its order, are what the pin records.
+  const template = await compile("template", "console.log(typeof global, typeof MessageEvent);");
+  expect(template.code, template.text).toBe(0);
+  const pin = ["global", "MessageEvent"];
+  // Same pinned set whatever the app references first, owned names included: the same globals unit, byte for byte.
+  const pinned = await compile("a", "console.log(typeof MessageEvent, typeof global);", pin);
+  const owned = await compile(
+    "b",
+    "console.log(performance.now(), typeof process.stdin, typeof process, typeof global);",
+    pin,
+  );
+  const none = await compile("c", "console.log(1);", pin);
+  for (const r of [pinned, owned, none]) expect(r.code, r.text).toBe(0);
+  expect(pinned.globals).toBeDefined();
+  expect(owned.globals).toBe(pinned.globals!);
+  expect(none.globals).toBe(pinned.globals!);
+  // A name the template did not install is named in the error.
+  const outside = await compile("d", "console.log(typeof MessageChannel);", pin);
+  expect(outside.code).not.toBe(0);
+  expect(outside.text).toContain("MessageChannel is not available in the shared generation");
+  // Without a pin nothing changes: the app installs what it uses.
+  const free = await compile("e", "console.log(typeof MessageChannel);");
+  expect(free.code, free.text).toBe(0);
 }, 180_000);
