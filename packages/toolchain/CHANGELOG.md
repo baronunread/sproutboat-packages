@@ -1,5 +1,15 @@
 # @sproutboat/toolchain
 
+## 0.25.0
+
+### Minor Changes
+
+- 9c6ca3e: toolchain (alpha 21 line): P14 pins the runtime globals an app may use to the template's (sproutd issue 97). Porffor builds `node/internal/globals.js` from the runtime globals a program references, in first-use order, so a free `performance`, `process`, `Buffer`, `setImmediate` or `MessageEvent` in app code reordered its installs and, through their import edges, the order of every node unit behind them: an `abi_rejected` for an ordinary program. With `SB_GLOBALS_PIN` set (a JSON array of names), the module installs exactly that array in that order, and a free reference to any other runtime global fails the compile with `<name> is not available in the shared generation`. The names a compile would install are left in `globalThis.__sbGlobalsUsed`, which a template build records as the pin. P4 now also drops the dotted members of an object the prelude owns (`process.stdin` when the prelude assigns `globalThis.process`), and counts `Object.defineProperty(globalThis, "name", ...)` with a literal name as ownership, so a prelude can install a global as a lazy accessor that builds the object on its first read (sproutd's `process` and `performance`) without the template heap carrying the object. Nothing changes without `SB_GLOBALS_PIN`, so standalone builds are as before.
+
+### Patch Changes
+
+- 2b6d912: R2 large objects on the embedded transport (sproutd #99 and #100). `get()` reads an object as asked: a `range` reads only its window from the object's file, and `body` is a stream of 256 KiB reads, so an object of any size can be returned with `new Response(object.body)`; `text()`, `json()`, `arrayBuffer()` and `blob()` still read the whole window. A streamed response now has flow control on a host that offers it (sproutd): the pump reads no more of its source while a window of its bytes is unacknowledged, and a response with a declared `content-length` is sent with it. A worker whose host forwards `/__sb/r2/transfer/BUCKET/TOKEN` (sproutd) serves the ticket itself, with the standalone server's statuses and headers: uploads and downloads move a window at a time between the connection and the object's file. A standalone executable answers a HEAD request with the length the app declared.
+
 ## 0.24.2
 
 ### Patch Changes
