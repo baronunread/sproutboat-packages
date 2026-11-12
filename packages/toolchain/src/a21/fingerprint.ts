@@ -22,7 +22,7 @@ export function a21SourceFingerprint(dir: string): string | null {
 }
 
 /** As released; kept current by a21/patch.test.ts (UPDATE_FINGERPRINT=1). */
-export const A21_RELEASED_FINGERPRINT = "c292638faa72";
+export const A21_RELEASED_FINGERPRINT = "918b547cc2d2";
 
 export const A21_PATCH_FINGERPRINT = a21SourceFingerprint(import.meta.dir) ?? A21_RELEASED_FINGERPRINT;
 

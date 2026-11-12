@@ -83,6 +83,7 @@ test("the alpha 21 chain applies to the pinned tree, once, and the second run ch
     ["compiler/modules.js", "sproutboat P7: stable entry path"],
     ["compiler/render.js", "sproutboat: collector hooks for the fork template"],
     ["compiler/render.js", "static void porf_gc_scan_template_cards(void)"],
+    ["compiler/render.js", "static u64 porf_gc_limit_room(void) {"],
     ["compiler/builtins/_internal_object.ts", "sproutboat: frozen megamorphic cache"],
     ["compiler/render.js", "sproutboat: per-request cpu"],
     ["compiler/builtins/promise.ts", "sproutboat: per-request cpu"],
@@ -267,6 +268,66 @@ test("the alpha 23 pin is the same chain, applied once, and the tree tells its o
   const { ensurePorfforPatchedA21: again } = await import(`./patch.ts?a23-${Date.now()}`);
   await again(root);
   expect(await readFile(join(root, "compiler/codegen.js"), "utf8")).toBe(first);
+}, 180_000);
+
+test("plan 001 step B: the collector's budget and nursery cap are clamped by the app's memory limit", async () => {
+  const root = await pristine("alpha-23");
+  await ensurePorfforPatchedA21(root);
+  const render = await readFile(join(root, "compiler/render.js"), "utf8");
+  // Both edits are in, each once: the limit and its setter, the budget clamp and the nursery cap clamp.
+  for (const needle of [
+    "static u64 porf_gc_limit_bytes = 0;",
+    "${st}void porf_gc_set_limit(u64 bytes) { porf_gc_limit_bytes = bytes; }",
+    "static u64 porf_gc_limit_room(void) {",
+    "  return (u64)want > room ? (i64)room : want;\n",
+    "  const u32 cap = cap_free > cap_room ? (u32)cap_room : cap_free;\n",
+    // the collector-less renderer links against the same hook
+    "${st}void porf_gc_set_limit(u64 bytes) { (void)bytes; }",
+  ])
+    expect(render.split(needle).length, needle).toBe(2);
+  // Behaviour, not only text: compile the patched budget with stand-in state and read what it decides.
+  const from = render.indexOf("static u64 porf_gc_limit_bytes = 0;");
+  const to = render.indexOf("static void porf_gc_cycle(i64 allocated) {", from);
+  expect(from).toBeGreaterThan(0);
+  expect(to).toBeGreaterThan(from);
+  const budget = render.slice(from, to).replaceAll("${st}", "");
+  const harness =
+    "#include <stdio.h>\n#include <stdint.h>\ntypedef uint64_t u64;\ntypedef int64_t i64;\n" +
+    "static u64 porf_gc_last_live_bytes; static i64 porf_gc_promoted_since_full, porf_gc_survival; static u64 porf_gc_nursery_bytes;\n" +
+    budget +
+    "static void row(u64 limit, u64 live, i64 promoted, i64 survival, u64 nursery) {\n" +
+    "  porf_gc_set_limit(limit); porf_gc_last_live_bytes = live; porf_gc_promoted_since_full = promoted;\n" +
+    "  porf_gc_survival = survival; porf_gc_nursery_bytes = nursery;\n" +
+    '  printf("%lld %llu\\n", (long long)porf_gc_budget(), (unsigned long long)porf_gc_limit_room());\n}\n' +
+    "int main(void) {\n" +
+    "  const u64 M = 1048576ull;\n" +
+    "  row(0, 20 * M, 0, 80, 4 * M);        // no limit: twice live while survival is high\n" +
+    "  row(0, 20 * M, 0, 10, 4 * M);        // no limit: the nursery\n" +
+    "  row(24 * M, 0, 0, 10, 32 * M);       // limit 24 MiB, nothing live: half of it\n" +
+    "  row(24 * M, 18 * M, 0, 10, 32 * M);  // 18 MiB live: half of the 6 MiB left\n" +
+    "  row(24 * M, 8 * M, 0, 80, 4 * M);    // survival high: twice live would be 16 MiB, the limit allows 8\n" +
+    "  row(24 * M, 8 * M, 4 * M, 10, 32 * M); // what minor collections promoted counts as live\n" +
+    "  row(24 * M, 30 * M, 0, 10, 32 * M);  // past the limit already: 1 MiB, never zero\n" +
+    "  row(24 * M, 2 * M, 0, 10, 2 * M);    // a small nursery stays as it is\n" +
+    "  return 0;\n}\n";
+  const dir = await mkdtemp(join(tmpdir(), "sb-a21-budget-"));
+  temporary.push(dir);
+  await writeFile(join(dir, "budget.c"), harness);
+  const cc = Bun.spawnSync(["cc", "-O1", "-Wall", "-Werror", "-o", join(dir, "budget"), join(dir, "budget.c")], {
+    stderr: "pipe",
+  });
+  expect(cc.exitCode, new TextDecoder().decode(cc.stderr)).toBe(0);
+  const run = Bun.spawnSync([join(dir, "budget")], { stdout: "pipe" });
+  expect(new TextDecoder().decode(run.stdout).trim().split("\n")).toEqual([
+    "41943040 18446744073709551615",
+    "4194304 18446744073709551615",
+    "12582912 12582912",
+    "3145728 3145728",
+    "8388608 8388608",
+    "6291456 6291456",
+    "1048576 1048576",
+    "2097152 11534336",
+  ]);
 }, 180_000);
 
 test("P8: alpha 23's shared dispatch functions sit in the unit that asked, under stable names", async () => {
