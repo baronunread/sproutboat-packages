@@ -918,7 +918,7 @@ async function patchedByThisVersion(root: string): Promise<boolean> {
   }
 }
 
-/** Every pass, in order, on a pristine alpha 21 or alpha 22 tree at `root` (pin.ts channelOfTree). Idempotent. */
+/** Every pass, in order, on a pristine alpha 21, 22 or 23 tree at `root` (pin.ts channelOfTree). Idempotent. */
 export async function ensurePorfforPatchedA21(root: string): Promise<void> {
   if (done.has(root)) return;
   if (await patchedByThisVersion(root)) {
@@ -937,7 +937,7 @@ export async function ensurePorfforPatchedA21(root: string): Promise<void> {
   await patchPreludeOwnedGlobals(root);
   await patchGlobalsPin(root);
   await patchClassUnit(root);
-  if (channelOfTree(root) === "alpha-22") await patchSharedDispatchUnit(root); // after P1: it reads classUnit
+  if (channelOfTree(root) !== "alpha-21") await patchSharedDispatchUnit(root); // after P1: it reads classUnit
   await patchStableNames(root);
   await patchUnitLayout(root);
   await patchStableEntryPath(root);
@@ -949,7 +949,7 @@ export async function ensurePorfforPatchedA21(root: string): Promise<void> {
   await patchResponseStatics(root);
   await patchProcessNullTables(root);
   await patchJsonWideStringBound(root);
-  if (channelOfTree(root) === "alpha-22") await patchDispatchArgOrder(root); // alpha 21 has no shared dispatch
+  if (channelOfTree(root) !== "alpha-21") await patchDispatchArgOrder(root); // alpha 21 has no shared dispatch
   await patchClassBindingWrite(root);
   await patchLogicalBranchInference(root);
   await patchDateOffsets(root);

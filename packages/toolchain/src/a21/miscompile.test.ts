@@ -5,14 +5,14 @@ import { join, resolve } from "node:path";
 import { ensurePorfforPatchedA21 } from "./patch";
 import { PORFFOR_A21_PINS } from "./pin";
 
-// Three miscompiles the control-plane spike found on Porffor alpha 22 (postgres.js and drizzle-orm
-// run into all three). Each program is compiled to a native binary with the patched alpha 22 tree.
+// Three miscompiles the control-plane spike found on Porffor alpha 22 (still there on alpha 23) (postgres.js and drizzle-orm
+// run into all three). Each program is compiled to a native binary with the patched alpha 23 tree.
 let root = "";
 let work = "";
 beforeAll(async () => {
   root = await realpath(await mkdtemp(join(tmpdir(), "sb-a21-mis-")));
   work = join(root, "work");
-  const pin = PORFFOR_A21_PINS["alpha-22"];
+  const pin = PORFFOR_A21_PINS["alpha-23"];
   const archive = resolve(import.meta.dir, "../../vendor", pin.vendoredArchive);
   const tar = Bun.spawnSync(["tar", "-xzf", archive, "-C", root, "--strip-components=1"], { stderr: "pipe" });
   expect(tar.exitCode, new TextDecoder().decode(tar.stderr)).toBe(0);

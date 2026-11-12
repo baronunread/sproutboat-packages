@@ -4,10 +4,10 @@ The 25 passes of `ensurePorfforPatchedA21` (`src/a21/patch.ts`), each checked ag
 [CanadaHonk/porffor](https://github.com/CanadaHonk/porffor) issues and PRs, open and closed. Update this
 file whenever a pass is added, dropped or filed upstream.
 
-**Last checked: alpha 23 (`a97a0ae`, 2026-11-10), 2026-11-11.** The check was by reading upstream's source
-and its issue tracker; nothing was compiled or run. "Still needed" means each pass's anchor text is still in
-`a97a0ae` unchanged and nothing there fixes the case, not that every repro was re-run. The chain pins alpha 21
-and alpha 22, so a `Still needed` row says the pass will still apply on alpha 23.
+**Last checked: alpha 23 (`a97a0ae`, 2026-11-10), 2026-11-12, by running it.** On 2026-11-11 the check was
+reading upstream's source and issue tracker. On 2026-11-12 the chain was applied to a pristine alpha 23 tree (all
+passes anchor once, none moved) and the repros were compiled and run on the unpatched tree (see "Alpha 23 check"
+below). The chain now pins alpha 21, alpha 22 and alpha 23 (`src/a21/pin.ts`); no pass was dropped by alpha 23.
 
 Classes:
 
@@ -49,6 +49,38 @@ applies. Drafts live in [`sproutboat/patches/upstream`](https://github.com/baron
 | `patchLogicalBranchInference`                | P13 | 3     | upstream | [#456](https://github.com/CanadaHonk/porffor/issues/456), open, same bug (filed by us 2026-11-08)                                                                                                                                     | in a function, `let o = 1; o \|\| (o = {}); typeof o` answers `"object"`: the right operand's assignment retypes the local as if it always ran                   | alpha 23, a97a0ae |
 
 `precompileBuiltinsA21` runs last and is a build step, not a patch: it compiles the builtins the passes above edited.
+
+## Alpha 23 check (2026-11-12)
+
+Alpha 23 is eight commits on alpha 22 (+25/-21 lines, five files under `compiler/`; nothing in `compiler/builtins/`
+or `runtime/`; upstream `main` is this commit, no later one). Every anchor of every pass is found once, so the chain applies
+unchanged; the one new rule is that P8 and P10 are applied on every tree but alpha 21's (`channelOfTree`).
+
+| Upstream commit | Touches | Effect on the chain |
+| --- | --- | --- |
+| `f85e9473` swiftcall for js functions on clang arm64 | `render.js`: `PORF_CC` on every js function definition and prototype, the dynamic thunks and `porf_call<n>` | none of our passes anchors on a js function signature; the **template script** does (`sproutd/build/a21/prepare-dynamic-template.py`), and so do tests that grep the emitted C |
+| `56b08ce5` six dynamic call args in registers | `render.js`: `DYN_REGS` 4 to 6, so `porf_thk` entries take `u64 ra, jsval thisv` and six `jsval` | none for the chain; the template's `SproutThunk` typedef must follow it |
+| `6f64fd79` strict assignments to captured bindings | `codegen.js` `isIdentAssignable` | none; `#457` (`A = A` on a class) is a different path and is still wrong, see below |
+| `ea2d36c3` constructor returns test `new.target` by type | `codegen.js` | none (P1 anchors on `declareClass`) |
+| `ece6782f`, `22159adc`, `f5eb200f`, `a97a0ae8` | `Math` constants, module export lists, `.d.ts` candidates, a pkg-config message | none |
+
+Repros run on the **unpatched** alpha 23 tree (macOS arm64, `porf native`), 2026-11-12. All still fail, so no pass can be dropped:
+
+| Issue | Result on stock alpha 23 |
+| --- | --- |
+| [#454](https://github.com/CanadaHonk/porffor/issues/454) | `decode(Buffer.from("hello world"), 6, 5)` gives `"|11"`, expected `"world|11"` |
+| [#455](https://github.com/CanadaHonk/porffor/issues/455) | `new Date("2026-11-08 14:48:19.097+00")` and `...+0000` are `NaN` |
+| [#456](https://github.com/CanadaHonk/porffor/issues/456) | `let o = 1; o || (o = {}); typeof o` is `"object"` |
+| [#457](https://github.com/CanadaHonk/porffor/issues/457) | `class A {}; A = A; typeof A` is `"undefined"` |
+| [#459](https://github.com/CanadaHonk/porffor/issues/459) | `replaceAll` over 148,890 characters 147 ms, over 628,890 characters 2,009 ms (4x input, 13.7x time) |
+| [#460](https://github.com/CanadaHonk/porffor/issues/460) | `replace(/\d+/g, fn)` over 628,890 characters (80,000 matches) 3,653 ms stock, 26 ms patched; with a template string 3,564 ms stock, 45 ms patched. This is the pass the "regex rewrite" question is about: alpha 23 changes nothing in `builtins/regexp.ts`, so `patchRegexReplace` stays |
+| [#461](https://github.com/CanadaHonk/porffor/issues/461) | `"é".toUpperCase()` and `"ж".toUpperCase()` are unchanged |
+| [#462](https://github.com/CanadaHonk/porffor/issues/462) | not run (Linux glibc only); the anchor `const cReservedNames = new Set([` is still there once |
+| [#463](https://github.com/CanadaHonk/porffor/issues/463) | `typeof Response.redirect` and `Response.error` are `"undefined"` |
+| [#464](https://github.com/CanadaHonk/porffor/issues/464) | `JSON.parse` of 12,000 objects with `"naïve 中文 x<i>"` exits 139 |
+
+All ten issues are still open, none has a comment or a linked PR. Our passes that are not upstream bugs (the 13 "ours") are
+not covered by any upstream change.
 
 ## Counts
 

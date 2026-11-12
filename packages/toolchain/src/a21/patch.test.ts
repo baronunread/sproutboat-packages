@@ -156,7 +156,7 @@ test("a shared prelude owns fetch and the timers: the worker compile links no ne
   );
   expect(appUnit).toContain("twice");
   const main = await readFile(join(out, "porf__main.c"), "utf8");
-  expect(main).not.toMatch(/^jsval p_\w*__23twice/m);
+  expect(main).not.toMatch(/^(?:PORF_CC )?jsval p_\w*__23twice/m);
   // P2: the function-record and name regions sit at the pinned offsets (the image is sparse between them).
   expect(main).toContain("porf_fnrecs");
 }, 120_000);
@@ -239,8 +239,38 @@ test("the alpha 22 pin is the alpha 21 chain plus P8, applied once, and the tree
   expect(await readFile(join(root, "compiler/codegen.js"), "utf8")).toBe(first);
 }, 180_000);
 
-test("P8: alpha 22's shared dispatch functions sit in the unit that asked, under stable names", async () => {
-  const root = await pristine("alpha-22");
+test("the alpha 23 pin is the same chain, applied once, and the tree tells its own channel", async () => {
+  const root = await pristine("alpha-23");
+  expect(channelOfTree(root)).toBe("alpha-23");
+  expect(pinOfTree(root).commitFull).toBe("a97a0ae8e296009aee482dff11b150528098a9b7");
+  await ensurePorfforPatchedA21(root);
+  // The patched tree still reads as alpha 23: the discriminator is a codegen line no pass edits.
+  expect(channelOfTree(root)).toBe("alpha-23");
+  const codegen = await readFile(join(root, "compiler/codegen.js"), "utf8");
+  for (const marker of [
+    "sproutboat P1: class functions stay in their module's unit",
+    "sproutboat P5: stable derived names",
+    "sproutboat P8: shared dispatch functions belong to the asking unit",
+  ])
+    expect(codegen, marker).toContain(marker);
+  const render = await readFile(join(root, "compiler/render.js"), "utf8");
+  for (const marker of [
+    "sproutboat P2: app units last, pinned ABI regions",
+    "sproutboat: collector hooks for the fork template",
+    "sproutboat: per-request cpu",
+    "sproutboat: glibc select",
+    // alpha 23's own text, untouched by any pass: js functions carry PORF_CC (swiftcall on clang arm64).
+    "#define PORF_CC __attribute__((swiftcall))",
+  ])
+    expect(render, marker).toContain(marker);
+  const first = await readFile(join(root, "compiler/codegen.js"), "utf8");
+  const { ensurePorfforPatchedA21: again } = await import(`./patch.ts?a23-${Date.now()}`);
+  await again(root);
+  expect(await readFile(join(root, "compiler/codegen.js"), "utf8")).toBe(first);
+}, 180_000);
+
+test("P8: alpha 23's shared dispatch functions sit in the unit that asked, under stable names", async () => {
+  const root = await pristine("alpha-23");
   await ensurePorfforPatchedA21(root);
   const work = join(root, "work");
   await mkdir(work);
@@ -279,16 +309,16 @@ test("P8: alpha 22's shared dispatch functions sit in the unit that asked, under
     "utf8",
   );
   const main = await readFile(join(out, "porf__main.c"), "utf8");
-  // Stock alpha 22 put every one of these into porf__main.c as p__main__23anonymous_1, _1_, _1__, ...
-  expect(main).not.toMatch(/^jsval p__main__23anonymous_1_*\(/m);
-  expect(main).not.toMatch(/^jsval p__main__23shared_/m);
-  expect(prelude).toMatch(/^jsval p_\w+__23shared_trim_0\(jsval r\) \{$/m);
-  expect(prelude).toMatch(/^jsval p_\w+__23shared_padStart_1\(jsval r, jsval a0\) \{$/m);
+  // Stock alpha 23 put every one of these into porf__main.c as p__main__23anonymous_1, _1_, _1__, ...
+  expect(main).not.toMatch(/^(?:PORF_CC )?jsval p__main__23anonymous_1_*\(/m);
+  expect(main).not.toMatch(/^(?:PORF_CC )?jsval p__main__23shared_/m);
+  expect(prelude).toMatch(/^(?:PORF_CC )?jsval p_\w+__23shared_trim_0\(jsval r\) \{$/m);
+  expect(prelude).toMatch(/^(?:PORF_CC )?jsval p_\w+__23shared_padStart_1\(jsval r, jsval a0\) \{$/m);
   for (const name of ["trim_0", "padStart_1", "toUpperCase_0", "slice_2"])
-    expect(worker).toMatch(new RegExp(`^jsval p_\\w+__23shared_${name}\\(`, "m"));
+    expect(worker).toMatch(new RegExp(`^(?:PORF_CC )?jsval p_\\w+__23shared_${name}\\(`, "m"));
   // One copy per unit: the app unit's trim is its own, not a call into the prelude's.
-  const preludeUnit = /^jsval (p_\w+?)__23shared_trim_0/m.exec(prelude)![1];
-  const workerUnit = /^jsval (p_\w+?)__23shared_trim_0/m.exec(worker)![1];
+  const preludeUnit = /^(?:PORF_CC )?jsval (p_\w+?)__23shared_trim_0/m.exec(prelude)![1];
+  const workerUnit = /^(?:PORF_CC )?jsval (p_\w+?)__23shared_trim_0/m.exec(worker)![1];
   expect(workerUnit).not.toBe(preludeUnit);
   const run = Bun.spawnSync(["bun", join(root, "runtime/index.js"), join(work, "app.js")], {
     cwd: work,
@@ -299,8 +329,8 @@ test("P8: alpha 22's shared dispatch functions sit in the unit that asked, under
   expect(new TextDecoder().decode(run.stdout).trim()).toBe("ABab  abb c c  2,3");
 }, 180_000);
 
-test("P9: JSON.parse of a large document with wide strings runs on patched alpha 22", async () => {
-  const root = await pristine("alpha-22");
+test("P9: JSON.parse of a large document with wide strings runs on patched alpha 23", async () => {
+  const root = await pristine("alpha-23");
   await ensurePorfforPatchedA21(root);
   const work = join(root, "work-p9");
   await mkdir(work);
@@ -330,7 +360,7 @@ test("P9: JSON.parse of a large document with wide strings runs on patched alpha
 }, 180_000);
 
 test("P14: runtime globals are pinned to the template's set, and a free reference outside it is a compile error", async () => {
-  const root = await pristine("alpha-22");
+  const root = await pristine("alpha-23");
   await ensurePorfforPatchedA21(root);
   // The shared prelude owns performance (an assignment) and process (a lazy accessor, `Object.defineProperty(globalThis, 'process', ...)`),
   // both P4, the way sproutd's does; the template names MessageEvent.
