@@ -43,6 +43,13 @@ extern "C" int sb_stream_write(u32 id, const char* data, size_t len) {
   return 0;
 }
 
+// Flow-control hooks of the prelude's pump (sproutd's host answers them). The standalone server buffers by
+// itself, so it never holds a stream back: nothing is unacknowledged and there is nothing to wait for. They are
+// definitions, not weak undefined references in the prelude: Mach-O will not link an undefined weak reference
+// without -U, so a macOS standalone build failed to link.
+extern "C" size_t sb_stream_pending(u32 id) { (void)id; return 0; }
+extern "C" void sb_stream_wait(u32 id, u32 timer) { (void)id; (void)timer; }
+
 extern "C" void sb_stream_end(u32 id) {
   auto it = sb_streams.find(id);
   if (it == sb_streams.end()) return;
