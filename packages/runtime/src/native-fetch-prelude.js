@@ -11024,27 +11024,62 @@ function __sbR2StrictObject(meta, bytes, range, include) {
   };
   if (bytes == null) return obj;
   let used = false;
+  // A lazy body (bytes.lazy: the object's file, read as asked) is never read whole unless text(), json(),
+  // arrayBuffer() or blob() ask for all of it; its stream reads one chunk at a time.
+  const lazy = bytes.lazy === true;
   const take = () => {
     if (used) throw new TypeError("Body has already been used. It can only be used once. Use tee() first if you need to read it twice.");
     used = true;
-    return bytes;
+    return lazy ? __sbR2ReadAll(bytes, range) : bytes;
   };
   // The stream is made when first asked for: text() and friends read the bytes directly,
   // so an object read as text never holds a second copy (sproutd #22).
   let stream = null;
   Object.defineProperty(obj, "body", {
     get: () => {
-      if (stream === null) stream = new Response(__sbBufFrom(bytes)).body;
+      if (stream === null) stream = lazy ? __sbR2LazyStream(bytes, range) : new Response(__sbBufFrom(bytes)).body;
       return stream;
     },
     enumerable: true,
   });
   Object.defineProperty(obj, "bodyUsed", { get: () => used, enumerable: true });
-  obj.text = async () => __sbFromUtf8(take());
-  obj.json = async () => JSON.parse(__sbFromUtf8(take()));
-  obj.arrayBuffer = async () => __sbBufFrom(take());
-  obj.blob = async () => new Blob([__sbBufFrom(take())], { type: obj.httpMetadata.contentType || "" });
+  // A lazy body reads into a Uint8Array (never a bytestring), so each of these takes bytes, not text.
+  obj.text = async () => (lazy ? new TextDecoder().decode(take()) : __sbFromUtf8(take()));
+  obj.json = async () => JSON.parse(lazy ? new TextDecoder().decode(take()) : __sbFromUtf8(take()));
+  obj.arrayBuffer = async () => (lazy ? take().buffer : __sbBufFrom(take()));
+  obj.blob = async () => new Blob([lazy ? take().buffer : __sbBufFrom(take())], { type: obj.httpMetadata.contentType || "" });
   return obj;
+}
+// The chunk a streamed R2 body reads at a time (a Uint8Array of this size, then collected): a chunk is
+// what the worker's heap holds per read, and what the response's flow control hands to the host.
+const __SB_R2_CHUNK = 256 * 1024;
+// The bytes of a lazy body's window, all of them: text(), json(), arrayBuffer() and blob() need the whole
+// object in memory whatever they are called on.
+function __sbR2ReadAll(src, range) {
+  const out = new Uint8Array(range.length);
+  if (range.length > 0 && __sbR2ReadRange(src.bucket, src.key, src.blobId, range.offset, out) !== range.length)
+    throw new Error("sproutboat r2.get: the object could not be read");
+  return out;
+}
+// A lazy body's window as a ReadableStream of __SB_R2_CHUNK-byte reads.
+function __sbR2LazyStream(src, range) {
+  let at = 0;
+  return new ReadableStream({
+    pull(controller) {
+      if (at >= range.length) {
+        controller.close();
+        return;
+      }
+      const n = Math.min(__SB_R2_CHUNK, range.length - at);
+      const chunk = new Uint8Array(n);
+      if (__sbR2ReadRange(src.bucket, src.key, src.blobId, range.offset + at, chunk) !== n) {
+        controller.error(new Error("sproutboat r2.get: the object could not be read"));
+        return;
+      }
+      at += n;
+      controller.enqueue(chunk);
+    },
+  });
 }
 // A hex string's bytes, one char per byte.
 function __sbR2Bytes(hex) {
@@ -11092,7 +11127,19 @@ function __sbMakeR2(name) {
     get(key, options) {
       return attempt(() => {
         const o = options || {};
-        const r = __sbR2Get(name, __sbR2Key(key, "get"));
+        const objectKey = __sbR2Key(key, "get");
+        // Where the transport can read an object's file as asked (embedded: sproutd and standalone), get() takes its
+        // metadata and no bytes: a range reads only its own window, a body streams. The broker answers null here
+        // and returns the object whole, as before.
+        const opened = __sbR2Open(name, objectKey);
+        if (opened !== null) {
+          if (!opened.found) return null;
+          const meta = opened.object;
+          if (!__sbR2OnlyIf(o.onlyIf, meta.md5 || meta.etag, meta.uploaded)) return __sbR2StrictObject(meta, null, { offset: 0, length: meta.size });
+          const window = o.range == null ? { offset: 0, length: meta.size } : __sbR2Range(o.range, meta.size);
+          return __sbR2StrictObject(meta, { lazy: true, bucket: name, key: objectKey, blobId: opened.blobId }, window);
+        }
+        const r = __sbR2Get(name, objectKey);
         if (!r.found) return null;
         const meta = r.object;
         if (!__sbR2OnlyIf(o.onlyIf, meta.md5 || meta.etag, meta.uploaded)) return __sbR2StrictObject(meta, null, { offset: 0, length: meta.size });
@@ -14090,7 +14137,8 @@ function __sbHasStreamBody(res) {
 // x-sb-stream header, the native writer sends the status and headers and holds the
 // connection open, and each chunk is written as it arrives. Hosts that do not stream
 // (sproutd's workers, for now) link the weak fallbacks, report unsupported and keep buffering.
-// op: "s" supported, "o" open, "w" write data, "e" end. Returns a short string.
+// op: "s" supported, "o" open, "w" write data (a bytestring), "W" write the Uint8Array in data, "p" the bytes written
+// the client's connection has not taken yet, "k" park the timer in data until that falls, "e" end. Returns a short string.
 // oxlint-disable-next-line no-unused-vars -- read inside the RawC block, not by JS.
 function __sbStreamOp(op, id, data) {
   let out = "";
@@ -14100,6 +14148,11 @@ function __sbStreamOp(op, id, data) {
     extern unsigned int sb_stream_open(void);
     extern int sb_stream_write(unsigned int, const char*, size_t);
     extern void sb_stream_end(unsigned int);
+    // Flow control (sproutd): the bytes written and not yet taken by the client's connection, and a timer the
+    // host fires when that falls. A host without them (a standalone executable, whose server buffers by itself)
+    // reports none, so a stream is never held back there.
+    extern size_t sb_stream_pending(unsigned int) __attribute__((weak));
+    extern void sb_stream_wait(unsigned int, unsigned int) __attribute__((weak));
     const char* __o; size_t __ol; char* __oo = 0;
     porf_native_fetch_read_value(op, &__o, &__ol, &__oo);
     char __op = __ol ? __o[0] : 0;
@@ -14119,7 +14172,17 @@ function __sbStreamOp(op, id, data) {
         int __w = -1;
         if (porf_native_fetch_read_raw_bytes(data, &__d, &__dl) == 0) __w = sb_stream_write(__id, __d, __dl);
         snprintf(__r, sizeof(__r), "%d", __w);
-      } else if (__op == 'e') { sb_stream_end(__id); snprintf(__r, sizeof(__r), "0"); }
+      } else if (__op == 'W' && data.type == 81) {
+        // A Uint8Array written as it is, with no bytestring copy of it.
+        const u32 __ta = (u32)data.val;
+        const int32_t __len = *(int32_t*)(MEM + __ta);
+        const u32 __at = *(u32*)(MEM + __ta + 4) + 4;
+        int __w = -1;
+        if (__len >= 0) __w = sb_stream_write(__id, (const char*)(MEM + __at), (size_t)__len);
+        snprintf(__r, sizeof(__r), "%d", __w);
+      } else if (__op == 'p') snprintf(__r, sizeof(__r), "%zu", sb_stream_pending ? sb_stream_pending(__id) : (size_t)0);
+      else if (__op == 'k') { if (sb_stream_wait && data.type == 1 && data.val > 0) sb_stream_wait(__id, (unsigned int)data.val); }
+      else if (__op == 'e') { sb_stream_end(__id); snprintf(__r, sizeof(__r), "0"); }
     }
     out = porf_box((f64)porf_native_fetch_alloc_bytestring(__r, strlen(__r)), 195);
   `;
@@ -14129,6 +14192,16 @@ let __sbStreaming = -1;
 function __sbStreamingSupported() {
   if (__sbStreaming < 0) __sbStreaming = __sbStreamOp("s", "0", "") === "1" ? 1 : 0;
   return __sbStreaming === 1;
+}
+// What the client's connection may hold of a stream before the pump waits for it (the host credits bytes as
+// they leave): a client slower than the app is waited for, not buffered for or cut off.
+const __SB_STREAM_WINDOW = 1024 * 1024;
+// Resolves when the host says the stream's unsent bytes fell (or the client went away).
+function __sbStreamDrained(id) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, 2147483647);
+    __sbStreamOp("k", id, timer);
+  });
 }
 function __sbStreamResponse(response) {
   const stream = __sbRawBody(response);
@@ -14148,10 +14221,22 @@ function __sbStreamResponse(response) {
         else if (value instanceof ArrayBuffer) bytes = new Uint8Array(value);
         else if (ArrayBuffer.isView(value)) bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
         else throw new TypeError("This ReadableStream did not return bytes.");
-        if (bytes.length > 0 && __sbStreamOp("w", id, __sbToBytes(bytes)) !== "0") {
-          // The client went away: stop the source.
-          reader.cancel();
-          break;
+        if (bytes.length > 0) {
+          // A whole Uint8Array goes to the host without a copy; a view of part of a buffer is copied.
+          const wrote =
+            bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
+              ? __sbStreamOp("W", id, bytes)
+              : __sbStreamOp("w", id, __sbToBytes(bytes));
+          if (wrote !== "0") {
+            // The client went away: stop the source.
+            reader.cancel();
+            break;
+          }
+          // Flow control: while the connection holds more than the window, read no more of the source.
+          while (Number(__sbStreamOp("p", id, "")) > __SB_STREAM_WINDOW) {
+            await __sbStreamDrained(id);
+            // Woken by the client going away: the next write says so (-1).
+          }
         }
       }
     } catch (error) {
@@ -15891,7 +15976,164 @@ function __sbTrustedProxiesOnce() {
   return __sbTrustedCache;
 }
 
+// R2 transfer tickets (createUploadUrl, createDownloadUrl): /__sb/r2/transfer/BUCKET/TOKEN, scoped to one object and
+// good once. A standalone executable's native server answers them before JavaScript runs (patchR2Transfer, #195);
+// on a host that forwards every path to the worker (sproutd) the worker answers them here with the same statuses
+// and headers, before the app's fetch() sees the request. The body goes straight between the connection and the
+// object's file, one step at a time (__sbR2XferOp): at most a window of it is ever in the worker.
+const __SB_R2_TRANSFER = "/__sb/r2/transfer/";
+// Set by the embedded transport (it has the ticket contexts and their steps); the broker's own listener owns the path.
+// oxlint-disable-next-line no-unassigned-vars -- set by the embedded transport, above
+var __sbR2TransferOn; // no initializer: the embedded transport (above) sets it, and an initializer here would run after it
+// [bucket, token] when the request is for a ticket (the same shape the native server accepts), else null.
+function __sbR2TransferTarget(request) {
+  const method = request.method;
+  if (method !== "GET" && method !== "PUT" && method !== "HEAD" && method !== "POST" && method !== "DELETE") return null;
+  const url = request.url;
+  const at = url.indexOf(__SB_R2_TRANSFER);
+  if (at < 0) return null;
+  const hostEnd = url.indexOf("/", url.indexOf("//") + 2);
+  if (at !== hostEnd) return null;
+  let rest = url.slice(at + __SB_R2_TRANSFER.length);
+  const cut = rest.search(/[?#]/);
+  if (cut >= 0) rest = rest.slice(0, cut);
+  const slash = rest.indexOf("/");
+  if (slash <= 0 || slash > 255 || rest.indexOf("/", slash + 1) >= 0) return null;
+  const bucket = rest.slice(0, slash);
+  const token = rest.slice(slash + 1);
+  if (token.length !== 24 || !/^[0-9a-f]+$/.test(token) || !/^[A-Za-z0-9_]+$/.test(bucket)) return null;
+  return [bucket, token];
+}
+function __sbR2TransferError(status, text) {
+  return new Response(text, { status, headers: { "content-type": "text/plain" } });
+}
+// A transfer status as a response (the native server's table: anything else is a 500).
+function __sbR2TransferFailed(status, text) {
+  const known = status === 404 || status === 410 || status === 413 || status === 422 || status === 503 || status === 507;
+  return __sbR2TransferError(known ? status : 500, text);
+}
+// Resolves when the streamed request body `body` has more (or ended or failed): the host fires the parked timer.
+function __sbR2BodyWait(body) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, 2147483647);
+    __sbReqBodyOp("w", body, timer);
+  });
+}
+async function __sbR2TransferUpload(request, bucket, token, body) {
+  let declared = 0;
+  const length = request.headers.get("content-length");
+  if (length !== null && length !== "") {
+    if (!/^[0-9]+$/.test(length) || length.length > 15) return __sbR2TransferError(400, "invalid content-length");
+    declared = Number(length);
+  }
+  const opened = __sbR2XferOp("u", bucket, token, declared).split(" ");
+  if (opened[0] !== "0") return __sbR2TransferFailed(Number(opened[0]), "R2 transfer unavailable");
+  const handle = opened[1];
+  let status = 0;
+  if (body === 0) {
+    // The host delivered the body whole (or there is none): one write.
+    const raw = __sbRawBody(request);
+    if (raw != null && raw !== "") status = Number(__sbR2XferOp("b", handle, raw, 0));
+  } else {
+    for (;;) {
+      const step = __sbR2XferOp("s", handle, "", body).split(" ");
+      const kind = step[0];
+      if (kind === "d") continue;
+      if (kind === "w") {
+        await __sbR2BodyWait(body);
+        continue;
+      }
+      if (kind === "e") break;
+      // 'f': the client went away; 's': a status refused the bytes (the ticket is released with it).
+      status = kind === "s" ? Number(step[1]) : 500;
+      if (kind === "f") __sbR2XferOp("x", "0", "", Number(handle));
+      __sbReqBodyOp("c", body, "");
+      return kind === "f" ? __sbR2TransferError(500, "R2 transfer failed") : __sbR2TransferFailed(status, "R2 transfer failed");
+    }
+    __sbReqBodyOp("c", body, "");
+  }
+  if (status !== 0) return __sbR2TransferFailed(status, "R2 transfer failed");
+  const finished = Number(__sbR2XferOp("f", handle, "", 0));
+  if (finished === 201) return new Response(null, { status: 201 });
+  return __sbR2TransferFailed(finished, "R2 transfer failed");
+}
+function __sbR2TransferDownload(request, bucket, token) {
+  const opened = __sbR2XferOp("d", bucket, token, 0).split(" ");
+  if (opened[0] !== "0") return __sbR2TransferFailed(Number(opened[0]), "R2 transfer unavailable");
+  const handle = Number(opened[1]);
+  const size = Number(opened[2]);
+  const etag = opened[3];
+  const close = () => __sbR2XferOp("c", "0", "", handle);
+  const match = request.headers.get("if-none-match");
+  if (match === "*" || match === etag || match === '"' + etag + '"') {
+    close();
+    return new Response(null, { status: 304, headers: { etag } });
+  }
+  let first = 0;
+  let last = size ? size - 1 : 0;
+  let partial = false;
+  const range = request.headers.get("range");
+  if (range) {
+    const refuse = (why) => {
+      close();
+      return __sbR2TransferError(416, why);
+    };
+    if (range.slice(0, 6) !== "bytes=") return refuse("invalid range");
+    const spec = range.slice(6);
+    const dash = spec.indexOf("-");
+    if (dash <= 0) return refuse("invalid range");
+    const from = spec.slice(0, dash);
+    const to = spec.slice(dash + 1);
+    if (!/^[0-9]+$/.test(from) || (to !== "" && !/^[0-9]+$/.test(to))) return refuse("invalid range");
+    first = Number(from);
+    if (to !== "") last = Number(to);
+    if (first >= size || last < first) return refuse("range outside object");
+    if (last >= size) last = size - 1;
+    partial = true;
+  }
+  const total = size === 0 ? 0 : last - first + 1;
+  const headers = { "content-type": "application/octet-stream", etag, "accept-ranges": "bytes", "content-length": String(total) };
+  if (partial) headers["content-range"] = "bytes " + first + "-" + last + "/" + size;
+  let sent = 0;
+  const stream = new ReadableStream({
+    pull(controller) {
+      if (sent >= total) {
+        close();
+        controller.close();
+        return;
+      }
+      const chunk = new Uint8Array(Math.min(__SB_R2_CHUNK, total - sent));
+      const got = Number(__sbR2XferOp("r", String(handle), "", first + sent, chunk));
+      if (got !== chunk.length) {
+        close();
+        controller.error(new Error("R2 transfer failed"));
+        return;
+      }
+      sent += got;
+      controller.enqueue(chunk);
+    },
+    cancel() {
+      close();
+    },
+  });
+  return new Response(stream, { status: partial ? 206 : 200, headers });
+}
+// The response for a ticket request, or a Promise of it.
+function __sbR2Transfer(request, target) {
+  // The streamed body's id, taken now: a ticket request never reaches __sbDecodeIngress.
+  const body = __sbReqBodyTake();
+  const method = request.method;
+  if (method === "GET") return __sbR2TransferDownload(request, target[0], target[1]);
+  if (method !== "PUT") return __sbR2TransferError(405, "R2 transfer requires GET or PUT");
+  return __sbR2TransferUpload(request, target[0], target[1], body);
+}
+
 globalThis.__sbEntry = function (handlers, request) {
+  if (__sbR2TransferOn) {
+    const ticket = __sbR2TransferTarget(request);
+    // Through the same finish as the app's answer (promise, then a stream body is sent as it is read).
+    if (ticket !== null) return __sbFetchWithDrain(__sbR2Transfer(request, ticket), [], false, false, true, null, null);
+  }
   __sbDecodeIngress(request);
   const trigger = __sbHeader(request.headers, "x-sb-trigger");
   if (!trigger) {

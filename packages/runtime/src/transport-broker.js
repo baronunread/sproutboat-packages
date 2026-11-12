@@ -1400,6 +1400,19 @@ globalThis.__sbR2Get = function (bucket, key) {
   return { found: true, object: reply.object, body: __sbTakeBin() };
 };
 
+// The broker returns an object whole (r2.get); only the embedded transport reads a file as asked.
+globalThis.__sbR2Open = function () {
+  return null;
+};
+globalThis.__sbR2ReadRange = function () {
+  return -1;
+};
+
+// The broker's own transfer listener owns /__sb/r2/transfer/: this runtime serves none of it.
+function __sbR2XferOp() {
+  return "404";
+}
+
 globalThis.__sbR2MultipartPut = function (bucket, key, uploadId, partNumber, body) {
   const token = __sbEnv("SB_BROKER_TOKEN");
   const reply = JSON.parse(
