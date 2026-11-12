@@ -332,10 +332,12 @@ test("P9: JSON.parse of a large document with wide strings runs on patched alpha
 test("P14: runtime globals are pinned to the template's set, and a free reference outside it is a compile error", async () => {
   const root = await pristine("alpha-22");
   await ensurePorfforPatchedA21(root);
-  // The shared prelude owns performance and process (P4), the way sproutd's does; the template names MessageEvent.
+  // The shared prelude owns performance (an assignment) and process (a lazy accessor, `Object.defineProperty(globalThis, 'process', ...)`),
+  // both P4, the way sproutd's does; the template names MessageEvent.
   const prelude =
     "globalThis.performance = { now() { return 1; }, timeOrigin: 0 };\n" +
-    "globalThis.process = { env: {}, platform: 'linux' };\nglobalThis.__sbAnchor = () => [ MessageEvent, global ];\nexport {};\n";
+    "Object.defineProperty(globalThis, 'process', { get() { return { env: {}, platform: 'linux' }; }, set(v) {}, configurable: true });\n" +
+    "globalThis.__sbAnchor = () => [ MessageEvent, global ];\nexport {};\n";
   const compile = async (name: string, body: string, pin?: string[]) => {
     const work = join(root, name);
     await mkdir(work);

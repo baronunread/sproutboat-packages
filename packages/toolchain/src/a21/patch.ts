@@ -189,8 +189,9 @@ export async function patchAppModuleIds(root: string): Promise<void> {
 /**
  * P4: a name the shared prelude declares at its top level (`const fetch = ...`) or assigns on
  * `globalThis` anywhere in its body (`globalThis.setTimeout = ...` in an installer it calls at
- * init; the assignment binds every free reference program-wide at run time, checked on alpha 21)
- * is the prelude's own global, so the runtime's is not installed. Restricted to
+ * init; the assignment binds every free reference program-wide at run time, checked on alpha 21),
+ * or defines with a literal name (`Object.defineProperty(globalThis, "process", ...)`, which is how a
+ * lazy accessor installs a global), is the prelude's own global, so the runtime's is not installed. Restricted to
  * `shared-prelude.js`: an app declaring `const process` must not hide the real one from the
  * modules beside it. Without this any free `fetch(` in app code links fetch-client, http, net,
  * dns, uws and libuv into the worker.
@@ -211,6 +212,9 @@ export async function patchPreludeOwnedGlobals(root: string): Promise<void> {
         "      // the prelude's too: the assignment binds every free reference to it at run time\n" +
         "      const owned = new Set(); const walk = n => { if (n == null || typeof n !== 'object') return; if (Array.isArray(n)) { for (const x of n) walk(x); return; }\n" +
         "        if (n.type === 'AssignmentExpression' && n.left.type === 'MemberExpression' && !n.left.computed && n.left.object.type === 'Identifier' && n.left.object.name === 'globalThis') owned.add(n.left.property.name);\n" +
+        "        // Object.defineProperty(globalThis, 'name', ...) owns the name too: a lazy accessor installs the global without building it\n" +
+        "        if (n.type === 'CallExpression' && n.callee.type === 'MemberExpression' && !n.callee.computed && n.callee.object.type === 'Identifier' && n.callee.object.name === 'Object' && n.callee.property.name === 'defineProperty' &&\n" +
+        "          n.arguments.length >= 2 && n.arguments[0].type === 'Identifier' && n.arguments[0].name === 'globalThis' && n.arguments[1].type === 'Literal' && typeof n.arguments[1].value === 'string') owned.add(n.arguments[1].value);\n" +
         "        for (const k in n) if (k !== 'loc' && k !== 'range') walk(n[k]); };\n" +
         "      walk(mod.body); for (const name of owned) used.delete(name);\n" +
         "      // and the members of an owned object (process.stdin when the prelude owns process): the object is the prelude's\n" +
