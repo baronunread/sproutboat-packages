@@ -211,40 +211,101 @@ export function parseRedirects(text: string): RedirectRule[] {
 }
 
 /**
- * Match `pathname` against one `_redirects` rule's `from`, substituting
- * `:name` segments and a trailing `*` (as `:splat`) into `to`. `null` if the
- * rule doesn't match.
+ * Cloudflare's `_redirects` matching (workers-sdk, `asset-worker/src/utils/rules-engine.ts`), on the request pathname:
  *
- * The splat case matches on the literal string prefix up to `*`, not a
- * segment array — `pathname.split("/").filter(Boolean)` would collapse
- * `/blog` and `/blog/` to the same `["blog"]`, wrongly matching `/blog/*`
- * against a path that never reaches the `/` the wildcard starts after.
+ *   - the whole pathname must match, so a trailing slash is significant: `/compare` does not match `/compare/`, and
+ *     `/compare /compare/ 308` is one hop, not a loop;
+ *   - `:name` matches one or more characters up to the next `/` (letters, digits and `_` after a letter name it);
+ *     a name may appear once per rule;
+ *   - `*` matches anything, including `/` and nothing, and is `:splat` in `to`; a rule has at most one;
+ *   - a rule that breaks those limits never matches (Cloudflare drops it).
+ *
+ * A rule with no `:name` and no `*` is static: a static rule beats a dynamic one whatever the order (`findRedirect`);
+ * among rules of one kind the first in the file wins.
+ */
+type RedirectToken = { kind: "text"; text: string } | { kind: "name"; name: string } | { kind: "splat" };
+
+function redirectTokens(from: string): RedirectToken[] | null {
+  const tokens: RedirectToken[] = [];
+  const names = new Set<string>();
+  let text = "";
+  const flush = () => {
+    if (text !== "") tokens.push({ kind: "text", text });
+    text = "";
+  };
+  for (let i = 0; i < from.length; i++) {
+    const c = from[i]!;
+    if (c === "*") {
+      flush();
+      if (names.has("splat")) return null;
+      names.add("splat");
+      tokens.push({ kind: "splat" });
+    } else if (c === ":" && /[A-Za-z]/.test(from[i + 1] ?? "")) {
+      let end = i + 2;
+      while (end < from.length && /\w/.test(from[end]!)) end++;
+      const name = from.slice(i + 1, end);
+      if (names.has(name)) return null;
+      names.add(name);
+      flush();
+      tokens.push({ kind: "name", name });
+      i = end - 1;
+    } else text += c;
+  }
+  flush();
+  return tokens;
+}
+
+function matchTokens(tokens: RedirectToken[], t: number, path: string, p: number, groups: [string, string][]): boolean {
+  const token = tokens[t];
+  if (token === undefined) return p === path.length;
+  if (token.kind === "text")
+    return path.startsWith(token.text, p) && matchTokens(tokens, t + 1, path, p + token.text.length, groups);
+  const slash = path.indexOf("/", p);
+  const limit = token.kind === "splat" || slash === -1 ? path.length : slash;
+  const name = token.kind === "splat" ? "splat" : token.name;
+  // Longest first, as the regular expression `[^/]+` / `.*` is greedy; a name needs at least one character.
+  for (let q = limit; q >= (token.kind === "splat" ? p : p + 1); q--) {
+    groups.push([name, path.slice(p, q)]);
+    if (matchTokens(tokens, t + 1, path, q, groups)) return true;
+    groups.pop();
+  }
+  return false;
+}
+
+const isStaticRedirect = (from: string): boolean => !from.includes("*") && !/:[A-Za-z]/.test(from);
+
+function redirectLocation(rule: RedirectRule, pathname: string): string | null {
+  if (isStaticRedirect(rule.from)) return rule.from === pathname ? rule.to : null;
+  const tokens = redirectTokens(rule.from);
+  if (tokens === null) return null;
+  const groups: [string, string][] = [];
+  if (!matchTokens(tokens, 0, pathname, 0, groups)) return null;
+  let to = rule.to;
+  for (const [name, value] of groups) to = to.split(`:${name}`).join(value);
+  return to;
+}
+
+/**
+ * Where one `_redirects` rule sends `pathname`, with `:name` and `:splat` substituted into `to`; `null` if the rule does
+ * not match. See the notes above for what matches.
  */
 export function matchRedirect(rule: RedirectRule, pathname: string): string | null {
-  const starIndex = rule.from.indexOf("*");
-  if (starIndex !== -1) {
-    const prefix = rule.from.slice(0, starIndex);
-    if (!pathname.startsWith(prefix)) return null;
-    const splat = pathname.slice(prefix.length);
-    return rule.to.split(":splat").join(splat);
-  }
+  return redirectLocation(rule, pathname);
+}
 
-  const fromSegments = rule.from.split("/").filter(Boolean);
-  const pathSegments = pathname.split("/").filter(Boolean);
-  if (fromSegments.length !== pathSegments.length) return null;
-  const params: Record<string, string> = {};
-  for (let i = 0; i < fromSegments.length; i++) {
-    const segment = fromSegments[i];
-    if (segment.startsWith(":")) {
-      params[segment.slice(1)] = pathSegments[i];
-      continue;
-    }
-    if (pathSegments[i] !== segment) return null;
+/** The rule that redirects `pathname`, and where to: the first static rule that matches, else the first dynamic one. */
+export function findRedirect(
+  rules: readonly RedirectRule[],
+  pathname: string,
+): { rule: RedirectRule; location: string } | null {
+  for (const rule of rules)
+    if (isStaticRedirect(rule.from) && rule.from === pathname) return { rule, location: rule.to };
+  for (const rule of rules) {
+    if (isStaticRedirect(rule.from)) continue;
+    const location = redirectLocation(rule, pathname);
+    if (location !== null) return { rule, location };
   }
-
-  let to = rule.to;
-  for (const [name, value] of Object.entries(params)) to = to.split(`:${name}`).join(value);
-  return to;
+  return null;
 }
 
 export type AssetRules = { headers: HeaderRule[]; redirects: RedirectRule[] };

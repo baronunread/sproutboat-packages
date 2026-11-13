@@ -1,46 +1,69 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import {
-  matchRedirect,
-  matchHeaders,
-  parseHeaders,
-  parseRedirects,
-} from "../../assets/src/assets.ts";
+import { REDIRECT_CASES as CASES } from "../test/fixtures/asset-redirect-cases";
+import { findRedirect, matchRedirect, matchHeaders, parseHeaders, parseRedirects } from "../../assets/src/assets.ts";
 
 const source = readFileSync(new URL("./native-fetch-prelude.js", import.meta.url), "utf8");
-const start = source.indexOf("function __sbAssetRedirect(");
+const start = source.indexOf("function __sbRuleAlpha(");
 const end = source.indexOf("// Installed only when the project declares bindings.", start);
 if (start < 0 || end < start) throw new Error("asset rule helpers not found");
 // oxlint-disable-next-line no-function-constructor -- test the text-only native prelude
 const load = new Function(
   "__sbRawBodyResponse",
   source.slice(start, end) +
-    "\nreturn { redirect: __sbAssetRedirect, matches: __sbAssetHeaderMatches, response: __sbAssetResponse };",
+    "\nreturn { redirect: __sbAssetRedirect, find: __sbFindAssetRedirect, matches: __sbAssetHeaderMatches, response: __sbAssetResponse };",
 );
-const { redirect, matches, response } = load((body, init) => new Response(body, init));
+const { redirect, find, matches, response } = load((body, init) => new Response(body, init));
 
 test("native redirect matching agrees with shared asset rules", () => {
-  const rules = parseRedirects(
-    "/old /new 301\n/blog/:slug /posts/:slug\n/docs/* https://example.test/:splat 307",
-  );
-  for (const path of [
-    "/old",
-    "/old/",
-    "/blog/a",
-    "/blog/a/b",
-    "/docs",
-    "/docs/",
-    "/docs/a/b",
-    "/missing",
-  ]) {
+  const rules = parseRedirects("/old /new 301\n/blog/:slug /posts/:slug\n/docs/* https://example.test/:splat 307");
+  for (const path of ["/old", "/old/", "/blog/a", "/blog/a/b", "/docs", "/docs/", "/docs/a/b", "/missing"]) {
     for (const rule of rules) expect(redirect(rule, path)).toBe(matchRedirect(rule, path));
   }
 });
 
+// What both matchers are held to (Cloudflare's rules-engine); the compiled one runs the same file in native-asset-redirects.ts.
+// [_redirects text, request path, [status, location] or null]
+test("redirect matching follows Cloudflare: whole path, trailing slash significant, static before dynamic", () => {
+  for (const [text, path, want] of CASES) {
+    const rules = parseRedirects(text);
+    const portable = findRedirect(rules, path);
+    const native = find(rules, path);
+    const got = (hit) => (hit === null ? null : [hit.rule?.status ?? hit.status, hit.location]);
+    expect(got(portable), `portable ${JSON.stringify(text)} ${path}`).toEqual(want);
+    expect(got(native), `native ${JSON.stringify(text)} ${path}`).toEqual(want);
+    for (const rule of rules) expect(redirect(rule, path)).toBe(matchRedirect(rule, path));
+  }
+});
+
+test("a trailing-slash rule is one hop: the target is not matched again", () => {
+  const rules = parseRedirects("/compare /compare/ 308");
+  const first = find(rules, "/compare");
+  expect(first).toEqual({ status: 308, location: "/compare/" });
+  expect(find(rules, first.location)).toBeNull();
+  const served = response("/compare/", {
+    found: true,
+    status: 200,
+    type: "text/html",
+    body: "page",
+    hash: "abc",
+    rules: { redirects: rules },
+  });
+  expect(served.status).toBe(200);
+  expect(
+    response("/compare", {
+      found: true,
+      status: 200,
+      type: "text/html",
+      body: "page",
+      hash: "abc",
+      rules: { redirects: rules },
+    }).status,
+  ).toBe(308);
+});
+
 test("native header matching agrees with shared asset rules", () => {
-  const rules = parseHeaders(
-    "/*\n  X-Test: yes\n/assets/*\n  Cache-Control: public\n/exact\n  ! ETag",
-  );
+  const rules = parseHeaders("/*\n  X-Test: yes\n/assets/*\n  Cache-Control: public\n/exact\n  ! ETag");
   for (const path of ["/", "/assets", "/assets/a/b", "/exact", "/exact/deep", "/missing"]) {
     expect(rules.filter((rule) => matches(rule.pattern, path))).toEqual(matchHeaders(rules, path));
   }
@@ -104,11 +127,9 @@ test("SPA/custom-404 assets receive headers, generated missing responses do not"
   });
   expect(custom.status).toBe(404);
   expect(custom.headers.get("x-test")).toBe("asset");
-  expect(
-    response("/missing", { status: 404, found: false, body: "Not Found", rules }).headers.has(
-      "x-test",
-    ),
-  ).toBe(false);
+  expect(response("/missing", { status: 404, found: false, body: "Not Found", rules }).headers.has("x-test")).toBe(
+    false,
+  );
 });
 
 test("a set wins over an unset in the same header block, matching edge behavior", () => {

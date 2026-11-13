@@ -5339,10 +5339,8 @@ function __sbEmbeddedDispatch(msg) {
     let path = String(msg.path || "/");
     if (path.charAt(0) !== "/") path = "/" + path;
     const redirects = (bundle.manifest && bundle.manifest.redirects) || [];
-    for (let i = 0; i < redirects.length; i++) {
-      const location = __sbAssetRedirect(redirects[i], path);
-      if (location !== null) return { ok: true, found: false, status: redirects[i].status, location };
-    }
+    const redirect = __sbFindAssetRedirect(redirects, path);
+    if (redirect !== null) return { ok: true, found: false, status: redirect.status, location: redirect.location };
 
     let key = null;
     if (path.charAt(path.length - 1) === "/") {
