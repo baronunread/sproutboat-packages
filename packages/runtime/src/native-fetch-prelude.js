@@ -13056,8 +13056,8 @@ function __sbDOUnlink(L, rec) {
   L.count--;
 }
 // Becomes idle now: the freshest record.
-function __sbDOFresh(L, rec) {
-  rec.last = Date.now();
+function __sbDOFresh(L, rec, now) {
+  rec.last = now === undefined ? Date.now() : now;
   if (L.tail === rec) return;
   __sbDOUnlink(L, rec);
   __sbDOLink(L, rec);
@@ -13282,6 +13282,9 @@ function __sbDOResolveId(cls, idText, idObj) {
 // Returns the record, or a promise of one when the cap is full and nothing is idle.
 function __sbDOAcquire(cls, idText, idObj) {
   const L = __sbDOLife();
+  // The common case: the caller's id text is the object's canonical id, so the record is one lookup away.
+  const quick = L.recs[cls + " " + idText];
+  if (quick !== undefined) return quick;
   if (!__sbDOClasses[cls]) throw new Error("no such Durable Object class: " + cls);
   const stateId = __sbDOResolveId(cls, idText, idObj);
   const id = stateId.toString();
@@ -13519,10 +13522,11 @@ function __sbDOSettle(L, rec, wait) {
 function __sbDOIdle(L, rec) {
   rec.busy--;
   if (rec.busy !== 0 || rec.dead) return;
-  if (rec.pins === 0) __sbDOFresh(L, rec);
-  __sbDOServe(L);
-  __sbDOArmSweep(L);
-  __sbDONote(L, false);
+  const now = Date.now();
+  if (rec.pins === 0) __sbDOFresh(L, rec, now);
+  if (L.waiters.length > 0) __sbDOServe(L);
+  if (!L.sweepArmed) __sbDOArmSweep(L);
+  if (now - L.noteAt >= 1000) __sbDONote(L, true);
 }
 
 // ---- pins: a timer, an unawaited fetch and a streamed response keep their object in memory ----
@@ -13604,7 +13608,7 @@ function __sbDOZombie(rec) {
 function __sbDOFetchEvent(inst, req) {
   return __sbFetchWithDrain(inst.fetch(req), [], false, true).then((r) => {
     // A streamed response keeps its object busy until the stream ends (__sbStreamResponse unpins it).
-    if (r && r.headers && r.headers.get("x-sb-stream") !== null && !inst.__sbRec.dead) {
+    if (r && r._sbStreamed === true && !inst.__sbRec.dead) {
       __sbDOPin(inst.__sbRec);
       r._sbDOPin = inst.__sbRec;
     }
@@ -15057,6 +15061,7 @@ function __sbStreamResponse(response) {
   response.headers._immutable = false;
   response.headers.set("x-sb-stream", id);
   response.body = "";
+  response._sbStreamed = true;
   (async () => {
     const reader = stream.getReader();
     try {
