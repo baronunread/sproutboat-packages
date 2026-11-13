@@ -13163,7 +13163,7 @@ function __sbDOEvict(rec, reason, force) {
   return true;
 }
 
-// The object's hibernatable sockets go back to the host (op u: unclaimed, their queued events kept), or are closed for a reset.
+// The object's hibernatable sockets go back to the host (op g: unclaimed, their queued events kept), or are closed for a reset.
 function __sbDOReleaseSockets(L, rec, force) {
   const holder = rec.holder;
   if (holder === null) return;
@@ -13192,7 +13192,7 @@ function __sbDOReleaseSockets(L, rec, force) {
         L.restoreParked = true;
         __sbWsRestorePark();
       }
-      __sbWsOp("u", hostId, "", 0);
+      __sbWsOp("g", hostId, "", 0);
     }
   }
 }
@@ -13629,7 +13629,7 @@ function __sbWsRestoreFailed(id, error) {
     return;
   }
   // Back to the host's restore list with its queued events: the next slot serves it.
-  __sbWsOp("u", id, "", 0);
+  __sbWsOp("g", id, "", 0);
 }
 
 function __sbDOStorage(cls, id) {

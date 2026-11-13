@@ -10,7 +10,7 @@ Durable Objects leave memory when idle and are constructed again by their next e
 - **Pins.** A pending `setTimeout` or `setInterval`, an unawaited `fetch`, an open plain WebSocket, outbound WebSocket or `connect()` socket, and a streamed response keep the object in memory. The timer globals become wrappers once the first object is built; the prelude's own timers use the runtime's.
 - **Revoked instances.** A leftover closure of an evicted instance throws "This Durable Object instance was evicted from memory." instead of writing as a second instance. `abort()` and a `blockConcurrencyWhile` that rejects or runs 30 s reset the object the same way (events waiting at its gate fail).
 - **Alarms.** The embedded pass runs its claimed batch concurrently and renews the claim; `alarm()` gets the delivery row's attempt count, so `retryCount` survives eviction; an alarm that cannot get a slot is released without counting an attempt.
-- **Host.** Parked sweep timer (op `D`), giving hibernatable sockets back (ops `U`, `u`); a host without them pins objects that hold such sockets, and sweeps when the next event arrives. A standalone binary keeps every object with an open socket in memory.
+- **Host.** Parked sweep timer (op `D`), giving hibernatable sockets back (ops `U`, `g`); a host without them pins objects that hold such sockets, and sweeps when the next event arrives. A standalone binary keeps every object with an open socket in memory.
 - A counters line (`objects_awake`, `evicted_idle`, `wake_us`, ...) goes to the host as a note, or to stderr with `SB_DO_STATS=1`.
 
 Not in this release: the memory-pressure eviction trigger (it waits for plan 016's pool).
