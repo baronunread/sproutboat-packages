@@ -13214,12 +13214,16 @@ function __sbDOStalest(L) {
   return null;
 }
 
-// The sweep: idle objects older than the timeout leave, from the stale end of the list. Bounded, so an acquire never pays much.
-function __sbDOSweep(L, limit) {
+// The sweep: idle objects older than the timeout leave, from the stale end of the list. Bounded twice: `limit` records are looked at and at
+// most `most` leave, because an eviction closes a SQLite handle (a checkpoint and its fsyncs, about a millisecond) and the whole sweep is one
+// synchronous turn: 500 objects going at once would stop every request for half a second or more (measured: p99 1.9 s in an alarm storm).
+// What is left goes on the next tick; the cap evicts one object at a time when a slot is needed in the meantime.
+function __sbDOSweep(L, limit, most) {
   if (L.idle === 0) return;
   const now = Date.now();
   let seen = 0;
-  for (let rec = L.head; rec !== null && seen < limit; ) {
+  let left = most;
+  for (let rec = L.head; rec !== null && seen < limit && left > 0; ) {
     const next = rec.next;
     seen++;
     if (rec.busy === 0) {
@@ -13229,7 +13233,7 @@ function __sbDOSweep(L, limit) {
           rec.pinLogged = true;
           console.error("Durable Object " + rec.cls + " has been held in memory for over 60 s by a timer, a connection or a streamed response; it cannot be evicted while that lives");
         }
-      } else __sbDOEvict(rec, "idle", false);
+      } else if (__sbDOEvict(rec, "idle", false)) left--;
     }
     rec = next;
   }
@@ -13259,7 +13263,7 @@ function __sbDOSweepFire() {
   if (L === null) return;
   L.sweepArmed = false;
   const before = L.evictedIdle;
-  __sbDOSweep(L, 100000);
+  __sbDOSweep(L, 100000, 24);
   // Objects left: SQLite hands the pages of the databases still open back too (the quiet collection follows this timer).
   if (L.evictedIdle !== before) {
     try {
@@ -13291,7 +13295,7 @@ function __sbDOAcquire(cls, idText, idObj) {
   const key = cls + " " + id;
   const rec = L.recs[key];
   if (rec !== undefined) return rec;
-  __sbDOSweep(L, 8);
+  __sbDOSweep(L, 8, 4);
   if (L.count >= L.cap) {
     const victim = __sbDOStalest(L);
     if (victim === null) return __sbDOWait(L, cls, id, stateId, key);
