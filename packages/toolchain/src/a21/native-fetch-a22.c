@@ -25,7 +25,15 @@ void porf_native_fetch_timer_clear(u32 id);
 void porf_native_fetch_response_complete_flat(void* pending, i32 status, const char* head, size_t head_len, const char* body, size_t body_len, i32 is_reject);
 
 // --- the compiled program ---
-extern void p__main__23main(void);
+// Generated JS functions carry PORF_CC (alpha 23: swiftcall on clang arm64; alpha 22's porf.h has no such macro),
+// and so does this declaration. Without it the call here is a plain C call to a swiftcall definition: harmless
+// across object files with no arguments, but under -flto LLVM sees the mismatch and turns the call into
+// unreachable (a trap in main on macOS arm64). Any new call into generated code must use PORF_CC too;
+// native-fetch-a22.cc.test.ts checks every one.
+#ifndef PORF_CC
+#define PORF_CC
+#endif
+extern PORF_CC void p__main__23main(void);
 extern void sb_data_init(void);
 extern jsval sb_dispatch_fn, sb_fire_timer_fn, sb_drain_fn;
 // The port the wrapper baked (globalThis.__sbStandalonePort), read by the preamble's C.

@@ -69,7 +69,9 @@
     "test:native-cpu-requests": "bun packages/runtime/test/native-cpu-requests.ts",
     "test:native-subtle": "bun packages/runtime/test/native-subtle.ts",
     "test:native-request-log": "bun packages/runtime/test/native-request-log.ts",
-    "test:native-r2-transfer": "bun packages/runtime/test/native-r2-transfer.ts"
+    "test:native-r2-transfer": "bun packages/runtime/test/native-r2-transfer.ts",
+    "test:native-lto": "bun packages/runtime/test/native-lto.ts",
+    "test:native-cc": "bun packages/runtime/test/native-cc.ts"
   },
   "devDependencies": {
     "@changesets/cli": "^3.0.2",

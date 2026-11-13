@@ -30,6 +30,11 @@ export type NativeCompileInput = {
   bearssl?: boolean;
   /** `-O` level. Default 0. */
   optimize?: number;
+  /** Link-time optimisation, as the CLI's host and release builds have it (`-flto`). Default off. */
+  flto?: boolean;
+  /** Compilers as argv prefixes (default `cc` and `c++`). */
+  cc?: string[];
+  cxx?: string[];
   /** Extra environment for the alpha 19 compiler process (the default is `process.env`). */
   env?: Record<string, string>;
   /** Message prefix of the failure assertion. Default "Porffor native compile failed". */
@@ -112,6 +117,47 @@ export async function compileNative(input: NativeCompileInput): Promise<void> {
     return;
   }
 
+  const a21Channel = standaloneA21Channel(standaloneChannel());
+  const unitsDir = await renderStandaloneUnits({
+    generated: input.generated,
+    binary: input.binary,
+    dir,
+    cacheRoot: input.cacheRoot,
+    env: input.env,
+    failure,
+  });
+  await rm(input.binary, { force: true });
+  await buildStandaloneA21({
+    unitsDir,
+    alpha19Root: alpha19,
+    outPath: input.binary,
+    cc: input.cc ?? ["cc"],
+    cxx: input.cxx ?? ["c++"],
+    uwsDir: await uwsDirectory(alpha19),
+    extraLink,
+    extraCflags,
+    optimize,
+    flto: input.flto ?? false,
+    musl: false,
+    strip: true,
+  }).catch((error: Error) => {
+    throw new Error(`${failure} (${a21Channel} build):\n${error.message}`);
+  });
+}
+
+export type RenderUnitsInput = Pick<
+  NativeCompileInput,
+  "generated" | "binary" | "dir" | "cacheRoot" | "env" | "failure"
+>;
+
+/**
+ * The compiler's half of a standalone build on the alpha 21 line: compose the sources, render the C units
+ * with the pinned alpha 22 or 23 compiler, and return the units directory (porf.h, porf__main.c, the units).
+ */
+export async function renderStandaloneUnits(input: RenderUnitsInput): Promise<string> {
+  const dir = input.dir ?? dirname(input.binary);
+  const failure = input.failure ?? "Porffor native compile failed";
+  const alpha19 = await ensurePorffor(input.cacheRoot === undefined ? {} : { cacheRoot: input.cacheRoot });
   const bun = process.execPath;
   const a21Channel = standaloneA21Channel(standaloneChannel());
   const a21 = await ensurePorfforA21(a21Channel);
@@ -144,22 +190,5 @@ export async function compileNative(input: NativeCompileInput): Promise<void> {
   }
   if (rendered.exitCode !== 0)
     throw new Error(`${failure} (${a21Channel} render):\n${rendered.stderr}\n${rendered.stdout}`);
-  const unitsDir = join(work, "units");
-  await rm(input.binary, { force: true });
-  await buildStandaloneA21({
-    unitsDir,
-    alpha19Root: alpha19,
-    outPath: input.binary,
-    cc: ["cc"],
-    cxx: ["c++"],
-    uwsDir: await uwsDirectory(alpha19),
-    extraLink,
-    extraCflags,
-    optimize,
-    flto: false,
-    musl: false,
-    strip: true,
-  }).catch((error: Error) => {
-    throw new Error(`${failure} (${a21Channel} build):\n${error.message}`);
-  });
+  return join(work, "units");
 }
