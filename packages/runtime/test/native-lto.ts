@@ -20,10 +20,9 @@ const handler = `export default {async fetch(request) {
   return new Response("hello");
 }};`;
 
-if (standaloneChannel() === "alpha-19") {
-  console.log(
-    "SKIPPED: the alpha 19 fallback compiles through the compiler's own native build, which has no -flto switch here",
-  );
+if (standaloneChannel() !== "alpha-23") {
+  // the bug is alpha 23's (PORF_CC); alpha 22 has no swiftcall and alpha 19 builds through the compiler's own native build
+  console.log(`SKIPPED: the -flto check is for the alpha-23 channel, not ${standaloneChannel()}`);
   process.exit(0);
 }
 
