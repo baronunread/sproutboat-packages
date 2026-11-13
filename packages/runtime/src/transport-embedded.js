@@ -6617,7 +6617,7 @@ async function __sbQueuePass(handlers, queues) {
     // From 2026-11-05 a consumer that runs past the 30 s lease keeps its messages: the lease
     // is renewed while it runs, so they are not delivered a second time or lose their ack.
     const beat = __sbQueuesFixed()
-      ? setInterval(() => {
+      ? __sbSetInterval(() => {
           __sbSql(store, "UPDATE mq SET visible_at=? WHERE queue=? AND claim_token=? AND visible_at>?", [Date.now() + 30000, name, claim, Date.now()]);
         }, 10000)
       : null;
@@ -6627,7 +6627,7 @@ async function __sbQueuePass(handlers, queues) {
       if (result && __sbIsFn(result.then)) result = await result;
       if (__sbTasks.length) await __sbDrainWaitUntil(__sbTasks);
     } finally {
-      if (beat !== null) clearInterval(beat);
+      if (beat !== null) __sbClearInterval(beat);
     }
     __sbQueueSettle(store, name, claim, result);
   }
@@ -6740,6 +6740,9 @@ async function __sbAlarmPass() {
     __sbSql(store, "ROLLBACK", []);
     throw error;
   }
+  // From the eviction date the claimed batch runs at once (each alarm through its own object's gate; one alarm() per object at a
+  // time is the gate and the single row), the claim is renewed while it runs, and the row's attempts reach alarm().
+  if (__sbDOEvictOn()) return __sbAlarmRunBatch(store, claim, due.rows);
   for (let i = 0; i < due.rows.length; i++) {
     const cls = due.rows[i][0];
     const id = due.rows[i][1];
@@ -6775,6 +6778,46 @@ async function __sbAlarmPass() {
           [Date.now() + 5000, cls, id, claim, Date.now()],
         );
     }
+  }
+}
+
+async function __sbAlarmRunBatch(store, claim, rows) {
+  const beat = __sbSetInterval(() => {
+    __sbSql(store, "UPDATE do_alarm_delivery SET expires=? WHERE token=? AND expires>?", [Date.now() + 30000, claim, Date.now()]);
+  }, 10000);
+  try {
+    const runs = [];
+    for (let i = 0; i < rows.length; i++) runs.push(__sbAlarmDeliver(store, claim, rows[i]));
+    for (let i = 0; i < runs.length; i++) await runs[i];
+  } finally {
+    __sbClearInterval(beat);
+  }
+}
+
+// One claimed alarm: construct the object if it is evicted (its constructor runs before alarm()), run alarm() through its gate, and
+// settle the delivery row. A call that could not get a slot within the wait is not a failed attempt: the row is released uncounted.
+async function __sbAlarmDeliver(store, claim, row) {
+  const cls = row[0];
+  const id = row[1];
+  try {
+    await __sbDORun(cls, id, undefined, (instance) => (__sbIsFn(instance.alarm) ? __sbDOAlarmCall(instance, cls, id, row[2], row[3]) : undefined), true);
+    __sbSql(store, "DELETE FROM do_alarm_delivery WHERE cls=? AND id=? AND token=? AND expires>?", [cls, id, claim, Date.now()]);
+  } catch (error) {
+    if (error && error.overloaded === true) {
+      __sbSql(store, "UPDATE do_alarm_delivery SET expires=?, attempts=attempts-1 WHERE cls=? AND id=? AND token=? AND expires>?", [
+        Date.now() + 1000,
+        cls,
+        id,
+        claim,
+        Date.now(),
+      ]);
+      return;
+    }
+    const scheduled = __sbSql(store, "SELECT 1 FROM do_alarm WHERE cls=? AND id=?", [cls, id]);
+    if (scheduled.rows.length)
+      __sbSql(store, "DELETE FROM do_alarm_delivery WHERE cls=? AND id=? AND token=? AND expires>?", [cls, id, claim, Date.now()]);
+    else
+      __sbSql(store, "UPDATE do_alarm_delivery SET expires=? WHERE cls=? AND id=? AND token=? AND expires>?", [Date.now() + 5000, cls, id, claim, Date.now()]);
   }
 }
 
@@ -6864,7 +6907,7 @@ globalThis.__sbStartLocalTriggers = function (handlers, bindings) {
   }
 
   if (scheduled) {
-    setInterval(async function () {
+    __sbSetInterval(async function () {
       const now = new Date();
       const stamp =
         now.getUTCFullYear() +
@@ -6904,7 +6947,7 @@ globalThis.__sbStartLocalTriggers = function (handlers, bindings) {
     }, 15000);
   }
 
-  if (queues.length > 0) setInterval(() => __sbQueuePass(handlers, queues), 500);
+  if (queues.length > 0) __sbSetInterval(() => __sbQueuePass(handlers, queues), 500);
 
-  if (dos.length > 0) setInterval(() => __sbAlarmPass(), 500);
+  if (dos.length > 0) __sbSetInterval(() => __sbAlarmPass(), 500);
 };

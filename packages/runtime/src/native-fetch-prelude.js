@@ -3043,6 +3043,12 @@ if (globalThis.setTimeout == null) globalThis.setTimeout = setTimeout;
 if (globalThis.clearTimeout == null) globalThis.clearTimeout = clearTimeout;
 if (globalThis.setInterval == null) globalThis.setInterval = setInterval;
 if (globalThis.clearInterval == null) globalThis.clearInterval = clearInterval;
+// The runtime's timers, for the prelude's own use. Once a Durable Object is built at the eviction date, the four globals become
+// wrappers that pin the object that armed a timer (__sbDOWrapTimers); a parked timer or a poll of ours must never pin anything.
+const __sbSetTimeout = globalThis.setTimeout;
+const __sbClearTimeout = globalThis.clearTimeout;
+const __sbSetInterval = globalThis.setInterval;
+const __sbClearInterval = globalThis.clearInterval;
 
 // Prepended to every handler by tools/compile.ts, before Porffor's native-fetch
 // bundled handler. Porffor's runtime/fetch-globals.js (checked through alpha-10)
@@ -3895,7 +3901,7 @@ if (typeof globalThis.EventTarget !== "function") {
     }
     static timeout(ms) {
       const signal = new AbortSignal();
-      setTimeout(() => signal.__sbAbort(namedError("TimeoutError", "The operation timed out")), ms);
+      __sbSetTimeout(() => signal.__sbAbort(namedError("TimeoutError", "The operation timed out")), ms);
       return signal;
     }
     static any(signals) {
@@ -12276,7 +12282,7 @@ async function __sbPumpRequestBody(id, source, ended) {
       if (bytes.length === 0) continue;
       let backlog = Number(globalThis.__sbAsyncBody(id, "c", __sbToBytes(bytes)));
       while (backlog > 4 * 1024 * 1024 && !ended()) {
-        await new Promise((resolve) => setTimeout(resolve, 2));
+        await new Promise((resolve) => __sbSetTimeout(resolve, 2));
         backlog = Number(globalThis.__sbAsyncBody(id, "q", ""));
       }
     }
@@ -12296,10 +12302,10 @@ function __sbUpstreamStreamed(op, msg, label, signal) {
     let done = false;
     const finish = () => {
       done = true;
-      clearInterval(id);
+      __sbClearInterval(id);
       if (onAbort) signal.removeEventListener("abort", onAbort);
     };
-    const id = setInterval(() => {
+    const id = __sbSetInterval(() => {
       if (done) return;
       const raw = __sbHttpAsyncResult(id);
       if (controller === null) {
@@ -12435,7 +12441,7 @@ function __sbUpstream(op, msg, label, signal, always) {
     const settled = () => {
       if (onAbort) signal.removeEventListener("abort", onAbort);
     };
-    const id = setTimeout(() => {
+    const id = __sbSetTimeout(() => {
       settled();
       try {
         resolve(__sbUpstreamResponse(__sbFetchReply(__sbHttpAsyncResult(id))));
@@ -12446,7 +12452,7 @@ function __sbUpstream(op, msg, label, signal, always) {
     if (signal) {
       onAbort = () => {
         settled();
-        clearTimeout(id);
+        __sbClearTimeout(id);
         __sbCancelAsync(id);
         reject(signal.reason);
       };
@@ -12457,7 +12463,7 @@ function __sbUpstream(op, msg, label, signal, always) {
       globalThis.__sbFetchUpstream(op, msg);
     } catch (e) {
       settled();
-      clearTimeout(id);
+      __sbClearTimeout(id);
       reject(e);
     }
   });
@@ -12470,7 +12476,7 @@ function __sbUpstream(op, msg, label, signal, always) {
 globalThis.__sbInstallFetch = function () {
   __sbIngressStreamingSetup();
   __sbInstallWebSockets();
-  globalThis.fetch = function (input, init) {
+  const plainFetch = function (input, init) {
     let parts;
     try {
       parts = __sbFetchParts(input, init);
@@ -12491,6 +12497,29 @@ globalThis.__sbInstallFetch = function () {
     if (__sbStreamsBody(stream)) return send({ bodyStream: true, __sbBodySource: stream });
     if (stream instanceof ReadableStream) return __sbCollectBody(stream).then((bytes) => send(__sbRequestBody(bytes)));
     return send(__sbPartsBody(parts));
+  };
+  // Inside a Durable Object's event an unawaited fetch keeps its object in memory until it settles.
+  globalThis.fetch = function (input, init) {
+    const rec = __sbDOL !== null ? __sbDOFrameRec() : undefined;
+    if (rec === undefined || rec.dead) return plainFetch(input, init);
+    __sbDOPin(rec);
+    let p;
+    try {
+      p = plainFetch(input, init);
+    } catch (error) {
+      __sbDOUnpin(rec);
+      throw error;
+    }
+    return p.then(
+      (r) => {
+        __sbDOUnpin(rec);
+        return r;
+      },
+      (error) => {
+        __sbDOUnpin(rec);
+        throw error;
+      },
+    );
   };
 };
 
@@ -12739,6 +12768,7 @@ function __sbDOCallback(fn, args) {
 
 // One RPC call: method `method` with `args`, or the getter `method` when args is null.
 function __sbDOInvoke(cls, id, method, args) {
+  if (__sbDOEvictOn()) return __sbDOInvokeLive(cls, id, method, args);
   let copied = null;
   let inst;
   try {
@@ -12765,7 +12795,38 @@ function __sbDOInvoke(cls, id, method, args) {
   );
 }
 
+// RPC into an object that may be evicted (compatibility date 2026-11-21): the event enters through __sbDORun.
+function __sbDOInvokeLive(cls, id, method, args) {
+  let copied = null;
+  try {
+    if (args !== null) copied = __sbDOCopy(args);
+  } catch (error) {
+    return Promise.reject(error);
+  }
+  return __sbDORun(
+    cls,
+    id.toString(),
+    id,
+    (inst) => {
+      const d = __sbDOFind(__sbDOClasses[cls], method);
+      if (args === null) return d.get.call(inst);
+      if (!d || !__sbIsFn(d.value)) throw new TypeError('The RPC receiver does not implement the method "' + method + '".');
+      return d.value.apply(inst, copied);
+    },
+    false,
+  ).then(__sbDOCopy);
+}
+
 function __sbDOFetchV2(className, id, input, init) {
+  if (__sbDOEvictOn()) {
+    let request;
+    try {
+      request = new Request(input, init);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return __sbDORun(className, id.toString(), id, (inst) => __sbDOFetchEvent(inst, request), false);
+  }
   let req;
   let inst;
   try {
@@ -12890,6 +12951,687 @@ function __sbGetDOInstance(cls, idText, idObj) {
   return inst;
 }
 
+// ---------------------------------------------------------------------------
+// Durable Object lifecycle (design 07 stage 1c, plan 018), from compatibility date 2026-11-21: an idle object
+// leaves memory and is constructed again by its next event, so one app can hold one object per customer.
+//
+// A record per object in a worker (not the bare instance): { cls, id, key, inst, state, gate, holder, tasks, busy,
+// pins, last, dead, prev, next, ... }. `busy` counts the events that entered through __sbDORun and have not
+// finished, their waitUntil drain included; `pins` counts things that outlive an event and cannot be rebuilt (a pending
+// timer, an unawaited fetch, a streamed response); open plain sockets are checked when idleness is. The records are one
+// least-recently-idle list (`head` the stalest). An object is evicted only when __sbDOIsIdle says so, in one synchronous
+// turn (__sbDOEvict): nothing in it awaits. Before the date nothing here runs and every object stays resident.
+//
+// Settings (environment; sproutd sets them from `limits ID do-idle-ms|objects|do-wait-ms`):
+//   SB_DO_IDLE_MS  how long an object sits idle before it leaves, 100 to 600000 (default 10000; 0 turns idle eviction off)
+//   SB_DO_MAX      most objects in memory in this worker (default 16 per MiB of SB_MEMORY_LIMIT, 64 to 4096; 4096 with no limit)
+//   SB_DO_WAIT_MS  how long an object's first event waits for a slot at the cap before it fails alone (default 5000)
+//   SB_DO_QUEUE_MAX  most events queued behind one object's input gate (default 1024)
+const __SB_DO_EVICT_DATE = "2026-11-21";
+const __sbDOCtxKey = {};
+let __sbDOL = null;
+
+function __sbDOEvictOn() {
+  return __sbCompatDate() >= __SB_DO_EVICT_DATE && __sbDOGated() && __sbDOv3();
+}
+
+function __sbDOEnvNum(name, fallback, min, max) {
+  const text = __sbEnv(name);
+  if (text === "") return fallback;
+  const n = Number(text);
+  return n >= min && n <= max ? Math.trunc(n) : fallback;
+}
+
+function __sbDOLife() {
+  if (__sbDOL !== null) return __sbDOL;
+  let idle = __sbDOEnvNum("SB_DO_IDLE_MS", 10000, 100, 600000);
+  if (__sbEnv("SB_DO_IDLE_MS") === "0") idle = 0;
+  const limit = Number(__sbEnv("SB_MEMORY_LIMIT"));
+  const byLimit = limit > 0 ? Math.max(64, Math.min(4096, Math.floor(limit / 1048576) * 16)) : 4096;
+  __sbDOL = {
+    idle,
+    cap: __sbDOEnvNum("SB_DO_MAX", byLimit, 1, 100000),
+    waitMs: __sbDOEnvNum("SB_DO_WAIT_MS", 5000, 10, 600000),
+    queueMax: __sbDOEnvNum("SB_DO_QUEUE_MAX", 1024, 1, 1000000),
+    recs: {},
+    head: null,
+    tail: null,
+    count: 0,
+    waiters: [],
+    sweepArmed: false,
+    hostU: -1,
+    restoreParked: false,
+    restoreTries: {},
+    noteAt: 0,
+    noteText: "",
+    pinned: 0,
+    evictedIdle: 0,
+    evictedCap: 0,
+    evictedAbort: 0,
+    waits: 0,
+    waitMsMax: 0,
+    overloaded: 0,
+    zombie: 0,
+    wakeUsLast: 0,
+    wakeUsMax: 0,
+  };
+  __sbDOWrapTimers();
+  return __sbDOL;
+}
+
+function __sbDOEvictedError() {
+  return new Error("This Durable Object instance was evicted from memory.");
+}
+
+function __sbDOOverloaded(why) {
+  const error = new Error("Durable Object is overloaded: " + why);
+  error.overloaded = true;
+  return error;
+}
+
+// The record of the object whose event is running now (the frame the event entered carries it), or undefined.
+function __sbDOFrameRec() {
+  const frame = __sbCtxGet();
+  if (!frame) return undefined;
+  const at = __sbFrameIndex(frame, __sbDOCtxKey);
+  return at === -1 ? undefined : frame.vals[at];
+}
+
+// ---- the list: head is the stalest record, tail the freshest ----
+function __sbDOLink(L, rec) {
+  rec.prev = L.tail;
+  rec.next = null;
+  if (L.tail !== null) L.tail.next = rec;
+  else L.head = rec;
+  L.tail = rec;
+  L.count++;
+}
+function __sbDOUnlink(L, rec) {
+  if (rec.prev !== null) rec.prev.next = rec.next;
+  else L.head = rec.next;
+  if (rec.next !== null) rec.next.prev = rec.prev;
+  else L.tail = rec.prev;
+  rec.prev = null;
+  rec.next = null;
+  L.count--;
+}
+// Becomes idle now: the freshest record.
+function __sbDOFresh(L, rec) {
+  rec.last = Date.now();
+  if (L.tail === rec) return;
+  __sbDOUnlink(L, rec);
+  __sbDOLink(L, rec);
+}
+
+// ---- idleness ----
+function __sbDOSocketsFree(L, rec) {
+  const plain = rec.plain;
+  if (plain.length > 0) {
+    for (let i = plain.length - 1; i >= 0; i--) if (plain[i]._state === __SB_WS_CLOSED) plain.splice(i, 1);
+    if (plain.length > 0) return false;
+  }
+  const tcp = rec.tcp;
+  if (tcp.length > 0) {
+    for (let i = tcp.length - 1; i >= 0; i--) if (tcp[i].id === 0) tcp.splice(i, 1);
+    if (tcp.length > 0) return false;
+  }
+  const sockets = rec.holder.sockets;
+  for (let i = 0; i < sockets.length; i++) {
+    const server = sockets[i];
+    if (server._state === __SB_WS_CLOSED) continue;
+    const client = server._peer;
+    // A pair whose two ends are both in the worker, or no host that takes a socket back: nothing outside holds it.
+    if (client === null || client._host === 0) return false;
+    if (L.hostU < 0) L.hostU = __sbWsOp("U", 0, "", 0) === "1" ? 1 : 0;
+    if (L.hostU !== 1) return false;
+    // An event that left the bridge and exists only in this worker (the bridge keeps the rest of the queue).
+    if (client._inbox.length > 0 || server._inbox.length > 0 || client._flushing || server._flushing) return false;
+  }
+  return true;
+}
+function __sbDOIsIdle(L, rec) {
+  const gate = rec.gate;
+  return (
+    rec.busy === 0 &&
+    rec.pins === 0 &&
+    gate.locks === 0 &&
+    gate.waiting.length === 0 &&
+    !gate.txnBusy &&
+    gate.txnQueue.length === 0 &&
+    __sbDOSocketsFree(L, rec)
+  );
+}
+
+function __sbDOPin(rec) {
+  rec.pins++;
+  if (rec.pins === 1) {
+    rec.pinSince = Date.now();
+    __sbDOL.pinned++;
+  }
+}
+function __sbDOUnpin(rec) {
+  if (rec.pins === 0) return;
+  rec.pins--;
+  if (rec.pins !== 0) return;
+  const L = __sbDOL;
+  if (rec.dead) return;
+  L.pinned--;
+  rec.pinLogged = false;
+  if (rec.busy === 0) {
+    __sbDOFresh(L, rec);
+    __sbDOServe(L);
+    __sbDOArmSweep(L);
+  }
+}
+
+// ---- eviction: one synchronous turn, nothing awaits ----
+// The reason says why: "idle", "cap" (a slot was needed), "abort" (state.abort()), "bcw" (blockConcurrencyWhile failed).
+// `force` skips the idleness check and closes the object's sockets (abort and reset); otherwise sockets go back to the host.
+function __sbDOEvict(rec, reason, force) {
+  if (rec.dead) return false;
+  const L = __sbDOL;
+  if (!force && !__sbDOIsIdle(L, rec)) return false;
+  if (rec.registered) {
+    delete L.recs[rec.key];
+    __sbDOUnlink(L, rec);
+    rec.registered = false;
+    if (rec.pins > 0) L.pinned--;
+  }
+  // Revoke: every state method of this instance now throws the evicted error, so a leftover closure cannot write as a second instance.
+  rec.dead = true;
+  __sbDOReleaseSockets(L, rec, force);
+  if (rec.usedSql) {
+    try {
+      __sbRpc("do.sql.close", { cls: rec.cls, file: rec.sqlFile });
+    } catch (error) {
+      __sbLogUncaught("do.sql.close", error);
+    }
+  }
+  const holder = rec.holder;
+  if (holder !== null) {
+    holder.inst = null;
+    holder.rec = null;
+    holder.sockets = [];
+  }
+  rec.inst = null;
+  rec.state = null;
+  rec.plain = [];
+  rec.tcp = [];
+  if (reason === "idle") L.evictedIdle++;
+  else if (reason === "cap") L.evictedCap++;
+  else L.evictedAbort++;
+  return true;
+}
+
+// The object's hibernatable sockets go back to the host (op u: unclaimed, their queued events kept), or are closed for a reset.
+function __sbDOReleaseSockets(L, rec, force) {
+  const holder = rec.holder;
+  if (holder === null) return;
+  const sockets = holder.sockets;
+  for (let i = 0; i < sockets.length; i++) {
+    const server = sockets[i];
+    const client = server._peer;
+    if (client !== null && client._pumpTimer !== undefined) {
+      __sbClearTimeout(client._pumpTimer);
+      client._pumpTimer = undefined;
+    }
+    if (server._state === __SB_WS_CLOSED) continue;
+    if (force) {
+      try {
+        server.close(1011, "Durable Object reset");
+      } catch {
+        /* already closing */
+      }
+      continue;
+    }
+    if (client !== null && client._host > 0) {
+      const hostId = client._host;
+      client._host = 0;
+      server._state = __SB_WS_CLOSED;
+      if (!L.restoreParked) {
+        L.restoreParked = true;
+        __sbWsRestorePark();
+      }
+      __sbWsOp("u", hostId, "", 0);
+    }
+  }
+}
+
+// state.abort() and a failed blockConcurrencyWhile(): the object is forgotten (storage kept) and this instance is revoked.
+function __sbDOReset(rec, reason, error) {
+  if (rec.dead) return;
+  const L = __sbDOL;
+  rec.deadError = error === undefined ? null : error;
+  __sbDOEvict(rec, reason, true);
+  // Events waiting at its gate now fail (each finds the record dead).
+  rec.gate.locks = 0;
+  __sbDOPump(rec.gate);
+  __sbDOServe(L);
+}
+
+function __sbDOStalest(L) {
+  for (let rec = L.head; rec !== null; rec = rec.next) if (__sbDOIsIdle(L, rec)) return rec;
+  return null;
+}
+
+// The sweep: idle objects older than the timeout leave, from the stale end of the list. Bounded, so an acquire never pays much.
+function __sbDOSweep(L, limit) {
+  if (L.idle === 0) return;
+  const now = Date.now();
+  let seen = 0;
+  for (let rec = L.head; rec !== null && seen < limit; ) {
+    const next = rec.next;
+    seen++;
+    if (rec.busy === 0) {
+      if (now - rec.last < L.idle) break;
+      if (rec.pins > 0) {
+        if (!rec.pinLogged && now - rec.pinSince > 60000) {
+          rec.pinLogged = true;
+          console.error("Durable Object " + rec.cls + " has been held in memory for over 60 s by a timer, a connection or a streamed response; it cannot be evicted while that lives");
+        }
+      } else __sbDOEvict(rec, "idle", false);
+    }
+    rec = next;
+  }
+}
+
+// The sweep timer is parked at the host (op D): the host fires it when its deadline passes, and it is not background work, so
+// an app whose objects are all evicted is still reaped on time. A host without the op (an older sproutd) gets no timer: objects
+// then leave when the next event arrives. A standalone binary has no reaper, so a plain timer does it.
+function __sbDOArmSweep(L) {
+  if (L.sweepArmed || L.idle === 0 || L.count === 0) return;
+  let delay = L.idle;
+  if (L.head !== null) delay = Math.max(50, Math.min(L.idle, L.head.last + L.idle - Date.now()));
+  const timer = __sbSetTimeout(__sbDOSweepFire, 2147483647);
+  const parked = __sbWsOp("D", Math.trunc(delay), "", timer) === "0";
+  if (parked) {
+    L.sweepArmed = true;
+    return;
+  }
+  __sbClearTimeout(timer);
+  if (!__sbHosted()) {
+    L.sweepArmed = true;
+    __sbSetTimeout(__sbDOSweepFire, delay);
+  }
+}
+function __sbDOSweepFire() {
+  const L = __sbDOL;
+  if (L === null) return;
+  L.sweepArmed = false;
+  const before = L.evictedIdle;
+  __sbDOSweep(L, 100000);
+  // Objects left: SQLite hands the pages of the databases still open back too (the quiet collection follows this timer).
+  if (L.evictedIdle !== before) {
+    try {
+      __sbRpc("do.release", {});
+    } catch (error) {
+      __sbLogUncaught("do.release", error);
+    }
+  }
+  __sbDOServe(L);
+  __sbDOArmSweep(L);
+  __sbDONote(L, true);
+}
+
+// ---- acquire: the record of an object, constructing it when it has none ----
+function __sbDOResolveId(cls, idText, idObj) {
+  const stateId = idObj || (idText.indexOf("name:") === 0 ? __sbDONamedId(cls, idText.slice(5)) : __sbDOMakeId(idText, undefined));
+  return stateId;
+}
+
+// Returns the record, or a promise of one when the cap is full and nothing is idle.
+function __sbDOAcquire(cls, idText, idObj) {
+  const L = __sbDOLife();
+  if (!__sbDOClasses[cls]) throw new Error("no such Durable Object class: " + cls);
+  const stateId = __sbDOResolveId(cls, idText, idObj);
+  const id = stateId.toString();
+  const key = cls + " " + id;
+  const rec = L.recs[key];
+  if (rec !== undefined) return rec;
+  __sbDOSweep(L, 8);
+  if (L.count >= L.cap) {
+    const victim = __sbDOStalest(L);
+    if (victim === null) return __sbDOWait(L, cls, id, stateId, key);
+    __sbDOEvict(victim, "cap", false);
+  }
+  return __sbDOBuild(L, cls, id, stateId, key);
+}
+
+function __sbDOWait(L, cls, id, stateId, key) {
+  L.waits++;
+  return new Promise((resolve, reject) => {
+    const w = { cls, id, stateId, key, resolve, reject, timer: 0, done: false, t0: Date.now() };
+    w.timer = __sbSetTimeout(() => {
+      if (w.done) return;
+      w.done = true;
+      const at = L.waiters.indexOf(w);
+      if (at >= 0) L.waiters.splice(at, 1);
+      L.overloaded++;
+      reject(__sbDOOverloaded("too many objects are awake in this app"));
+    }, L.waitMs);
+    L.waiters.push(w);
+  });
+}
+
+// A slot or an idle object freed: serve the waiting first events in order.
+function __sbDOServe(L) {
+  while (L.waiters.length > 0) {
+    const w = L.waiters[0];
+    let rec = L.recs[w.key];
+    if (rec === undefined) {
+      if (L.count >= L.cap) {
+        const victim = __sbDOStalest(L);
+        if (victim === null) return;
+        __sbDOEvict(victim, "cap", false);
+      }
+    }
+    L.waiters.shift();
+    w.done = true;
+    __sbClearTimeout(w.timer);
+    const waited = Date.now() - w.t0;
+    if (waited > L.waitMsMax) L.waitMsMax = waited;
+    try {
+      if (rec === undefined) rec = __sbDOBuild(L, w.cls, w.id, w.stateId, w.key);
+      w.resolve(rec);
+    } catch (error) {
+      w.reject(error);
+    }
+  }
+}
+
+// A clock finer than Date.now() for the wake counter (microseconds); the performance object is built on its first read.
+function __sbDONow() {
+  const p = globalThis.performance;
+  return p && __sbIsFn(p.now) ? p.now() : Date.now();
+}
+
+function __sbDOBuild(L, cls, id, stateId, key) {
+  const Ctor = __sbDOClasses[cls];
+  const t0 = __sbDONow();
+  if (stateId.name !== undefined) __sbDOAdopt(cls, "name:" + stateId.name, id);
+  const tasks = [];
+  const gate = __sbDOMakeGate();
+  const rec = {
+    cls,
+    id,
+    key,
+    inst: null,
+    state: null,
+    gate,
+    holder: null,
+    tasks,
+    busy: 0,
+    pins: 0,
+    pinSince: 0,
+    pinLogged: false,
+    last: Date.now(),
+    usedSql: false,
+    sqlFile: "",
+    dead: false,
+    registered: false,
+    prev: null,
+    next: null,
+    frame: null,
+    plain: [],
+    tcp: [],
+    deadError: null,
+  };
+  rec.frame = __sbFrameWith(undefined, __sbDOCtxKey, rec);
+  const state = {
+    id: stateId,
+    storage: __sbDOAsyncStorage(cls, id, gate, rec),
+    blockConcurrencyWhile(fn) {
+      if (!__sbIsFn(fn))
+        throw new TypeError("Failed to execute 'blockConcurrencyWhile' on 'DurableObjectState': parameter 1 is not of type 'function'.");
+      if (rec.dead) throw __sbDOEvictedError();
+      // No event enters until fn settles; a throw or 30 s without settling resets the object, as in workerd.
+      gate.locks++;
+      let settled = false;
+      const done = () => {
+        settled = true;
+        __sbClearTimeout(timer);
+        if (!rec.dead) {
+          gate.locks--;
+          __sbDOPump(gate);
+        }
+      };
+      const timer = __sbSetTimeout(() => {
+        if (settled) return;
+        settled = true;
+        console.error("blockConcurrencyWhile() did not settle in 30 seconds: the Durable Object " + cls + " was reset");
+        __sbDOReset(rec, "bcw", new Error("Durable Object reset because blockConcurrencyWhile() did not settle in 30 seconds."));
+      }, 30000);
+      let r;
+      try {
+        r = fn();
+      } catch (error) {
+        done();
+        __sbDOReset(rec, "bcw", new Error("Durable Object reset because blockConcurrencyWhile() threw: " + String((error && error.message) || error)));
+        return Promise.reject(error);
+      }
+      return Promise.resolve(r).then(
+        (v) => {
+          done();
+          return v;
+        },
+        (error) => {
+          done();
+          __sbDOReset(rec, "bcw", new Error("Durable Object reset because blockConcurrencyWhile() failed: " + String((error && error.message) || error)));
+          throw error;
+        },
+      );
+    },
+    waitUntil(p) {
+      if (rec.dead) throw __sbDOEvictedError();
+      if (p && __sbIsFn(p.then)) tasks.push(p);
+    },
+  };
+  state.props = {};
+  state.abort = (reason) => {
+    __sbDOReset(rec, "abort");
+    throw new Error(reason == null ? "Durable Object was aborted." : String(reason));
+  };
+  const holder = { inst: null, rec, auto: null, cls, id, restored: [], sockets: [] };
+  rec.holder = holder;
+  rec.state = state;
+  if (__sbWsEnabled()) __sbDOWebSocketState(state, holder);
+  let inst;
+  try {
+    inst = new Ctor(state, __sbEnvValue());
+  } catch (error) {
+    rec.dead = true;
+    throw error;
+  }
+  // blockConcurrencyWhile() reset the object while its constructor was still running (a synchronous throw).
+  if (rec.dead) throw new Error("The Durable Object " + cls + " was reset while it was starting.");
+  holder.inst = inst;
+  inst.__sbTasks = tasks;
+  inst.__sbGate = gate;
+  rec.inst = inst;
+  inst.__sbRec = rec;
+  L.recs[key] = rec;
+  rec.registered = true;
+  __sbDOLink(L, rec);
+  const wake = Math.round((__sbDONow() - t0) * 1000);
+  L.wakeUsLast = wake;
+  if (wake > L.wakeUsMax) L.wakeUsMax = wake;
+  // Sockets restored from hibernation start delivering now that the object exists.
+  const restored = holder.restored;
+  holder.restored = [];
+  for (let i = 0; i < restored.length; i++) __sbWsPump(restored[i]);
+  __sbDOArmSweep(L);
+  return rec;
+}
+
+// ---- run an event: the one entry for RPC, stub.fetch, alarms and socket events ----
+// `run(inst)` is the event; it enters the object's gate and runs in a frame that names the object. The returned promise settles with
+// the event's value. The object counts as busy until the event and the drain of its waitUntil tasks have settled (`wait`: the
+// returned promise waits for that drain too).
+function __sbDORun(cls, idText, idObj, run, wait) {
+  let acquired;
+  try {
+    acquired = __sbDOAcquire(cls, idText, idObj);
+  } catch (error) {
+    return Promise.reject(error);
+  }
+  if (__sbIsFn(acquired.then)) return acquired.then((rec) => __sbDOStart(rec, run, wait));
+  return __sbDOStart(acquired, run, wait);
+}
+
+function __sbDOStart(rec, run, wait) {
+  const L = __sbDOL;
+  if (rec.dead) return Promise.reject(rec.deadError !== null ? rec.deadError : __sbDOEvictedError());
+  if (rec.gate.waiting.length >= L.queueMax) {
+    L.overloaded++;
+    return Promise.reject(__sbDOOverloaded("too many events are queued for this object"));
+  }
+  rec.busy++;
+  const entered = __sbDOEnter(rec.gate, () => {
+    if (rec.dead) throw rec.deadError !== null ? rec.deadError : __sbDOEvictedError();
+    return __sbRunInFrame(rec.frame, run, [rec.inst]);
+  });
+  return entered.then(
+    (value) => {
+      const drained = __sbDOSettle(L, rec, wait);
+      return drained === undefined ? value : drained.then(() => value);
+    },
+    (error) => {
+      const drained = __sbDOSettle(L, rec, wait);
+      if (drained === undefined) throw error;
+      return drained.then(() => {
+        throw error;
+      });
+    },
+  );
+}
+
+// The event is over: drain its waitUntil tasks (it stays busy until they settle), then it may become idle.
+function __sbDOSettle(L, rec, wait) {
+  if (rec.tasks.length > 0) {
+    const finish = () => __sbDOIdle(L, rec);
+    const drained = __sbDrainWaitUntil(rec.tasks);
+    drained.then(finish, finish);
+    return wait ? drained.then(undefined, () => {}) : undefined;
+  }
+  __sbDOIdle(L, rec);
+  return undefined;
+}
+function __sbDOIdle(L, rec) {
+  rec.busy--;
+  if (rec.busy !== 0 || rec.dead) return;
+  if (rec.pins === 0) __sbDOFresh(L, rec);
+  __sbDOServe(L);
+  __sbDOArmSweep(L);
+  __sbDONote(L, false);
+}
+
+// ---- pins: a timer, an unawaited fetch and a streamed response keep their object in memory ----
+// The timer globals become wrappers once the first object is built. The prelude's own timers use __sbSetTimeout and the rest,
+// which are the runtime's, so a parked timer of ours never pins anything.
+function __sbDOWrapTimers() {
+  const armed = new Map();
+  const arm = (original, repeat) =>
+    function (callback, delay, ...args) {
+      const rec = __sbDOFrameRec();
+      if (rec === undefined || rec.dead || !__sbIsFn(callback)) return original(callback, delay, ...args);
+      const slot = { id: 0, rec };
+      __sbDOPin(rec);
+      const fired = repeat
+        ? callback
+        : function (...fireArgs) {
+            armed.delete(slot.id);
+            __sbDOUnpin(slot.rec);
+            return callback.apply(undefined, fireArgs);
+          };
+      slot.id = Number(original(fired, delay, ...args));
+      armed.set(slot.id, slot);
+      return slot.id;
+    };
+  const clear = (original) =>
+    function (id) {
+      const key = Number(id);
+      const slot = armed.get(key);
+      if (slot !== undefined) {
+        armed.delete(key);
+        __sbDOUnpin(slot.rec);
+      }
+      return original(id);
+    };
+  globalThis.setTimeout = arm(__sbSetTimeout, false);
+  globalThis.setInterval = arm(__sbSetInterval, true);
+  globalThis.clearTimeout = clear(__sbClearTimeout);
+  globalThis.clearInterval = clear(__sbClearInterval);
+}
+
+// ---- counters: cheap, one host note a second at most, only when changed ----
+function __sbDOStats(L) {
+  let sqlOpen = 0;
+  try {
+    sqlOpen = Number(__sbRpc("do.stats", {}).stats.doOpen) || 0;
+  } catch {
+    sqlOpen = 0;
+  }
+  return (
+    "objects_awake=" + L.count +
+    " objects_pinned=" + L.pinned +
+    " do_sql_open=" + sqlOpen +
+    " evicted_idle=" + L.evictedIdle +
+    " evicted_cap=" + L.evictedCap +
+    " evicted_abort=" + L.evictedAbort +
+    " waits=" + L.waits +
+    " wait_ms_max=" + L.waitMsMax +
+    " overloaded=" + L.overloaded +
+    " zombie_calls=" + L.zombie +
+    " wake_us=" + L.wakeUsLast + "," + L.wakeUsMax
+  );
+}
+function __sbDONote(L, force) {
+  const now = Date.now();
+  if (!force && now - L.noteAt < 1000) return;
+  L.noteAt = now;
+  const text = __sbDOStats(L);
+  if (text === L.noteText) return;
+  L.noteText = text;
+  if (__sbHosted()) __sbHostNote("do " + text);
+  if (__sbEnv("SB_DO_STATS") === "1") console.error("do " + text);
+}
+
+// A revoked state method: the evicted (or reset) object's instance cannot touch storage any more.
+function __sbDOZombie(rec) {
+  __sbDOL.zombie++;
+  return rec.deadError !== null ? rec.deadError : __sbDOEvictedError();
+}
+function __sbDOFetchEvent(inst, req) {
+  return __sbFetchWithDrain(inst.fetch(req), [], false, true).then((r) => {
+    // A streamed response keeps its object busy until the stream ends (__sbStreamResponse unpins it).
+    if (r && r.headers && r.headers.get("x-sb-stream") !== null && !inst.__sbRec.dead) {
+      __sbDOPin(inst.__sbRec);
+      r._sbDOPin = inst.__sbRec;
+    }
+    return r;
+  });
+}
+function __sbWsRestorePark() {
+  const timer = __sbSetTimeout(__sbWsRestoreLoop, 2147483647);
+  __sbWsOp("R", 0, "", timer);
+}
+function __sbWsRestoreFailed(id, error) {
+  __sbLogUncaught("websocket", error);
+  if (!(error && error.overloaded === true)) return;
+  const L = __sbDOL;
+  const tries = (L.restoreTries[id] || 0) + 1;
+  L.restoreTries[id] = tries;
+  if (tries >= 3) {
+    delete L.restoreTries[id];
+    // Three waits for a slot and none came: try again later, said to the client.
+    __sbWsOp("c", id, "", 1013);
+    __sbWsOp("r", id, "", 0);
+    return;
+  }
+  // Back to the host's restore list with its queued events: the next slot serves it.
+  __sbWsOp("u", id, "", 0);
+}
+
 function __sbDOStorage(cls, id) {
   return {
     get(key) {
@@ -12987,7 +13729,7 @@ function __sbDOPump(gate) {
 // Shut the gate until the next timer turn (see above).
 function __sbDOHold(gate) {
   gate.locks++;
-  setTimeout(function () {
+  __sbSetTimeout(function () {
     gate.locks--;
     __sbDOPump(gate);
   }, 0);
@@ -13023,6 +13765,12 @@ function __sbDOEnter(gate, run) {
 // (kept on the instance, as __sbAlarmAt and __sbAlarmFails)
 function __sbDOAlarmCall(inst, cls, id, at, attempts) {
   if (__sbCompatDate() < "2026-11-04") return inst.alarm();
+  // From the eviction date the count is the delivery row's (or the host's), never the instance's: the instance can be gone
+  // between two runs of the same alarm.
+  if (__sbDOEvictOn()) {
+    const retries = attempts != null && Number(attempts) > 0 ? Number(attempts) : 0;
+    return __sbDOAlarmRun(inst, { retryCount: retries, isRetry: retries > 0 });
+  }
   const when = Number(at) || 0;
   if (inst.__sbAlarmAt !== when) {
     inst.__sbAlarmAt = when;
@@ -13333,7 +14081,8 @@ function __sbDOStrictStorage(cls, id) {
     setAlarm(when) {
       const at = when instanceof Date ? when.getTime() : when;
       if (__sbDOv3()) {
-        const inst = __sbDOInstances[cls + " " + id];
+        const live = __sbDOL !== null ? __sbDOL.recs[cls + " " + id] : undefined;
+        const inst = live !== undefined ? live.inst : __sbDOInstances[cls + " " + id];
         if (inst && !__sbIsFn(inst.alarm))
           throw new TypeError("Your Durable Object class must have an alarm() handler in order to call setAlarm()");
         if (when instanceof Date || Object(when) instanceof Number) {
@@ -13375,9 +14124,11 @@ function __sbDOStrictStorage(cls, id) {
 }
 
 // The 2026-10-28 storage: every method returns a Promise; reads shut the input gate.
-function __sbDOAsyncStorage(cls, id, gate) {
+function __sbDOAsyncStorage(cls, id, gate, rec) {
   const s = __sbDOStrictStorage(cls, id);
+  // rec is the record of an object that may be evicted (2026-11-21): once it is dead every storage call fails with the evicted error.
   const settle = (f) => {
+    if (rec !== undefined && rec.dead) return Promise.reject(__sbDOZombie(rec));
     try {
       return Promise.resolve(f());
     } catch (error) {
@@ -13385,8 +14136,12 @@ function __sbDOAsyncStorage(cls, id, gate) {
     }
   };
   const read = (f) => {
+    if (rec !== undefined && rec.dead) return Promise.reject(__sbDOZombie(rec));
     __sbDOHold(gate);
     return settle(f);
+  };
+  const alive = () => {
+    if (rec !== undefined && rec.dead) throw __sbDOZombie(rec);
   };
   const storage = {
     get: (key) => read(() => s.get(key)),
@@ -13398,10 +14153,13 @@ function __sbDOAsyncStorage(cls, id, gate) {
     setAlarm: (when) => settle(() => s.setAlarm(when)),
     deleteAlarm: () => settle(() => s.deleteAlarm()),
     sync: () => Promise.resolve(),
-    transaction: (fn) => __sbDOTransaction(cls, id, s, gate, fn),
+    transaction: (fn) => {
+      if (rec !== undefined && rec.dead) return Promise.reject(__sbDOZombie(rec));
+      return __sbDOTransaction(cls, id, s, gate, fn);
+    },
   };
   if (__sbDOv2()) {
-    const sql = __sbDOSql(cls, id);
+    const sql = __sbDOSql(cls, id, rec);
     storage.sql = sql;
     storage.transactionSync = (fn) => sql.__sbTransaction(fn);
     if (__sbDOv3()) {
@@ -13413,12 +14171,22 @@ function __sbDOAsyncStorage(cls, id, gate) {
         });
       // The synchronous key-value API, over the same keys as get() and put().
       storage.kv = {
-        get: (key) => s.get(key),
+        get: (key) => {
+          alive();
+          return s.get(key);
+        },
         put: (key, value) => {
+          alive();
           s.put(key, value);
         },
-        delete: (key) => s.delete(key),
-        list: (options) => s.list(options).entries(),
+        delete: (key) => {
+          alive();
+          return s.delete(key);
+        },
+        list: (options) => {
+          alive();
+          return s.list(options).entries();
+        },
       };
       // Point-in-time recovery needs the storage engine's log, which this one does not keep.
       const pitr = () => Promise.reject(new Error("Point-in-time recovery is not supported by this Durable Object storage."));
@@ -13593,9 +14361,14 @@ function __sbDOSqlPolicy(text) {
   }
 }
 
-function __sbDOSql(cls, id) {
+function __sbDOSql(cls, id, rec) {
   const file = __sbDOIsHex64(id) ? id.toLowerCase() : __sbDOSha("sbdo-file:" + id);
+  if (rec !== undefined) rec.sqlFile = file;
   const run = (sql, params) => {
+    if (rec !== undefined) {
+      if (rec.dead) throw __sbDOZombie(rec);
+      rec.usedSql = true;
+    }
     try {
       return __sbRpc("do.sql", { cls, file, sql, params });
     } catch (err) {
@@ -14148,10 +14921,10 @@ async function __sbDrainWaitUntil(tasks, logRec) {
   // busy for the full 25 s (sproutd will not reap a worker with timers left, B22).
   let timer;
   const cap = new Promise((resolve) => {
-    timer = setTimeout(resolve, __SB_WAITUNTIL_TIMEOUT_MS);
+    timer = __sbSetTimeout(resolve, __SB_WAITUNTIL_TIMEOUT_MS);
   });
   await Promise.race([__sbDrainAll(pending, logRec), cap]);
-  clearTimeout(timer);
+  __sbClearTimeout(timer);
 }
 
 async function __sbDrainAll(pending, logRec) {
@@ -14273,7 +15046,7 @@ const __SB_STREAM_WINDOW = 1024 * 1024;
 // Resolves when the host says the stream's unsent bytes fell (or the client went away).
 function __sbStreamDrained(id) {
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, 2147483647);
+    const timer = __sbSetTimeout(resolve, 2147483647);
     __sbStreamOp("k", id, timer);
   });
 }
@@ -14318,6 +15091,7 @@ function __sbStreamResponse(response) {
       __sbLogUncaught("fetch", error);
     }
     __sbStreamOp("e", id, "");
+    if (response._sbDOPin !== undefined) __sbDOUnpin(response._sbDOPin);
   })();
   return response;
 }
@@ -14460,6 +15234,10 @@ class __SbWebSocket {
     if (this._hib !== null) throw new TypeError("Can't accept() a WebSocket that was accepted with acceptWebSocket().");
     if (this._accepted) return;
     this._accepted = true;
+    if (__sbDOL !== null) {
+      const rec = __sbDOFrameRec();
+      if (rec !== undefined && !rec.dead) rec.plain.push(this);
+    }
     __sbWsSchedule(this);
   }
   send(message) {
@@ -14631,6 +15409,16 @@ function __sbWsDispatch(ws, event) {
 
 // A hibernatable socket's event runs the object's handler through its input gate.
 function __sbWsHibernated(ws, name, args) {
+  const rec = ws._hib.holder.rec;
+  if (rec !== undefined && rec !== null) {
+    if (rec.dead || rec.inst === null || !__sbIsFn(rec.inst[name])) return;
+    __sbDOStart(
+      rec,
+      (inst) => (name === "webSocketClose" ? inst.webSocketClose(args[0], args[1], args[2], args[3]) : inst.webSocketMessage(args[0], args[1])),
+      false,
+    ).then(undefined, (error) => __sbLogUncaught("websocket", error));
+    return;
+  }
   const inst = ws._hib.holder.inst;
   if (inst == null || !__sbIsFn(inst[name])) return;
   const run = () => {
@@ -14651,12 +15439,14 @@ function __sbWsHibernated(ws, name, args) {
 // state from 2026-10-30. `holder.inst` is the object once it exists.
 function __sbDOWebSocketState(state, holder) {
   const sockets = [];
+  holder.sockets = sockets;
   const live = () => {
     for (let i = sockets.length - 1; i >= 0; i--) if (sockets[i]._state === __SB_WS_CLOSED) sockets.splice(i, 1);
     return sockets;
   };
   __sbWsHibRestore(holder, sockets);
   state.acceptWebSocket = function (ws, tags) {
+    if (holder.rec !== undefined && holder.rec !== null && holder.rec.dead) throw __sbDOZombie(holder.rec);
     if (!(ws instanceof __SbWebSocket)) throw new TypeError("acceptWebSocket needs a WebSocket");
     if (ws._accepted || ws._hib !== null || ws._host !== 0) throw new TypeError("This WebSocket was already accepted.");
     const list = [];
@@ -14731,7 +15521,8 @@ function __sbWsPump(ws) {
   for (;;) {
     const head = __sbWsOp("p", id, "", 0);
     if (head === "") {
-      const timer = setTimeout(() => __sbWsPump(ws), 2147483647);
+      const timer = __sbSetTimeout(() => __sbWsPump(ws), 2147483647);
+      ws._pumpTimer = timer;
       // From 2026-11-01 a parked socket is not background work (z): its app may be reaped.
       __sbWsOp(__sbWsHibOn() ? "z" : "w", id, "", timer);
       return;
@@ -14820,9 +15611,9 @@ function __sbTcpPump(st) {
     if (head === "") {
       if (st.id === 0) return;
       if (__sbWsCanWake()) {
-        st.timer = setTimeout(() => __sbTcpPump(st), 2147483647);
+        st.timer = __sbSetTimeout(() => __sbTcpPump(st), 2147483647);
         __sbWsOp("w", st.id, "", st.timer);
-      } else st.timer = setTimeout(() => __sbTcpPump(st), 10);
+      } else st.timer = __sbSetTimeout(() => __sbTcpPump(st), 10);
       return;
     }
     const parts = head.split(" ");
@@ -14887,7 +15678,7 @@ function __sbTcpRelease(st) {
   const id = st.id;
   if (id === 0) return;
   st.id = 0;
-  if (st.timer !== undefined) clearTimeout(st.timer);
+  if (st.timer !== undefined) __sbClearTimeout(st.timer);
   __sbWsOp("r", id, "", 0);
   __sbTcpOpen--;
 }
@@ -15035,7 +15826,7 @@ function __sbTcpFacade(st, mode, upgrade) {
       // the old socket ends once the upgrade is under way (workerd resolves its `closed`)
       const oldResolve = st.closedResolve;
       const next = __sbTcpFacade(st, "on", upgrade);
-      setTimeout(() => oldResolve(undefined), 0);
+      __sbSetTimeout(() => oldResolve(undefined), 0);
       return next;
     },
   };
@@ -15067,7 +15858,7 @@ function __sbConnect(address, options) {
   if (target.port === 25) {
     st.failed = new Error("proxy request failed, cannot connect to the specified address");
     st.eof = true;
-    setTimeout(() => __sbTcpSettle(st), 0);
+    __sbSetTimeout(() => __sbTcpSettle(st), 0);
     return socket;
   }
   const spec = target.host + "\n" + target.port + "\n" + (mode === "on" ? "1" : mode === "starttls" ? "2" : "0") + "\n" + target.host;
@@ -15075,11 +15866,15 @@ function __sbConnect(address, options) {
   if (!(id > 0)) {
     st.failed = new Error(__sbTcpOpen >= 16 ? "Too many open connections" : "TCP sockets are not available on this host");
     st.eof = true;
-    setTimeout(() => __sbTcpSettle(st), 0);
+    __sbSetTimeout(() => __sbTcpSettle(st), 0);
     return socket;
   }
   st.id = id;
   __sbTcpOpen++;
+  if (__sbDOL !== null) {
+    const rec = __sbDOFrameRec();
+    if (rec !== undefined && !rec.dead) rec.tcp.push(st);
+  }
   __sbTcpPump(st);
   return socket;
 }
@@ -15156,10 +15951,14 @@ function __sbWsConnectOutbound(ws, input, protocols) {
   ws._accepted = true;
   ws._state = 0;
   ws.url = target.url;
+  if (__sbDOL !== null) {
+    const rec = __sbDOFrameRec();
+    if (rec !== undefined && !rec.dead) rec.plain.push(ws);
+  }
   const id = __sbWsOpen(target, list, null);
   if (!(id > 0)) {
     ws._state = __SB_WS_CLOSED;
-    setTimeout(() => {
+    __sbSetTimeout(() => {
       __sbWsFire(ws, { type: "error", target: ws });
       __sbWsFire(ws, { type: "close", code: 1006, reason: "", wasClean: false, target: ws });
     }, 0);
@@ -15178,9 +15977,9 @@ function __sbWsPumpOut(ws) {
     const head = __sbWsOp("p", id, "", 0);
     if (head === "") {
       if (__sbWsCanWake()) {
-        const timer = setTimeout(() => __sbWsPumpOut(ws), 2147483647);
+        const timer = __sbSetTimeout(() => __sbWsPumpOut(ws), 2147483647);
         __sbWsOp("w", id, "", timer);
-      } else setTimeout(() => __sbWsPumpOut(ws), 15);
+      } else __sbSetTimeout(() => __sbWsPumpOut(ws), 15);
       return;
     }
     const parts = head.split(" ");
@@ -15286,7 +16085,7 @@ function __sbWsOutClose(ws, code, text) {
     const pending = ws._pending;
     ws._pending = null;
     if (pending) pending.reject(new TypeError("WebSocket connection was closed before it opened"));
-    else setTimeout(() => {
+    else __sbSetTimeout(() => {
       __sbWsFire(ws, { type: "error", target: ws });
       __sbWsFire(ws, { type: "close", code: 1006, reason: "", wasClean: false, target: ws });
     }, 0);
@@ -15295,7 +16094,7 @@ function __sbWsOutClose(ws, code, text) {
   ws._state = __SB_WS_CLOSING;
   __sbWsOp("c", id, text, code === undefined ? 1000 : code);
   // A peer that never answers the close is dropped after a while.
-  setTimeout(() => {
+  __sbSetTimeout(() => {
     if (ws._host !== id) return;
     ws._host = 0;
     __sbWsOp("r", id, "", 0);
@@ -15488,8 +16287,7 @@ function __sbWsRestoreLoop() {
       __sbLogUncaught("websocket", error);
     }
   }
-  const timer = setTimeout(__sbWsRestoreLoop, 2147483647);
-  __sbWsOp("R", 0, "", timer);
+  __sbWsRestorePark();
 }
 function __sbWsRestoreSocket(id) {
   const r = __sbRpc("do.storage.get", { cls: "__sbws", id: "index", key: "s" + id });
@@ -15508,6 +16306,10 @@ function __sbWsRestoreSocket(id) {
     return;
   }
   // Constructing the object restores its sockets (__sbWsHibRestore) and starts their pumps.
+  if (__sbDOEvictOn()) {
+    __sbDORun(target[0], target[1], undefined, () => undefined, false).then(undefined, (error) => __sbWsRestoreFailed(id, error));
+    return;
+  }
   __sbGetDOInstance(target[0], target[1]);
 }
 
@@ -15943,7 +16745,7 @@ function __sbIngressStream(request, id) {
     const state = Number(__sbReqBodyOp("p", id, ""));
     if (state === 0) {
       // Nothing yet: the server fires this timer when bytes, the end or an error arrive.
-      const timer = setTimeout(() => step(controller, resolve), 2147483647);
+      const timer = __sbSetTimeout(() => step(controller, resolve), 2147483647);
       __sbReqBodyOp("w", id, timer);
       return;
     }
@@ -16089,7 +16891,7 @@ function __sbR2TransferFailed(status, text) {
 // Resolves when the streamed request body `body` has more (or ended or failed): the host fires the parked timer.
 function __sbR2BodyWait(body) {
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, 2147483647);
+    const timer = __sbSetTimeout(resolve, 2147483647);
     __sbReqBodyOp("w", body, timer);
   });
 }
@@ -16341,6 +17143,22 @@ globalThis.__sbEntry = function (handlers, request) {
     const body = __sbReadJson(request);
     const __acls = String(body.cls || "");
     const __aid = String(body.id || "");
+    if (__sbDOEvictOn()) {
+      const none = {};
+      return __sbDORun(
+        __acls,
+        __aid,
+        undefined,
+        (instance) => (__sbIsFn(instance.alarm) ? __sbDOAlarmCall(instance, __acls, __aid, body.scheduledTime, body.attempts) : none),
+        true,
+      ).then(
+        (value) => (value === none ? new Response("no alarm handler", { status: 404 }) : new Response(null, { status: 204 })),
+        (error) => {
+          __sbLogUncaught("alarm", error);
+          return error && error.overloaded === true ? new Response("alarm deferred: too many objects are awake", { status: 503 }) : new Response("alarm failed", { status: 500 });
+        },
+      );
+    }
     const inst = __sbGetDOInstance(__acls, __aid);
     if (!__sbIsFn(inst.alarm)) return new Response("no alarm handler", { status: 404 });
     const __retries = __sbCompatDate() >= "2026-11-04";
