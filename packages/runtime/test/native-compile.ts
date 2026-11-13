@@ -10,7 +10,7 @@ import {
   STANDALONE_A21_COMPILE_FLAGS,
 } from "../../toolchain/src/a21/standalone";
 import { buildStandaloneA21 } from "../../toolchain/src/a21/standalone-build";
-import { standaloneChannel } from "../../toolchain/src/a21/standalone-channel";
+import { standaloneA21Channel, standaloneChannel } from "../../toolchain/src/a21/standalone-channel";
 import { bearsslEnv } from "./bearssl";
 
 export type NativeCompileInput = {
@@ -113,7 +113,8 @@ export async function compileNative(input: NativeCompileInput): Promise<void> {
   }
 
   const bun = process.execPath;
-  const alpha22 = await ensurePorfforA21("alpha-22");
+  const a21Channel = standaloneA21Channel(standaloneChannel());
+  const a21 = await ensurePorfforA21(a21Channel);
   const work = join(dir, `a22-${(input.binary.split("/").pop() ?? "bin").replace(/[^\w.-]/g, "_")}`);
   await rm(work, { recursive: true, force: true });
   await mkdir(work, { recursive: true });
@@ -134,14 +135,15 @@ export async function compileNative(input: NativeCompileInput): Promise<void> {
     await writeFile(entry, composed.entry);
     const unitsDir = join(work, "units");
     const render = Bun.spawn(
-      [bun, resolve(alpha22, "runtime/index.js"), "c", entry, "-o", `${unitsDir}/`, ...STANDALONE_A21_COMPILE_FLAGS],
+      [bun, resolve(a21, "runtime/index.js"), "c", entry, "-o", `${unitsDir}/`, ...STANDALONE_A21_COMPILE_FLAGS],
       { cwd: work, env: { ...process.env, ...input.env }, stdout: "pipe", stderr: "pipe" },
     );
     rendered = await drain(render);
   } finally {
     release();
   }
-  if (rendered.exitCode !== 0) throw new Error(`${failure} (alpha 22 render):\n${rendered.stderr}\n${rendered.stdout}`);
+  if (rendered.exitCode !== 0)
+    throw new Error(`${failure} (${a21Channel} render):\n${rendered.stderr}\n${rendered.stdout}`);
   const unitsDir = join(work, "units");
   await rm(input.binary, { force: true });
   await buildStandaloneA21({
@@ -158,6 +160,6 @@ export async function compileNative(input: NativeCompileInput): Promise<void> {
     musl: false,
     strip: true,
   }).catch((error: Error) => {
-    throw new Error(`${failure} (alpha 22 build):\n${error.message}`);
+    throw new Error(`${failure} (${a21Channel} build):\n${error.message}`);
   });
 }

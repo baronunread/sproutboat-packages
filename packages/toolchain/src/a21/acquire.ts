@@ -1,6 +1,6 @@
 /**
  * `ensurePorfforA21(channel)`: the alpha 21 line's counterpart of `../acquire.ts` `ensurePorffor`.
- * Fetches (or takes from `vendor/`) the pinned alpha 21 or alpha 22 archive, verifies it, extracts
+ * Fetches (or takes from `vendor/`) the pinned alpha 21, 22 or 23 archive, verifies it, extracts
  * it, runs the a21 chain (`ensurePorfforPatchedA21`) and publishes the tree atomically under the
  * toolchain cache, keyed by commit and by the chain's fingerprint, so an edited pass or a new release
  * gets a fresh tree. Until now only sproutd used the a21 chain, copying a pristine tree per build
@@ -15,16 +15,19 @@ import { resolve } from "node:path";
 import vendoredAlpha21 from "../../vendor/porffor-1f8d148.tar.gz" with { type: "file" };
 // @ts-expect-error Bun's file loader supplies a path.
 import vendoredAlpha22 from "../../vendor/porffor-a081ebd.tar.gz" with { type: "file" };
+// @ts-expect-error Bun's file loader supplies a path.
+import vendoredAlpha23 from "../../vendor/porffor-a97a0ae.tar.gz" with { type: "file" };
 import { version as TOOLCHAIN_VERSION } from "../../package.json" with { type: "json" };
 import { PorfforToolchainError } from "../acquire";
 import { A21_PATCH_FINGERPRINT } from "./fingerprint";
 import { ensurePorfforPatchedA21 } from "./patch";
 import { PORFFOR_A21_PINS, type PorfforA21Channel, type PorfforA21Pin } from "./pin";
 
-const VENDORED = { "alpha-21": vendoredAlpha21, "alpha-22": vendoredAlpha22 } satisfies Record<
-  PorfforA21Channel,
-  string
->;
+const VENDORED = {
+  "alpha-21": vendoredAlpha21,
+  "alpha-22": vendoredAlpha22,
+  "alpha-23": vendoredAlpha23,
+} satisfies Record<PorfforA21Channel, string>;
 
 const required = [
   "runtime/index.js",

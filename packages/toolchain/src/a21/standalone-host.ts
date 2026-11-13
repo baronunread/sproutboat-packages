@@ -11,6 +11,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { ensurePorffor } from "../acquire";
 import { ensurePorfforA21 } from "./acquire";
+import { standaloneA21Channel, standaloneChannel } from "./standalone-channel";
 import { composeStandaloneA21, SHARED_PRELUDE_FILE, STANDALONE_A21_COMPILE_FLAGS } from "./standalone";
 import { buildStandaloneA21 } from "./standalone-build";
 
@@ -62,9 +63,10 @@ export type HostCompileInput = {
   log?: (line: string) => void;
 };
 
-/** Compile `generatedPath` to a host binary at `outPath` on the alpha 22 channel. */
+/** Compile `generatedPath` to a host binary at `outPath` on the alpha 21 line (alpha 23 unless the channel says alpha 22). */
 export async function compileStandaloneHostA21(input: HostCompileInput): Promise<void> {
-  const [alpha19, alpha22] = await Promise.all([ensurePorffor(), ensurePorfforA21("alpha-22")]);
+  const channel = standaloneA21Channel(standaloneChannel());
+  const [alpha19, a21] = await Promise.all([ensurePorffor(), ensurePorfforA21(channel)]);
   const dir = resolve(input.workDir ?? dirname(input.generatedPath));
   await mkdir(dir, { recursive: true });
   const composed = composeStandaloneA21(await readFile(input.generatedPath, "utf8"), alpha19);
@@ -74,7 +76,7 @@ export async function compileStandaloneHostA21(input: HostCompileInput): Promise
   const unitsDir = join(dir, "units-a22");
   await rm(unitsDir, { recursive: true, force: true });
   const render = Bun.spawn(
-    ["bun", resolve(alpha22, "runtime/index.js"), "c", entry, "-o", `${unitsDir}/`, ...STANDALONE_A21_COMPILE_FLAGS],
+    ["bun", resolve(a21, "runtime/index.js"), "c", entry, "-o", `${unitsDir}/`, ...STANDALONE_A21_COMPILE_FLAGS],
     {
       cwd: dir,
       stdout: "pipe",
@@ -86,7 +88,7 @@ export async function compileStandaloneHostA21(input: HostCompileInput): Promise
     new Response(render.stdout).text(),
     new Response(render.stderr).text(),
   ]);
-  if (code !== 0) throw new Error(`Porffor (alpha 22) render failed: ${(stderr || stdout).trim() || `exit ${code}`}`);
+  if (code !== 0) throw new Error(`Porffor (${channel}) render failed: ${(stderr || stdout).trim() || `exit ${code}`}`);
   await buildStandaloneA21({
     unitsDir,
     alpha19Root: alpha19,

@@ -561,9 +561,37 @@ export async function patchGcHooks(root: string): Promise<void> {
         "    memset(porf_gc_cards + (porf_heap_base >> 9), 0, (size_t)((porf_heap_top - porf_heap_base) >> 9) + 1);\n",
         "    if (porf_gc_template_top < porf_heap_top) memset(porf_gc_cards + ((porf_gc_template_top > porf_heap_base ? porf_gc_template_top : porf_heap_base) >> 9), 0, (size_t)((porf_heap_top - (porf_gc_template_top > porf_heap_base ? porf_gc_template_top : porf_heap_base)) >> 9) + 1);\n",
       ],
+      // The app's memory limit reaches the collector (plan 001 step B, 2026-11-12). Alpha 21's pacing knows
+      // nothing of the cgroup: the nursery may grow to 32 MiB once 8 MiB is live and, while most allocations
+      // survive, the budget is twice what is live, so a worker at a 32 MiB memory.max is OOM-killed by late
+      // collection (a burst of 1 MiB request bodies killed 26 to 28 of 400 workers, sproutd
+      // test/memory-burst-smoke.ts). A collection triggered from the host between replies cannot help: one JS
+      // turn allocates 12 to 17 MiB before the host runs. So the clamp is here, where the budget is decided.
+      // The host calls porf_gc_set_limit(bytes) once at worker start with the share of the limit the JS heap
+      // may reach (75%; the rest is the stack, SQLite caches, request bodies and the host's own allocations).
+      // What may be allocated before the next collection is half of what the limit leaves above what is live
+      // (live after the last full collection plus what minor collections promoted since): the other half is
+      // for the survivors of that collection. Never below 1 MiB, so a heap already past its limit still makes
+      // progress. Unset (0, the template and any host that does not call it): no clamp, alpha 21's own pacing.
+      [
+        "static i64 porf_gc_budget(void) {\n  const i64 grown = (i64)porf_gc_last_live_bytes * 2;\n  return porf_gc_survival > 50 && grown > (i64)porf_gc_nursery_bytes ? grown : (i64)porf_gc_nursery_bytes;\n}\n",
+        "static u64 porf_gc_limit_bytes = 0;\n" +
+          "${st}void porf_gc_set_limit(u64 bytes) { porf_gc_limit_bytes = bytes; }\n" +
+          "static u64 porf_gc_limit_room(void) {\n" +
+          "  if (porf_gc_limit_bytes == 0) return ~0ull;\n" +
+          "  const u64 live = porf_gc_last_live_bytes + (porf_gc_promoted_since_full > 0 ? (u64)porf_gc_promoted_since_full : 0u);\n" +
+          "  const u64 room = porf_gc_limit_bytes > live ? (porf_gc_limit_bytes - live) / 2u : 0u;\n" +
+          "  return room > 1048576ull ? room : 1048576ull;\n" +
+          "}\n" +
+          "static i64 porf_gc_budget(void) {\n  const i64 grown = (i64)porf_gc_last_live_bytes * 2;\n  const i64 want = porf_gc_survival > 50 && grown > (i64)porf_gc_nursery_bytes ? grown : (i64)porf_gc_nursery_bytes;\n  const u64 room = porf_gc_limit_room();\n  return (u64)want > room ? (i64)room : want;\n}\n",
+      ],
+      [
+        "  const u32 cap = porf_gc_last_live_bytes >= 8388608ull ? 33554432u : near_live < 8388608ull ? (u32)near_live : 8388608u;\n",
+        "  const u32 cap_free = porf_gc_last_live_bytes >= 8388608ull ? 33554432u : near_live < 8388608ull ? (u32)near_live : 8388608u;\n  const u64 cap_room = porf_gc_limit_room();\n  const u32 cap = cap_free > cap_room ? (u32)cap_room : cap_free;\n",
+      ],
       [
         "${st}i64 porf_gc_idle_due(void) { return -1; }\n${st}void porf_gc_idle(void) {}\n",
-        "${st}i64 porf_gc_idle_due(void) { return -1; }\n${st}void porf_gc_idle(void) {}\n${st}void porf_gc_quiet(void) {}\n${st}void porf_gc_seal_heap(void) {}\n",
+        "${st}i64 porf_gc_idle_due(void) { return -1; }\n${st}void porf_gc_idle(void) {}\n${st}void porf_gc_quiet(void) {}\n${st}void porf_gc_seal_heap(void) {}\n${st}void porf_gc_set_limit(u64 bytes) { (void)bytes; }\n",
       ],
     ],
   );
@@ -918,7 +946,7 @@ async function patchedByThisVersion(root: string): Promise<boolean> {
   }
 }
 
-/** Every pass, in order, on a pristine alpha 21 or alpha 22 tree at `root` (pin.ts channelOfTree). Idempotent. */
+/** Every pass, in order, on a pristine alpha 21, 22 or 23 tree at `root` (pin.ts channelOfTree). Idempotent. */
 export async function ensurePorfforPatchedA21(root: string): Promise<void> {
   if (done.has(root)) return;
   if (await patchedByThisVersion(root)) {
@@ -937,7 +965,7 @@ export async function ensurePorfforPatchedA21(root: string): Promise<void> {
   await patchPreludeOwnedGlobals(root);
   await patchGlobalsPin(root);
   await patchClassUnit(root);
-  if (channelOfTree(root) === "alpha-22") await patchSharedDispatchUnit(root); // after P1: it reads classUnit
+  if (channelOfTree(root) !== "alpha-21") await patchSharedDispatchUnit(root); // after P1: it reads classUnit
   await patchStableNames(root);
   await patchUnitLayout(root);
   await patchStableEntryPath(root);
@@ -949,7 +977,7 @@ export async function ensurePorfforPatchedA21(root: string): Promise<void> {
   await patchResponseStatics(root);
   await patchProcessNullTables(root);
   await patchJsonWideStringBound(root);
-  if (channelOfTree(root) === "alpha-22") await patchDispatchArgOrder(root); // alpha 21 has no shared dispatch
+  if (channelOfTree(root) !== "alpha-21") await patchDispatchArgOrder(root); // alpha 21 has no shared dispatch
   await patchClassBindingWrite(root);
   await patchLogicalBranchInference(root);
   await patchDateOffsets(root);
