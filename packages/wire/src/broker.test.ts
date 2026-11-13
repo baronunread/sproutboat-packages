@@ -1707,6 +1707,39 @@ test("v1: a binary static asset round-trips without UTF-8 replacement", async ()
   rmSync(dir, { recursive: true, force: true });
 });
 
+test("v1: a trailing-slash redirect is one hop, and a static rule beats a dynamic one above it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "sb-redirect-asset-"));
+  const assets = join(dir, "assets");
+  mkdirSync(join(assets, "compare"), { recursive: true });
+  writeFileSync(join(assets, "compare", "index.html"), "<p>compare</p>");
+  writeFileSync(
+    join(dir, "assets.json"),
+    JSON.stringify({
+      redirects: [
+        { from: "/blog/*", to: "/posts/:splat", status: 301 },
+        { from: "/compare", to: "/compare/", status: 308 },
+        { from: "/blog/old", to: "/archive", status: 301 },
+      ],
+      notFound: "none",
+      runSproutFirst: false,
+      files: { "/compare/index.html": { type: "text/html", hash: "compare" } },
+    }),
+  );
+  const b = make({ bindings: { assets: "ASSETS" }, assetsDir: assets, token: "tok" });
+  const server = listen(b, "127.0.0.1", 0);
+  const ask = (path: string) => v1(server, { v: 1, token: "tok", op: "assets.get", path });
+  const hop = await ask("/compare");
+  expect([hop.json.found, hop.json.status, hop.json.location]).toEqual([false, 308, "/compare/"]);
+  const page = await ask("/compare/");
+  expect([page.json.found, page.json.status]).toEqual([true, 200]);
+  expect(new TextDecoder().decode(page.bytes)).toBe("<p>compare</p>");
+  expect((await ask("/blog/old")).json.location).toBe("/archive");
+  expect((await ask("/blog/new")).json.location).toBe("/posts/new");
+  server.stop();
+  b.close();
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test("v1: the etag is sha256 of the bytes, matching the v0 path", async () => {
   const b = make({ bindings: { r2: ["UP"] }, token: "tok" });
   const server = listen(b, "127.0.0.1", 0);

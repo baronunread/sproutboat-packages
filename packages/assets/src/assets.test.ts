@@ -6,9 +6,11 @@ import {
   contentType,
   isSproutFirst,
   matchHeaders,
+  findRedirect,
   matchRedirect,
   parseHeaders,
   parseRedirects,
+  resolveAssetKey,
   readAssetRules,
   walkAssets,
 } from "./assets";
@@ -119,6 +121,54 @@ test("matchRedirect: a trailing * captures the rest of the path as :splat", () =
   expect(matchRedirect(rule, "/blog/2024/hello")).toBe("/articles/2024/hello");
   expect(matchRedirect(rule, "/blog/")).toBe("/articles/");
   expect(matchRedirect(rule, "/blog")).toBeNull();
+});
+
+test("matchRedirect: the whole path must match, so a trailing slash is significant", () => {
+  const add = { from: "/compare", to: "/compare/", status: 308 };
+  expect(matchRedirect(add, "/compare")).toBe("/compare/");
+  expect(matchRedirect(add, "/compare/")).toBeNull(); // the loop: this used to match again
+  const drop = { from: "/compare/", to: "/compare", status: 308 };
+  expect(matchRedirect(drop, "/compare/")).toBe("/compare");
+  expect(matchRedirect(drop, "/compare")).toBeNull();
+  const named = { from: "/user/:id", to: "/profile/:id", status: 302 };
+  expect(matchRedirect(named, "/user/42/")).toBeNull();
+  expect(matchRedirect(named, "/user/")).toBeNull();
+  const splat = { from: "/blog/*", to: "/posts/:splat", status: 301 };
+  expect(matchRedirect(splat, "/blog/a/")).toBe("/posts/a/");
+});
+
+test("matchRedirect: a name is one or more characters, backtracks around text, and the splat may sit in the middle", () => {
+  expect(matchRedirect({ from: "/files/:name.html", to: "/pages/:name", status: 302 }, "/files/about.html")).toBe(
+    "/pages/about",
+  );
+  expect(matchRedirect({ from: "/:a-:b", to: "/x/:b/:a", status: 302 }, "/one-two")).toBe("/x/two/one");
+  expect(matchRedirect({ from: "/a/*/c", to: "/x/:splat", status: 302 }, "/a/b/b2/c")).toBe("/x/b/b2");
+  expect(matchRedirect({ from: "/a/*/c", to: "/x/:splat", status: 302 }, "/a/c")).toBeNull();
+  expect(matchRedirect({ from: "/a:1", to: "/b", status: 302 }, "/a:1")).toBe("/b"); // a colon with no letter is text
+});
+
+test("matchRedirect: a rule with a repeated name or two splats never matches, as on Cloudflare", () => {
+  expect(matchRedirect({ from: "/:a/:a", to: "/x", status: 302 }, "/p/p")).toBeNull();
+  expect(matchRedirect({ from: "/*/*", to: "/x", status: 302 }, "/p/q")).toBeNull();
+});
+
+test("findRedirect: a static rule beats a dynamic one above it; within a kind the first rule wins", () => {
+  const rules = parseRedirects(
+    "/blog/* /dynamic/:splat\n/blog/old /static\n/blog/old /static-2\n/x/:a /first\n/x/:b /second",
+  );
+  expect(findRedirect(rules, "/blog/old")).toEqual({ rule: rules[1], location: "/static" });
+  expect(findRedirect(rules, "/blog/new")).toEqual({ rule: rules[0], location: "/dynamic/new" });
+  expect(findRedirect(rules, "/x/1")).toEqual({ rule: rules[3], location: "/first" });
+  expect(findRedirect(rules, "/nothing")).toBeNull();
+});
+
+test("a trailing-slash rule is one hop against the asset resolver too", () => {
+  const rules = parseRedirects("/compare /compare/ 308");
+  const files = new Set(["/compare/index.html"]);
+  const first = findRedirect(rules, "/compare");
+  expect(first?.location).toBe("/compare/");
+  expect(findRedirect(rules, first!.location)).toBeNull();
+  expect(resolveAssetKey(first!.location, (key) => files.has(key))).toBe("/compare/index.html");
 });
 
 test("readAssetRules: empty when neither file exists, parsed when both do", () => {

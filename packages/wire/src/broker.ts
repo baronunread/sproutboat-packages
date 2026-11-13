@@ -36,7 +36,7 @@ import {
 import { open } from "node:fs/promises";
 import { dirname, join, normalize, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { matchRedirect, resolveAssetKey, type AssetManifest } from "@sproutboat/assets";
+import { findRedirect, resolveAssetKey, type AssetManifest } from "@sproutboat/assets";
 import { egressAllowList } from "@sproutboat/runtime";
 import { EGRESS_ERROR_HEADER, EGRESS_TOKEN_HEADER, EGRESS_URL_HEADER, resolveAll, vettedFetch } from "./egress";
 import { isSafeInteger } from "./json";
@@ -2081,10 +2081,9 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
       if (!bindings.assets) throw new Error("assets not bound");
       const reqPath = str(msg.path) || "/";
       const rules = { headers: assetManifest?.headers ?? [], redirects: assetManifest?.redirects ?? [] };
-      for (const rule of rules.redirects) {
-        const location = matchRedirect(rule, reqPath);
-        if (location !== null) return { reply: { ok: true, found: false, status: rule.status, location, rules } };
-      }
+      const redirect = findRedirect(rules.redirects, reqPath);
+      if (redirect !== null)
+        return { reply: { ok: true, found: false, status: redirect.rule.status, location: redirect.location, rules } };
       const key = resolveAssetKey(reqPath, (candidate) => !!assetManifest?.files[candidate]);
       let hit = key ? readAsset(key) : null;
       let found = Boolean(hit);

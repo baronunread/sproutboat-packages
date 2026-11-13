@@ -11249,26 +11249,103 @@ function __sbMakeR2(name) {
   };
 }
 
-// Asset rules use the same parsed manifest in both transports. Matching mirrors
-// @sproutboat/assets; parity tests cover the portable native implementation.
-function __sbAssetRedirect(rule, path) {
-  const star = rule.from.indexOf("*");
-  if (star !== -1) {
-    const prefix = rule.from.slice(0, star);
-    if (!path.startsWith(prefix)) return null;
-    return rule.to.split(":splat").join(path.slice(prefix.length));
-  }
-  const from = rule.from.split("/").filter(Boolean);
-  const parts = path.split("/").filter(Boolean);
-  if (from.length !== parts.length) return null;
-  const params = {};
+// Asset rules use the same parsed manifest in both transports. Redirect matching mirrors
+// @sproutboat/assets (Cloudflare's `_redirects` rules: the whole path must match, so a trailing
+// slash is significant; `:name` is one or more characters up to the next "/"; one `*` is
+// `:splat`; a static rule beats a dynamic one); parity tests cover the portable implementation.
+function __sbRuleAlpha(code) {
+  return (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+}
+function __sbRuleWord(code) {
+  return __sbRuleAlpha(code) || (code >= 48 && code <= 57) || code === 95;
+}
+function __sbRuleIsStatic(from) {
   for (let i = 0; i < from.length; i++) {
-    if (from[i].startsWith(":")) params[from[i].slice(1)] = parts[i];
-    else if (from[i] !== parts[i]) return null;
+    const code = from.charCodeAt(i);
+    if (code === 42) return false;
+    if (code === 58 && i + 1 < from.length && __sbRuleAlpha(from.charCodeAt(i + 1))) return false;
   }
+  return true;
+}
+// Tokens are [kind, text-or-name] pairs: 0 literal text, 1 :name, 2 splat. Null: the rule can never match.
+function __sbRuleTokens(from) {
+  const tokens = [];
+  const names = [];
+  let text = "";
+  for (let i = 0; i < from.length; i++) {
+    const code = from.charCodeAt(i);
+    if (code === 42) {
+      if (text !== "") tokens.push([0, text]);
+      text = "";
+      if (names.indexOf("splat") !== -1) return null;
+      names.push("splat");
+      tokens.push([2, "splat"]);
+    } else if (code === 58 && i + 1 < from.length && __sbRuleAlpha(from.charCodeAt(i + 1))) {
+      let end = i + 2;
+      while (end < from.length && __sbRuleWord(from.charCodeAt(end))) end++;
+      const name = from.slice(i + 1, end);
+      if (names.indexOf(name) !== -1) return null;
+      names.push(name);
+      if (text !== "") tokens.push([0, text]);
+      text = "";
+      tokens.push([1, name]);
+      i = end - 1;
+    } else {
+      text += from.charAt(i);
+    }
+  }
+  if (text !== "") tokens.push([0, text]);
+  return tokens;
+}
+function __sbRuleMatch(tokens, t, path, p, names, values) {
+  if (t === tokens.length) return p === path.length;
+  const kind = tokens[t][0];
+  const word = tokens[t][1];
+  if (kind === 0) {
+    if (path.slice(p, p + word.length) !== word) return false;
+    return __sbRuleMatch(tokens, t + 1, path, p + word.length, names, values);
+  }
+  let limit = path.length;
+  if (kind === 1) {
+    for (let i = p; i < path.length; i++) {
+      if (path.charCodeAt(i) === 47) {
+        limit = i;
+        break;
+      }
+    }
+  }
+  const least = kind === 1 ? p + 1 : p;
+  for (let q = limit; q >= least; q--) {
+    names.push(word);
+    values.push(path.slice(p, q));
+    if (__sbRuleMatch(tokens, t + 1, path, q, names, values)) return true;
+    names.pop();
+    values.pop();
+  }
+  return false;
+}
+function __sbAssetRedirect(rule, path) {
+  if (__sbRuleIsStatic(rule.from)) return rule.from === path ? rule.to : null;
+  const tokens = __sbRuleTokens(rule.from);
+  if (tokens === null) return null;
+  const names = [];
+  const values = [];
+  if (!__sbRuleMatch(tokens, 0, path, 0, names, values)) return null;
   let to = rule.to;
-  for (const name in params) to = to.split(":" + name).join(params[name]);
+  for (let i = 0; i < names.length; i++) to = to.split(":" + names[i]).join(values[i]);
   return to;
+}
+// The first static rule that matches, else the first dynamic one: { status, location } or null.
+function __sbFindAssetRedirect(rules, path) {
+  for (let i = 0; i < rules.length; i++) {
+    if (__sbRuleIsStatic(rules[i].from) && rules[i].from === path) return { status: rules[i].status, location: rules[i].to };
+  }
+  for (let i = 0; i < rules.length; i++) {
+    if (__sbRuleIsStatic(rules[i].from)) continue;
+    const location = __sbAssetRedirect(rules[i], path);
+    if (location !== null) return { status: rules[i].status, location };
+  }
+  return null;
 }
 
 function __sbAssetHeaderMatches(pattern, path) {
@@ -11284,11 +11361,8 @@ function __sbAssetHeaderMatches(pattern, path) {
 function __sbAssetResponse(path, r) {
   if (r.location != null) return new Response(null, { status: r.status, headers: { location: r.location } });
   const rules = r.rules || {};
-  const redirects = rules.redirects || [];
-  for (let i = 0; i < redirects.length; i++) {
-    const to = __sbAssetRedirect(redirects[i], path);
-    if (to !== null) return new Response(null, { status: redirects[i].status, headers: { location: to } });
-  }
+  const redirect = __sbFindAssetRedirect(rules.redirects || [], path);
+  if (redirect !== null) return new Response(null, { status: redirect.status, headers: { location: redirect.location } });
   const headers = new Headers();
   if (r.type) headers.set("content-type", r.type);
   if (r.found) headers.set("etag", '"' + r.hash + '"');
