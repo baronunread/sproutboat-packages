@@ -160,12 +160,16 @@ try {
     checked.push(target.name);
   }
 
-  const onCi = Boolean(process.env.CI);
+  // Strict only where the job provisions an arm64 compiler (SB_NATIVE_CC_STRICT=1 in ci.yml's native job).
+  // The release workflow runs test:native on a stock runner without one; failing there blocked 0.26.1.
+  const strict = process.env.SB_NATIVE_CC_STRICT === "1";
   const arm64Hosted = process.platform === "darwin" ? "darwin-arm64" : "linux-arm64";
   if (checked.length === 0 || !checked.includes(arm64Hosted)) {
     const message = `no compiler for ${arm64Hosted} (needs clang with its headers, or zig): checked ${checked.join(", ") || "nothing"}`;
-    assert(!onCi, message);
-    console.log(`SKIPPED: ${message}`);
+    assert(!strict, message);
+    console.log(
+      `SKIPPED: ${message}${process.env.CI ? " (set SB_NATIVE_CC_STRICT=1 in a job that installs one)" : ""}`,
+    );
   } else {
     console.log(`Host C and generated code agree on the calling convention for ${checked.join(", ")}`);
   }
