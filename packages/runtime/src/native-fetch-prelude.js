@@ -13484,28 +13484,31 @@ function __sbDORun(cls, idText, idObj, run, wait) {
 function __sbDOStart(rec, run, wait) {
   const L = __sbDOL;
   if (rec.dead) return Promise.reject(rec.deadError !== null ? rec.deadError : __sbDOEvictedError());
-  if (rec.gate.waiting.length >= L.queueMax) {
+  const gate = rec.gate;
+  if (gate.waiting.length >= L.queueMax) {
     L.overloaded++;
     return Promise.reject(__sbDOOverloaded("too many events are queued for this object"));
   }
   rec.busy++;
-  const entered = __sbDOEnter(rec.gate, () => {
-    if (rec.dead) throw rec.deadError !== null ? rec.deadError : __sbDOEvictedError();
-    return __sbRunInFrame(rec.frame, run, [rec.inst]);
+  // The input gate, as __sbDOEnter has it: an open gate runs the event now, a shut one queues it behind the others.
+  if (gate.locks === 0 && gate.waiting.length === 0) return __sbDOEvent(L, rec, run, wait);
+  return new Promise((resolve) => {
+    gate.waiting.push(() => {
+      resolve(__sbDOEvent(L, rec, run, wait));
+    });
   });
-  return entered.then(
-    (value) => {
-      const drained = __sbDOSettle(L, rec, wait);
-      return drained === undefined ? value : drained.then(() => value);
-    },
-    (error) => {
-      const drained = __sbDOSettle(L, rec, wait);
-      if (drained === undefined) throw error;
-      return drained.then(() => {
-        throw error;
-      });
-    },
-  );
+}
+
+// One event, in the object's frame; busy until it and the drain of its waitUntil tasks have settled. One coroutine and nothing else
+// per event: this path is paid by every call into every object.
+async function __sbDOEvent(L, rec, run, wait) {
+  try {
+    if (rec.dead) throw rec.deadError !== null ? rec.deadError : __sbDOEvictedError();
+    return await __sbRunInFrame(rec.frame, run, [rec.inst]);
+  } finally {
+    const drained = __sbDOSettle(L, rec, wait);
+    if (drained !== undefined) await drained;
+  }
 }
 
 // The event is over: drain its waitUntil tasks (it stays busy until they settle), then it may become idle.
@@ -13606,14 +13609,7 @@ function __sbDOZombie(rec) {
   return rec.deadError !== null ? rec.deadError : __sbDOEvictedError();
 }
 function __sbDOFetchEvent(inst, req) {
-  return __sbFetchWithDrain(inst.fetch(req), [], false, true).then((r) => {
-    // A streamed response keeps its object busy until the stream ends (__sbStreamResponse unpins it).
-    if (r && r._sbStreamed === true && !inst.__sbRec.dead) {
-      __sbDOPin(inst.__sbRec);
-      r._sbDOPin = inst.__sbRec;
-    }
-    return r;
-  });
+  return __sbFetchWithDrain(inst.fetch(req), [], false, true);
 }
 function __sbWsRestorePark() {
   const timer = __sbSetTimeout(__sbWsRestoreLoop, 2147483647);
@@ -15061,7 +15057,14 @@ function __sbStreamResponse(response) {
   response.headers._immutable = false;
   response.headers.set("x-sb-stream", id);
   response.body = "";
-  response._sbStreamed = true;
+  // A streamed response of a Durable Object keeps its object busy until the stream ends (this runs in the object's frame).
+  if (__sbDOL !== null) {
+    const owner = __sbDOFrameRec();
+    if (owner !== undefined && !owner.dead) {
+      __sbDOPin(owner);
+      response._sbDOPin = owner;
+    }
+  }
   (async () => {
     const reader = stream.getReader();
     try {
