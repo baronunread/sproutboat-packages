@@ -25,22 +25,22 @@
     },
     "packages/config": {
       "name": "@sproutboat/config",
-      "version": "0.5.0",
+      "version": "0.6.0",
     },
     "packages/runtime": {
       "name": "@sproutboat/runtime",
-      "version": "0.31.0",
+      "version": "0.45.0",
     },
     "packages/toolchain": {
       "name": "@sproutboat/toolchain",
-      "version": "0.16.1",
+      "version": "0.26.1",
     },
     "packages/wire": {
       "name": "@sproutboat/wire",
-      "version": "0.19.1",
+      "version": "0.22.5",
       "dependencies": {
         "@sproutboat/assets": "^0.3.0",
-        "@sproutboat/runtime": "^0.31.0",
+        "@sproutboat/runtime": "^0.45.0",
       },
     },
   },

@@ -27,6 +27,7 @@ Porffor.c`
 #include <string.h>
 #include <strings.h>
 #include <sys/time.h>
+#include <time.h>
 #include <pthread.h>
 #include <bearssl.h>
 
@@ -65,6 +66,11 @@ extern int sqlite3_extended_errcode(sqlite3*);
 extern int sqlite3_error_offset(sqlite3*);
 extern const char* sqlite3_sql(sqlite3_stmt*);
 extern int sqlite3_total_changes(sqlite3*);
+extern int sqlite3_get_autocommit(sqlite3*);
+extern int sqlite3_db_status(sqlite3*, int, int*, int*, int);
+extern int sqlite3_db_release_memory(sqlite3*);
+extern long long sqlite3_soft_heap_limit64(long long);
+extern long long sqlite3_memory_used(void);
 
 // baronunread/sproutboat#176 — defined in render.js, alongside
 // porf_native_fetch_read_value (which every inline-C block below already
@@ -79,7 +85,7 @@ extern int porf_native_fetch_read_raw_bytes(jsval value, const char** out_buf, s
 // SQLITE_STATIC: "this buffer is yours to read and outlives the statement".
 // Worth using for an object body — the alternative is sqlite copying it.
 #define SB_SQLITE_STATIC ((void*)0)
-#define SB_MAX_DB 16
+#define SB_MAX_DB 64
 
 static sqlite3* sb_dbs[SB_MAX_DB];
 static char sb_db_names[SB_MAX_DB][256];
@@ -1173,8 +1179,9 @@ static int sb_ltx_opted(const char *path) {
 }
 // END LTX NATIVE
 
-// One handle per path, opened once and kept for the process lifetime — the same
-// lifetime the broker gives a Database. Returns an index, or -1.
+// One handle per path, kept open until the slot is needed (Durable Object SQL) or for the process lifetime
+// (everything else). Returns an index, or -1.
+// BEGIN DB TABLE NATIVE: also compiled directly by the handle-table regression (packages/runtime/test/native-db-table.ts).
 // Create every parent directory of path, like mkdir -p. A standalone binary
 // has no launcher to prepare its data directory, and sqlite3_open creates files
 // but never the directories above them.
@@ -1191,13 +1198,31 @@ static void sb_mkdirs(const char* path) {
   }
 }
 
-// Durable Objects SQL (storage.sql): one database per object, under "/do-sql/". At most
-// SB_DO_SQL_OPEN of them stay open; the one used longest ago is closed for the next.
-#define SB_DO_SQL_OPEN 8
+// Durable Objects SQL (storage.sql): one database per object, under "/do-sql/". At most sb_do_sql_open of them
+// stay open (8 until the memory limit is known, then clamp(T / 160 KiB, 8, 48); 48 with no limit); the one used
+// longest ago, and not inside a transaction, is closed for the next. A Durable Object instance leaving memory closes
+// its handle at once (op do.sql.close).
+static int sb_do_sql_open = 8;
 static unsigned long sb_db_used[SB_MAX_DB];
 static unsigned long sb_db_tick = 0;
+static int sb_db_last = -1;
 static int sb_is_do_sql(const char* path) { return strstr(path, "/do-sql/") != 0; }
-static void sb_db_evict(int idx);
+static int sb_db_close(int idx);
+
+// SQLite page caches (plan 016 section 5 as plan 018 phase 1 delivers it). Every database starts at 256 KiB. T is the
+// target for all of them together: SB_MEMORY_LIMIT / 8 (4 MiB at 32 MiB), none without a limit. Each database may
+// grow, on evidence, to min(2 MiB, T / open databases); when a new one opens and the sizes no longer fit under T the
+// stalest ones go back to their share. SB_SQLITE_CACHE_MB, when set, is the old fixed size and turns all of this off.
+#define SB_CACHE_START_KB 256
+#define SB_CACHE_MIN_KB 64
+#define SB_CACHE_MAX_KB 2048
+static long sb_cache_target_kb = 0;
+static int sb_cache_fixed_kb = 0;
+static int sb_cache_kb[SB_MAX_DB];
+static unsigned long sb_db_calls[SB_MAX_DB];
+static long sb_db_changes0[SB_MAX_DB];
+static unsigned long sb_stat_closes, sb_stat_busy, sb_stat_ckpt_fail, sb_stat_grow, sb_stat_shrink, sb_stat_opens;
+static long sb_stat_open_us_last, sb_stat_open_us_max;
 
 // SQLite allocates 20 pages in one block for every page cache it creates, and a statement that
 // builds a temporary table (INSERT ... RETURNING, a sort) creates one: an 88 KiB mmap and munmap
@@ -1209,33 +1234,113 @@ static void sb_sqlite_boot(void) {
   if (sb_sqlite_booted) return;
   sb_sqlite_booted = 1;
   sqlite3_config(7 /* SQLITE_CONFIG_PAGECACHE */, (void*)0, 0, 0);
+  const char* mb = getenv("SB_SQLITE_CACHE_MB");
+  long mib = mb && *mb ? strtol(mb, 0, 10) : 0;
+  if (mib >= 1 && mib <= 4096) sb_cache_fixed_kb = (int)(mib * 1024);
+  const char* limit = getenv("SB_MEMORY_LIMIT");
+  unsigned long long bytes = limit && *limit ? strtoull(limit, 0, 10) : 0;
+  if (bytes >= 8ull << 20) {
+    sb_cache_target_kb = (long)(bytes / 8 / 1024);
+    long slots = sb_cache_target_kb / 160;
+    sb_do_sql_open = slots < 8 ? 8 : slots > 48 ? 48 : (int)slots;
+    // SQLite frees cache pages of every database before it goes over T; one statement that needs more still succeeds.
+    sqlite3_soft_heap_limit64((long long)(bytes / 8));
+  } else sb_do_sql_open = 48;
+}
+static int sb_open_dbs(void) {
+  int n = 0;
+  for (int i = 0; i < sb_db_count; i++) if (sb_dbs[i]) n++;
+  return n;
+}
+// The most one database may hold now: min(2 MiB, T / open databases), and never under 64 KiB.
+static int sb_cache_share_kb(void) {
+  if (!sb_cache_target_kb) return SB_CACHE_MAX_KB;
+  int open = sb_open_dbs();
+  long share = sb_cache_target_kb / (open ? open : 1);
+  return share < SB_CACHE_MIN_KB ? SB_CACHE_MIN_KB : share > SB_CACHE_MAX_KB ? SB_CACHE_MAX_KB : (int)share;
+}
+static void sb_cache_set(int idx, int kb) {
+  char pragma[48];
+  snprintf(pragma, sizeof(pragma), "PRAGMA cache_size=-%d", kb);
+  sqlite3_exec(sb_dbs[idx], pragma, 0, 0, 0);
+  sb_cache_kb[idx] = kb;
+}
+// After a database opens: while the sizes together are over T, the stalest database above its share goes back to it.
+static void sb_cache_rebalance(int keep) {
+  if (!sb_cache_target_kb || sb_cache_fixed_kb) return;
+  for (;;) {
+    long sum = 0;
+    int share = sb_cache_share_kb(), victim = -1;
+    for (int i = 0; i < sb_db_count; i++) {
+      if (!sb_dbs[i]) continue;
+      sum += sb_cache_kb[i];
+      if (i != keep && sb_cache_kb[i] > share && (victim < 0 || sb_db_used[i] < sb_db_used[victim])) victim = i;
+    }
+    if (sum <= sb_cache_target_kb || victim < 0) return;
+    sb_cache_set(victim, share);
+    sqlite3_exec(sb_dbs[victim], "PRAGMA shrink_memory", 0, 0, 0);
+    sb_stat_shrink++;
+  }
+}
+// Every 64th use of a database: over 90% full and over 10% misses since the last look doubles its cache, up to its share.
+static void sb_cache_tune(int idx) {
+  if (sb_cache_fixed_kb || sb_cache_kb[idx] >= SB_CACHE_MAX_KB) return;
+  int used = 0, hit = 0, miss = 0, high = 0;
+  sqlite3_db_status(sb_dbs[idx], 1 /* CACHE_USED */, &used, &high, 0);
+  sqlite3_db_status(sb_dbs[idx], 7 /* CACHE_HIT */, &hit, &high, 1);
+  sqlite3_db_status(sb_dbs[idx], 8 /* CACHE_MISS */, &miss, &high, 1);
+  if ((long long)used * 10 < (long long)sb_cache_kb[idx] * 1024 * 9 || (long long)miss * 10 <= (long long)(hit + miss)) return;
+  int share = sb_cache_share_kb(), next = sb_cache_kb[idx] * 2;
+  if (next > share) next = share;
+  if (next <= sb_cache_kb[idx]) return;
+  sb_cache_set(idx, next);
+  sb_stat_grow++;
+  sb_cache_rebalance(idx);
+}
+static void sb_db_touch(int i) {
+  sb_db_used[i] = ++sb_db_tick;
+  sb_db_last = i;
+  if ((++sb_db_calls[i] & 63) == 0) sb_cache_tune(i);
+}
+static long sb_now_us(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (long)t.tv_sec * 1000000L + t.tv_nsec / 1000;
 }
 static int sb_db_for(const char* path) {
+  if (sb_db_last >= 0 && sb_dbs[sb_db_last] && strcmp(sb_db_names[sb_db_last], path) == 0) {
+    sb_db_touch(sb_db_last);
+    return sb_ltx_states[sb_db_last].failed ? -1 : sb_db_last;
+  }
   for (int i = 0; i < sb_db_count; i++) {
     if (sb_dbs[i] && strcmp(sb_db_names[i], path) == 0) {
-      sb_db_used[i] = ++sb_db_tick;
+      sb_db_touch(i);
       return sb_ltx_states[i].failed ? -1 : i;
     }
   }
   sb_sqlite_boot();
+  const long t0 = sb_now_us();
   const int do_sql = sb_is_do_sql(path);
   // A name that would not fit could never be found again.
   if (do_sql && strlen(path) >= sizeof(sb_db_names[0])) return -1;
   int replicated = do_sql ? 0 : sb_ltx_opted(path), lock = -1;
   if (replicated < 0 || (replicated && strlen(path) >= sizeof(sb_db_names[0]))) return -1;
-  // A Durable Object SQL database reuses the slot of the one used longest ago once
-  // SB_DO_SQL_OPEN are open; any other database takes one when every slot is in use.
-  int slot = sb_db_count, lru = -1, open_do_sql = 0;
+  // A closed slot is reused first. A Durable Object SQL database takes the slot of the one used longest ago
+  // (outside a transaction) once sb_do_sql_open are open; any other database does the same when every slot is in use.
+  int slot = -1, lru = -1, open_do_sql = 0;
   for (int i = 0; i < sb_db_count; i++) {
-    if (!sb_dbs[i] || !sb_is_do_sql(sb_db_names[i])) continue;
+    if (!sb_dbs[i]) { if (slot < 0) slot = i; continue; }
+    if (!sb_is_do_sql(sb_db_names[i])) continue;
     open_do_sql++;
-    if (lru < 0 || sb_db_used[i] < sb_db_used[lru]) lru = i;
+    if (sqlite3_get_autocommit(sb_dbs[i]) && (lru < 0 || sb_db_used[i] < sb_db_used[lru])) lru = i;
   }
-  if (lru >= 0 && !replicated && ((do_sql && open_do_sql >= SB_DO_SQL_OPEN) || sb_db_count >= SB_MAX_DB)) {
-    sb_db_evict(lru);
+  if (slot < 0 && sb_db_count < SB_MAX_DB) slot = sb_db_count;
+  if (!replicated && ((do_sql && open_do_sql >= sb_do_sql_open) || slot < 0)) {
+    // Every candidate inside a transaction, or none open: the new database cannot be opened now.
+    if (lru < 0 || sb_db_close(lru)) return -1;
     slot = lru;
   }
-  if (slot >= SB_MAX_DB) return -1;
+  if (slot < 0) return -1;
   sqlite3* db = 0;
   sb_mkdirs(path);
   if (replicated) {
@@ -1266,16 +1371,18 @@ static int sb_db_for(const char* path) {
   // The transport itself only reads the variable, so a host that embeds it (sproutd, the broker) stays
   // in shared mode unless it is set. A standalone binary sets it to 1 at startup (patch.ts, the shim's
   // constructor) unless the operator has set it, so SB_SQLITE_EXCLUSIVE=0 opts a standalone binary out.
-  // SB_SQLITE_CACHE_MB sizes each database's page cache in MiB (default 2, about -2000 KiB).
+  // The page cache: see the sizing comment above; SB_SQLITE_CACHE_MB is a fixed size in MiB.
   {
     const char* excl = getenv("SB_SQLITE_EXCLUSIVE");
     if (excl && excl[0] == '1' && !excl[1] && !replicated) sqlite3_exec(db, "PRAGMA locking_mode=EXCLUSIVE", 0, 0, 0);
-    char cache[64];
-    const char* mb = getenv("SB_SQLITE_CACHE_MB");
-    long mib = mb && *mb ? strtol(mb, 0, 10) : 0;
-    if (mib >= 1 && mib <= 4096) snprintf(cache, sizeof(cache), "PRAGMA cache_size=-%ld", mib * 1024);
-    else snprintf(cache, sizeof(cache), "PRAGMA cache_size=-2000");
-    sqlite3_exec(db, cache, 0, 0, 0);
+  }
+  sb_dbs[slot] = db;
+  snprintf(sb_db_names[slot], 256, "%s", path);
+  if (slot >= sb_db_count) sb_db_count = slot + 1;  // before the sizing below, which counts open databases
+  {
+    const int share = sb_cache_share_kb();
+    const int kb = sb_cache_fixed_kb ? sb_cache_fixed_kb : (SB_CACHE_START_KB < share ? SB_CACHE_START_KB : share);
+    sb_cache_set(slot, kb);
   }
   sqlite3_exec(db,
     "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;"
@@ -1283,9 +1390,10 @@ static int sb_db_for(const char* path) {
     0, 0, 0);
   // Durable Object SQLite enforces foreign keys, as in workerd.
   if (do_sql) sqlite3_exec(db, "PRAGMA foreign_keys=ON", 0, 0, 0);
+  sb_db_changes0[slot] = sqlite3_total_changes(db);
+  sb_db_calls[slot] = 0;
   sb_db_used[slot] = ++sb_db_tick;
-  sb_dbs[slot] = db;
-  snprintf(sb_db_names[slot], 256, "%s", path);
+  sb_db_last = slot;
   if (replicated && sb_ltx_start(slot, db, path, lock)) {
     sb_ltx_states[slot].failed = 1;
     fprintf(stderr, "LTX initialization failed for %s\n", path);
@@ -1293,10 +1401,12 @@ static int sb_db_for(const char* path) {
     if (sb_ltx_states[slot].read_fd >= 0) close(sb_ltx_states[slot].read_fd);
     sb_ltx_states[slot].read_fd = -1;
     sb_dbs[slot] = 0;
-    if (slot == sb_db_count) sb_db_count++;
     close(lock); return -1;
   }
-  if (slot == sb_db_count) sb_db_count++;
+  sb_stat_opens++;
+  sb_cache_rebalance(slot);
+  sb_stat_open_us_last = sb_now_us() - t0;
+  if (sb_stat_open_us_last > sb_stat_open_us_max) sb_stat_open_us_max = sb_stat_open_us_last;
   return slot;
 }
 
@@ -1308,7 +1418,7 @@ static int sb_db_for(const char* path) {
 // ponytail: FIFO eviction over 32 slots, linear scan, no lock (the runtime
 // serves one turn at a time). Move to LRU + a hash if a real app keeps >32 hot
 // statements per db, or if execution ever overlaps. Entries are never finalized
-// on shutdown — sb_db_for never closes a handle, the process owns it for life.
+// on shutdown; sb_db_close finalizes a database's entries when its handle goes.
 #define SB_STMT_CACHE 32
 typedef struct { char* sql; sqlite3_stmt* st; } sb_cached_stmt;
 static sb_cached_stmt sb_stmt_cache[SB_MAX_DB][SB_STMT_CACHE];
@@ -1336,9 +1446,18 @@ static sqlite3_stmt* sb_stmt_get(int idx, sqlite3* db, const char* sql) {
   return st;
 }
 
-// Close a Durable Object SQL database to reuse its slot: its cached statements first.
+// The one place a handle is closed: the slot LRU, a Durable Object instance leaving memory (do.sql.close), and later
+// a capturing handle (plan 013 phase D extends it at the two marked steps and removes the LRU's capture guard; it must not
+// add a second close path). The order is a contract:
 static unsigned char sb_quota_frozen[SB_MAX_DB];
-static void sb_db_evict(int idx) {
+// Returns 0 when the handle is closed (or was not open), -1 when it is left open: a statement outlives its call
+// (SQLITE_BUSY: counted, never sqlite3_close_v2), or the connection is inside a transaction.
+static int sb_db_close(int idx) {
+  sqlite3* db = sb_dbs[idx];
+  if (!db) return 0;
+  // A savepoint or transaction held across calls: closing would roll it back silently.
+  if (!sqlite3_get_autocommit(db)) return -1;
+  // 1. finalize the slot's cached statements;
   for (int i = 0; i < SB_STMT_CACHE; i++) {
     if (sb_stmt_cache[idx][i].st) sqlite3_finalize(sb_stmt_cache[idx][i].st);
     free(sb_stmt_cache[idx][i].sql);
@@ -1346,11 +1465,61 @@ static void sb_db_evict(int idx) {
     sb_stmt_cache[idx][i].sql = 0;
   }
   sb_stmt_fifo[idx] = 0;
-  sqlite3_close(sb_dbs[idx]);
+  // 2. (phase D inserts: unhook capture, write what is pending)
+  // 3. if the connection wrote since it was opened, a TRUNCATE checkpoint and its result. With synchronous=NORMAL this is
+  //    the fsync that makes the data durable on the local disk. A read-only open skips it; sqlite3_close below still
+  //    checkpoints a WAL that holds schema changes (they do not count as changes), as it does for the last connection.
+  if (sqlite3_total_changes(db) != sb_db_changes0[idx]) {
+    int frames = 0, done = 0;
+    if (sqlite3_wal_checkpoint_v2(db, "main", 3 /* TRUNCATE */, &frames, &done)) sb_stat_ckpt_fail++;
+  }
+  // 4. (phase D inserts: the clean position record)
+  // 5. sqlite3_close must return SQLITE_OK. SQLITE_BUSY means a leaked statement: the slot stays open.
+  if (sqlite3_close(db)) {
+    sb_stat_busy++;
+    return -1;
+  }
+  // 6. only then close any raw descriptor on the same inode (capture's read_fd and lock): fcntl locks belong to the
+  //    process, so closing a descriptor of the file while the SQLite handle is open would drop SQLite's locks. Object
+  //    SQL has none; the order is written so that phase D cannot get it wrong.
+  // 7. clear the slot.
+  if (sb_ltx_states[idx].db) memset(&sb_ltx_states[idx], 0, sizeof(sb_ltx_states[idx]));
   sb_dbs[idx] = 0;
   sb_db_names[idx][0] = 0;
   sb_quota_frozen[idx] = 0;
+  sb_cache_kb[idx] = 0;
+  sb_db_calls[idx] = 0;
+  if (sb_db_last == idx) sb_db_last = -1;
+  sb_stat_closes++;
+  return 0;
 }
+// do.sql.close: the handle of one path. 0: not open, 1: closed, -1: left open.
+static int sb_db_close_path(const char* path) {
+  for (int i = 0; i < sb_db_count; i++)
+    if (sb_dbs[i] && strcmp(sb_db_names[i], path) == 0) return sb_db_close(i) ? -1 : 1;
+  return 0;
+}
+// Hands SQLite's cached pages back, from every open database; returns the bytes SQLite memory fell by.
+static long long sb_db_release_all(void) {
+  long long before = sqlite3_memory_used();
+  for (int i = 0; i < sb_db_count; i++) if (sb_dbs[i]) sqlite3_db_release_memory(sb_dbs[i]);
+  return before - sqlite3_memory_used();
+}
+// The handle table's counters as one JSON line, for the host note (plan 018) and the tests.
+static int sb_db_stats(char* out, size_t cap) {
+  int open = 0, open_do = 0;
+  long cache_kb = 0;
+  for (int i = 0; i < sb_db_count; i++) {
+    if (!sb_dbs[i]) continue;
+    open++;
+    cache_kb += sb_cache_kb[i];
+    if (sb_is_do_sql(sb_db_names[i])) open_do++;
+  }
+  return snprintf(out, cap,
+    "{\"open\":%d,\"doOpen\":%d,\"doSlots\":%d,\"cacheKb\":%ld,\"targetKb\":%ld,\"memUsed\":%lld,\"opens\":%lu,\"closes\":%lu,\"busy\":%lu,\"ckptFail\":%lu,\"grow\":%lu,\"shrink\":%lu,\"openUsLast\":%ld,\"openUsMax\":%ld}",
+    open, open_do, sb_do_sql_open, cache_kb, sb_cache_target_kb, sqlite3_memory_used(), sb_stat_opens, sb_stat_closes, sb_stat_busy, sb_stat_ckpt_fail, sb_stat_grow, sb_stat_shrink, sb_stat_open_us_last, sb_stat_open_us_max);
+}
+// END DB TABLE NATIVE
 
 // --- a growable output buffer, for building the reply JSON ------------------
 typedef struct { char* p; size_t len; size_t cap; } sb_buf;
@@ -2232,7 +2401,7 @@ static void sb_xfer_download_close(int handle) {
 // every write is refused (a same-size UPDATE or a DELETE still adds an LTX file to the
 // spool, which counts toward the quota). Reads and transaction control still run.
 #define SB_QUOTA_FULL "storage quota exceeded: writes are refused while this app's data, including its replication log, is over its quota"
-// sb_quota_frozen (per database slot) is declared with sb_db_evict, which clears it.
+// sb_quota_frozen (per database slot) is declared with sb_db_close, which clears it.
 static int sb_db_capture_failed(const char* path) {
   for (int i = 0; i < sb_db_count; i++) if (strcmp(sb_db_names[i], path) == 0) return sb_ltx_states[i].failed;
   return 0;
@@ -2549,6 +2718,7 @@ static char* sb_sql_run(const char* path, const char* sql, const char* params) {
 
 // The storage quota (docs: an app's data directory is capped): bytes in regular files under
 // dir, symlinks not followed. Bounded by depth; an unreadable entry counts as 0.
+static long sb_dir_files;  // regular files counted by the last walk (the quota scan's interval grows with it)
 static long long sb_dir_bytes(const char* dir, int depth) {
   DIR* d = opendir(dir);
   if (!d || depth > 16) { if (d) closedir(d); return 0; }
@@ -2560,7 +2730,7 @@ static long long sb_dir_bytes(const char* dir, int depth) {
     if (snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) >= (int)sizeof(path)) continue;
     struct stat st;
     if (lstat(path, &st)) continue;
-    if (S_ISREG(st.st_mode)) total += (long long)st.st_size;
+    if (S_ISREG(st.st_mode)) { total += (long long)st.st_size; sb_dir_files++; }
     else if (S_ISDIR(st.st_mode)) total += sb_dir_bytes(path, depth + 1);
   }
   closedir(d);
@@ -4610,7 +4780,7 @@ function __sbSqlScriptRaw(path, sql) {
   return res;
 }
 
-// The bytes under a directory, as a decimal string (sb_dir_bytes).
+// The bytes under a directory and the number of regular files, as "BYTES FILES" (sb_dir_bytes).
 // oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
 function __sbDirBytesRaw(dir) {
   let res = "";
@@ -4620,11 +4790,48 @@ function __sbDirBytesRaw(dir) {
     porf_native_fetch_read_value(dir, &__d, &__dl, &__do);
     char* __dir = (char*)malloc(__dl + 1); memcpy(__dir, __d, __dl); __dir[__dl] = 0;
     if (__do) free(__do);
-    char __n[32]; int __k = snprintf(__n, sizeof(__n), "%lld", sb_dir_bytes(__dir, 0));
+    char __n[64]; sb_dir_files = 0; long long __b = sb_dir_bytes(__dir, 0); int __k = snprintf(__n, sizeof(__n), "%lld %ld", __b, sb_dir_files);
     free(__dir);
     res = porf_box((f64)porf_native_fetch_alloc_bytestring(__n, (size_t)__k), 195);
   `;
   return res;
+}
+
+// Closes the handle of one database path (sb_db_close_path): 1 closed, 0 not open, -1 left open.
+// oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
+function __sbDbCloseRaw(path) {
+  let status = 0;
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    const char* __p; size_t __pl; char* __po = 0;
+    porf_native_fetch_read_value(path, &__p, &__pl, &__po);
+    char* __path = (char*)malloc(__pl + 1); memcpy(__path, __p, __pl); __path[__pl] = 0;
+    if (__po) free(__po);
+    status = (f64)sb_db_close_path(__path);
+    free(__path);
+  `;
+  return status;
+}
+
+// The handle table's counters, one JSON line (sb_db_stats).
+function __sbDbStatsRaw() {
+  let res = "";
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    char __n[512]; int __k = sb_db_stats(__n, sizeof(__n));
+    res = porf_box((f64)porf_native_fetch_alloc_bytestring(__n, (size_t)__k), 195);
+  `;
+  return res;
+}
+
+// Hands SQLite's cached pages back (sb_db_release_all); returns the bytes released.
+function __sbDbReleaseRaw() {
+  let freed = 0;
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    freed = (f64)sb_db_release_all();
+  `;
+  return freed;
 }
 
 // "captured" of __sbD1DbRaw as a number: no text made in C and parsed here, on every D1 query.
@@ -4972,6 +5179,9 @@ function __sbDir() {
 var __sbQuotaMax = -1;
 var __sbQuotaUsed = 0;
 var __sbQuotaAt = -1;
+// Milliseconds between scans of the data directory: one lstat per file, so 1 s per 1,000 files and at most 10 s (7 ms of
+// walking at 5,000 files, 20 ms at 15,000, measured). Writes can overshoot the quota by up to that long.
+var __sbQuotaEvery = 1000;
 function __sbQuotaLimit() {
   if (__sbQuotaMax < 0) {
     const v = Number(__sbEnv("SB_STORAGE_MAX_BYTES"));
@@ -4981,8 +5191,10 @@ function __sbQuotaLimit() {
 }
 function __sbQuotaFull() {
   const now = Date.now();
-  if (__sbQuotaAt < 0 || now - __sbQuotaAt >= 1000) {
-    __sbQuotaUsed = Number(__sbDirBytesRaw(__sbDir())) || 0;
+  if (__sbQuotaAt < 0 || now - __sbQuotaAt >= __sbQuotaEvery) {
+    const scan = String(__sbDirBytesRaw(__sbDir())).split(" ");
+    __sbQuotaUsed = Number(scan[0]) || 0;
+    __sbQuotaEvery = Math.min(10000, Math.max(1000, Math.ceil((Number(scan[1]) || 0) / 1000) * 1000));
     __sbQuotaAt = now;
   }
   return __sbQuotaUsed >= __sbQuotaLimit();
@@ -5503,7 +5715,7 @@ function __sbEmbeddedDispatch(msg) {
   // run like a strict D1 query (BLOBs as hex, D1_ERROR text the shim rewords).
   if (op === "do.sql") {
     const path = __sbDOSqlPath(msg.cls, msg.file);
-    // Its handle may have been closed and reopened since (SB_DO_SQL_OPEN), which drops the
+    // Its handle may have been closed and reopened since (the slot LRU, an eviction), which drops the
     // size cap: set it again.
     delete __sbD1Capped[path];
     __sbD1Quota(path);
@@ -5511,6 +5723,16 @@ function __sbEmbeddedDispatch(msg) {
     if (r.ok === false) throw __sbD1Error(r);
     return { ok: true, columns: r.cols, rows: r.rows, meta: { changes: r.changes } };
   }
+
+  // A Durable Object instance leaving memory closes its SQLite handle (plan 018): the last connection checkpoints, so the
+  // evicted object is one clean file. A no-op when it is not open; closed: -1 means a transaction or a statement kept it open.
+  if (op === "do.sql.close") {
+    const path = __sbDOSqlPath(msg.cls, msg.file);
+    return { ok: true, closed: __sbDbCloseRaw(path) };
+  }
+
+  if (op === "do.stats") return { ok: true, stats: JSON.parse(__sbDbStatsRaw()) };
+  if (op === "do.release") return { ok: true, freed: __sbDbReleaseRaw() };
 
   if (op === "d1.backup") {
     const src = __sbD1Path(String(msg.db));
