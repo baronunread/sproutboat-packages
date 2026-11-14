@@ -1,5 +1,43 @@
 # @sproutboat/runtime
 
+## 0.46.0
+
+### Minor Changes
+
+- ca85623: Durable Objects leave memory when idle and are constructed again by their next event, behind compatibility date 2026-11-21 (design 07 stage 1c, plan 018 phase 2). Before the date nothing changes.
+  
+  - **Eviction.** Every object has a record; an event of any kind (RPC, `stub.fetch`, alarm, hibernatable socket event, socket restore) enters through one function, counts the object busy until the event and its `waitUntil` drain have settled, and runs in an async-context frame that names the object. An object is evicted, in one synchronous turn, when nothing is in flight, nothing waits at its input gate, no `blockConcurrencyWhile` or transaction is open, nothing pins it, and its hibernatable sockets can go back to the host. Its storage, alarm, and SQLite file stay (the file is checkpointed and closed: one clean file). The next event runs the constructor again before the event.
+  - **Settings** (environment; sproutd sets them from `limits`): `SB_DO_IDLE_MS` (default 10,000; 0 turns idle eviction off), `SB_DO_MAX` (default 16 per MiB of `SB_MEMORY_LIMIT`, 64 to 4,096; 4,096 with no limit), `SB_DO_WAIT_MS` (5,000), `SB_DO_QUEUE_MAX` (1,024).
+  - **The cap and the overloaded error.** At `SB_DO_MAX` objects the first event of a new object evicts the stalest idle one; with none idle it waits up to `SB_DO_WAIT_MS`, then fails alone with an error whose `overloaded` is `true`. More than 1,024 events queued behind one object's gate fail the same way.
+  - **Pins.** A pending `setTimeout` or `setInterval`, an unawaited `fetch`, an open plain WebSocket, outbound WebSocket or `connect()` socket, and a streamed response keep the object in memory. The timer globals become wrappers once the first object is built; the prelude's own timers use the runtime's.
+  - **Revoked instances.** A leftover closure of an evicted instance throws "This Durable Object instance was evicted from memory." instead of writing as a second instance. `abort()` and a `blockConcurrencyWhile` that rejects or runs 30 s reset the object the same way (events waiting at its gate fail).
+  - **Alarms.** The embedded pass runs its claimed batch concurrently and renews the claim; `alarm()` gets the delivery row's attempt count, so `retryCount` survives eviction; an alarm that cannot get a slot is released without counting an attempt.
+  - **Host.** Parked sweep timer (op `D`), giving hibernatable sockets back (ops `U`, `g`); a host without them pins objects that hold such sockets, and sweeps when the next event arrives. A standalone binary keeps every object with an open socket in memory.
+  - A counters line (`objects_awake`, `evicted_idle`, `wake_us`, ...) goes to the host as a note, or to stderr with `SB_DO_STATS=1`.
+  
+  Not in this release: the memory-pressure eviction trigger (it waits for plan 016's pool).
+- ca85623: SQLite page caches start small and grow on evidence, and one function closes a database handle (design 07 stage 1c, plan 018 phase 1).
+  
+  - Every database opens with a 256 KiB page cache (`PRAGMA cache_size=-256`). Every 64th use, a cache over 90% full with over 10% misses doubles, up to 2 MiB or its share. The share is `T / open databases`, where `T` is `SB_MEMORY_LIMIT / 8` (4 MiB at 32 MiB); when a database opens and the sizes no longer fit under `T`, the stalest go back to their share. `SB_SQLITE_CACHE_MB` keeps its meaning and fixes the size. `sqlite3_soft_heap_limit64(T)` is set when a limit is known. A standalone binary without a limit starts at 256 KiB and grows to 2 MiB.
+  - The handle table holds 64 databases (was 16). Object databases (`storage.sql`) take at most `clamp(T / 160 KiB, 8, 48)` of them (25 at 32 MiB; 48 with no limit; was 8), and the slot used longest ago is closed first, but never one inside a transaction or savepoint.
+  - `sb_db_close` is the only place a handle is closed (statement cache, a TRUNCATE checkpoint if the connection wrote, `sqlite3_close`, which must return OK; `SQLITE_BUSY` leaves the slot open and is counted). New ops `do.sql.close`, `do.stats` and `do.release`.
+  - The storage quota scan runs every second per 1,000 files (at most every 10 s) instead of every second: at 5,000 object files the walk takes 7 ms, at 15,000 about 20 ms. A write can overshoot the quota by up to that interval.
+  
+  Nothing an app can observe changes except lower SQLite memory and the longer quota interval; the ABI hash changes with the prelude.
+
+### Patch Changes
+
+- d4bbcd5: `_redirects` matching follows Cloudflare's rules. The whole request path must match, so a trailing slash is significant: `/compare /compare/ 308` redirects `/compare` once, and `/compare/` is then served (or matched by a rule of its own) instead of redirecting to itself forever. Before, a rule's `from` was compared segment by segment with the empty ones dropped, so `/compare` also matched `/compare/` and `/user/:id` matched `/user/42/`.
+  
+  What matches, as in Cloudflare's rules engine:
+  
+  - `:name` matches one or more characters up to the next `/`, may sit inside a segment (`/files/:name.html`), and may appear once per rule;
+  - `*` matches anything including `/` and the empty string, is `:splat` in the target, and may sit in the middle of the path (`/a/*/c`); a rule has at most one;
+  - a rule with a repeated name or two splats never matches (Cloudflare drops it);
+  - a static rule (no `:name`, no `*`) beats a dynamic one whatever the order; among rules of one kind the first in the file wins. `findRedirect(rules, pathname)` is the new entry point; `matchRedirect(rule, pathname)` still answers for one rule.
+  
+  This changes what an existing `_redirects` file does for paths that differ only by a trailing slash, with no compatibility date: the edge serves assets before any app code runs and cannot see the date, and the old matching was what looped. Run `bun run test:native-asset-redirects` to check the compiled matcher against the same cases as the portable one.
+
 ## 0.45.0
 
 ### Minor Changes
