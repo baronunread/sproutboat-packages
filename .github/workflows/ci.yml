@@ -1,6 +1,7 @@
 name: ci
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     # The changesets bot's "Version Packages" PR only deletes .changeset/*.md and
     # bumps versions and CHANGELOGs. GitHub opens it as github-actions[bot], so
     # every ci run it triggers waits for a maintainer's approval
@@ -28,7 +29,7 @@ concurrency:
 jobs:
   check:
     # Same skip as paths-ignore above, for a release PR that ever touches more.
-    if: github.head_ref != 'changeset-release/main'
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && github.head_ref != 'changeset-release/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -46,16 +47,17 @@ jobs:
 
   native:
     name: native (${{ matrix.channel }})
-    if: github.head_ref != 'changeset-release/main'
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && github.head_ref != 'changeset-release/main'
     runs-on: ubuntu-latest
-    # Standalone builds default to Porffor alpha 22; alpha 19 stays a fallback pin for one release
-    # (SPROUTBOAT_PORFFOR_CHANNEL=alpha-19), so both are tested until it is dropped.
+    # Standalone builds default to Porffor alpha 23; alpha 22 (othello's generation until its swap) and the
+    # alpha 19 fallback pin (SPROUTBOAT_PORFFOR_CHANNEL=alpha-19) are tested until they are dropped.
     strategy:
       fail-fast: false
       matrix:
-        channel: [alpha-22, alpha-19]
+        channel: [alpha-23, alpha-22, alpha-19]
     env:
       SPROUTBOAT_PORFFOR_CHANNEL: ${{ matrix.channel }}
+      SB_NATIVE_CC_STRICT: "1"
     steps:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
@@ -64,7 +66,8 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc libsqlite3-dev
+      # clang and the arm64 cross headers: test:native-cc compiles the units to LLVM IR for aarch64 as well.
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc clang libc6-dev-arm64-cross libsqlite3-dev
       - run: bun install --frozen-lockfile
       # The patched Porffor toolchain, and the uWebSockets checkout and uSockets.a
       # its native compiles build on first use. The toolchain's directory is
@@ -80,13 +83,41 @@ jobs:
       # Every test:native-* script, 4 at a time (scripts/test-native.ts).
       - run: bun run test:native
 
+  # Alpha 23 prefixes generated functions with swiftcall on clang arm64 (PORF_CC), and the CLI's host and
+  # release builds link with -flto. A host C call without the same convention compiled, linked and then
+  # trapped at startup on macOS arm64 only when LTO saw both sides. The ubuntu job above never links with
+  # LTO and has no arm64, so the two checks that cover it run here on the real platform.
+  native-macos:
+    name: native (macOS arm64, alpha-23)
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && github.head_ref != 'changeset-release/main'
+    runs-on: macos-latest
+    env:
+      SPROUTBOAT_PORFFOR_CHANNEL: alpha-23
+      SB_NATIVE_CC_STRICT: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: bun install --frozen-lockfile
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/sproutboat/porffor-*
+            ~/.cache/porffor/deps
+          key: porffor-alpha-23-${{ runner.os }}-${{ hashFiles('packages/toolchain/package.json', 'packages/toolchain/src/**/*.ts', 'packages/toolchain/src/**/*.c', 'packages/toolchain/src/**/*.js', 'packages/toolchain/vendor/**') }}
+      - run: bun run test:native lto cc
+
   # The published packages' consumer: sproutboat-cli's kitchen-sink app, built
   # against this PR's packages. Its compatibility_date is 2026-08-26, so it is
   # the "an app written before a behaviour change keeps working" check that
   # caught the last three regressions only after they were published.
   downstream:
     name: downstream (sproutboat-cli kitchen-sink)
-    if: github.head_ref != 'changeset-release/main'
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && github.head_ref != 'changeset-release/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
