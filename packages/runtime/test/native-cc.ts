@@ -97,9 +97,11 @@ function irReferences(ir: string): { name: string; swift: boolean; kind: string 
   return out;
 }
 
-if (standaloneChannel() !== "alpha-23") {
+if (standaloneChannel() !== "alpha-23" && standaloneChannel() !== "alpha-24") {
   // alpha 22's porf.h has no PORF_CC and alpha 19 has no bridge: nothing to compare
-  console.log(`SKIPPED: the calling-convention check is for the alpha-23 channel, not ${standaloneChannel()}`);
+  console.log(
+    `SKIPPED: the calling-convention check is for the alpha-23 and alpha-24 channels, not ${standaloneChannel()}`,
+  );
   process.exit(0);
 }
 

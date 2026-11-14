@@ -2,7 +2,7 @@
  * The Porffor alpha 21 line pins: a second channel beside `../pin.ts` (alpha 19, the default for the
  * CLI and every existing caller). Sproutd's alpha 21 to alpha 24 generations read these,
  * behind its `--porffor=alpha-21` / `--porffor=alpha-22` / `--porffor=alpha-23` / `--porffor=alpha-24` flag, and standalone builds
- * default to alpha 23 (`standalone-channel.ts`). Moving the default channel is a
+ * default to alpha 24 (`standalone-channel.ts`; alpha 23 was the default until the alpha 24 flip). Moving the default channel is a
  * separate decision (see sproutboat-platform/sproutd-alpha21-port.md).
  *
  * One chain (`patch.ts`) serves all four pins: alpha 22 is five commits on alpha 21 (+77/-22 lines) and

@@ -83,6 +83,16 @@ end to end, compiled to native binaries) passes on both alpha 23 and alpha 24. A
 decorated method and a parameter property compiles and runs correctly on stock and on patched alpha 24; the repo had no workaround
 for any of them to remove.
 
+## Alpha 24 qualification (2026-11-14)
+
+`SPROUTBOAT_PORFFOR_CHANNEL=alpha-24 bun scripts/test-native.ts` on romeo (Linux x64, Debian 13, concurrency 2, 5 GiB cap): 47 passed, 3 failed in 499 s.
+The three failures (`native-ltx`, `native-d1`, `native-db-table`) were `sqlite3.h` and `-lsqlite3` missing on the box (CI installs `libsqlite3-dev`); rerun
+with the dev package unpacked into a scratch directory and `CPATH`/`LIBRARY_PATH` pointing at it, all three pass. Seven of the 47 only printed a skip:
+five need `SB_CLI` (`sockets-starttls`, `do-evict`, `websockets-outbound`, `async-local-storage`, `sqlite-lock`) and ran on the Mac (arm64) against a
+sproutboat-cli `cb5624a` worktree linked to this checkout: 5 of 5 pass; `native-cc` and `native-lto` skipped because their gate was `=== "alpha-23"`
+(this PR widens it to alpha 24) and pass on the Mac on alpha 24. So every `test:native-*` script has passed on alpha 24. No new Porffor bug was found.
+The sproutd side (a template-script break from `e92728e3`'s new `porf_invoke` tables) is sproutd #123.
+
 ## Alpha 23 check (2026-11-12)
 
 Alpha 23 is eight commits on alpha 22 (+25/-21 lines, five files under `compiler/`; nothing in `compiler/builtins/`

@@ -63,7 +63,7 @@ export type HostCompileInput = {
   log?: (line: string) => void;
 };
 
-/** Compile `generatedPath` to a host binary at `outPath` on the alpha 21 line (alpha 23 unless the channel says alpha 22). */
+/** Compile `generatedPath` to a host binary at `outPath` on the alpha 21 line (alpha 24 unless the channel says alpha 23 or alpha 22). */
 export async function compileStandaloneHostA21(input: HostCompileInput): Promise<void> {
   const channel = standaloneA21Channel(standaloneChannel());
   const [alpha19, a21] = await Promise.all([ensurePorffor(), ensurePorfforA21(channel)]);

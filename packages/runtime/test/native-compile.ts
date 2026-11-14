@@ -82,7 +82,7 @@ async function uwsDirectory(alpha19: string): Promise<string> {
   return dir;
 }
 
-/** Compile a generated module into a native binary on the standalone channel (alpha 22 by default, `SPROUTBOAT_PORFFOR_CHANNEL=alpha-19` for the fallback). */
+/** Compile a generated module into a native binary on the standalone channel (alpha 24 by default, `SPROUTBOAT_PORFFOR_CHANNEL=alpha-23` for the previous default, `=alpha-19` for the oldest fallback). */
 export async function compileNative(input: NativeCompileInput): Promise<void> {
   const which = channel();
   const dir = input.dir ?? dirname(input.binary);
