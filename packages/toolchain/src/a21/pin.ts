@@ -1,13 +1,15 @@
 /**
  * The Porffor alpha 21 line pins: a second channel beside `../pin.ts` (alpha 19, the default for the
- * CLI and every existing caller). Sproutd's alpha 21, alpha 22 and alpha 23 generations read these,
- * behind its `--porffor=alpha-21` / `--porffor=alpha-22` / `--porffor=alpha-23` flag, and standalone builds
+ * CLI and every existing caller). Sproutd's alpha 21 to alpha 24 generations read these,
+ * behind its `--porffor=alpha-21` / `--porffor=alpha-22` / `--porffor=alpha-23` / `--porffor=alpha-24` flag, and standalone builds
  * default to alpha 23 (`standalone-channel.ts`). Moving the default channel is a
  * separate decision (see sproutboat-platform/sproutd-alpha21-port.md).
  *
- * One chain (`patch.ts`) serves all three pins: alpha 22 is five commits on alpha 21 (+77/-22 lines) and
+ * One chain (`patch.ts`) serves all four pins: alpha 22 is five commits on alpha 21 (+77/-22 lines) and
  * every alpha 21 pass anchors unchanged on it; alpha 23 is eight more commits (+25/-21, none in
- * `builtins/` or `runtime/`) and every pass anchors unchanged on it too. The alpha 22 and later passes (P8,
+ * `builtins/` or `runtime/`) and every pass anchors unchanged on it too; alpha 24 is fifteen more (TypeScript lowering,
+ * decorators, a new `builtins/decorator.ts`, class codegen) and every pass but P5 and P11 anchors unchanged (those two
+ * moved: see `patchStableNames`, `patchClassBindingWrite`). The alpha 22 and later passes (P8,
  * shared dispatch functions; P10) are applied where their anchor exists, which is every tree but alpha 21's. The pin a tree is on is read from the tree
  * (`channelOfTree`), so the alpha 21 results stay reproducible from the alpha 21 archive.
  *
@@ -15,10 +17,10 @@
  * archive after the ref in the URL, so the short-ref tarball holds the same files under another
  * root directory and has another digest.
  */
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-export type PorfforA21Channel = "alpha-21" | "alpha-22" | "alpha-23";
+export type PorfforA21Channel = "alpha-21" | "alpha-22" | "alpha-23" | "alpha-24";
 
 export interface PorfforA21Pin {
   readonly channel: PorfforA21Channel;
@@ -73,6 +75,17 @@ export const PORFFOR_A21_PINS = {
     "c39f102df21dae9fb7ffeada8b3d90eb47256d2e8d83ebb912c2fe9a5c34fd43",
     "0.0.0-alpha.23",
   ),
+  // alpha 24 (published 2026-11-14 21:38 UTC): fifteen commits on alpha 23, +~620/-~245 lines. 99bf9066 compiler: ts
+  // lowering (new compiler/typescript.js: namespaces, enums and the like) and decorators (new compiler/builtins/decorator.ts,
+  // `__Porffor_decorate`), c17f9def runtime tdz for top-level lexicals, cacc5536 and 15df2d2d evaluation order,
+  // e92728e3 render: porf_invoke cases per signature, 07df32d3 native: -ffp-contract=off, 1b8225ea builtin instanceof
+  // sees proxies, plus loop labels, string index and nul-in-number fixes. Upstream main is this commit.
+  "alpha-24": pin(
+    "alpha-24",
+    "1b8225eafda6664dcd4f274d002603bd9797de6a",
+    "0032b12fa9f096e7b05f64c80520cf20e5ab0e7ed83b70fd33095f4ca2a4d59a",
+    "0.0.0-alpha.24",
+  ),
 } as const satisfies Readonly<Record<PorfforA21Channel, PorfforA21Pin>>;
 
 /**
@@ -81,6 +94,8 @@ export const PORFFOR_A21_PINS = {
  * table, and alpha 23's `isIdentAssignable` that lets an assignment to a captured binding through.
  */
 export function channelOfTree(root: string): PorfforA21Channel {
+  // alpha 24 added the TypeScript lowering as its own file (99bf9066); no pass creates or edits it.
+  if (existsSync(resolve(root, "compiler/typescript.js"))) return "alpha-24";
   const codegen = readFileSync(resolve(root, "compiler/codegen.js"), "utf8");
   // alpha 23 lets an assignment to a captured binding through isIdentAssignable (6f64fd79); no pass touches it.
   if (
@@ -115,6 +130,12 @@ export const PORFFOR_A23_COMMIT = PORFFOR_A21_PINS["alpha-23"].commit;
 export const PORFFOR_A23_ARCHIVE_SHA256 = PORFFOR_A21_PINS["alpha-23"].archiveSha256;
 export const PORFFOR_A23_ARCHIVE_URL = PORFFOR_A21_PINS["alpha-23"].archiveUrl;
 export const PORFFOR_A23_NPM_VERSION = PORFFOR_A21_PINS["alpha-23"].npmVersion;
+export const PORFFOR_A24_CHANNEL = PORFFOR_A21_PINS["alpha-24"].channel;
+export const PORFFOR_A24_COMMIT_FULL = PORFFOR_A21_PINS["alpha-24"].commitFull;
+export const PORFFOR_A24_COMMIT = PORFFOR_A21_PINS["alpha-24"].commit;
+export const PORFFOR_A24_ARCHIVE_SHA256 = PORFFOR_A21_PINS["alpha-24"].archiveSha256;
+export const PORFFOR_A24_ARCHIVE_URL = PORFFOR_A21_PINS["alpha-24"].archiveUrl;
+export const PORFFOR_A24_NPM_VERSION = PORFFOR_A21_PINS["alpha-24"].npmVersion;
 
 /** A compact identity string for a manifest / report (`alpha-21 (1f8d148)`). */
 export function porfforA21Version(channel: PorfforA21Channel = "alpha-21"): string {

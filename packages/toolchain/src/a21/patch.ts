@@ -270,9 +270,10 @@ export async function patchStableNames(root: string): Promise<void> {
       "  const cache = local(scope, `#func_cache_${func.start ?? func.index}`, T.jsval);\n",
       "  const cache = local(scope, `#func_cache_${func.start ?? func.name}`, T.jsval); // " + P5_MARKER + "\n",
     ],
+    // indentation-free: alpha 24 moved the computed-key block two columns left
     [
-      "        const keyGlobal = `#class_computed_prop${scope.start ?? scope.index}` + uniqId(scope);\n",
-      "        const keyGlobal = `#class_computed_prop_${unitOf(scope)}_${scope.start ?? scope.index}` + uniqId(scope);\n",
+      "const keyGlobal = `#class_computed_prop${scope.start ?? scope.index}` + uniqId(scope);\n",
+      "const keyGlobal = `#class_computed_prop_${unitOf(scope)}_${scope.start ?? scope.index}` + uniqId(scope);\n",
     ],
     [
       "  if (builtinGlobalInits.length !== 0) topLevelFunc.body.unshift(...builtinGlobalInits);\n",
@@ -837,12 +838,25 @@ export async function patchDispatchArgOrder(root: string): Promise<void> {
  */
 const CLASS_WRITE_MARKER = "sproutboat P11: a written class declaration initialises its binding";
 export async function patchClassBindingWrite(root: string): Promise<void> {
-  await editOnce(resolve(root, "compiler/codegen.js"), "a reassigned class declaration (P11)", CLASS_WRITE_MARKER, [
+  const file = resolve(root, "compiler/codegen.js");
+  // Alpha 24 reads the root of a decorated class from materializeFunctionValue (the decorated value is
+  // written back after the class body) and boxes a class captured and written in a loop (`decl._boxed`);
+  // the store below applies to neither. Alpha 21 to 23 have no decorators and no box.
+  const before =
+    "const classRoot = reuseNamed(scope, decl._writes ? generate(scope, root) : materializeFunctionValue(scope, func));\n";
+  const after =
+    "const classRoot = reuseNamed(scope, decl._writes && !classDecorators ? generate(scope, root) : materializeFunctionValue(scope, func));\n";
+  const a24 = (await readFile(file, "utf8")).includes(after);
+  const anchor = "  " + (a24 ? after : before);
+  const guard = a24 ? "!expr && decl._writes && !classDecorators && !decl._boxed" : "!expr && decl._writes";
+  await editOnce(file, "a reassigned class declaration (P11)", CLASS_WRITE_MARKER, [
     [
-      "  const classRoot = reuseNamed(scope, decl._writes ? generate(scope, root) : materializeFunctionValue(scope, func));\n",
+      anchor,
       "  // " +
         CLASS_WRITE_MARKER +
-        "\n  if (!expr && decl._writes) {\n" +
+        "\n  if (" +
+        guard +
+        ") {\n" +
         "    const global = scope.topLevel;\n" +
         "    allocVar(scope, name, global);\n" +
         "    func.referenced = true;\n" +
@@ -850,7 +864,7 @@ export async function patchClassBindingWrite(root: string): Promise<void> {
         "    const capture = scope.closureOwnLocals?.[name];\n" +
         "    if (capture && closureBindingNeedsSlot(capture)) mirrorToClosureEnv(scope, name, closureLocalReadNode(name, false));\n" +
         "  }\n" +
-        "  const classRoot = reuseNamed(scope, decl._writes ? generate(scope, root) : materializeFunctionValue(scope, func));\n",
+        anchor,
     ],
   ]);
 }
@@ -946,7 +960,7 @@ async function patchedByThisVersion(root: string): Promise<boolean> {
   }
 }
 
-/** Every pass, in order, on a pristine alpha 21, 22 or 23 tree at `root` (pin.ts channelOfTree). Idempotent. */
+/** Every pass, in order, on a pristine alpha 21, 22, 23 or 24 tree at `root` (pin.ts channelOfTree). Idempotent. */
 export async function ensurePorfforPatchedA21(root: string): Promise<void> {
   if (done.has(root)) return;
   if (await patchedByThisVersion(root)) {

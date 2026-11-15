@@ -270,6 +270,38 @@ test("the alpha 23 pin is the same chain, applied once, and the tree tells its o
   expect(await readFile(join(root, "compiler/codegen.js"), "utf8")).toBe(first);
 }, 180_000);
 
+test("the alpha 24 pin is the same chain with P5 and P11 re-anchored, applied once, and the tree tells its own channel", async () => {
+  const root = await pristine("alpha-24");
+  expect(channelOfTree(root)).toBe("alpha-24");
+  expect(pinOfTree(root).commitFull).toBe("1b8225eafda6664dcd4f274d002603bd9797de6a");
+  await ensurePorfforPatchedA21(root);
+  // typescript.js (the TypeScript lowering) is alpha 24's own file and no pass touches it.
+  expect(channelOfTree(root)).toBe("alpha-24");
+  const codegen = await readFile(join(root, "compiler/codegen.js"), "utf8");
+  for (const marker of [
+    "sproutboat P1: class functions stay in their module's unit",
+    "sproutboat P5: stable derived names",
+    "#class_computed_prop_${unitOf(scope)}_",
+    "sproutboat P8: shared dispatch functions belong to the asking unit",
+    // P11 on alpha 24 leaves a decorated or boxed class alone.
+    "if (!expr && decl._writes && !classDecorators && !decl._boxed) {",
+  ])
+    expect(codegen, marker).toContain(marker);
+  const render = await readFile(join(root, "compiler/render.js"), "utf8");
+  for (const marker of [
+    "sproutboat P2: app units last, pinned ABI regions",
+    "sproutboat: collector hooks for the fork template",
+    "sproutboat: per-request cpu",
+    "sproutboat: glibc select",
+    "#define PORF_CC __attribute__((swiftcall))",
+  ])
+    expect(render, marker).toContain(marker);
+  const first = await readFile(join(root, "compiler/codegen.js"), "utf8");
+  const { ensurePorfforPatchedA21: again } = await import(`./patch.ts?a24-${Date.now()}`);
+  await again(root);
+  expect(await readFile(join(root, "compiler/codegen.js"), "utf8")).toBe(first);
+}, 180_000);
+
 test("plan 001 step B: the collector's budget and nursery cap are clamped by the app's memory limit", async () => {
   const root = await pristine("alpha-23");
   await ensurePorfforPatchedA21(root);
