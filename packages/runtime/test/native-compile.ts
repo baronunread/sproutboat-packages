@@ -20,9 +20,9 @@ export type NativeCompileInput = {
   dir?: string;
   /** Toolchain cache root for the Porffor tree (`ensurePorfforA21(channel, { cacheRoot })`). */
   cacheRoot?: string;
-  /** Objects and link flags for the link line . */
+  /** Objects and link flags for the link line (SQLite, BearSSL, trust anchors). */
   extraLink?: string[];
-  /** Flags for every C compile . */
+  /** Flags for every C compile (the BearSSL include). */
   extraCflags?: string[];
   /** Link BearSSL, as a test that uses crypto.subtle needs. */
   bearssl?: boolean;
@@ -42,6 +42,15 @@ export type NativeCompileInput = {
 let renderQueue: Promise<void> = Promise.resolve();
 
 const split = (flags: string | undefined): string[] => (flags ?? "").split(" ").filter(Boolean);
+
+async function drain(child: Bun.Subprocess<"ignore", "pipe", "pipe">) {
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  return { exitCode, stdout, stderr };
+}
 
 /** Compile a generated module into a native binary on the standalone channel (alpha 24). */
 export async function compileNative(input: NativeCompileInput): Promise<void> {
