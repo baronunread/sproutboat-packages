@@ -13,7 +13,7 @@ and checks all of it:
 bun scripts/porffor-patches.ts apply   [--dir D] [--base alpha-NN] [--upstream URL|PATH]  # upstream commit + series -> a git checkout (git am --3way)
 bun scripts/porffor-patches.ts export  [--dir D]                                          # the checkout's commits -> porffor-patches/
 bun scripts/porffor-patches.ts vendor  [--dir D] [--tag alpha-NN]                         # -> vendor/porffor-patched.tar.gz + .json
-bun scripts/porffor-patches.ts verify  [--upstream URL|PATH]                              # apply + export + vendor in a temp dir, compare byte for byte
+bun scripts/porffor-patches.ts verify  [--upstream URL|PATH]                              # apply + export + vendor in a temp dir: patches and tar byte for byte, the tarball unpacks to that tar
 bun scripts/porffor-patches.ts check                                                      # no git, no network: series hash and tarball sha256 vs the manifest
 ```
 
