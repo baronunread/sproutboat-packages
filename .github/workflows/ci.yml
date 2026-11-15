@@ -47,9 +47,10 @@ jobs:
 
   # The Porffor patch series is the source of the patched tarball the toolchain ships. Re-run apply (git am
   # --3way onto the pinned upstream commit, then the precompile), export and vendor, and compare with what is
-  # committed byte for byte: the patches, the uncompressed tar and the gzipped tarball. No dependencies to
-  # install: scripts/porffor-patches.ts uses only node builtins and git. Needs the network for the one upstream
-  # commit (fetched by sha, depth 1). bun is pinned: the tarball's gzip bytes are those of this version.
+  # committed byte for byte: the patches and the uncompressed tar; the committed .tar.gz must unpack to that tar
+  # (gzip bytes depend on the platform's zlib, so macOS and Linux differ). No dependencies to install:
+  # scripts/porffor-patches.ts uses only node builtins and git. Needs the network for the one upstream commit
+  # (fetched by sha, depth 1).
   porffor-series:
     name: porffor patch series
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && github.head_ref != 'changeset-release/main'
