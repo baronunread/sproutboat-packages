@@ -348,6 +348,8 @@ export function check(): string[] {
   const tarball = readFileSync(TARBALL_FILE);
   if (sha256(tarball) !== manifest.tarball.sha256)
     problems.push("vendored tarball sha256 differs from the manifest: run `vendor`");
+  else if (sha256(Bun.gunzipSync(tarball)) !== manifest.tar.sha256)
+    problems.push("vendored tarball does not unpack to the manifest's tar: run `vendor`");
   return problems;
 }
 
@@ -373,12 +375,15 @@ export function verify(upstream?: string, log: (line: string) => void = (line) =
       const { manifest: rebuilt, tar, tarball } = vendorTree(dir);
       if (rebuilt.tar.sha256 !== manifest.tar.sha256)
         problems.push(`tar (uncompressed) differs: ${rebuilt.tar.sha256} vs committed ${manifest.tar.sha256}`);
-      else if (sha256(tarball) !== manifest.tarball.sha256)
-        problems.push(
-          `tarball bytes differ with the tar equal: compressor ${compressorId()} vs ${manifest.tarball.compressor}`,
+      // The tar is the reproducible artifact. gzip output depends on the zlib Bun links (macOS and Linux differ at
+      // the same level), so the committed .tar.gz is checked by what it unpacks to, and its own sha256 by `check`.
+      const committedTar = Bun.gunzipSync(readFileSync(TARBALL_FILE));
+      if (sha256(committedTar) !== manifest.tar.sha256)
+        problems.push("committed tarball does not unpack to the manifest's tar");
+      if (sha256(tarball) !== manifest.tarball.sha256)
+        log(
+          `note: gzip bytes differ from the committed tarball (${compressorId()} here, ${manifest.tarball.compressor} committed); the tar is identical`,
         );
-      if (!readFileSync(TARBALL_FILE).equals(Buffer.from(tarball)))
-        problems.push("committed tarball is not byte-identical to the rebuilt one");
       log(`tar ${sha256(tar).slice(0, 12)} tarball ${sha256(tarball).slice(0, 12)}`);
     }
   } finally {
@@ -422,7 +427,9 @@ if (import.meta.main) {
         console.error(problems.map((p) => `FAIL ${p}`).join("\n"));
         process.exit(1);
       }
-      console.log("ok: apply + export + vendor reproduce the committed series, tar and tarball byte for byte");
+      console.log(
+        "ok: apply + export + vendor reproduce the committed series and tar byte for byte; the committed tarball unpacks to that tar",
+      );
     } else if (command === "check") {
       const problems = check();
       if (problems.length > 0) {
