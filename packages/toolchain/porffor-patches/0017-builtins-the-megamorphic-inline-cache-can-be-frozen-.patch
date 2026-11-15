@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sproutboat <noreply@sproutboat.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH] builtins: the megamorphic inline cache can be frozen after
+ warm-up
+
+The shared megamorphic inline cache (icMega, 4,096 entries of 20 bytes) is a zero-filled 80 KiB block
+the template allocates; a worker's misses write entries all over it, so the first request copied most
+of its 20 pages per worker. The template freezes it after its warm-up (__Porffor_object_icFreezeMega):
+workers read the template's entries and never write one. Open upstream IC rewrites (#420, #421)
+would touch the same code.
+
+Class: ours
+Pass: patchIcMegaFreeze
+---
+ compiler/builtins/_internal_object.ts | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/compiler/builtins/_internal_object.ts b/compiler/builtins/_internal_object.ts
+index 7b25084f7f6adbe3469e28d5fb5d60d2eeca787b..32d99928ef24746dd0bd410fd3b04fafa9cc43dd 100644
+--- a/compiler/builtins/_internal_object.ts
++++ b/compiler/builtins/_internal_object.ts
+@@ -1336,6 +1336,11 @@ export const __Porffor_object_getWithReceiver = (obj: any, key: any, receiver: a
+ //   holder shape only for data slots of shaped holders, epoch -1 for the receiver's own prototype, else icEpoch
+ // icMega: misses shared by all sites, the same 4 words (epoch -2: own) then the key hash
+ let icMega: i32 = 0;
++// sproutboat: frozen megamorphic cache
++let icMegaFrozen: i32 = 0;
++export const __Porffor_object_icFreezeMega = (): void => {
++  icMegaFrozen = 1;
++};
+ 
+ // a cached read's slot index + 1 in its holder (p + 4, else obj for own), -1 when absent, 0 when stale
+ export const __Porffor_object_icEntry = (obj: i32, p: i32, hash: i32): i32 => {
+@@ -1542,6 +1547,7 @@ export const __Porffor_object_icFlagChainTo = (obj: any, holder: any): void => {
+ };
+ 
+ export const __Porffor_object_icStoreMega = (shape: i32, hash: i32, holder: i32, i: i32, epoch: i32): void => {
++  if (icMegaFrozen != 0) return;
+   if (icMega == 0) {
+     icMega = Porffor.malloc(4096 * 20);
+     Porffor.IR.fill(icMega, 0, 4096 * 20);

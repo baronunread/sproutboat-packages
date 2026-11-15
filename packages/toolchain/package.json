@@ -12,8 +12,6 @@
   "types": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts",
-    "./pin": "./src/pin.ts",
-    "./patch": "./src/patch.ts",
     "./package.json": "./package.json",
     "./a21": "./src/a21/index.ts"
   },

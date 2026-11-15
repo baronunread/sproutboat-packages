@@ -1,25 +1,18 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import { ensurePorfforPatchedA21 } from "./patch";
-import { PORFFOR_A21_PINS } from "./pin";
+import { rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { extractPatchedTree } from "./patched-tree";
 
 // Three miscompiles the control-plane spike found on Porffor alpha 22 (postgres.js and drizzle-orm
 // run into all three; still there on alpha 23 and alpha 24, the stock repros fail on both). Each program is
-// compiled to a native binary with the patched tree of each channel.
-for (const channel of ["alpha-23", "alpha-24"] as const) {
+// compiled to a native binary with the shipped patched tree.
+for (const channel of ["alpha-24"] as const) {
   describe(channel, () => {
     let root = "";
     let work = "";
     beforeAll(async () => {
-      root = await realpath(await mkdtemp(join(tmpdir(), "sb-a21-mis-")));
+      root = await extractPatchedTree(channel);
       work = join(root, "work");
-      const pin = PORFFOR_A21_PINS[channel];
-      const archive = resolve(import.meta.dir, "../../vendor", pin.vendoredArchive);
-      const tar = Bun.spawnSync(["tar", "-xzf", archive, "-C", root, "--strip-components=1"], { stderr: "pipe" });
-      expect(tar.exitCode, new TextDecoder().decode(tar.stderr)).toBe(0);
-      await ensurePorfforPatchedA21(root);
       await Bun.write(join(root, "work/.keep"), "");
     }, 120_000);
     afterAll(async () => {

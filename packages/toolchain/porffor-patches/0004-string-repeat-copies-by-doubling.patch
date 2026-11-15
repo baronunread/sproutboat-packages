@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sproutboat <noreply@sproutboat.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH] string: repeat copies by doubling
+
+"ab".repeat(300000) makes 300,000 small copies; doubling makes log2(n) copies. Not an upstream
+bug: repeat is linear on alpha 23/24 (1.6 MB in 8 ms, 32 MB in 105 ms), this only cuts a constant
+factor, so nothing is filed. Candidate to drop.
+
+Class: upstream
+Pass: patchRepeatDoubling
+---
+ compiler/builtins/string.ts | 24 ++++++++++++++++++++----
+ 1 file changed, 20 insertions(+), 4 deletions(-)
+
+diff --git a/compiler/builtins/string.ts b/compiler/builtins/string.ts
+index 59a0728b3f123bc8228bb04c1639a9648907a0fd..42cd32bf7a228545165edaf0cc6764afaafde0ee 100644
+--- a/compiler/builtins/string.ts
++++ b/compiler/builtins/string.ts
+@@ -1046,8 +1046,16 @@ export const __String_prototype_repeat = function (this: string, cnt: any) {
+   if (thisLen == 0) return '';
+ 
+   const out: string = Porffor.malloc(6 + thisLen * count);
+-  for (let i: i32 = 0; i < count; i++) {
+-    Porffor.IR.copy(Porffor.IR.ptr(out) + 4 + i * thisLen, Porffor.IR.ptr(this) + 4, thisLen);
++  // sproutboat B16: doubling repeat
++  const total: i32 = thisLen * count;
++  if (total > 0) {
++    Porffor.IR.copy(Porffor.IR.ptr(out) + 4, Porffor.IR.ptr(this) + 4, thisLen);
++    let filled: i32 = thisLen;
++    while (filled * 2 <= total) {
++      Porffor.IR.copy(Porffor.IR.ptr(out) + 4 + filled, Porffor.IR.ptr(out) + 4, filled);
++      filled *= 2;
++    }
++    if (filled < total) Porffor.IR.copy(Porffor.IR.ptr(out) + 4 + filled, Porffor.IR.ptr(out) + 4, total - filled);
+   }
+ 
+   Porffor.IR.storeI32(out, 0, this.length * count);
+@@ -1062,8 +1070,16 @@ export const __ByteString_prototype_repeat = function (this: bytestring, cnt: an
+   if (thisLen == 0) return '';
+ 
+   const out: bytestring = Porffor.malloc(6 + thisLen * count);
+-  for (let i: i32 = 0; i < count; i++) {
+-    Porffor.IR.copy(Porffor.IR.ptr(out) + 4 + i * thisLen, Porffor.IR.ptr(this) + 4, thisLen);
++  // sproutboat B16: doubling repeat
++  const total: i32 = thisLen * count;
++  if (total > 0) {
++    Porffor.IR.copy(Porffor.IR.ptr(out) + 4, Porffor.IR.ptr(this) + 4, thisLen);
++    let filled: i32 = thisLen;
++    while (filled * 2 <= total) {
++      Porffor.IR.copy(Porffor.IR.ptr(out) + 4 + filled, Porffor.IR.ptr(out) + 4, filled);
++      filled *= 2;
++    }
++    if (filled < total) Porffor.IR.copy(Porffor.IR.ptr(out) + 4 + filled, Porffor.IR.ptr(out) + 4, total - filled);
+   }
+ 
+   Porffor.IR.storeI32(out, 0, thisLen * count);

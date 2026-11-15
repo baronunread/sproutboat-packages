@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sproutboat <noreply@sproutboat.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH] modules: record app module ids and declare their namespaces
+ after the shared ones (P6)
+
+The ids of app modules are recorded as they are loaded, and their namespace declarations come
+after the shared modules' ones, so the template's initializer prefix is app-independent.
+Exports appModuleIds for codegen.js and render.js (P5 and P2 import it).
+
+Class: ours
+Pass: patchAppModuleIds (P6, modules.js)
+---
+ compiler/modules.js | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/compiler/modules.js b/compiler/modules.js
+index ee5767e202b585380f218ba81946c230e1cfe875..415c7d05ed34a636b550b8a9925162648e9f878b 100644
+--- a/compiler/modules.js
++++ b/compiler/modules.js
+@@ -245,6 +245,10 @@ const dataSource = url => {
+   return url.slice(0, comma).endsWith(';base64') ? atob(url.slice(comma + 1)) : decodeURIComponent(url.slice(comma + 1).replace(/%(?![\da-f]{2})/gi, '%25'));
+ };
+ 
++// sproutboat P6: app-owned modules: ids of every module that is neither the runtime's nor the shared prelude's,
++// so their globals, inits and namespace bindings can be emitted after the shared ones
++export const appModuleIds = new Set();
++export const isAppModule = (file, rel, entry) => !entry && !file.startsWith(RUNTIME_ROOT) && !file.startsWith('data:') && !/(^|\/)(shared-prelude|anchor-ns)\.js$/.test(rel);
+ export const isEsmSource = (file, src) => {
+   if (/\.m[jt]s$/.test(file) || file.startsWith('data:')) return true;
+   if (/\.c[jt]s$/.test(file)) return false;
+@@ -927,6 +931,7 @@ export default (entrySource, entryFile, opts = {}) => {
+     source ??= file.startsWith('data:') ? dataSource(file) : (runtime && file in runtime) ? runtime[file] : fs.readFileSync(file, 'utf8');
+     const rel = file.startsWith(entryDir + '/') ? file.slice(entryDir.length + 1) : file;
+     mod = { file, rel, src: source, id: hashId(rel), entry, esm: true, exports: new Map(), stars: [], imports: [], deps: [], body: null, nsUsed: false };
++    if (isAppModule(file, rel, entry)) appModuleIds.add(mod.id);
+ 
+     if (kind === 'json' || kind === 'text') {
+       modules.set(file, mod);
+@@ -1802,7 +1807,8 @@ export default (entrySource, entryFile, opts = {}) => {
+   if (modules.has(RUNTIME_ROOT + '/node/vm.js')) body.push({ type: 'FunctionDeclaration', id: ident('#vmcode'), params: [ ident('#key') ], async: false, generator: false, expression: false,
+     body: { type: 'BlockStatement', body: [ { type: 'SwitchStatement', discriminant: ident('#key'), cases: Array.from(vmSources, ([ key, fn ]) => ({ type: 'SwitchCase', test: literal(key), consequent: [ { type: 'ReturnStatement', argument: fn } ] })) } ] } });
+   // namespaces declared up front for cycles, filled after the module's last class
+-  for (const mod of order) {
++  // (app modules' declarations after the shared ones: the template's initializer prefix is app-independent)
++  for (const mod of [ ...order.filter(m => !appModuleIds.has(m.id)), ...order.filter(m => appModuleIds.has(m.id)) ]) {
+     if (mod.nsExpr) body.push(varDecl('let', nsName(mod), null));
+     if (mod.dnsUsed) body.push(varDecl('let', dnsName(mod), null));
+   }

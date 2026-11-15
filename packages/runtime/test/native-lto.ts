@@ -3,7 +3,6 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { compileNative } from "./native-compile";
-import { standaloneChannel } from "../../toolchain/src/a21/standalone-channel";
 import { preludePath, TRANSPORT_MARKER, transportPath, wrapNativeFetchHandler } from "../src/wrap";
 
 // A standalone server built the way the CLI's host and release builds are: `-flto -O3`. Every other native test
@@ -19,12 +18,6 @@ const handler = `export default {async fetch(request) {
   if (url.pathname === "/json") return Response.json({ n: [1, 2, 3], s: "é" });
   return new Response("hello");
 }};`;
-
-if (standaloneChannel() !== "alpha-23") {
-  // the bug is alpha 23's (PORF_CC); alpha 22 has no swiftcall and alpha 19 builds through the compiler's own native build
-  console.log(`SKIPPED: the -flto check is for the alpha-23 channel, not ${standaloneChannel()}`);
-  process.exit(0);
-}
 
 function freePort(): number {
   const listener = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });

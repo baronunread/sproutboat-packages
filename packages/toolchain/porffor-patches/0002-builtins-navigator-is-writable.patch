@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sproutboat <noreply@sproutboat.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH] builtins: navigator is writable
+
+navigator.userAgent is frozen to "Porffor/<version>". workerd's is "Cloudflare-Workers", and pg
+chooses its Workers socket code on that exact string, so the prelude sets it from the
+compatibility date that has connect() (__sbSetCompat). That needs the property to be writable.
+
+Class: ours
+Pass: patchNavigatorWritableA21
+---
+ compiler/builtins.js | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/compiler/builtins.js b/compiler/builtins.js
+index 29e85ab5f84983d413aa01ba07f903150b616b7b..5e68d2e0005c75e1c0a1613892140aba661d8dcd 100644
+--- a/compiler/builtins.js
++++ b/compiler/builtins.js
+@@ -458,9 +458,9 @@ export const BuiltinVars = ({ builtinFuncs }) => {
+   // these technically not spec compliant as it should be classes or non-enumerable but eh
+   object('navigator', {
+     ...props({
+-      writable: false,
++      writable: true, // sproutboat: navigator is writable
+       enumerable: true,
+-      configurable: false
++      configurable: true
+     }, {
+       userAgent: `Porffor/${globalThis.version}`
+     })

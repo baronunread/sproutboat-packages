@@ -1,15 +1,15 @@
 /**
- * `@sproutboat/toolchain/a21`: the Porffor alpha 21 line (alpha 21, 22, 23 and 24). Pin, patch chain and fingerprint
- * for sproutd's generation, and the standalone build, whose default channel is alpha 23
- * (`standaloneChannel`; `SPROUTBOAT_PORFFOR_CHANNEL=alpha-22` selects alpha 22, `=alpha-19` the alpha 19 fallback pin of
- * `@sproutboat/toolchain`, which other callers still default to).
+ * `@sproutboat/toolchain/a21`: the Porffor line, on one alpha at a time (alpha 24). The pin of the patched tree
+ * (upstream commit, patch series hash, tarball sha256), its fingerprint, the acquire step that unpacks the
+ * vendored patched tarball, and the standalone build with its vendored server sources
+ * (`standalone-server/`). The standalone channel is alpha 24 (`standaloneChannel`).
  */
 export * from "./pin";
-export * from "./patch";
 export * from "./fingerprint";
 export * from "./acquire";
 export * from "./standalone";
 export * from "./standalone-channel";
 export * from "./standalone-shim";
 export * from "./standalone-build";
+export * from "./standalone-server";
 export * from "./standalone-host";

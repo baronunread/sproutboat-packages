@@ -1,36 +1,29 @@
 /**
- * `ensurePorfforA21(channel)`: the alpha 21 line's counterpart of `../acquire.ts` `ensurePorffor`.
- * Fetches (or takes from `vendor/`) the pinned alpha 21, 22, 23 or 24 archive, verifies it, extracts
- * it, runs the a21 chain (`ensurePorfforPatchedA21`) and publishes the tree atomically under the
- * toolchain cache, keyed by commit and by the chain's fingerprint, so an edited pass or a new release
- * gets a fresh tree. Until now only sproutd used the a21 chain, copying a pristine tree per build
- * (`build/deps.ts`); the standalone channel needs the same cached shape the CLI already relies on.
+ * `ensurePorfforA21(channel)`: acquire the Porffor compiler tree. Takes the vendored PATCHED tarball (`vendor/porffor-patched.tar.gz`: upstream's pinned commit with the
+ * series in `porffor-patches/` applied, `scripts/porffor-patches.ts vendor`), verifies its sha256 against the
+ * manifest, extracts it and publishes the tree atomically under the toolchain cache, keyed by commit and by
+ * the series hash. Nothing is patched here: no git, no bun and no network on the user's machine.
+ * Used by sproutd's standalone channel and the CLI's standalone builds, which need the same cached shape.
  */
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
-// @ts-expect-error Bun's file loader supplies a path (see ../acquire.ts).
-import vendoredAlpha21 from "../../vendor/porffor-1f8d148.tar.gz" with { type: "file" };
 // @ts-expect-error Bun's file loader supplies a path.
-import vendoredAlpha22 from "../../vendor/porffor-a081ebd.tar.gz" with { type: "file" };
-// @ts-expect-error Bun's file loader supplies a path.
-import vendoredAlpha23 from "../../vendor/porffor-a97a0ae.tar.gz" with { type: "file" };
-// @ts-expect-error Bun's file loader supplies a path.
-import vendoredAlpha24 from "../../vendor/porffor-1b8225e.tar.gz" with { type: "file" };
+import vendoredPatched from "../../vendor/porffor-patched.tar.gz" with { type: "file" };
 import { version as TOOLCHAIN_VERSION } from "../../package.json" with { type: "json" };
-import { PorfforToolchainError } from "../acquire";
 import { A21_PATCH_FINGERPRINT } from "./fingerprint";
-import { ensurePorfforPatchedA21 } from "./patch";
 import { PORFFOR_A21_PINS, type PorfforA21Channel, type PorfforA21Pin } from "./pin";
 
-const VENDORED = {
-  "alpha-21": vendoredAlpha21,
-  "alpha-22": vendoredAlpha22,
-  "alpha-23": vendoredAlpha23,
-  "alpha-24": vendoredAlpha24,
-} satisfies Record<PorfforA21Channel, string>;
+export class PorfforToolchainError extends Error {
+  constructor(
+    readonly kind: "download" | "integrity" | "archive" | "cache" | "unsupported",
+    message: string,
+  ) {
+    super(message);
+  }
+}
 
 const required = [
   "runtime/index.js",
@@ -44,8 +37,6 @@ const required = [
 
 type AcquireOptions = {
   cacheRoot?: string;
-  fetcher?: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
-  timeoutMs?: number;
 };
 
 async function digest(path: string): Promise<string> {
@@ -79,29 +70,6 @@ async function complete(dir: string, pin: PorfforA21Pin): Promise<boolean> {
   }
 }
 
-async function download(
-  url: string,
-  path: string,
-  fetcher: NonNullable<AcquireOptions["fetcher"]>,
-  timeoutMs: number,
-): Promise<void> {
-  let last: unknown;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const response = await fetcher(url, { signal: AbortSignal.timeout(timeoutMs) });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      await writeFile(path, new Uint8Array(await response.arrayBuffer()));
-      return;
-    } catch (error) {
-      last = error;
-    }
-  }
-  throw new PorfforToolchainError(
-    "download",
-    `could not download pinned Porffor from ${url}: ${last instanceof Error ? last.message : String(last)}`,
-  );
-}
-
 async function extract(archive: string, stage: string): Promise<void> {
   const child = Bun.spawn(["tar", "-xzf", archive, "-C", stage, "--strip-components=1"], {
     stdout: "pipe",
@@ -109,7 +77,7 @@ async function extract(archive: string, stage: string): Promise<void> {
   });
   const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
   if (code !== 0)
-    throw new PorfforToolchainError("archive", `could not extract pinned Porffor archive: ${stderr.trim()}`);
+    throw new PorfforToolchainError("archive", `could not extract the vendored Porffor archive: ${stderr.trim()}`);
   for (const file of required)
     if (!existsSync(resolve(stage, file)))
       throw new PorfforToolchainError("archive", `Porffor archive is missing required file ${file}`);
@@ -139,8 +107,8 @@ export function cachedPorfforA21Root(
 }
 
 /**
- * Acquire the patched alpha 21 or alpha 22 compiler into a verified, atomically published cache
- * entry and return its path. `SPROUTBOAT_PORFFOR_DIR` overrides it as for the alpha 19 channel.
+ * Acquire the patched compiler into a verified, atomically published cache
+ * entry and return its path. `SPROUTBOAT_PORFFOR_DIR` overrides it with a tree you point at.
  */
 export async function ensurePorfforA21(channel: PorfforA21Channel, options: AcquireOptions = {}): Promise<string> {
   const pin = PORFFOR_A21_PINS[channel];
@@ -176,19 +144,18 @@ export async function ensurePorfforA21(channel: PorfforA21Channel, options: Acqu
     await rm(dir, { recursive: true, force: true });
     await mkdir(stage);
     const archive = resolve(stage, "source.tar.gz");
-    const vendored = VENDORED[channel];
-    if (existsSync(vendored) && (await digest(vendored)) === pin.archiveSha256)
-      await writeFile(archive, await readFile(vendored));
-    else await download(pin.archiveUrl, archive, options.fetcher ?? fetch, options.timeoutMs ?? 30_000);
+    // The vendored file is the only source: the patched tree cannot be downloaded from upstream.
+    if (!existsSync(vendoredPatched))
+      throw new PorfforToolchainError("archive", `the vendored Porffor archive is missing: ${vendoredPatched}`);
+    await writeFile(archive, await readFile(vendoredPatched));
     const actual = await digest(archive);
     if (actual !== pin.archiveSha256)
       throw new PorfforToolchainError(
         "integrity",
-        `Porffor archive sha256 mismatch\n  expected ${pin.archiveSha256}\n  got      ${actual}`,
+        `vendored Porffor archive sha256 mismatch\n  expected ${pin.archiveSha256}\n  got      ${actual}`,
       );
     await extract(archive, stage);
     await rm(archive, { force: true });
-    await ensurePorfforPatchedA21(stage);
     const files = Object.fromEntries(
       await Promise.all(required.map(async (file) => [file, await digest(resolve(stage, file))] as const)),
     );

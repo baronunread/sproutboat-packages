@@ -1,0 +1,121 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sproutboat <noreply@sproutboat.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH] render, promise: per-request CPU stamp on promise reactions
+
+Per-request CPU (sproutd design 02): the thread CPU time each request has used, summed over the
+slices in which it ran. The current request is a small id (slot and generation) that rides with the
+async context: a promise reaction records it when it is made (a new u32 at offset 48, so a reaction
+is 56 bytes) and it becomes current when the reaction runs; the queue running dry resets it. The
+clock is read only when the request changes.
+
+Class: ours
+Pass: patchCpuStamp
+---
+ compiler/builtins/promise.ts |  3 ++-
+ compiler/render.js           | 49 ++++++++++++++++++++++++++++++++++--
+ 2 files changed, 49 insertions(+), 3 deletions(-)
+
+diff --git a/compiler/builtins/promise.ts b/compiler/builtins/promise.ts
+index eb3729064811a01805cd3b8ff5e2c344298da9d0..41130b5f5ef2cbe5f69b1cd7282e871ce0f197f5 100644
+--- a/compiler/builtins/promise.ts
++++ b/compiler/builtins/promise.ts
+@@ -28,7 +28,7 @@ export const __Porffor_promise_setHandled = (promise: any): void => {
+ };
+ 
+ export const __Porffor_promise_newReaction = (handler: any, promise: any, kind: i32): i32 => {
+-  const out: i32 = Porffor.malloc(48);
++  const out: i32 = Porffor.malloc(56); // sproutboat: per-request cpu
+   Porffor.IR.storeJv(out, 0, handler);
+   Porffor.IR.storeJv(out, 8, promise);
+   Porffor.IR.storeJv(out, 16, undefined);
+@@ -37,6 +37,7 @@ export const __Porffor_promise_newReaction = (handler: any, promise: any, kind:
+   Porffor.IR.storeU8(out, 32, kind);
+   Porffor.IR.storeU8(out, 33, 0);
+   Porffor.c`*(jsbits*)(MEM + (u32)out + PORF_REACTION_CONTEXT) = porf_async_context;
++*(u32*)(MEM + (u32)out + PORF_REACTION_CPU) = porf_cpu_cur;
+ porf_gc_barrier((u32)out, PORF_GC_KIND_PROMISE_REACTION);`;
+   return out;
+ };
+diff --git a/compiler/render.js b/compiler/render.js
+index a4ee36bbfa268838c7354518fd21ef8eeb0c9492..12126cf28674d5c0d3ce83ef669ede6c717bca9d 100644
+--- a/compiler/render.js
++++ b/compiler/render.js
+@@ -4464,7 +4464,8 @@ extern const u32 porf_static_end;
+ #define PORF_REACTION_KIND 32
+ #define PORF_REACTION_FLAGS 33
+ #define PORF_REACTION_CONTEXT 40
+-#define PORF_REACTION_SIZE 48
++#define PORF_REACTION_CPU 48
++#define PORF_REACTION_SIZE 56
+ 
+ #define PORF_GC_KIND_PROMISE_REACTION 248u
+ 
+@@ -4511,6 +4512,48 @@ static inline f64 porf_canon(f64 d) { return d == d ? d : porf_bits_to_f64(0x7FF
+ static u32* porf_promise_job_queue = NULL;
+ // async context (AsyncLocalStorage) a promise job runs with, captured when its reaction is made
+ static jsbits porf_async_context = JV_UNDEFINED_BITS;
++// sproutboat: per-request cpu
++#define PORF_CPU_SLOTS 256
++static u32 porf_cpu_cur = 0;
++static double porf_cpu_last_ns = 0;
++static double porf_cpu_acc[PORF_CPU_SLOTS];
++static u16 porf_cpu_gen[PORF_CPU_SLOTS];
++static u8 porf_cpu_used[PORF_CPU_SLOTS];
++static u16 porf_cpu_next_gen = 0;
++static u32 porf_cpu_next_slot = 0;
++static inline double porf_cpu_now_ns(void) { struct timespec ts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts); return (double)ts.tv_sec * 1e9 + (double)ts.tv_nsec; }
++static inline int porf_cpu_live(u32 id) { const u32 i = id & 255u; return id != 0 && porf_cpu_used[i] && porf_cpu_gen[i] == (u16)(id >> 8); }
++static void porf_cpu_switch(u32 next) {
++  if (next == porf_cpu_cur) return;
++  const double t = porf_cpu_now_ns();
++  if (porf_cpu_live(porf_cpu_cur)) porf_cpu_acc[porf_cpu_cur & 255u] += t - porf_cpu_last_ns;
++  porf_cpu_last_ns = t;
++  porf_cpu_cur = next;
++}
++static u32 porf_cpu_begin(void) {
++  for (u32 k = 0; k < PORF_CPU_SLOTS; k++) {
++    const u32 i = (porf_cpu_next_slot + k) & 255u;
++    if (porf_cpu_used[i]) continue;
++    porf_cpu_next_slot = i + 1u;
++    if (++porf_cpu_next_gen == 0) porf_cpu_next_gen = 1;
++    porf_cpu_used[i] = 1; porf_cpu_gen[i] = porf_cpu_next_gen; porf_cpu_acc[i] = 0;
++    const u32 id = i | ((u32)porf_cpu_next_gen << 8);
++    porf_cpu_switch(id);
++    return id;
++  }
++  return 0;
++}
++static double porf_cpu_read_ms(u32 id) {
++  if (!porf_cpu_live(id)) return -1.0;
++  if (porf_cpu_cur == id) { const double t = porf_cpu_now_ns(); porf_cpu_acc[id & 255u] += t - porf_cpu_last_ns; porf_cpu_last_ns = t; }
++  return porf_cpu_acc[id & 255u] / 1e6;
++}
++static void porf_cpu_end(u32 id) {
++  if (!porf_cpu_live(id)) return;
++  if (porf_cpu_cur == id) porf_cpu_switch(0);
++  porf_cpu_used[id & 255u] = 0;
++}
++static inline u32 porf_cpu_current(void) { return porf_cpu_cur; }
+ // bloom filter of key hashes some accessor property was defined for
+ static u32 porf_accessor_keys[64];
+ static u32 porf_promise_job_head = 0;
+@@ -4539,8 +4582,9 @@ static void porf_promise_enqueue_job(u32 reaction) {
+ }
+ 
+ static u32 porf_promise_dequeue_job(void) {
+-  if (porf_promise_job_len == 0) return 0;
++  if (porf_promise_job_len == 0) { porf_cpu_switch(0); return 0; }
+   const u32 reaction = porf_promise_job_queue[porf_promise_job_head];
++  porf_cpu_switch(*(u32*)(MEM + reaction + PORF_REACTION_CPU));
+   porf_promise_job_head = (porf_promise_job_head + 1u) & (porf_promise_job_cap - 1u);
+   porf_promise_job_len--;
+   if (porf_promise_job_len == 0) porf_promise_job_head = 0;
+@@ -5673,6 +5717,7 @@ static u32 porf_promise_new_coro_reaction(porf_coro_call* call, jsval out_promis
+   *(u8*)(MEM + reaction + PORF_REACTION_KIND) = 11;
+   *(u8*)(MEM + reaction + PORF_REACTION_FLAGS) = 0;
+   *(jsbits*)(MEM + reaction + PORF_REACTION_CONTEXT) = porf_async_context;
++  *(u32*)(MEM + reaction + PORF_REACTION_CPU) = porf_cpu_cur;
+   porf_gc_barrier(reaction, PORF_GC_KIND_PROMISE_REACTION);
+   return reaction;
+ }

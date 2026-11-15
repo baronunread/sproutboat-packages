@@ -1,0 +1,259 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sproutboat <noreply@sproutboat.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH] render: collector hooks for the fork template (quiet, seal,
+ immortal pages, memory limit)
+
+sproutd's collector hooks. porf_gc_quiet is idle collection on demand; porf_gc_seal_heap closes every
+open allocation window, drops the partial-page lists and seals every page the template filled before
+it forks, so a child allocates into fresh pages instead of copy-on-write copies of the template's.
+A sealed page is immortal in the worker: a worker's full collection neither clears nor sets its mark
+bits nor sweeps it, and what a template object comes to reference in the worker is found through the
+card table (cards below the template top are never cleared). Without this every worker's first full
+collection rewrote the metadata of the whole template heap (56 KiB per worker on a 1.5 MiB template).
+
+porf_gc_set_limit(bytes) lets the host pass the app's memory limit to the collector (plan 001 step B):
+the nursery and the budget are clamped to half of what the limit leaves above what is live, never
+below 1 MiB. Unset (0): upstream's own pacing.
+
+Class: ours
+Pass: patchGcHooks
+---
+ compiler/render.js | 106 +++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 93 insertions(+), 13 deletions(-)
+
+diff --git a/compiler/render.js b/compiler/render.js
+index 2a5b5f594d1ed3a90f55f3072a4eb27975df8e3b..a4ee36bbfa268838c7354518fd21ef8eeb0c9492 100644
+--- a/compiler/render.js
++++ b/compiler/render.js
+@@ -2194,6 +2194,9 @@ ${sti}void porf_gc_entries_moved(u32 from, u32 to) { (void)from; (void)to; }
+ ${sti}int porf_gc_type_can_reference(i32 type) { (void)type; return 0; }
+ ${st}i64 porf_gc_idle_due(void) { return -1; }
+ ${st}void porf_gc_idle(void) {}
++${st}void porf_gc_quiet(void) {}
++${st}void porf_gc_seal_heap(void) {}
++${st}void porf_gc_set_limit(u64 bytes) { (void)bytes; }
+ static inline u32 porf_gc_barrier_ptr_u32(u32 p) { return p; }
+ static inline u32 porf_gc_barrier_ptr_i32(i32 p) { return (u32)p; }
+ static inline u32 porf_gc_barrier_ptr_jsval(jsval v) { return (u32)v.val; }
+@@ -2285,6 +2288,7 @@ static const u16 porf_gc_slot_mask_at[PORF_GC_NCLASSES] = { ${slotMaskAt.join(',
+ #define PORF_GC_PF_TOUCHED 1u
+ #define PORF_GC_PF_PARTIAL 4u
+ #define PORF_GC_PF_TAIL 8u
++#define PORF_GC_PF_SEALED 16u
+ 
+ struct porf_gc_page {
+   u16 cls;
+@@ -2317,6 +2321,9 @@ static u32 porf_gc_free_page_count = 0;
+ struct porf_gc_window { u32 cur, end, lo; };
+ static struct porf_gc_window porf_gc_active[PORF_GC_NCLASSES];
+ static u32 porf_gc_partial[PORF_GC_NCLASSES];
++// the fork template's heap top and live bytes at the seal (0: no template)
++static u32 porf_gc_template_top = 0;
++static u64 porf_gc_template_live = 0;
+ 
+ static u64 porf_gc_last_live_bytes = 0;
+ static u64 porf_gc_live_bytes = 0;
+@@ -2504,12 +2511,12 @@ static inline void porf_gc_set_kind(i32 body, u32 kind) {
+   } else if (k == PORF_GC_PK_SPAN) {
+     if (((u32)body & PORF_GC_SPAGE_MASK) != 0u) return;
+   } else return;
+-  porf_gc_kinds[porf_gc_gran(body)] = (u8)kind;
++  if (porf_gc_kinds[porf_gc_gran(body)] != (u8)kind) porf_gc_kinds[porf_gc_gran(body)] = (u8)kind;
+ }
+ 
+ static inline void porf_gc_set_marked_type(i32 body, i32 type) {
+-  porf_gc_bit_set(PORF_GC_B_MARK, porf_gc_gran(body));
+-  porf_gc_kinds[porf_gc_gran(body)] = (u8)type;
++  if (porf_gc_bit(PORF_GC_B_MARK, porf_gc_gran(body)) == 0u) porf_gc_bit_set(PORF_GC_B_MARK, porf_gc_gran(body));
++  if (porf_gc_kinds[porf_gc_gran(body)] != (u8)type) porf_gc_kinds[porf_gc_gran(body)] = (u8)type;
+ }
+ static inline int porf_gc_has_marked_type(i32 body, i32 type) {
+   if (!porf_gc_is_block_start(body)) return 0;
+@@ -2675,6 +2682,7 @@ static u32 porf_gc_find_slot(u32 base_addr, i32 ci, u32 i, u32 slots, u32 want)
+ }
+ 
+ static int porf_gc_install_run(i32 ci, u32 pg) {
++  if ((porf_gc_pages[pg].flags & PORF_GC_PF_SEALED) != 0u) return 0;
+   struct porf_gc_window* w = &porf_gc_active[ci];
+   struct porf_gc_page* m = &porf_gc_pages[pg];
+   const u32 cls = porf_gc_cls_size[ci];
+@@ -2838,7 +2846,7 @@ ${st}void porf_gc_barrier_reclassify(u32 p, i32 type) {
+   } else if (k == PORF_GC_PK_SPAN) {
+     if ((p & PORF_GC_SPAGE_MASK) != 0u) return;
+   } else return;
+-  porf_gc_kinds[p >> 4] = (u8)type;
++  if (porf_gc_kinds[p >> 4] != (u8)type) porf_gc_kinds[p >> 4] = (u8)type;
+ }
+ // only old blocks need cards, young ones (and window blocks, with no alloc bit) are traced in full
+ static inline int porf_gc_old_block(u32 p) {
+@@ -2987,7 +2995,7 @@ static void porf_gc_mark_raw(i32 body) {
+   const u32 g = porf_gc_gran(body);
+   if (porf_gc_bit(PORF_GC_B_ALLOC, g) == 0u) return;
+   if (porf_gc_minor_mode && porf_gc_bit(PORF_GC_B_YOUNG, g) == 0u) return;
+-  porf_gc_bit_set(PORF_GC_B_MARK, g);
++  if (porf_gc_bit(PORF_GC_B_MARK, g) == 0u) porf_gc_bit_set(PORF_GC_B_MARK, g);
+ }
+ 
+ static void porf_gc_mark_boxed_primitive(f64 value, i32 type) {
+@@ -3430,6 +3438,7 @@ static void porf_gc_mark_js_now(f64 value, i32 type) {
+   // static strings hold no references and are never freed
+   if ((u32)body < porf_heap_base && (type == ${TYPES.bytestring} || type == ${TYPES.string})) return;
+   if (porf_gc_is_block_start(body)) {
++    if (porf_gc_template_top != 0 && (u32)body < porf_gc_template_top && (porf_gc_pages[(u32)body >> PORF_GC_SPAGE_SHIFT].flags & PORF_GC_PF_SEALED) != 0u) return;
+     // skip header reads for old or already-marked blocks
+     const u32 g = porf_gc_gran(body);
+     if (porf_gc_minor_mode && porf_gc_bit(PORF_GC_B_YOUNG, g) == 0u) return;
+@@ -3970,14 +3979,14 @@ static void porf_gc_scan_cards(void) {
+       porf_gc_scan_young_seen = 0;
+       porf_gc_scan_card(c);
+       porf_gc_drain_mark_queue();
+-      porf_gc_cards[c] = porf_gc_scan_young_seen;
++      porf_gc_cards[c] = c < (porf_gc_template_top >> 9) ? 1u : porf_gc_scan_young_seen;
+     }
+   }
+ }
+ 
+ static void porf_gc_partial_push(u32 pg) {
+   struct porf_gc_page* m = &porf_gc_pages[pg];
+-  if ((m->flags & PORF_GC_PF_PARTIAL) != 0u) return;
++  if ((m->flags & (PORF_GC_PF_PARTIAL | PORF_GC_PF_SEALED)) != 0u) return;
+   m->flags |= PORF_GC_PF_PARTIAL;
+   m->aux = porf_gc_partial[m->cidx];
+   porf_gc_partial[m->cidx] = pg + 1u;
+@@ -4146,9 +4155,19 @@ static u64 porf_gc_settled_live(void) {
+ }
+ 
+ // while most allocations survive the budget is twice live
++static u64 porf_gc_limit_bytes = 0;
++${st}void porf_gc_set_limit(u64 bytes) { porf_gc_limit_bytes = bytes; }
++static u64 porf_gc_limit_room(void) {
++  if (porf_gc_limit_bytes == 0) return ~0ull;
++  const u64 live = porf_gc_last_live_bytes + (porf_gc_promoted_since_full > 0 ? (u64)porf_gc_promoted_since_full : 0u);
++  const u64 room = porf_gc_limit_bytes > live ? (porf_gc_limit_bytes - live) / 2u : 0u;
++  return room > 1048576ull ? room : 1048576ull;
++}
+ static i64 porf_gc_budget(void) {
+   const i64 grown = (i64)porf_gc_last_live_bytes * 2;
+-  return porf_gc_survival > 50 && grown > (i64)porf_gc_nursery_bytes ? grown : (i64)porf_gc_nursery_bytes;
++  const i64 want = porf_gc_survival > 50 && grown > (i64)porf_gc_nursery_bytes ? grown : (i64)porf_gc_nursery_bytes;
++  const u64 room = porf_gc_limit_room();
++  return (u64)want > room ? (i64)room : want;
+ }
+ 
+ static void porf_gc_cycle(i64 allocated) {
+@@ -4157,7 +4176,9 @@ static void porf_gc_cycle(i64 allocated) {
+   porf_gc_busy = 1;
+   // a small heap's nursery stays near twice what is live: fewer gcs past that only cost memory
+   const u64 near_live = porf_gc_last_live_bytes * 2u < 1048576ull ? 1048576ull : porf_gc_last_live_bytes * 2u;
+-  const u32 cap = porf_gc_last_live_bytes >= 8388608ull ? 33554432u : near_live < 8388608ull ? (u32)near_live : 8388608u;
++  const u32 cap_free = porf_gc_last_live_bytes >= 8388608ull ? 33554432u : near_live < 8388608ull ? (u32)near_live : 8388608u;
++  const u64 cap_room = porf_gc_limit_room();
++  const u32 cap = cap_free > cap_room ? (u32)cap_room : cap_free;
+   if (ms < 50 && porf_gc_nursery_bytes * 2u <= cap) porf_gc_nursery_bytes <<= 1;
+     else if ((ms > 1000 || porf_gc_nursery_bytes > cap) && porf_gc_nursery_bytes > 1048576u) porf_gc_nursery_bytes >>= 1;
+   // only full gcs while the heap is small or most allocations survive
+@@ -4181,6 +4202,59 @@ ${st}void porf_gc_idle(void) {
+   porf_gc_collect(0);
+   porf_gc_discard_free_runs(1u);
+ }
++// sproutboat: collector hooks for the fork template
++${st}void porf_gc_quiet(void) {
++  porf_gc_busy = 0;
++  porf_gc_nursery_bytes = 1048576u;
++  porf_gc_collect(0);
++  porf_gc_discard_free_runs(1u);
++}
++${st}void porf_gc_seal_heap(void) {
++  if (porf_heap_base == 0) return;
++  porf_gc_quiet();
++  for (i32 ci = 0; ci < PORF_GC_NCLASSES; ci++) {
++    struct porf_gc_window* w = &porf_gc_active[ci];
++    if (w->end != 0) porf_gc_publish_window(ci);
++    w->cur = w->end = w->lo = 0;
++    while (porf_gc_partial[ci] != 0) {
++      struct porf_gc_page* m = &porf_gc_pages[porf_gc_partial[ci] - 1u];
++      porf_gc_partial[ci] = m->aux;
++      m->aux = 0;
++      m->flags &= (u8)~PORF_GC_PF_PARTIAL;
++    }
++  }
++  // every page in use is sealed (tails too) and its live objects stay marked for the life of every worker
++  const u32 top = porf_heap_top >> PORF_GC_SPAGE_SHIFT;
++  for (u32 pg = porf_heap_base >> PORF_GC_SPAGE_SHIFT; pg < top; pg++) {
++    const u8 k = porf_gc_page_kind[pg];
++    if (k == 0u) continue;
++    porf_gc_pages[pg].flags |= PORF_GC_PF_SEALED;
++    if (k == PORF_GC_PK_SMALL) {
++      if ((porf_gc_pages[pg].flags & PORF_GC_PF_TAIL) != 0u) continue;
++      u64* blk = porf_gc_meta + ((size_t)pg << 5);
++      const u32 npg = porf_gc_cls_pages[porf_gc_pages[pg].cidx];
++      for (u32 w = 0; w < npg * 8u; w++) blk[((size_t)w << 2) + PORF_GC_B_MARK] = blk[((size_t)w << 2) + PORF_GC_B_ALLOC];
++    } else if (k == PORF_GC_PK_SPAN) porf_gc_bit_set(PORF_GC_B_MARK, porf_gc_gran(pg << PORF_GC_SPAGE_SHIFT));
++  }
++  porf_gc_template_top = porf_heap_top;
++  porf_gc_template_live = porf_gc_last_live_bytes;
++}
++// cards below the template top are sticky (never cleared): every collection scans them
++static void porf_gc_scan_template_cards(void) {
++  const u32 c_lo = porf_heap_base >> 9;
++  const u32 c_hi = porf_gc_template_top >> 9;
++  for (u32 cw = c_lo & ~7u; cw < c_hi; cw += 8u) {
++    u64 w8;
++    memcpy(&w8, porf_gc_cards + cw, 8);
++    if (w8 == 0) continue;
++    for (u32 j = 0; j < 8u; j++) {
++      const u32 c = cw + j;
++      if (c < c_lo || c >= c_hi || porf_gc_cards[c] == 0) continue;
++      porf_gc_scan_card(c);
++      porf_gc_drain_mark_queue();
++    }
++  }
++}
+ 
+ static void porf_gc_clear_marks(u32 lo, u32 hi) {
+   for (size_t w = (size_t)(lo >> 4 >> 6); w < (size_t)(((hi >> 4) + 63u) >> 6); w++)
+@@ -4197,10 +4271,13 @@ ${st}void porf_gc_collect(int minor) {
+     porf_gc_claimed_since_full = 0;
+     porf_gc_promoted_since_full = 0;
+     // the skipped alias window holds no blocks, writing its marks would only dirty pages
+-    if (porf_gc_alias_lo < porf_heap_top && porf_gc_alias_hi > porf_heap_base) {
+-      porf_gc_clear_marks(porf_heap_base, porf_gc_alias_lo);
++    const u32 clear_lo = porf_gc_template_top != 0 && porf_gc_template_top < porf_heap_top ? porf_gc_template_top : porf_gc_template_top != 0 ? porf_heap_top : porf_heap_base;
++    for (u32 pg = porf_heap_base >> PORF_GC_SPAGE_SHIFT; pg < (clear_lo >> PORF_GC_SPAGE_SHIFT); pg++)
++      if (porf_gc_page_kind[pg] != 0u && (porf_gc_pages[pg].flags & PORF_GC_PF_SEALED) == 0u) porf_gc_clear_marks(pg << PORF_GC_SPAGE_SHIFT, (pg + 1u) << PORF_GC_SPAGE_SHIFT);
++    if (porf_gc_alias_lo < porf_heap_top && porf_gc_alias_hi > clear_lo) {
++      if (porf_gc_alias_lo > clear_lo) porf_gc_clear_marks(clear_lo, porf_gc_alias_lo);
+       porf_gc_clear_marks(porf_gc_alias_hi, porf_heap_top);
+-    } else porf_gc_clear_marks(porf_heap_base, porf_heap_top);
++    } else porf_gc_clear_marks(clear_lo, porf_heap_top);
+   }
+   porf_gc_static_marks_len = 0;
+   if (porf_gc_static_marks != NULL) memset(porf_gc_static_marks, 0, (size_t)porf_gc_static_marks_cap * sizeof(*porf_gc_static_marks));
+@@ -4214,6 +4291,7 @@ ${st}void porf_gc_collect(int minor) {
+   porf_gc_mark_global_roots();
+   porf_gc_drain_mark_queue();
+   if (minor) porf_gc_scan_cards();
++  else if (porf_gc_template_top != 0) porf_gc_scan_template_cards();
+   porf_gc_mark_global_raw_roots();
+   porf_gc_drain_mark_queue();
+   porf_gc_process_weakmaps();
+@@ -4248,15 +4326,17 @@ ${st}void porf_gc_collect(int minor) {
+     const u32 top = porf_heap_top >> PORF_GC_SPAGE_SHIFT;
+     for (u32 pg = porf_heap_base >> PORF_GC_SPAGE_SHIFT; pg < top; pg++) {
+       const u8 k = porf_gc_page_kind[pg];
++      if ((porf_gc_pages[pg].flags & PORF_GC_PF_SEALED) != 0u) continue;
+       if (k == PORF_GC_PK_SMALL) {
+         if ((porf_gc_pages[pg].flags & PORF_GC_PF_TAIL) != 0u) continue;
+         porf_gc_sweep_page_small(pg, 0, &promoted, &live_bytes);
+       } else if (k == PORF_GC_PK_SPAN) porf_gc_sweep_span(pg, 0, &promoted, &live_bytes);
+     }
++    live_bytes += porf_gc_template_live;
+     porf_gc_last_live_bytes = live_bytes;
+     porf_gc_record_live(live_bytes);
+     porf_gc_live_bytes = live_bytes;
+-    memset(porf_gc_cards + (porf_heap_base >> 9), 0, (size_t)((porf_heap_top - porf_heap_base) >> 9) + 1);
++    if (porf_gc_template_top < porf_heap_top) memset(porf_gc_cards + ((porf_gc_template_top > porf_heap_base ? porf_gc_template_top : porf_heap_base) >> 9), 0, (size_t)((porf_heap_top - (porf_gc_template_top > porf_heap_base ? porf_gc_template_top : porf_heap_base)) >> 9) + 1);
+     porf_gc_run_cache_drain();
+     porf_gc_retreat_heap_top();
+     // free pages a busy program will reuse soon stay, more than that go back

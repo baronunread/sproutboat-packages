@@ -25,6 +25,7 @@
     "packages/toolchain/src/case-map.ts",
     "packages/toolchain/scorecards/**",
     "packages/toolchain/vendor/**",
+    "packages/toolchain/src/a21/standalone-server/**",
     "packages/wire/native/**",
     "**/CHANGELOG.md",
     "**/*.md",

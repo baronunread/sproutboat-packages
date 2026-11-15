@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sproutboat <noreply@sproutboat.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH] json: a wide JSON string is sized by its own length (P9)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+JSON.parse of a string with a character past Latin-1 (or a \u escape past it) allocates its UTF-16
+output as (len - start) * 2 bytes, where len is the length of the whole document: every wide string
+in a 400 KB document asks for 800 KB, and a document with a few thousand of them dies (signal 138/139;
+"naïve 中文" in 6,000 objects of a 316 KB document reproduces it). The string is scanned to its
+closing quote first and the output sized by that.
+
+Class: upstream
+Pass: patchJsonWideStringBound (P9)
+Upstream: https://github.com/CanadaHonk/porffor/issues/464
+---
+ compiler/builtins/json.ts | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/compiler/builtins/json.ts b/compiler/builtins/json.ts
+index 26127e6581cb2971f92e66ea2fcc58b7255120ec..ef0bc9d0d7befef63f13fa052dec115fbb5c2de1 100644
+--- a/compiler/builtins/json.ts
++++ b/compiler/builtins/json.ts
+@@ -754,7 +754,14 @@ export const __Porffor_json_hex4 = (text: bytestring, pos: i32, len: i32): i32 =
+ 
+ // strings with \u escapes past latin-1, from after the opening quote
+ export const __Porffor_json_parseWideString = (text: bytestring, start: i32, posPtr: i32, len: i32): string => {
+-  const out: string = Porffor.malloc(6 + (len - start) * 2);
++  // sproutboat P9: a wide JSON string is sized by its own length
++  let end: i32 = start;
++  while (end < len) {
++    const c: i32 = text.charCodeAt(end);
++    if (c == 34) break;
++    end += c == 92 ? 2 : 1;
++  }
++  const out: string = Porffor.malloc(6 + (end - start) * 2);
+   let n: i32 = 0, pos: i32 = start;
+   while (pos < len) {
+     let ch: i32 = text.charCodeAt(pos++);

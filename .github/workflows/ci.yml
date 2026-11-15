@@ -45,18 +45,34 @@ jobs:
       - run: bun run lint
       - run: bun run test
 
-  native:
-    name: native (${{ matrix.channel }})
+  # The Porffor patch series is the source of the patched tarball the toolchain ships. Re-run apply (git am
+  # --3way onto the pinned upstream commit, then the precompile), export and vendor, and compare with what is
+  # committed byte for byte: the patches, the uncompressed tar and the gzipped tarball. No dependencies to
+  # install: scripts/porffor-patches.ts uses only node builtins and git. Needs the network for the one upstream
+  # commit (fetched by sha, depth 1). bun is pinned: the tarball's gzip bytes are those of this version.
+  porffor-series:
+    name: porffor patch series
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && github.head_ref != 'changeset-release/main'
     runs-on: ubuntu-latest
-    # Standalone builds default to Porffor alpha 23; alpha 22 (othello's generation until its swap) and the
-    # alpha 19 fallback pin (SPROUTBOAT_PORFFOR_CHANNEL=alpha-19) are tested until they are dropped.
-    strategy:
-      fail-fast: false
-      matrix:
-        channel: [alpha-23, alpha-22, alpha-19]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - run: bun scripts/porffor-patches.ts check
+      - run: bun scripts/porffor-patches.ts verify
+      # The standalone server's vendored sources (shim, web classes, uWebSockets patches): their hashes, then the
+      # pinned uWebSockets commit fetched and patched, compared with sources.json.
+      - run: bun scripts/standalone-sources.ts check
+      - run: bun scripts/standalone-sources.ts verify
+
+  native:
+    name: native (alpha-24)
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && github.head_ref != 'changeset-release/main'
+    runs-on: ubuntu-latest
+    # Standalone builds use Porffor alpha 24 (the toolchain supports one alpha at a time).
     env:
-      SPROUTBOAT_PORFFOR_CHANNEL: ${{ matrix.channel }}
+      SPROUTBOAT_PORFFOR_CHANNEL: alpha-24
       SB_NATIVE_CC_STRICT: "1"
     steps:
       - uses: actions/checkout@v7
@@ -77,22 +93,22 @@ jobs:
           path: |
             ~/.cache/sproutboat/porffor-*
             ~/.cache/porffor/deps
-          key: porffor-${{ matrix.channel }}-${{ runner.os }}-${{ hashFiles('packages/toolchain/package.json', 'packages/toolchain/src/**/*.ts', 'packages/toolchain/src/**/*.c', 'packages/toolchain/src/**/*.js', 'packages/toolchain/vendor/**') }}
+          key: porffor-alpha-24-${{ runner.os }}-${{ hashFiles('packages/toolchain/package.json', 'packages/toolchain/src/**/*.ts', 'packages/toolchain/src/**/*.c', 'packages/toolchain/src/**/*.cpp', 'packages/toolchain/src/**/*.js', 'packages/toolchain/src/**/*.patch', 'packages/toolchain/vendor/**') }}
       # BearSSL is read from vendor/bearssl (sha256-pinned in packages/toolchain/src/deps.ts), so this
       # job needs no network for it; bearssl.org is only a fallback.
       # Every test:native-* script, 4 at a time (scripts/test-native.ts).
       - run: bun run test:native
 
-  # Alpha 23 prefixes generated functions with swiftcall on clang arm64 (PORF_CC), and the CLI's host and
+  # Alpha 23 and later prefix generated functions with swiftcall on clang arm64 (PORF_CC), and the CLI's host and
   # release builds link with -flto. A host C call without the same convention compiled, linked and then
   # trapped at startup on macOS arm64 only when LTO saw both sides. The ubuntu job above never links with
   # LTO and has no arm64, so the two checks that cover it run here on the real platform.
   native-macos:
-    name: native (macOS arm64, alpha-23)
+    name: native (macOS arm64, alpha-24)
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && github.head_ref != 'changeset-release/main'
     runs-on: macos-latest
     env:
-      SPROUTBOAT_PORFFOR_CHANNEL: alpha-23
+      SPROUTBOAT_PORFFOR_CHANNEL: alpha-24
       SB_NATIVE_CC_STRICT: "1"
     steps:
       - uses: actions/checkout@v7
@@ -108,7 +124,7 @@ jobs:
           path: |
             ~/.cache/sproutboat/porffor-*
             ~/.cache/porffor/deps
-          key: porffor-alpha-23-${{ runner.os }}-${{ hashFiles('packages/toolchain/package.json', 'packages/toolchain/src/**/*.ts', 'packages/toolchain/src/**/*.c', 'packages/toolchain/src/**/*.js', 'packages/toolchain/vendor/**') }}
+          key: porffor-alpha-24-${{ runner.os }}-${{ hashFiles('packages/toolchain/package.json', 'packages/toolchain/src/**/*.ts', 'packages/toolchain/src/**/*.c', 'packages/toolchain/src/**/*.cpp', 'packages/toolchain/src/**/*.js', 'packages/toolchain/src/**/*.patch', 'packages/toolchain/vendor/**') }}
       - run: bun run test:native lto cc
 
   # The published packages' consumer: sproutboat-cli's kitchen-sink app, built
@@ -159,7 +175,7 @@ jobs:
           path: |
             ~/.cache/sproutboat/porffor-*
             ~/.cache/porffor/deps
-          key: porffor-${{ runner.os }}-${{ hashFiles('packages/toolchain/package.json', 'packages/toolchain/src/*.ts', 'packages/toolchain/vendor/**') }}
+          key: porffor-${{ runner.os }}-${{ hashFiles('packages/toolchain/package.json', 'packages/toolchain/src/**', 'packages/toolchain/vendor/**') }}
       - run: bun run kitchen-sink
         working-directory: sproutboat-cli
       - run: bun run kitchen-sink:standalone

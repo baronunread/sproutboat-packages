@@ -7,5 +7,11 @@
     "skipLibCheck": true,
     "types": ["bun-types"]
   },
-  "include": ["packages/*/src", "scripts/porffor-scorecard.ts", "scripts/test-native.ts"]
+  "include": [
+    "packages/*/src",
+    "scripts/porffor-patches.ts",
+    "scripts/standalone-sources.ts",
+    "packages/runtime/test/native-compile.ts",
+    "scripts/test-native.ts"
+  ]
 }
