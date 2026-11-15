@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sproutboat <noreply@sproutboat.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH] compiler: SB_EXTRA_LINK and SB_EXTRA_CFLAGS add link inputs
+ and C flags
+
+The C the platform links in (SQLite, BearSSL, the broker and R2 transfer glue) needs extra
+link inputs and compiler flags that come from the environment of whoever builds. Upstream
+names libraries in source (Porffor.link) and has no environment hook.
+
+Class: ours
+Pass: patchCompilerArgsA21
+---
+ compiler/index.js | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/compiler/index.js b/compiler/index.js
+index 7454c7653213c06fa04569cfa776f7f19dd3d5ec..fb8a4d0b799eb64bdf42ae02eed11d29b18db5d6 100644
+--- a/compiler/index.js
++++ b/compiler/index.js
+@@ -195,6 +195,7 @@ export default (code, module = Prefs.module, opts = {}) => {
+         // js arithmetic rounds every op, no fused multiply-add
+         '-ffp-contract=off',
+         ...darwinReleaseCompileArgs,
++        ...(process.env.SB_EXTRA_CFLAGS ? process.env.SB_EXTRA_CFLAGS.split(' ').filter(Boolean) : []),
+         ...compilerArgs,
+         // linux has no continuous mode without it, and only compiles take it
+         ...(Prefs.pgoGen && process.platform !== 'darwin' ? [ '-mllvm', '-runtime-counter-relocation' ] : []),
+@@ -247,6 +248,7 @@ export default (code, module = Prefs.module, opts = {}) => {
+         '-o', outFile, // set path for output
+         ...(uws ? [ uws.archive ] : []),
+         ...(adaLib ? [ adaLib.archive ] : []),
++        ...(process.env.SB_EXTRA_LINK ? process.env.SB_EXTRA_LINK.split(' ').filter(Boolean) : []),
+         '-lm', // link math.h
+         ...libs.ldflags,
+         ...(objects ? [ ...compilerArgs, `-O${Prefs.O ?? 3}` ] : []),

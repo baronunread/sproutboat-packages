@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sproutboat <noreply@sproutboat.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH] render: app units last, content-ordered data segments, pinned
+ ABI regions (P2, P3, P6)
+
+App units go last, in their original order, so every shared unit keeps its function-index base, and
+the module ABI regions sproutd's template script pins are fixed: static data under 1 MiB, function
+records at 1 MiB, names at 2 MiB, zero data at 4 MiB, under 65,536 functions. P3: each unit's data
+segments are laid out by content, not by creation order (which follows first use and so depends on
+the app). P3b: identical immutable byte segments in one unit share one offset, so two equal strings
+cannot swap places between apps; static arrays are excluded (they are written in place). P6: app
+modules' globals are declared, and rooted, after the shared ones.
+
+Class: ours
+Pass: patchUnitLayout (P2, P3, P3b, P6 render.js part)
+---
+ compiler/render.js | 26 ++++++++++++++++++++++----
+ 1 file changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/compiler/render.js b/compiler/render.js
+index 219c5bfab128dc915058903500ba4ddbb53ad5c3..2a5b5f594d1ed3a90f55f3072a4eb27975df8e3b 100644
+--- a/compiler/render.js
++++ b/compiler/render.js
+@@ -5,6 +5,7 @@ import {
+   CONVERT_RANGE_KNOWN, CONVERT_SIGNED
+ } from './ir.js';
+ import { TYPES, TYPE_NAMES, ITERATOR_TYPES } from './types.js';
++import { appModuleIds } from './modules.js'; // sproutboat P6
+ import { ieee754_binary64 } from './encoding.js';
+ 
+ // C type per IR value type
+@@ -320,6 +321,8 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null,
+   for (const u of funcsByUnit.keys()) if (u !== 'main' && !unitOrder.includes(u)) unitOrder.push(u);
+   for (const u of dataUnits) if (u !== 'main' && !unitOrder.includes(u)) unitOrder.push(u);
+   unitOrder.push('main');
++  // sproutboat P2: app units last, pinned ABI regions
++  { const appIds = (units ?? []).filter(u => appModuleIds.has(u.id)).map(u => u.id).filter(id => unitOrder.includes(id)); for (const id of appIds) unitOrder.splice(unitOrder.indexOf(id), 1); unitOrder.push(...appIds); }
+ 
+   const linkFuncs = [], fnBase = {}, linkIdx = [];
+   for (const u of unitOrder) {
+@@ -389,15 +392,24 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null,
+   const placeData = (bases, zero) => {
+     for (const u of unitOrder) {
+       bases[u] = off;
+-      for (let i = 0; i < data.length; i++) {
+-        if (dataUnits[i] !== u || zeroed[i] !== zero) continue;
+-        dataOffsets[i] = off;
++      // sproutboat P3: a unit's segments by content, not by creation order (which follows first use, and so the app)
++      const ids = [];
++      for (let i = 0; i < data.length; i++) if (dataUnits[i] === u && zeroed[i] === zero) ids.push(i);
++      const keys = new Map();
++      let prevKey = null, prevOff = 0;
++      const key = i => { if (!keys.has(i)) { const seg = data[i]; keys.set(i, seg.staticArray ? 'A' + JSON.stringify(seg.staticArray.map(it => it.str !== undefined ? ['s', key(it.str)] : it)) : 'B' + Array.from(seg, b => String.fromCharCode(b)).join('')); } return keys.get(i); };
++      if (!zero) ids.sort((x, y) => key(x) < key(y) ? -1 : key(x) > key(y) ? 1 : 0);
++      for (const i of ids) {
++        // P3b: identical immutable byte segments (string literals) share one offset, so equal-content ties cannot swap
++        if (!zero && !data[i].staticArray && prevKey === key(i)) { dataOffsets[i] = prevOff; continue; }
++        dataOffsets[i] = off; prevKey = zero ? null : key(i); prevOff = off;
+         off += align8(data[i].length);
+       }
+     }
+   };
+   placeData(dbase, false);
+-  const fnrecBase = off;
++  if (off >= 1048576) throw new Error('static data exceeds module ABI region');
++  const fnrecBase = 1048576; off = fnrecBase;
+   off += linkFuncs.length * 8;
+   const builtinName = name => {
+     const accessor = name.match(/\$([gs]et)$/)?.[1];
+@@ -409,6 +421,8 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null,
+     return accessor ? `${accessor} ${name}` : name;
+   };
+ 
++  if (linkFuncs.length >= 65536) throw new Error('function capacity exceeded');
++  off = 2097152;
+   // empty names reuse offset 0 (0-length bytestring in the null region)
+   const fnNameSegs = [];
+   const fnNameOff = [];
+@@ -422,6 +436,8 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null,
+     off += align8(bytes.length);
+   }
+   const imageEnd = off;
++  if (off >= 4194304) throw new Error('function names exceed module ABI region');
++  off = 4194304;
+   placeData(zbase, true);
+   const staticEnd = off;
+ 
+@@ -1605,6 +1621,8 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null,
+   }
+ 
+   // module globals (top-level JS bindings)
++  // sproutboat P6: app-module globals last, so the shared prefix of the declaration and root lists is app-independent
++  { const isApp = g => [ ...appModuleIds ].some(id => g.name.includes('#m' + id) || g.name.includes('_' + id + '_') || g.name.endsWith('_' + id)); globals = [ ...globals.filter(g => !isApp(g)), ...globals.filter(isApp) ]; }
+   for (const g of globals) link.push(`${st}${CT[g.type]} ${sanitize(g.name)}${g.type === T.jsval ? ` = {0.0, ${TYPES.undefined}}` : ''};\n`);
+   link.push('\n');
+   if (gcEnabled) {

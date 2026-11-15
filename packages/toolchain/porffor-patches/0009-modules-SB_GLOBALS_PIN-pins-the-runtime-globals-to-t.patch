@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sproutboat <noreply@sproutboat.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH] modules: SB_GLOBALS_PIN pins the runtime globals to the
+ template's set (P14)
+
+sproutd issue 97. The compiler builds node/internal/globals.js from the names the program references,
+in first-use order, so a free `performance` in app code reordered its installs, and through their
+import edges the order of every node unit behind them: an abi_rejected for an ordinary program.
+With SB_GLOBALS_PIN set (a JSON array of names, which sproutd's admission passes from the template's
+metadata) a name outside the array is an error, `<name> is not available in the shared generation`,
+and the module installs exactly the array, in its order. The names the program would install are
+always left in globalThis.__sbGlobalsUsed, which the template build records as the pin.
+
+Class: ours
+Pass: patchGlobalsPin (P14)
+---
+ compiler/modules.js | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/compiler/modules.js b/compiler/modules.js
+index 51cdcaeb3640d906493a58b6ef2ddb095024a306..20cde9a9a07190ff4bda251633af51563b926961 100644
+--- a/compiler/modules.js
++++ b/compiler/modules.js
+@@ -1613,6 +1613,13 @@ export default (entrySource, entryFile, opts = {}) => {
+       // and the members of an owned object (process.stdin when the prelude owns process): the object is the prelude's
+       for (const name of owned) for (const dotted of [ ...used ]) if (dotted.startsWith(name + '.')) used.delete(dotted);
+     }
++    // sproutboat P14: runtime globals pinned to the template's
++    if (process.env.SB_GLOBALS_PIN) {
++      const pin = JSON.parse(process.env.SB_GLOBALS_PIN);
++      for (const name of used) if (!pin.includes(name)) throw new Error(`${name} is not available in the shared generation`);
++      used.clear(); for (const name of pin) used.add(name);
++    }
++    globalThis.__sbGlobalsUsed = [ ...used ];
+     if (used.size > 0) {
+       let src = '';
+       // dotted names (process.send) assign into globals, which are defined first

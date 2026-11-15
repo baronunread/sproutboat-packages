@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sproutboat <noreply@sproutboat.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH] codegen: stable derived names, and app modules'
+ builtin-global inits last (P5, P6)
+
+The per-activation function-value cache was `#func_cache_<global index>`, which any app shifts, so
+the prelude's unit differed byte-wise between apps (442 lines for yaml); the function's name (or
+source start) is as unique within a scope and app-independent. A class's computed-key global
+carries its unit so an app's computed keys are attributable to the app. App modules' builtin-global
+inits run after the shared ones.
+
+Class: ours
+Pass: patchStableNames (P5, P6 codegen.js part)
+---
+ compiler/codegen.js | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/compiler/codegen.js b/compiler/codegen.js
+index 36d232d4cb8c374735f7a0666199379918939db3..01f1e6852a5cc6701cfc1da4a157ce26ca2fd142 100644
+--- a/compiler/codegen.js
++++ b/compiler/codegen.js
+@@ -12,7 +12,7 @@ import { BuiltinFuncs, BuiltinVars, fullPrototypes } from './builtins.js';
+ import { TYPES, TYPE_FLAGS, TYPE_NAMES, TYPED_ARRAY_TYPES, ITERATOR_TYPES } from './types.js';
+ import semantic, { knownValue, unknownValue, storageInt } from './semantic.js';
+ import parse from './parse.js';
+-import { patternNames } from './modules.js';
++import { patternNames, appModuleIds } from './modules.js';
+ import temporalPolyfillSource from './intl/temporal.js';
+ import intlPolyfillSource from './intl/intl.js';
+ import tzSource from './intl/tz.js';
+@@ -518,7 +518,7 @@ const materializeFunctionValue = (scope, func, markReferenced = true) => {
+ 
+ // one record per activation: shared within it, fresh next call (cache resets to undefined)
+ const cachedFunctionValue = (scope, func, markReferenced = true) => {
+-  const cache = local(scope, `#func_cache_${func.start ?? func.index}`, T.jsval);
++  const cache = local(scope, `#func_cache_${func.start ?? func.name}`, T.jsval); // sproutboat P5: stable derived names
+   emitIf(scope, Bin('!=', T.i32, JvType(cache), Const(T.i32, TYPES.function)),
+     () => assign(scope, cache, makeFunctionValue(scope, func, markReferenced)));
+   return cache;
+@@ -5613,7 +5613,7 @@ const generateClass0 = (scope, decl) => {
+     // computed keys are evaluated once
+     let keyNode = () => !storage && generate(func, key);
+     if (computed) {
+-      const keyGlobal = `#class_computed_prop${scope.start ?? scope.index}` + uniqId(scope);
++      const keyGlobal = `#class_computed_prop_${unitOf(scope)}_${scope.start ?? scope.index}` + uniqId(scope);
+       allocVar(scope, keyGlobal, true);
+       assign(scope, Global(keyGlobal, T.jsval), k);
+       keyNode = () => Global(keyGlobal, T.jsval);
+@@ -6728,6 +6728,8 @@ export default (program, opts = {}) => {
+   // a unit's last ic chunk only needs its sites
+   for (const unit in icSites) data[icSites[unit].chunk].length = ((icSites[unit].site - 1) % 256 + 1) * 48;
+ 
++  // sproutboat P6: inits of app-module globals (namespace objects and the like) go after the shared ones
++  { const isApp = n => { const s = JSON.stringify(n); return [ ...appModuleIds ].some(id => s.includes('#m' + id) || s.includes('_' + id + '_') || s.includes('_' + id + '"')); }; builtinGlobalInits = [ ...builtinGlobalInits.filter(n => !isApp(n)), ...builtinGlobalInits.filter(isApp) ]; }
+   if (builtinGlobalInits.length !== 0) topLevelFunc.body.unshift(...builtinGlobalInits);
+ 
+   // render input: funcs indexed by func.index, ungenerated ones null (tree-shaken to a trapping stub), globals as {name, type}

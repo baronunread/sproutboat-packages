@@ -4,3 +4,6 @@ dist/
 .DS_Store
 
 packages/wire/native/
+
+# scripts/porffor-patches.ts apply (the series applied to upstream, a git checkout)
+.porffor-series/

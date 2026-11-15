@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sproutboat <noreply@sproutboat.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH] render: select is a reserved C name
+
+A top-level binding named `select` fails the C compile on Linux: glibc's sys/select.h declares
+select() and the reserved-name list lacks it. #426 (ours, closed) fixed all-caps macro names only;
+lowercase libc functions are still missing from cReservedNames.
+
+Class: upstream
+Pass: patchReservedSelect
+Upstream: https://github.com/CanadaHonk/porffor/issues/462
+---
+ compiler/render.js | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/compiler/render.js b/compiler/render.js
+index 12126cf28674d5c0d3ce83ef669ede6c717bca9d..7df859a3a9543af17dee323c8eded0f9dcb7f3f5 100644
+--- a/compiler/render.js
++++ b/compiler/render.js
+@@ -35,6 +35,7 @@ const BIN_PREC = {
+ };
+ 
+ const cReservedNames = new Set([
++  'select', // sproutboat: glibc select: sys/select.h redeclares it
+   'auto', 'break', 'case', 'char', 'const', 'continue', 'default', 'do', 'double',
+   'else', 'enum', 'extern', 'float', 'for', 'goto', 'if', 'inline', 'int', 'long',
+   'register', 'restrict', 'return', 'short', 'signed', 'sizeof', 'static', 'struct',

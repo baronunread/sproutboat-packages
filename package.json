@@ -18,6 +18,7 @@
     "test:native-crypto": "bun packages/runtime/test/native-crypto.ts",
     "test:native-utf8": "bun packages/runtime/test/native-utf8.ts",
     "scorecard": "bun scripts/porffor-scorecard.ts",
+    "porffor-patches": "bun scripts/porffor-patches.ts",
     "lint": "oxlint .",
     "fmt": "oxfmt .",
     "fmt:check": "oxfmt --check .",

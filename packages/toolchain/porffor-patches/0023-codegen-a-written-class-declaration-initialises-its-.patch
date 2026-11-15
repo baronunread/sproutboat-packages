@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sproutboat <noreply@sproutboat.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH] codegen: a written class declaration initialises its binding
+ first (P11)
+
+A class declaration that is assigned to (`class SQL {}; (SQL || (SQL = {}))`, TypeScript's namespace
+merge, which drizzle-orm's sql.js uses) reads its own binding to build the class, but unlike a
+function declaration never stored the class in it first: the binding stayed null and the program
+died with "Cannot get property of null" (or read back undefined). A written class is now stored in
+its binding before the class body runs, as `case 'FunctionDeclaration'` does.
+
+Alpha 24 only: a decorated class reads its root from materializeFunctionValue (the decorated value
+is written back after the class body) and a class captured and written in a loop is boxed
+(decl._boxed); the store applies to neither, so the guard skips them.
+
+Class: upstream
+Pass: patchClassBindingWrite (P11)
+Upstream: https://github.com/CanadaHonk/porffor/issues/457
+---
+ compiler/codegen.js | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/compiler/codegen.js b/compiler/codegen.js
+index bfbf60feb795beb93c5a7d1c849a10b2749547b6..3d830eb78b19715875706215055c59b8517787bb 100644
+--- a/compiler/codegen.js
++++ b/compiler/codegen.js
+@@ -5455,6 +5455,15 @@ const generateClass0 = (scope, decl) => {
+   if (classDecorators && !expr && decl._variable.scope.type === 'Program') allocVar(scope, name, true);
+   if (decl._boxed) generateVarDstr(scope, 'let', decl.id, { type: 'ObjectExpression', properties: [] }, undefined, scope.topLevel);
+ 
++  // sproutboat P11: a written class declaration initialises its binding
++  if (!expr && decl._writes && !classDecorators && !decl._boxed) {
++    const global = scope.topLevel;
++    allocVar(scope, name, global);
++    func.referenced = true;
++    setLocalWithType(scope, name, global, materializeFunctionValue(scope, func, false), false, TYPES.function);
++    const capture = scope.closureOwnLocals?.[name];
++    if (capture && closureBindingNeedsSlot(capture)) mirrorToClosureEnv(scope, name, closureLocalReadNode(name, false));
++  }
+   const classRoot = reuseNamed(scope, decl._writes && !classDecorators ? generate(scope, root) : materializeFunctionValue(scope, func));
+   const rootIdent = { type: 'Identifier', name: classRoot[N_A] };
+ 

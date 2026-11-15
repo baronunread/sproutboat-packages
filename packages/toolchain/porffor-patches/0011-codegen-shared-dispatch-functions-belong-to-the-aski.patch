@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sproutboat <noreply@sproutboat.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH] codegen: shared dispatch functions belong to the asking unit,
+ named by method and arity (P8)
+
+A call or indexed read on a receiver of unknown type is routed through a small synthetic function,
+one per method and argument count, generated on first use into unit `main` as `#anonymous_1`
+(then `_1_`, `_1__`, ... in creation order). In the shared-template model that puts an app-created
+function into the common prefix: the first app to call `r.foo(x)` on an untyped `r` grows K by one
+and renames every later one, so no two apps agree on the runtime ABI. After this change the function
+belongs to the unit of the site that asked for it (one copy per unit) and is named after the method
+and argument count (`#shared_push_1`, `#shared_get`), so its symbol does not depend on creation
+order. Reads classUnit, so it follows P1.
+
+Class: ours
+Pass: patchSharedDispatchUnit (P8)
+---
+ compiler/codegen.js | 15 ++++++++++-----
+ 1 file changed, 10 insertions(+), 5 deletions(-)
+
+diff --git a/compiler/codegen.js b/compiler/codegen.js
+index 0a1632c754e338fa4932d602d089bba8010a3c16..36d232d4cb8c374735f7a0666199379918939db3 100644
+--- a/compiler/codegen.js
++++ b/compiler/codegen.js
+@@ -2340,7 +2340,7 @@ const generateCall = (scope, decl) => {
+       if (targetKnownType == null && calleeMember && !calleeMember.computed && !decl.optional && !inOptionalChain(calleeMember) && !decl._sharedDispatch && !globalThis.precompile &&
+         Object.keys(protoBC).length > 1 && !decl.arguments.some(x => x?.type === 'SpreadElement')) {
+         const params = decl.arguments.map((_, i) => 'a' + i);
+-        const func = sharedFunc(`((${[ 'r', ...params ].join(', ')}) => r.${protoName}(${params.join(', ')}))`);
++        const func = sharedFunc(`((${[ 'r', ...params ].join(', ')}) => r.${protoName}(${params.join(', ')}))`, scope, protoName + '_' + params.length);
+         return Call(func.index, [ targetTmp, ...args.map(x => coerceValue(generate(scope, x), T.jsval)) ], func.retType);
+       }
+ 
+@@ -2614,15 +2614,20 @@ const inOptionalChain = node => {
+ 
+ // one function for a dispatch many sites would otherwise inline, whose own body takes the inline path
+ let sharedFuncs;
+-const sharedFunc = src => {
+-  if (sharedFuncs.has(src)) return sharedFuncs.get(src);
++// sproutboat P8: shared dispatch functions belong to the asking unit, named by method and arity
++const sharedFunc = (src, scope, label) => {
++  const unit = scope?.internal ? 'builtins' : scope?.unit ?? classUnit ?? 'main';
++  const key = unit + '\0' + src;
++  if (sharedFuncs.has(key)) return sharedFuncs.get(key);
+   const fn = semantic(parse(src)).body[0].expression;
+   fn.body._sharedDispatch = true;
+   fn.strict = true;
+   fn._noClosureEnv = true;
++  fn.id = { type: 'Identifier', name: '#shared_' + label.replace(/[^A-Za-z0-9_]/g, c => '_' + c.charCodeAt(0).toString(16)) };
++  if (unit !== 'main') fn._unit = unit;
+   const [ func ] = generateFunc({}, fn, true);
+   func.generate();
+-  sharedFuncs.set(src, func);
++  sharedFuncs.set(key, func);
+   return func;
+ };
+ 
+@@ -5236,7 +5241,7 @@ const generateMember = (scope, decl, objValue = null) => {
+     [ [ TYPES.string, TYPES.bytestring ], () => builtinCall(scope, '__Porffor_string_get', [ obj, prop ]) ],
+     // unknown receivers share the rest
+     ...(known == null && !globalThis.precompile && !Prefs.d && !decl._sharedDispatch ? [ [ 'default', () => {
+-      const func = sharedFunc('((o, k) => o[k])');
++      const func = sharedFunc('((o, k) => o[k])', scope, 'get');
+       return Call(func.index, [ obj, coerceValue(prop, T.jsval) ], func.retType);
+     } ] ] : [
+       // unknown receivers inline only Uint8Array (Buffer), other typed arrays share one call

@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sproutboat <noreply@sproutboat.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH] modules: --sb-entry-file pins the entry path baked into
+ node:process (P7)
+
+node:process bakes the entry file's absolute path into its unit as entryFile (and argv[1]). Every
+sproutd app compiles in its own directory; without this any template that anchors `process` would
+differ from every app in the process unit's data. The path is replaced by the --sb-entry-file=PATH
+pref when given.
+
+Class: ours
+Pass: patchStableEntryPath (P7)
+---
+ compiler/modules.js | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/compiler/modules.js b/compiler/modules.js
+index 20cde9a9a07190ff4bda251633af51563b926961..7ec2fb8d50d34d33f3607a1f78915531863073c0 100644
+--- a/compiler/modules.js
++++ b/compiler/modules.js
+@@ -1237,7 +1237,7 @@ export default (entrySource, entryFile, opts = {}) => {
+     const walk = node => {
+       switch (node.type) {
+         case 'Identifier': {
+-          if (node.name === '__porffor_entry_file' && mod.file.startsWith(RUNTIME_ROOT)) return literal(entryFile);
++          if (node.name === '__porffor_entry_file' && mod.file.startsWith(RUNTIME_ROOT)) return literal(typeof Prefs.sbEntryFile === 'string' ? Prefs.sbEntryFile : entryFile); // sproutboat P7: stable entry path
+           if (node.name === '__porffor_bundle' && mod.file.startsWith(RUNTIME_ROOT)) return ident('#bundle');
+           if (node.name === '__porffor_vm_code' && mod.file.startsWith(RUNTIME_ROOT)) return ident('#vmcode');
+           // require as a value and module beyond module.exports need node's module system

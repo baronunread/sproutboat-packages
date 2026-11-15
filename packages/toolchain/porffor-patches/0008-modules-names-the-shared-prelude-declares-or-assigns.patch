@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sproutboat <noreply@sproutboat.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH] modules: names the shared prelude declares or assigns on
+ globalThis are its own globals (P4)
+
+A name the shared prelude declares at its top level, assigns on globalThis anywhere in its body, or
+defines with a literal name (Object.defineProperty(globalThis, "process", ...), a lazy accessor), is
+the prelude's own global, so the runtime's is not installed. Restricted to shared-prelude.js: an app
+declaring `const process` must not hide the real one from the modules beside it. Without this any
+free `fetch(` in app code links fetch-client, http, net, dns, uws and libuv into the worker.
+
+Class: ours
+Pass: patchPreludeOwnedGlobals (P4)
+---
+ compiler/modules.js | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/compiler/modules.js b/compiler/modules.js
+index 415c7d05ed34a636b550b8a9925162648e9f878b..51cdcaeb3640d906493a58b6ef2ddb095024a306 100644
+--- a/compiler/modules.js
++++ b/compiler/modules.js
+@@ -1597,6 +1597,22 @@ export default (entrySource, entryFile, opts = {}) => {
+     const names = new Set(Object.keys(globals)), used = new Set();
+     for (const mod of modules.values()) if (!mod.file.startsWith(RUNTIME_ROOT)) usedNames(mod.body, names, used);
+     usedNames([ ...vmSources.values() ], names, used);
++    // sproutboat P4: prelude-declared names override runtime globals
++    for (const mod of modules.values()) if (/(^|\/)shared-prelude\.js$/.test(mod.rel) && !mod.file.startsWith(RUNTIME_ROOT)) {
++      for (const st of mod.body) for (const d of st.type === 'VariableDeclaration' ? st.declarations : st.type === 'FunctionDeclaration' || st.type === 'ClassDeclaration' ? [ st ] : [])
++        if (d.id?.type === 'Identifier') used.delete(d.id.name.replace(/#m\w+$/, ''));
++      // a name the prelude assigns on globalThis anywhere (globalThis.fetch = ..., in an installer it calls at init) is
++      // the prelude's too: the assignment binds every free reference to it at run time
++      const owned = new Set(); const walk = n => { if (n == null || typeof n !== 'object') return; if (Array.isArray(n)) { for (const x of n) walk(x); return; }
++        if (n.type === 'AssignmentExpression' && n.left.type === 'MemberExpression' && !n.left.computed && n.left.object.type === 'Identifier' && n.left.object.name === 'globalThis') owned.add(n.left.property.name);
++        // Object.defineProperty(globalThis, 'name', ...) owns the name too: a lazy accessor installs the global without building it
++        if (n.type === 'CallExpression' && n.callee.type === 'MemberExpression' && !n.callee.computed && n.callee.object.type === 'Identifier' && n.callee.object.name === 'Object' && n.callee.property.name === 'defineProperty' &&
++          n.arguments.length >= 2 && n.arguments[0].type === 'Identifier' && n.arguments[0].name === 'globalThis' && n.arguments[1].type === 'Literal' && typeof n.arguments[1].value === 'string') owned.add(n.arguments[1].value);
++        for (const k in n) if (k !== 'loc' && k !== 'range') walk(n[k]); };
++      walk(mod.body); for (const name of owned) used.delete(name);
++      // and the members of an owned object (process.stdin when the prelude owns process): the object is the prelude's
++      for (const name of owned) for (const dotted of [ ...used ]) if (dotted.startsWith(name + '.')) used.delete(dotted);
++    }
+     if (used.size > 0) {
+       let src = '';
+       // dotted names (process.send) assign into globals, which are defined first

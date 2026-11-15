@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sproutboat <noreply@sproutboat.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH] process: tolerate a null argv and environ
+
+node:process reads porf_argv[i] and environ[i] at its init with no null check: a host that starts
+the runtime with no argv, or that cleared its environment (sproutd's fork template runs after
+clearenv(), so environ is NULL), crashes before the first module runs. Upstream's CLI always has an
+argv and an environment, so only an embedding host reaches it.
+
+Class: ours
+Pass: patchProcessNullTables
+---
+ runtime/node/process.js | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/runtime/node/process.js b/runtime/node/process.js
+index 6443180f1abf6e5ad945d2f6e9f4b1cbc9821ebf..cfb2d1661c8dd688570f11591a92a183b1e88ee3 100644
+--- a/runtime/node/process.js
++++ b/runtime/node/process.js
+@@ -27,13 +27,13 @@ export const windowSize = fd => {
+ // argv and environ entries, undefined past their end
+ const argAt = i => {
+   let out;
+-  Porffor.c`out = porf_argv[(i32)porf_jv_val(i)] ? porf_node_cstr(porf_argv[(i32)porf_jv_val(i)]) : JV_UNDEFINED;`;
++  Porffor.c`out = porf_argv && porf_argv[(i32)porf_jv_val(i)] ? porf_node_cstr(porf_argv[(i32)porf_jv_val(i)]) : JV_UNDEFINED;`; // sproutboat: null argv and environ
+   return out;
+ };
+ 
+ const envAt = i => {
+   let out;
+-  Porffor.c`out = environ[(i32)porf_jv_val(i)] ? porf_node_cstr(environ[(i32)porf_jv_val(i)]) : JV_UNDEFINED;`;
++  Porffor.c`out = environ && environ[(i32)porf_jv_val(i)] ? porf_node_cstr(environ[(i32)porf_jv_val(i)]) : JV_UNDEFINED;`;
+   return out;
+ };
+ 

@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sproutboat <noreply@sproutboat.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH] codegen: the right operand of ||, && and ?? is generated as a
+ branch (P13)
+
+The right operand runs conditionally, but its assignments updated the compile-time type of a local
+as if it always ran (the `if` and ternary paths scope them as a branch). In a function,
+`let o = 1; o || (o = {}); typeof o` answered "object", and the namespace-merge pattern
+`class SQL {}; (SQL || (SQL = {}))` inside any function (every bundled app body is one) left SQL typed
+as an object while it held the class: "Cannot get property of null" at startup.
+
+Class: upstream
+Pass: patchLogicalBranchInference (P13)
+Upstream: https://github.com/CanadaHonk/porffor/issues/456
+---
+ compiler/codegen.js | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/compiler/codegen.js b/compiler/codegen.js
+index 3d830eb78b19715875706215055c59b8517787bb..51f189d9af75936e13830b07d190414906605fc6 100644
+--- a/compiler/codegen.js
++++ b/compiler/codegen.js
+@@ -1584,8 +1584,11 @@ const generateLogicExp = (scope, decl, valueUnused = false) => {
+   const check = logicalChecks[decl.operator];
+   const res = tmp(scope, T.jsval, coerceValue(generate(scope, decl.left), T.jsval));
+   emitIf(scope, check(scope, res, getNodeType(scope, decl.left)), () => {
++    // sproutboat P13: the right operand of a logical expression is a branch
++    inferBranchStart(scope);
+     if (valueUnused) exprStmt(scope, generate(scope, decl.right, undefined, true));
+       else assign(scope, res, coerceValue(generate(scope, decl.right), T.jsval));
++    inferBranchEnd(scope);
+   });
+   return res;
+ };

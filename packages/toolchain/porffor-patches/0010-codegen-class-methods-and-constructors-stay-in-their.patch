@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sproutboat <noreply@sproutboat.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH] codegen: class methods and constructors stay in their
+ module's unit (P1)
+
+Methods and constructors of a module's classes landed in `main` instead of the module's unit, so an
+app's classes changed the shared prefix of the template.
+
+Class: ours
+Pass: patchClassUnit (P1)
+---
+ compiler/codegen.js | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/compiler/codegen.js b/compiler/codegen.js
+index 3357d9af39f486394f07bfaa24cf0753a0e3087f..0a1632c754e338fa4932d602d089bba8010a3c16 100644
+--- a/compiler/codegen.js
++++ b/compiler/codegen.js
+@@ -5338,7 +5338,11 @@ const classSuperExpr = () => ({
+   ]
+ });
+ 
++let classUnit = null; // sproutboat P1: class functions stay in their module's unit instead of #main
+ const declareClass = (scope, decl) => {
++  const prev = classUnit; if (decl._unit != null) classUnit = decl._unit; try { return declareClass0(scope, decl); } finally { classUnit = prev; }
++};
++const declareClass0 = (scope, decl) => {
+   const expr = decl.type === 'ClassExpression';
+   const name = decl.id.name;
+   const body = decl.body.body;
+@@ -5395,6 +5399,9 @@ const declareClass = (scope, decl) => {
+ };
+ 
+ const generateClass = (scope, decl) => {
++  const prevClassUnit = classUnit; if (decl._unit != null) classUnit = decl._unit; try { return generateClass0(scope, decl); } finally { classUnit = prevClassUnit; }
++};
++const generateClass0 = (scope, decl) => {
+   const expr = decl.type === 'ClassExpression';
+   if (!expr && !classHasDefinitionSideEffects(decl) && (decl._refs ?? 0) === 0) {
+     return valUndefined();
+@@ -6077,7 +6084,7 @@ const generateFunc = (scope, decl, forceNoExpr = false) => {
+     strict: decl.strict ?? scope.strict,
+     usesArguments: decl._usesArguments,
+     ast: decl,
+-    unit: decl._unit ?? decl._hoistedUnit ?? scope.unit,
++    unit: decl._unit ?? decl._hoistedUnit ?? scope.unit ?? classUnit,
+     parentFunc: scope.name ? scope : null,
+     selfAware: !!decl._selfAware,
+     directCallOnly,

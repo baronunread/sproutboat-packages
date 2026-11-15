@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sproutboat <noreply@sproutboat.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH] date: Date.parse takes +HH and +HHmm offsets as well as
+ +HH:mm (P12)
+
+Date.parse / new Date(s) take only +HH:mm offsets in the date-time form. Postgres sends timestamptz
+text as `2026-11-08 14:48:19.097+00` and drivers send `+0000`; V8 and Bun accept both (and +HH),
+Porffor returned NaN, which breaks drizzle-orm's timestamp mapping. The offset is now [+-]HH,
+[+-]HHmm or [+-]HH:mm; anything else is still NaN. The earlier colon form was #387 (ours, closed).
+
+Class: upstream
+Pass: patchDateOffsets (P12)
+Upstream: https://github.com/CanadaHonk/porffor/issues/455
+---
+ compiler/builtins/date.ts | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/compiler/builtins/date.ts b/compiler/builtins/date.ts
+index 9b436faaab0882c45e4cac954c5c0bb2a3075968..19d91fed23dc40a4029c68ea1ba903e0058e60ef 100644
+--- a/compiler/builtins/date.ts
++++ b/compiler/builtins/date.ts
+@@ -505,15 +505,25 @@ export const __ecma262_ParseDTSF = (string: bytestring): number => {
+       local = false;
+       ptr++;
+     } else if (Porffor.fastAnd(ptr < endPtr, Porffor.fastOr(chr == 43, chr == 45))) { // + -
+-      if (Porffor.IR.loadU8(ptr + 3, 4) != 58) return NaN; // :
++      // sproutboat P12: UTC offsets without a colon: +HH, +HHmm and +HH:mm
+       const offsetH: number = __Porffor_date_digits(ptr + 1, 2, endPtr);
+-      const offsetM: number = __Porffor_date_digits(ptr + 4, 2, endPtr);
++      let offsetM: number = 0;
++      ptr += 3;
++      if (Porffor.fastAnd(ptr < endPtr, Porffor.IR.loadU8(ptr, 4) == 58)) { // :
++        offsetM = __Porffor_date_digits(ptr + 1, 2, endPtr);
++        ptr += 3;
++      } else if (ptr < endPtr) {
++        const next: i32 = Porffor.IR.loadU8(ptr, 4);
++        if (Porffor.fastAnd(next >= 48, next <= 57)) {
++          offsetM = __Porffor_date_digits(ptr, 2, endPtr);
++          ptr += 2;
++        }
++      }
+       if (Porffor.fastOr(offsetH > 23, offsetM > 59)) return NaN;
+       const offset: number = offsetH * 60 + offsetM;
+       if (chr == 43) min -= offset;
+         else min += offset;
+       local = false;
+-      ptr += 6;
+     }
+   }
+ 
