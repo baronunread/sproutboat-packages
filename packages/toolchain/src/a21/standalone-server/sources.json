@@ -1,0 +1,38 @@
+{
+  "note": "Provenance of the vendored standalone server sources. `check` verifies the content hashes; `verify` fetches uWebSockets and applies the patches.",
+  "uWebSockets": {
+    "repo": "https://github.com/uNetworking/uWebSockets",
+    "commit": "360c276d609d59af56ae6932adb95154ace9f15f",
+    "pristineSrcSha256": "5a67d7ebcd10ab4ccf041b6217572cdc717ce62044580a7dcd10291682eea9b9",
+    "patches": [
+      {
+        "file": "uws-patches/0001-remove-default-404.patch",
+        "sha256": "759b621f8e69f069f5f6f80439304b8c80c0993d527e9854acca4c2c06755bd5"
+      },
+      {
+        "file": "uws-patches/0002-shorten-uws-errors.patch",
+        "sha256": "1364a87a6745d70ddf22743d72c24496e7af15f6105bcda249e1b9d68408b20b"
+      },
+      {
+        "file": "uws-patches/0003-http10.patch",
+        "sha256": "ef3535f9334f4c7888d3a7364ac419e199c216d674e8c4708c8e75c37580d889"
+      }
+    ],
+    "patchedSrcSha256": "edd82cbcbff70e06683b689239e9ef256fdad09b8b33eafce9762efd42b75547"
+  },
+  "files": {
+    "uws-shim.cpp": {
+      "contentSha256": "c7444a670f25853803894eff13b08648450f0c715e634503c87b51cd4bda35a6"
+    },
+    "web-classes.js": {
+      "contentSha256": "e21d852f787e8b639c211e339af563b1f1abc27fef1a8608b880c00f578e30e2"
+    }
+  },
+  "origin": {
+    "porfforCommit": "0c135ce2f36fdd3467d5a58daa92283810705a51",
+    "toolchainVersion": "0.26.1",
+    "patchFingerprint": "d9f485cffe3c",
+    "composedShimA22Sha256": "c2da8a2e79062a3d428999dd2006fb39974dd5bd6f0e0e538705b746ec1dc6cd",
+    "note": "The alpha 19 patch chain's output at the commit that vendored these files; the files above are that output."
+  }
+}

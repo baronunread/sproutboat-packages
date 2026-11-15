@@ -12,4 +12,5 @@ export * from "./standalone";
 export * from "./standalone-channel";
 export * from "./standalone-shim";
 export * from "./standalone-build";
+export * from "./standalone-server";
 export * from "./standalone-host";

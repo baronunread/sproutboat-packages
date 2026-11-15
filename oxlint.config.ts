@@ -13,6 +13,8 @@ export default {
     ".roo/**",
     ".windsurf/**",
     "tools/oxlint/anti-slop/**",
+    "packages/toolchain/src/a21/standalone-server/*.js",
+    "packages/toolchain/src/a21/standalone-server/*.cpp",
   ],
   jsPlugins: [{ name: "anti-slop", specifier: "./tools/oxlint/anti-slop/index.ts" }],
   rules: {

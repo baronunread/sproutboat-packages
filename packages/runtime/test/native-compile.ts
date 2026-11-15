@@ -1,6 +1,4 @@
-import { existsSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { ensurePorffor } from "../../toolchain/src/acquire";
 import { ensurePorfforA21 } from "../../toolchain/src/a21/acquire";
@@ -9,6 +7,7 @@ import {
   SHARED_PRELUDE_FILE,
   STANDALONE_A21_COMPILE_FLAGS,
 } from "../../toolchain/src/a21/standalone";
+import { ensureHostUws } from "../../toolchain/src/a21/standalone-server";
 import { buildStandaloneA21 } from "../../toolchain/src/a21/standalone-build";
 import { standaloneA21Channel, standaloneChannel } from "../../toolchain/src/a21/standalone-channel";
 import { bearsslEnv } from "./bearssl";
@@ -41,12 +40,6 @@ export type NativeCompileInput = {
   failure?: string;
 };
 
-type UwsModule = {
-  UWS_COMMIT: string;
-  ensureUWebSockets: () => string;
-  ensureUSocketsBuilt: (dir: string) => void;
-};
-
 let renderQueue: Promise<void> = Promise.resolve();
 
 const channel = () => standaloneChannel();
@@ -62,26 +55,6 @@ async function drain(child: Bun.Subprocess<"ignore", "pipe", "pipe">) {
   return { exitCode, stdout, stderr };
 }
 
-/** The host uWebSockets checkout with a built uSockets.a, built on first use. */
-async function uwsDirectory(alpha19: string): Promise<string> {
-  // SAFETY: the patched alpha 19 tree's compiler/uwebsockets.js exports these (see the toolchain's standaloneShimSource).
-  const mod: UwsModule = await import(resolve(alpha19, "compiler/uwebsockets.js"));
-  const dir = resolve(homedir(), ".cache/porffor/deps", `uWebSockets-${mod.UWS_COMMIT}`);
-  if (!existsSync(join(dir, "uSockets/uSockets.a"))) {
-    // SAFETY: the compiler's prefs.js installs `Prefs` on globalThis as a plain flag object.
-    const g = globalThis as { Prefs?: { eventLoop?: boolean } };
-    const prev = g.Prefs;
-    g.Prefs = { ...prev, eventLoop: true };
-    try {
-      mod.ensureUSocketsBuilt(mod.ensureUWebSockets());
-    } finally {
-      if (prev === undefined) delete g.Prefs;
-      else g.Prefs = prev;
-    }
-  }
-  return dir;
-}
-
 /** Compile a generated module into a native binary on the standalone channel (alpha 24 by default, `SPROUTBOAT_PORFFOR_CHANNEL=alpha-19` for the frozen older build). */
 export async function compileNative(input: NativeCompileInput): Promise<void> {
   const which = channel();
@@ -91,9 +64,9 @@ export async function compileNative(input: NativeCompileInput): Promise<void> {
   const bearssl = input.bearssl ? await bearsslEnv() : undefined;
   const extraLink = [...(input.extraLink ?? []), ...split(bearssl?.SB_EXTRA_LINK)];
   const extraCflags = [...(input.extraCflags ?? []), ...split(bearssl?.SB_EXTRA_CFLAGS)];
-  const alpha19 = await ensurePorffor(input.cacheRoot === undefined ? {} : { cacheRoot: input.cacheRoot });
 
   if (which === "alpha-19") {
+    const alpha19 = await ensurePorffor(input.cacheRoot === undefined ? {} : { cacheRoot: input.cacheRoot });
     const node = Bun.which("node");
     if (!node) throw new Error("native compile needs node on PATH");
     const env = { ...process.env, ...input.env };
@@ -129,11 +102,10 @@ export async function compileNative(input: NativeCompileInput): Promise<void> {
   await rm(input.binary, { force: true });
   await buildStandaloneA21({
     unitsDir,
-    alpha19Root: alpha19,
     outPath: input.binary,
     cc: input.cc ?? ["cc"],
     cxx: input.cxx ?? ["c++"],
-    uwsDir: await uwsDirectory(alpha19),
+    uwsDir: await ensureHostUws(),
     extraLink,
     extraCflags,
     optimize,
@@ -157,14 +129,13 @@ export type RenderUnitsInput = Pick<
 export async function renderStandaloneUnits(input: RenderUnitsInput): Promise<string> {
   const dir = input.dir ?? dirname(input.binary);
   const failure = input.failure ?? "Porffor native compile failed";
-  const alpha19 = await ensurePorffor(input.cacheRoot === undefined ? {} : { cacheRoot: input.cacheRoot });
   const bun = process.execPath;
   const a21Channel = standaloneA21Channel(standaloneChannel());
   const a21 = await ensurePorfforA21(a21Channel);
   const work = join(dir, `a22-${(input.binary.split("/").pop() ?? "bin").replace(/[^\w.-]/g, "_")}`);
   await rm(work, { recursive: true, force: true });
   await mkdir(work, { recursive: true });
-  const composed = composeStandaloneA21(await readFile(input.generated, "utf8"), alpha19);
+  const composed = composeStandaloneA21(await readFile(input.generated, "utf8"));
   // Beside the generated module: its relative imports (a handler's sibling helper files) resolve from the
   // directory of the file they were written in, and the shared prelude carries the module's body. The
   // chain recognises the prelude by its file name, so a test that compiles several variants from one

@@ -17,38 +17,21 @@ import { basename, join, resolve } from "node:path";
 import bridgeSource from "./native-fetch-a22.c" with { type: "text" };
 import { standaloneShimA22 } from "./standalone-shim";
 import { prepareMainUnit } from "./standalone";
+import { applyUwsHttp10, uwsShimSource } from "./standalone-server";
 
 export { bridgeSource as NATIVE_FETCH_A22_BRIDGE };
 
 /**
- * The alpha 19 server shim source, rewritten for alpha 22. Read from the patched alpha 19 tree's
- * `compiler/uwebsockets.js` (the module needs the compiler's `Prefs` global: the event loop is on,
- * as the CLI's native-fetch builds always had it).
+ * The server shim source, rewritten for the flat bridge: the vendored `standalone-server/uws-shim.cpp`
+ * (the patched alpha 19 native-fetch server, see its provenance header) through `standaloneShimA22`.
  */
-export async function standaloneShimSource(alpha19Root: string): Promise<string> {
-  // SAFETY: the compiler's prefs.js installs `Prefs` on globalThis as a plain flag object; only the
-  // event-loop flag is read by the shim source.
-  const g = globalThis as { Prefs?: { eventLoop?: boolean } };
-  const prev = g.Prefs;
-  g.Prefs = { ...prev, eventLoop: true };
-  try {
-    // SAFETY: the patched alpha 19 tree's module exports `makeUWebSocketsShimSource` (the chain's
-    // patchUwebsockets anchors on it); a tree without it fails here, loudly.
-    const mod = (await import(resolve(alpha19Root, "compiler/uwebsockets.js"))) as {
-      makeUWebSocketsShimSource: () => string;
-    };
-    return standaloneShimA22(mod.makeUWebSocketsShimSource());
-  } finally {
-    if (prev === undefined) delete g.Prefs;
-    else g.Prefs = prev;
-  }
+export function standaloneShimSource(): string {
+  return standaloneShimA22(uwsShimSource());
 }
 
 export type StandaloneBuildInput = {
   /** The compiler's split output (`porffor c ENTRY -o DIR`): porf.h, porf__main.c, the units. */
   unitsDir: string;
-  /** The patched alpha 19 tree (the shim source; `ensurePorffor()`). */
-  alpha19Root: string;
   outPath: string;
   /** C and C++ compilers, as argv prefixes (`["zig", "cc", "-target", triple]` or `["cc"]`). */
   cc: string[];
@@ -75,14 +58,9 @@ export type StandaloneBuildInput = {
 
 export const HTTP10_SHIM_STAMP = "sproutboat #236 (alpha 22): compiled against an HttpParser.h that accepts HTTP/1.0";
 
-/** Apply the alpha 19 tree's HTTP/1.0 edit (#236) to a uWebSockets checkout; a no-op once it is applied. */
-export async function patchUwsHttp10(alpha19Root: string, uwsDir: string): Promise<void> {
-  const helper = join(alpha19Root, "compiler/sb-http10.js");
-  if (!existsSync(helper)) throw new Error(`no ${helper}: the alpha 19 tree is not patched for HTTP/1.0 (#236)`);
-  // SAFETY: compiler/sb-http10.js is written by the toolchain's own patch chain (patch.ts HTTP10_HELPER)
-  // and exports sbPatchHttp10(uwsDir); its presence was checked above.
-  const mod = (await import(helper)) as { sbPatchHttp10: (dir: string) => void };
-  mod.sbPatchHttp10(uwsDir);
+/** Apply sproutboat #236 (the HTTP/1.0 edit, `standalone-server/uws-patches/0003-http10.patch`) to a uWebSockets checkout; a no-op once it is applied. */
+export async function patchUwsHttp10(uwsDir: string): Promise<void> {
+  await applyUwsHttp10(uwsDir);
 }
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex").slice(0, 16);
@@ -162,11 +140,8 @@ export async function buildStandaloneA21(input: StandaloneBuildInput): Promise<v
   // never runs, so it applies the same marker-guarded edit (the patched tree's compiler/sb-http10.js) to
   // the checkout it compiles against. Objects are stamped by their own text, not by the headers they
   // include, so the shim names the edit: a shim compiled against an unedited header is not reused.
-  await patchUwsHttp10(input.alpha19Root, input.uwsDir);
-  await writeFile(
-    join(units, "porf_server.cpp"),
-    `// ${HTTP10_SHIM_STAMP}\n` + (await standaloneShimSource(input.alpha19Root)),
-  );
+  await patchUwsHttp10(input.uwsDir);
+  await writeFile(join(units, "porf_server.cpp"), `// ${HTTP10_SHIM_STAMP}\n` + standaloneShimSource());
   const sources = [
     ...unitFiles.map((f) => join(units, f)),
     join(units, "porf_native_fetch_a22.c"),

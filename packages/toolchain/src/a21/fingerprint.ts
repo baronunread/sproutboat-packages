@@ -23,6 +23,11 @@ export const A21_STANDALONE_SOURCES = [
   "native-fetch-a22.c",
   "standalone-dispatch.js",
   "standalone-preamble.js",
+  "standalone-server/uws-shim.cpp",
+  "standalone-server/web-classes.js",
+  "standalone-server/uws-patches/0001-remove-default-404.patch",
+  "standalone-server/uws-patches/0002-shorten-uws-errors.patch",
+  "standalone-server/uws-patches/0003-http10.patch",
 ] as const;
 
 export function a21StandaloneFingerprint(dir: string): string | null {
