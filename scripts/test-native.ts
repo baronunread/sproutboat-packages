@@ -10,13 +10,8 @@
  * NATIVE_TEST_CONCURRENCY sets how many run at once (default 4).
  * NATIVE_TEST_TIMEOUT_MS kills a script that runs longer (default 10 minutes).
  *
- * Every script asks for a Porffor toolchain in a fresh temp directory, which
- * means unpacking, patching and precompiling it again each time. This runner
- * prepares one toolchain up front, in the normal cache, and hands it to every
- * script through SPROUTBOAT_PORFFOR_DIR. The cache entry is keyed by the patch
- * fingerprint, so an edited patch still gets a freshly patched compiler. Set
- * SPROUTBOAT_PORFFOR_DIR yourself to use a different toolchain, or
- * NATIVE_TEST_FRESH_PORFFOR=1 to let every script prepare its own.
+ * The runner unpacks the vendored patched Porffor tree up front, in the normal cache, so every script finds
+ * it there. Set SPROUTBOAT_PORFFOR_DIR to point all of them at a different tree.
  *
  * The first native compile on a machine also fetches uWebSockets, patches it and
  * builds uSockets.a in ~/.cache/porffor/deps, shared by every compile. Four
@@ -30,7 +25,6 @@
 import { closeSync, mkdtempSync, openSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { ensurePorffor } from "../packages/toolchain/src/acquire";
 import { ensurePorfforA21 } from "../packages/toolchain/src/a21/acquire";
 import { standaloneA21Channel, standaloneChannel } from "../packages/toolchain/src/a21/standalone-channel";
 
@@ -81,19 +75,13 @@ const timeoutMs = positiveInteger(process.env.NATIVE_TEST_TIMEOUT_MS, 600_000, "
 const scripts = nativeScripts(process.argv.slice(2));
 const env = { ...process.env };
 
-if (standaloneChannel(env) !== "alpha-19") {
+{
+  // Warm the compiler tree in the normal cache so every script finds it there (SPROUTBOAT_PORFFOR_DIR points
+  // all of them at one tree you name instead).
   const a21Channel = standaloneA21Channel(standaloneChannel(env));
-  // SPROUTBOAT_PORFFOR_DIR overrides the alpha 21 line's compiler as well as the alpha 19 one (the standalone
-  // channel needs both trees), so pointing it at the alpha 19 tree would render with the wrong
-  // compiler. Warm both trees in the normal cache instead and let every script find them there.
   const started = performance.now();
-  await ensurePorffor();
   await ensurePorfforA21(a21Channel);
-  console.log(`Porffor alpha 19 and ${a21Channel.replace("-", " ")} trees ready in ${seconds(started).toFixed(1)}s`);
-} else if (!env.SPROUTBOAT_PORFFOR_DIR && env.NATIVE_TEST_FRESH_PORFFOR !== "1") {
-  const started = performance.now();
-  env.SPROUTBOAT_PORFFOR_DIR = await ensurePorffor();
-  console.log(`Porffor ready in ${seconds(started).toFixed(1)}s: ${env.SPROUTBOAT_PORFFOR_DIR}`);
+  console.log(`Porffor ${a21Channel.replace("-", " ")} tree ready in ${seconds(started).toFixed(1)}s`);
 }
 
 const logs = mkdtempSync(join(tmpdir(), "sb-test-native-"));

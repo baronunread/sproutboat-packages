@@ -1,17 +1,15 @@
 /**
- * The standalone binary's source shape on the alpha 21 line (alpha 22): sproutd's worker shape
- * applied to the CLI's generated module.
+ * The standalone binary's source shape: sproutd's worker shape applied to the CLI's generated module.
  *
- * On alpha 19 the CLI compiles one generated module (prelude, transport, app) that ends with
- * `export default { port, fetch }`, which selects Porffor's native-fetch server. On alpha 22 that
- * default export would link the node server runtime (serve.js, uws, libuv, streams: +1 MB and a JS
- * request path per request). Instead the module is compiled as `shared-prelude.js` (so the chain's
- * P4 makes every name it declares or assigns on `globalThis` prelude-owned and no runtime module is
- * pulled in by a free `fetch`, `crypto`, `Buffer` or `process`), preceded by the preamble (the alpha
- * 19 helper names over alpha 22's layouts, host-driven timers, the rejection hook) and the alpha 19
- * web classes, and followed by the dispatch shim; `export default` becomes `globalThis.__forkHandler`.
- * The entry (`sprout.generated.js`) just imports it. The server is the alpha 19 uWebSockets shim over
- * the alpha 22 native-fetch bridge (native-fetch-a22.c), both compiled by the CLI beside the units.
+ * The CLI generates one module (prelude, transport, app) that ends with `export default { port, fetch }`.
+ * Compiled as it is, that default export would link the node server runtime (serve.js, uws, libuv, streams:
+ * +1 MB and a JS request path per request). Instead the module is compiled as `shared-prelude.js` (so the
+ * chain's P4 makes every name it declares or assigns on `globalThis` prelude-owned and no runtime module is
+ * pulled in by a free `fetch`, `crypto`, `Buffer` or `process`), preceded by the preamble (the helper names
+ * the generated module uses, over the current layouts, host-driven timers, the rejection hook) and the web
+ * classes (vendored in `standalone-server/`), and followed by the dispatch shim; `export default` becomes
+ * `globalThis.__forkHandler`. The entry (`sprout.generated.js`) just imports it. The server is the vendored
+ * uWebSockets shim over the native-fetch bridge (native-fetch-a22.c), both compiled by the CLI beside the units.
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { webClassesSource } from "./standalone-server";

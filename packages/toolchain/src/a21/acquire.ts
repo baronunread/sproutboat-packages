@@ -1,6 +1,5 @@
 /**
- * `ensurePorfforA21(channel)`: the alpha 21 line's counterpart of `../acquire.ts` `ensurePorffor`.
- * Takes the vendored PATCHED tarball (`vendor/porffor-patched.tar.gz`: upstream's pinned commit with the
+ * `ensurePorfforA21(channel)`: acquire the Porffor compiler tree. Takes the vendored PATCHED tarball (`vendor/porffor-patched.tar.gz`: upstream's pinned commit with the
  * series in `porffor-patches/` applied, `scripts/porffor-patches.ts vendor`), verifies its sha256 against the
  * manifest, extracts it and publishes the tree atomically under the toolchain cache, keyed by commit and by
  * the series hash. Nothing is patched here: no git, no bun and no network on the user's machine.
@@ -11,12 +10,20 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
-// @ts-expect-error Bun's file loader supplies a path (see ../acquire.ts).
+// @ts-expect-error Bun's file loader supplies a path.
 import vendoredPatched from "../../vendor/porffor-patched.tar.gz" with { type: "file" };
 import { version as TOOLCHAIN_VERSION } from "../../package.json" with { type: "json" };
-import { PorfforToolchainError } from "../acquire";
 import { A21_PATCH_FINGERPRINT } from "./fingerprint";
 import { PORFFOR_A21_PINS, type PorfforA21Channel, type PorfforA21Pin } from "./pin";
+
+export class PorfforToolchainError extends Error {
+  constructor(
+    readonly kind: "download" | "integrity" | "archive" | "cache" | "unsupported",
+    message: string,
+  ) {
+    super(message);
+  }
+}
 
 const required = [
   "runtime/index.js",
@@ -101,7 +108,7 @@ export function cachedPorfforA21Root(
 
 /**
  * Acquire the patched compiler into a verified, atomically published cache
- * entry and return its path. `SPROUTBOAT_PORFFOR_DIR` overrides it as for the alpha 19 channel.
+ * entry and return its path. `SPROUTBOAT_PORFFOR_DIR` overrides it with a tree you point at.
  */
 export async function ensurePorfforA21(channel: PorfforA21Channel, options: AcquireOptions = {}): Promise<string> {
   const pin = PORFFOR_A21_PINS[channel];

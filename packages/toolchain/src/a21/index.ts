@@ -1,9 +1,8 @@
 /**
- * `@sproutboat/toolchain/a21`: the Porffor alpha 21 line, on one alpha at a time (alpha 24). The pin of the
- * patched tree (upstream commit, patch series hash, tarball sha256), its fingerprint, the acquire step that
- * unpacks the vendored patched tarball, and the standalone build, whose channel is alpha 24
- * (`standaloneChannel`; `SPROUTBOAT_PORFFOR_CHANNEL=alpha-19` still selects the frozen alpha 19 build the
- * CLI's `--with-restore` needs).
+ * `@sproutboat/toolchain/a21`: the Porffor line, on one alpha at a time (alpha 24). The pin of the patched tree
+ * (upstream commit, patch series hash, tarball sha256), its fingerprint, the acquire step that unpacks the
+ * vendored patched tarball, and the standalone build with its vendored server sources
+ * (`standalone-server/`). The standalone channel is alpha 24 (`standaloneChannel`).
  */
 export * from "./pin";
 export * from "./fingerprint";

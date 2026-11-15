@@ -6,15 +6,14 @@ import { PORFFOR_A24_SERIES_SHA256 } from "./pin";
 /**
  * What shapes the patched compiler is the patch series, so its fingerprint is the series hash from
  * the manifest (`vendor/porffor-patched.json`, written by `scripts/porffor-patches.ts vendor` and
- * checked against the committed patches by `patch.test.ts`). Separate from `../fingerprint.ts` on
- * purpose: an edit here must not invalidate every machine's alpha 19 cache.
+ * checked against the committed patches by `patch.test.ts`).
  */
 export const A21_PATCH_FINGERPRINT = PORFFOR_A24_SERIES_SHA256.slice(0, 12);
 
 /**
  * Every source that shapes a standalone binary on this channel beyond the compiler: the composition,
  * the shim pass, the build recipe, the bridge and the two JS shims. A build cache keyed on it (the
- * CLI's compile cache) rebuilds when one of them changes, as it does for the alpha 19 patch chain.
+ * CLI's compile cache) rebuilds when one of them changes.
  */
 export const A21_STANDALONE_SOURCES = [
   "standalone.ts",

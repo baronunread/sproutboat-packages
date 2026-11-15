@@ -1,6 +1,5 @@
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { ensurePorffor } from "../../toolchain/src/acquire";
 import { ensurePorfforA21 } from "../../toolchain/src/a21/acquire";
 import {
   composeStandaloneA21,
@@ -19,11 +18,11 @@ export type NativeCompileInput = {
   binary: string;
   /** Working directory of the compile, and where alpha 22 puts its intermediate files. Default: the binary's directory. */
   dir?: string;
-  /** Toolchain cache root for the alpha 19 tree (`ensurePorffor({ cacheRoot })`). */
+  /** Toolchain cache root for the Porffor tree (`ensurePorfforA21(channel, { cacheRoot })`). */
   cacheRoot?: string;
-  /** Objects and link flags for the link line (alpha 19: `SB_EXTRA_LINK`). */
+  /** Objects and link flags for the link line . */
   extraLink?: string[];
-  /** Flags for every C compile (alpha 19: `SB_EXTRA_CFLAGS`). */
+  /** Flags for every C compile . */
   extraCflags?: string[];
   /** Link BearSSL, as a test that uses crypto.subtle needs. */
   bearssl?: boolean;
@@ -34,7 +33,7 @@ export type NativeCompileInput = {
   /** Compilers as argv prefixes (default `cc` and `c++`). */
   cc?: string[];
   cxx?: string[];
-  /** Extra environment for the alpha 19 compiler process (the default is `process.env`). */
+  /** Extra environment for the compiler process (the default is `process.env`). */
   env?: Record<string, string>;
   /** Message prefix of the failure assertion. Default "Porffor native compile failed". */
   failure?: string;
@@ -42,53 +41,16 @@ export type NativeCompileInput = {
 
 let renderQueue: Promise<void> = Promise.resolve();
 
-const channel = () => standaloneChannel();
-
 const split = (flags: string | undefined): string[] => (flags ?? "").split(" ").filter(Boolean);
 
-async function drain(child: Bun.Subprocess<"ignore", "pipe", "pipe">) {
-  const [exitCode, stdout, stderr] = await Promise.all([
-    child.exited,
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-  ]);
-  return { exitCode, stdout, stderr };
-}
-
-/** Compile a generated module into a native binary on the standalone channel (alpha 24 by default, `SPROUTBOAT_PORFFOR_CHANNEL=alpha-19` for the frozen older build). */
+/** Compile a generated module into a native binary on the standalone channel (alpha 24). */
 export async function compileNative(input: NativeCompileInput): Promise<void> {
-  const which = channel();
   const dir = input.dir ?? dirname(input.binary);
   const optimize = input.optimize ?? 0;
   const failure = input.failure ?? "Porffor native compile failed";
   const bearssl = input.bearssl ? await bearsslEnv() : undefined;
   const extraLink = [...(input.extraLink ?? []), ...split(bearssl?.SB_EXTRA_LINK)];
   const extraCflags = [...(input.extraCflags ?? []), ...split(bearssl?.SB_EXTRA_CFLAGS)];
-
-  if (which === "alpha-19") {
-    const alpha19 = await ensurePorffor(input.cacheRoot === undefined ? {} : { cacheRoot: input.cacheRoot });
-    const node = Bun.which("node");
-    if (!node) throw new Error("native compile needs node on PATH");
-    const env = { ...process.env, ...input.env };
-    if (extraLink.length > 0) env.SB_EXTRA_LINK = extraLink.join(" ");
-    if (extraCflags.length > 0) env.SB_EXTRA_CFLAGS = extraCflags.join(" ");
-    const compile = Bun.spawn(
-      [
-        node,
-        resolve(alpha19, "runtime/index.js"),
-        "native",
-        input.generated,
-        "-o",
-        input.binary,
-        "-s",
-        `-O${optimize}`,
-      ],
-      { cwd: dir, env, stdout: "pipe", stderr: "pipe" },
-    );
-    const { exitCode, stdout, stderr } = await drain(compile);
-    if (exitCode !== 0) throw new Error(`${failure}:\n${stderr}\n${stdout}`);
-    return;
-  }
 
   const a21Channel = standaloneA21Channel(standaloneChannel());
   const unitsDir = await renderStandaloneUnits({
@@ -131,7 +93,7 @@ export async function renderStandaloneUnits(input: RenderUnitsInput): Promise<st
   const failure = input.failure ?? "Porffor native compile failed";
   const bun = process.execPath;
   const a21Channel = standaloneA21Channel(standaloneChannel());
-  const a21 = await ensurePorfforA21(a21Channel);
+  const a21 = await ensurePorfforA21(a21Channel, input.cacheRoot === undefined ? {} : { cacheRoot: input.cacheRoot });
   const work = join(dir, `a22-${(input.binary.split("/").pop() ?? "bin").replace(/[^\w.-]/g, "_")}`);
   await rm(work, { recursive: true, force: true });
   await mkdir(work, { recursive: true });

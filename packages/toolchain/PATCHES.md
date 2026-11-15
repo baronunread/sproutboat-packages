@@ -132,3 +132,18 @@ and [#428](https://github.com/CanadaHonk/porffor/issues/428) are closed. Open PR
 [#422](https://github.com/CanadaHonk/porffor/pull/422) (heap BigInts in conservative GC scans) and
 [#423](https://github.com/CanadaHonk/porffor/pull/423) (globalThis rewrites only changed bindings);
 [#395](https://github.com/CanadaHonk/porffor/pull/395) (TextEncoder astral chars) is merged.
+
+## The standalone server's sources
+
+The standalone build does not read an upstream tree for its server. `src/a21/standalone-server/` holds it, each file with
+a provenance header, and `sources.json` records the hashes:
+
+- `uws-shim.cpp`: the uWebSockets server shim (C++), which `standalone-shim.ts` rewrites over the flat bridge at build time.
+- `web-classes.js`: Headers, Blob, File, TextEncoder, TextDecoder, URL, Request and Response, composed into the shared prelude.
+- `uws-patches/`: unified diffs against uWebSockets `360c276` that every checkout the server compiles against gets: upstream
+  Porffor's two (no default 404, shorter error strings) and sproutboat #236 (HTTP/1.0).
+
+They began as the output of the Porffor alpha 19 patch chain and were compared with it byte for byte when they were vendored
+(`toolchain: vendor the standalone server's sources`). They are maintained by hand now. After an edit: `bun scripts/standalone-sources.ts write`
+(recomputes `sources.json`; needs git and the network for uWebSockets). CI runs `check` (hashes) and `verify` (fetch uWebSockets,
+apply the patches, compare the tree) on every PR.

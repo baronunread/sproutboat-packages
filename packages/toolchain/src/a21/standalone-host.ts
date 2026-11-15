@@ -1,5 +1,5 @@
 /**
- * A host build of a standalone binary on the alpha 21 line (the current alpha), for the tools that compile one on the
+ * A host build of a standalone binary, for the tools that compile one on the
  * machine they run on (the runtime's native tests, the monorepo's compat suite, `sproutboat dev`):
  * compose the sources, render the units with the patched alpha compiler, build with the bridge and the
  * server shim (`standalone-build.ts`) against the host's uWebSockets checkout. The CLI's cross builds
@@ -14,7 +14,7 @@ import { composeStandaloneA21, SHARED_PRELUDE_FILE, STANDALONE_A21_COMPILE_FLAGS
 import { buildStandaloneA21 } from "./standalone-build";
 
 export type HostCompileInput = {
-  /** The wrapped module as the alpha 19 path compiles it (`wrapNativeFetchHandler` output), on disk. */
+  /** The wrapped module (`wrapNativeFetchHandler` output), on disk. */
   generatedPath: string;
   outPath: string;
   /** Objects and link flags for this build (SQLite, BearSSL, trust anchors), as `SB_EXTRA_LINK` carried them. */

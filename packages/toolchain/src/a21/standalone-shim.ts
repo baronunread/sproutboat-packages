@@ -1,6 +1,6 @@
 /**
- * The standalone server on alpha 22: the alpha 19 uWebSockets shim (`compiler/uwebsockets.js`
- * `makeUWebSocketsShimSource()` of the patched alpha 19 tree: restart handover, WebSockets, request
+ * The standalone server: the uWebSockets shim vendored in `standalone-server/uws-shim.cpp` (it began as
+ * Porffor alpha 19's `makeUWebSocketsShimSource()` with the toolchain's patches: restart handover, WebSockets, request
  * and response streaming, R2 transfers, body limit, GC pacing) with its heap-layout sites rewritten
  * over flat data, so it drives the alpha 22 bridge (`native-fetch-a22.c`) instead of alpha 19's
  * render.js entry points. Everything else in the shim is C++ over plain C data and is kept verbatim.
@@ -286,9 +286,9 @@ const ON_REQUEST = String.raw`static void on_request(uWS::HttpResponse<false>* r
 }
 `;
 
-/** The alpha 22 server shim from the alpha 19 shim source (`makeUWebSocketsShimSource()` of the patched alpha 19 tree). */
-export function standaloneShimA22(alpha19Shim: string): string {
-  let s = alpha19Shim;
+/** The flat-bridge server shim from the vendored uWebSockets shim source (`standalone-server/uws-shim.cpp`). */
+export function standaloneShimA22(shim: string): string {
+  let s = shim;
   if (!s.includes("#include <unordered_map>\n")) throw new Error("standalone shim: includes: anchor not found");
   s = s.replace("#include <unordered_map>\n", "#include <unordered_map>\n#include <unordered_set>\n");
   // 1. the extern block: flat entry points, no heap

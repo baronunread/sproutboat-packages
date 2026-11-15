@@ -1,7 +1,6 @@
 /**
- * The Porffor alpha 21 line's pin: a second channel beside `../pin.ts` (alpha 19, which stays for the
- * CLI's `--with-restore` build and as the source of the uWebSockets shim and the web classes the
- * standalone build composes). The toolchain supports ONE alpha at a time on this line: `CURRENT_ALPHA`.
+ * The Porffor pin. The toolchain supports ONE alpha at a time: `CURRENT_ALPHA`. (The standalone server's own
+ * sources, the uWebSockets shim and the web classes, are vendored in `standalone-server/`, not taken from a tree.)
  *
  * What the pin names is the patched tree. `vendor/porffor-patched.tar.gz` is upstream's `commit` with the
  * series in `porffor-patches/` applied (`scripts/porffor-patches.ts`), and `vendor/porffor-patched.json`
