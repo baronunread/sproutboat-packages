@@ -1,26 +1,31 @@
-/**
- * Which Porffor channel a standalone build uses. Alpha 24 (the alpha 21 line's compiler, composed in
- * sproutd's worker shape and served by the alpha 19 uWebSockets shim over the alpha 22 bridge) is the
- * default; `SPROUTBOAT_PORFFOR_CHANNEL=alpha-23` selects the previous default for one release as a fallback,
- * `=alpha-22` the compiler before it, and `=alpha-19` the older native-fetch build. The CLI, the runtime's native tests and
- * `scripts/test-native.ts` all resolve the channel here, so they cannot disagree about the default.
- */
-export type StandaloneChannel = "alpha-19" | "alpha-22" | "alpha-23" | "alpha-24";
+import { CURRENT_ALPHA, type PorfforA21Channel } from "./pin";
 
-export const STANDALONE_DEFAULT_CHANNEL: StandaloneChannel = "alpha-24";
+/**
+ * Which Porffor channel a standalone build uses. The alpha 21 line's compiler (one alpha at a time:
+ * `CURRENT_ALPHA`, composed in sproutd's worker shape and served by the alpha 19 uWebSockets shim over the
+ * alpha 22 bridge) is the default. `SPROUTBOAT_PORFFOR_CHANNEL=alpha-19` still selects the older native-fetch
+ * build, which the CLI's `--with-restore` needs and which is frozen. Alpha 21, 22 and 23 are no longer
+ * supported: the variable names them in an error instead of building something else under their name.
+ * The CLI, the runtime's native tests and `scripts/test-native.ts` all resolve the channel here, so they
+ * cannot disagree about the default.
+ */
+export type StandaloneChannel = "alpha-19" | PorfforA21Channel;
+
+export const STANDALONE_DEFAULT_CHANNEL: StandaloneChannel = CURRENT_ALPHA;
 export const STANDALONE_FALLBACK_CHANNEL: StandaloneChannel = "alpha-19";
 export const STANDALONE_CHANNEL_ENV = "SPROUTBOAT_PORFFOR_CHANNEL";
 
 export function standaloneChannel(env: Record<string, string | undefined> = process.env): StandaloneChannel {
   const raw = env[STANDALONE_CHANNEL_ENV];
   if (!raw) return STANDALONE_DEFAULT_CHANNEL;
-  if (raw === "alpha-19" || raw === "alpha-22" || raw === "alpha-23" || raw === "alpha-24") return raw;
+  if (raw === "alpha-19" || raw === CURRENT_ALPHA) return raw;
+  const retired = /^alpha-2[123]$/.test(raw) ? `; ${raw} is no longer supported, the toolchain keeps one alpha` : "";
   throw new Error(
-    `${STANDALONE_CHANNEL_ENV}=${raw}: expected alpha-24 (default), alpha-23, alpha-22 or alpha-19 (fallback)`,
+    `${STANDALONE_CHANNEL_ENV}=${raw}: expected ${CURRENT_ALPHA} (default) or alpha-19 (frozen)${retired}`,
   );
 }
 
-/** The alpha 21 line's channel for a standalone channel: alpha 19 has none, so it gets the default line. */
-export function standaloneA21Channel(channel: StandaloneChannel): "alpha-22" | "alpha-23" | "alpha-24" {
-  return channel === "alpha-22" || channel === "alpha-23" ? channel : "alpha-24";
+/** The alpha 21 line's channel for a standalone channel: alpha 19 has none, so it gets the current alpha. */
+export function standaloneA21Channel(_channel: StandaloneChannel): PorfforA21Channel {
+  return CURRENT_ALPHA;
 }

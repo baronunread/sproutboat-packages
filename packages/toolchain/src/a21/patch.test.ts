@@ -1,62 +1,128 @@
 import { afterAll, expect, test } from "bun:test";
-import { mkdtemp, readFile, readdir, realpath, rm, writeFile, mkdir } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdtemp, readFile, readdir, rm, writeFile, mkdir } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { A21_PATCH_FINGERPRINT, A21_RELEASED_FINGERPRINT, a21SourceFingerprint } from "./fingerprint";
 import {
-  ensurePorfforPatchedA21,
-  patchClassUnit,
-  patchGlobalsPin,
-  patchPreludeOwnedGlobals,
-  patchReservedSelect,
-  patchResponseStatics,
-  patchStableEntryPath,
-  patchUnitLayout,
-} from "./patch";
-import { PORFFOR_A21_COMMIT_FULL, PORFFOR_A21_PINS, channelOfTree, pinOfTree, type PorfforA21Channel } from "./pin";
+  MANIFEST_FILE,
+  SERIES_DIR,
+  TARBALL_FILE,
+  check,
+  listSeries,
+  readManifest,
+  seriesSha256,
+  verify,
+} from "../../../../scripts/porffor-patches";
+import { ensurePorfforA21, cachedPorfforA21Root } from "./acquire";
+import { A21_PATCH_FINGERPRINT } from "./fingerprint";
+import { extractPatchedTree } from "./patched-tree";
+import { CURRENT_ALPHA, PORFFOR_A21_PINS } from "./pin";
+
+/**
+ * What these tests cover: the patch SERIES (`porffor-patches/`, applied to upstream by
+ * `scripts/porffor-patches.ts`) and the PATCHED TREE it makes (the vendored tarball the toolchain ships).
+ * The first block is cheap and runs everywhere: the committed series, manifest, tarball and PATCHES.md
+ * agree. The second reads the shipped tree for what each patch is meant to do and compiles programs with it.
+ * Reproducing the tarball from upstream (apply + export + vendor, byte for byte) needs git and the upstream
+ * commit: CI runs `bun scripts/porffor-patches.ts verify`, and PORFFOR_SERIES_VERIFY=1 runs it here.
+ */
 
 const temporary: string[] = [];
 afterAll(async () => {
   await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
-/** A pristine alpha 21 (or alpha 22) tree from the vendored archive, in a fresh directory. */
-async function pristine(channel: PorfforA21Channel = "alpha-21"): Promise<string> {
-  // Canonical: a module's unit is named by its path relative to the entry directory, and macOS's
-  // /var -> /private/var symlink would otherwise give it the absolute path.
-  const root = await realpath(await mkdtemp(join(tmpdir(), "sb-a21-")));
+/** The shipped patched tree in a fresh directory the test may write to. */
+async function patched(): Promise<string> {
+  const root = await extractPatchedTree();
   temporary.push(root);
-  const pin = PORFFOR_A21_PINS[channel];
-  const archive = resolve(import.meta.dir, "../../vendor", pin.vendoredArchive);
-  const digest = new Bun.CryptoHasher("sha256").update(await readFile(archive)).digest("hex");
-  expect(digest).toBe(pin.archiveSha256);
-  const tar = Bun.spawnSync(["tar", "-xzf", archive, "-C", root, "--strip-components=1"], { stderr: "pipe" });
-  expect(tar.exitCode, new TextDecoder().decode(tar.stderr)).toBe(0);
   return root;
 }
 
-test("a pass that finds its anchor twice or not at all stops with the pass's name", async () => {
-  const root = await mkdtemp(join(tmpdir(), "sb-a21-anchor-"));
-  temporary.push(root);
-  await mkdir(join(root, "compiler"), { recursive: true });
-  await writeFile(join(root, "compiler/render.js"), "x\n");
-  await expect(patchReservedSelect(root)).rejects.toThrow("the reserved name select");
-  await writeFile(
-    join(root, "compiler/render.js"),
-    "const cReservedNames = new Set([\nconst cReservedNames = new Set([\n",
-  );
-  await expect(patchReservedSelect(root)).rejects.toThrow("anchor not found once");
-  await writeFile(join(root, "compiler/render.js"), "const cReservedNames = new Set([\n  'auto',\n");
-  await patchReservedSelect(root);
-  const once = await readFile(join(root, "compiler/render.js"), "utf8");
-  expect(once).toContain("'select', // sproutboat: glibc select");
-  await patchReservedSelect(root);
-  expect(await readFile(join(root, "compiler/render.js"), "utf8")).toBe(once);
+// --- the series, the manifest and the tarball agree ---
+
+test("the committed series, manifest and tarball agree (no git, no network)", () => {
+  expect(check()).toEqual([]);
+  const manifest = readManifest();
+  expect(manifest.series.sha256).toBe(seriesSha256());
+  expect(manifest.series.files).toEqual(listSeries());
+  expect(manifest.tarball.sha256).toBe(createHash("sha256").update(readFileSync(TARBALL_FILE)).digest("hex"));
+  expect(MANIFEST_FILE.endsWith("vendor/porffor-patched.json")).toBe(true);
 });
 
-test("the alpha 21 chain applies to the pinned tree, once, and the second run changes nothing", async () => {
-  const root = await pristine();
-  await ensurePorfforPatchedA21(root);
+test("the pin is the manifest's: one alpha, the series hash is the cache fingerprint", () => {
+  const manifest = readManifest();
+  expect(CURRENT_ALPHA).toBe(manifest.upstream.channel);
+  expect(Object.keys(PORFFOR_A21_PINS)).toEqual([CURRENT_ALPHA]);
+  const pin = PORFFOR_A21_PINS[CURRENT_ALPHA];
+  expect(pin.commitFull).toBe(manifest.upstream.commit);
+  expect(pin.commitFull).toMatch(/^[0-9a-f]{40}$/);
+  expect(pin.archiveSha256).toBe(manifest.tarball.sha256);
+  expect(A21_PATCH_FINGERPRINT).toBe(manifest.series.sha256.slice(0, 12));
+  expect(A21_PATCH_FINGERPRINT).toMatch(/^[0-9a-f]{12}$/);
+});
+
+test("every patch says what, why and its class; upstream bugs link their issue; PATCHES.md indexes each", () => {
+  const index = readFileSync(resolve(SERIES_DIR, "../PATCHES.md"), "utf8");
+  const names = listSeries();
+  expect(names.length).toBeGreaterThan(20);
+  let generated = 0;
+  for (const [i, name] of names.entries()) {
+    expect(name, "numbered in order").toStartWith(String(i + 1).padStart(4, "0") + "-");
+    const text = readFileSync(join(SERIES_DIR, name), "utf8");
+    const message = text.slice(0, text.indexOf("\n---\n"));
+    const cls = /^Class: (ours|upstream|generated)$/m.exec(message)?.[1];
+    expect(cls, `${name}: a \`Class:\` trailer`).toBeDefined();
+    expect(message, `${name}: a body, not only a subject`).toMatch(/^Subject: .+\n(.+\n)*\n\S/m);
+    expect(message, name).toMatch(/^Pass: .+$/m);
+    if (cls === "generated") generated++;
+    // The one upstream-class pass with no issue is repeat (nothing to report: it is linear upstream).
+    if (cls === "upstream" && !name.includes("repeat"))
+      expect(message, `${name}: an upstream issue link`).toMatch(
+        /^Upstream: https:\/\/github\.com\/CanadaHonk\/porffor\/issues\/\d+$/m,
+      );
+    expect(index, `PATCHES.md lists ${name}`).toContain(name);
+  }
+  // The generated precompile patch is the last one, and the only one.
+  expect(generated).toBe(1);
+  expect(names.at(-1)).toContain("regenerate-compiler-builtins_precompiled");
+});
+
+test("the series reproduces from upstream byte for byte (PORFFOR_SERIES_VERIFY=1; CI runs it as a job)", () => {
+  if (!process.env.PORFFOR_SERIES_VERIFY) return;
+  expect(verify(process.env.PORFFOR_UPSTREAM, () => {})).toEqual([]);
+}, 300_000);
+
+// --- the shipped tree ---
+
+test("acquire unpacks the vendored tarball once, verified, and republishes a damaged cache entry", async () => {
+  const cacheRoot = await mkdtemp(join(tmpdir(), "sb-a21-acquire-"));
+  temporary.push(cacheRoot);
+  const dir = await ensurePorfforA21(CURRENT_ALPHA, { cacheRoot });
+  expect(dir).toBe(cachedPorfforA21Root(CURRENT_ALPHA, cacheRoot));
+  expect(dir).toContain(A21_PATCH_FINGERPRINT);
+  const complete = JSON.parse(await readFile(join(dir, ".sproutboat-complete"), "utf8"));
+  expect(complete.commit).toBe(PORFFOR_A21_PINS[CURRENT_ALPHA].commitFull);
+  expect(complete.archiveSha256).toBe(readManifest().tarball.sha256);
+  expect(complete.patchFingerprint).toBe(A21_PATCH_FINGERPRINT);
+  // Same tree as the tarball: nothing was patched on the way.
+  const direct = await patched();
+  for (const file of ["compiler/codegen.js", "compiler/render.js", "compiler/builtins_precompiled.js"])
+    expect(await readFile(join(dir, file), "utf8"), file).toBe(await readFile(join(direct, file), "utf8"));
+  expect(await ensurePorfforA21(CURRENT_ALPHA, { cacheRoot })).toBe(dir);
+  // A cache entry whose file no longer matches the manifest is replaced, not trusted.
+  await rm(join(dir, ".sproutboat-complete"), { force: true });
+  await writeFile(join(dir, "compiler/codegen.js"), "// damaged\n");
+  const again = await ensurePorfforA21(CURRENT_ALPHA, { cacheRoot });
+  expect(again).toBe(dir);
+  expect(await readFile(join(dir, "compiler/codegen.js"), "utf8")).toBe(
+    await readFile(join(direct, "compiler/codegen.js"), "utf8"),
+  );
+}, 120_000);
+
+test("the shipped tree carries every patch's edit", async () => {
+  const root = await patched();
   const files = [
     "compiler/codegen.js",
     "compiler/modules.js",
@@ -68,15 +134,24 @@ test("the alpha 21 chain applies to the pinned tree, once, and the second run ch
     "compiler/builtins/promise.ts",
     "compiler/builtins/string.ts",
     "compiler/builtins/regexp.ts",
+    "compiler/builtins/json.ts",
+    "compiler/builtins/date.ts",
     "compiler/builtins/_internal_object.ts",
     "compiler/builtins_precompiled.js",
   ];
-  const first: Record<string, string> = {};
-  for (const f of files) first[f] = await readFile(join(root, f), "utf8");
+  const text: Record<string, string> = {};
+  for (const f of files) text[f] = await readFile(join(root, f), "utf8");
   for (const [f, marker] of [
     ["compiler/codegen.js", "sproutboat P1: class functions stay in their module's unit"],
     ["compiler/codegen.js", "sproutboat P5: stable derived names"],
     ["compiler/codegen.js", "sproutboat P6: inits of app-module globals"],
+    ["compiler/codegen.js", "sproutboat P8: shared dispatch functions belong to the asking unit"],
+    ["compiler/codegen.js", "sharedFunc('((o, k) => o[k])', scope, 'get')"],
+    ["compiler/codegen.js", "#class_computed_prop_${unitOf(scope)}_"],
+    ["compiler/codegen.js", "sproutboat P10: shared dispatch arguments are evaluated in order"],
+    ["compiler/codegen.js", "sproutboat P13: the right operand of a logical expression is a branch"],
+    // P11 on alpha 24 leaves a decorated or boxed class alone.
+    ["compiler/codegen.js", "if (!expr && decl._writes && !classDecorators && !decl._boxed) {"],
     ["compiler/modules.js", "sproutboat P6: app-owned modules"],
     ["compiler/modules.js", "sproutboat P4: prelude-declared names override runtime globals"],
     ["compiler/modules.js", "sproutboat P14: runtime globals pinned to the template's"],
@@ -84,13 +159,17 @@ test("the alpha 21 chain applies to the pinned tree, once, and the second run ch
     ["compiler/render.js", "sproutboat: collector hooks for the fork template"],
     ["compiler/render.js", "static void porf_gc_scan_template_cards(void)"],
     ["compiler/render.js", "static u64 porf_gc_limit_room(void) {"],
-    ["compiler/builtins/_internal_object.ts", "sproutboat: frozen megamorphic cache"],
     ["compiler/render.js", "sproutboat: per-request cpu"],
-    ["compiler/builtins/promise.ts", "sproutboat: per-request cpu"],
     ["compiler/render.js", "sproutboat P2: app units last, pinned ABI regions"],
     ["compiler/render.js", "sproutboat P3: a unit's segments by content"],
     ["compiler/render.js", "sproutboat P6: app-module globals last"],
     ["compiler/render.js", "sproutboat: glibc select"],
+    // alpha 24's own text, untouched by any patch: js functions carry PORF_CC (swiftcall on clang arm64).
+    ["compiler/render.js", "#define PORF_CC __attribute__((swiftcall))"],
+    ["compiler/builtins/_internal_object.ts", "sproutboat: frozen megamorphic cache"],
+    ["compiler/builtins/promise.ts", "sproutboat: per-request cpu"],
+    ["compiler/builtins/json.ts", "sproutboat P9: a wide JSON string is sized by its own length"],
+    ["compiler/builtins/date.ts", "sproutboat P12: UTC offsets without a colon"],
     ["compiler/index.js", "SB_EXTRA_LINK"],
     ["compiler/index.js", "SB_EXTRA_CFLAGS"],
     ["compiler/builtins.js", "sproutboat: navigator is writable"],
@@ -101,19 +180,16 @@ test("the alpha 21 chain applies to the pinned tree, once, and the second run ch
     ["compiler/builtins/string.ts", "sproutboat: Unicode case mapping"],
     ["compiler/builtins/regexp.ts", "export const __Porffor_regex_replaceCallback = "],
   ] as const)
-    expect(first[f], `${marker} in ${f}`).toContain(marker);
-  // The precompile ran after the builtin edits: the table carries the replaceAll rewrite.
-  expect(first["compiler/builtins_precompiled.js"]).toContain("replaceAll");
-  expect(first["compiler/builtins_precompiled.js"]).toContain("icFreezeMega");
-  // Idempotent: a fresh chain on the patched tree (no manifest, so every pass runs) is a no-op.
-  const { ensurePorfforPatchedA21: again } = await import(`./patch.ts?${Date.now()}`);
-  await again(root);
-  for (const f of files) expect(await readFile(join(root, f), "utf8"), f).toBe(first[f]);
+    expect(text[f], `${marker} in ${f}`).toContain(marker);
+  // alpha 24's own file (the TypeScript lowering) is untouched by every patch.
+  expect(await Bun.file(join(root, "compiler/typescript.js")).exists()).toBe(true);
+  // The table was regenerated after the builtin edits: it carries the replaceAll rewrite and the mega freeze.
+  expect(text["compiler/builtins_precompiled.js"]).toContain("replaceAll");
+  expect(text["compiler/builtins_precompiled.js"]).toContain("icFreezeMega");
 }, 120_000);
 
 test("a shared prelude owns fetch and the timers: the worker compile links no network stack", async () => {
-  const root = await pristine();
-  await ensurePorfforPatchedA21(root);
+  const root = await patched();
   const work = join(root, "work");
   await mkdir(work);
   // sproutd's compile shape: the entry imports the app unit, which imports the prelude first.
@@ -162,149 +238,8 @@ test("a shared prelude owns fetch and the timers: the worker compile links no ne
   expect(main).toContain("porf_fnrecs");
 }, 120_000);
 
-test("P1, P2 and P4 edits are anchored on exact alpha 21 text", async () => {
-  const root = await mkdtemp(join(tmpdir(), "sb-a21-p-"));
-  temporary.push(root);
-  await mkdir(join(root, "compiler"), { recursive: true });
-  await mkdir(join(root, "runtime/node/internal"), { recursive: true });
-  await writeFile(join(root, "compiler/codegen.js"), "const declareClass = (scope, decl) => {\n");
-  await expect(patchClassUnit(root)).rejects.toThrow("class functions in their module's unit (P1)");
-  await writeFile(join(root, "compiler/render.js"), "  unitOrder.push('main');\n");
-  await expect(patchUnitLayout(root)).rejects.toThrow("unit layout (P2, P3, P6)");
-  await writeFile(join(root, "compiler/modules.js"), "nothing\n");
-  await expect(patchPreludeOwnedGlobals(root)).rejects.toThrow("prelude-owned globals (P4)");
-  await expect(patchGlobalsPin(root)).rejects.toThrow("the pinned runtime globals (P14)");
-  await expect(patchStableEntryPath(root)).rejects.toThrow("a stable entry path (P7)");
-  await writeFile(join(root, "runtime/node/internal/fetch.js"), "class Response {}\n");
-  await expect(patchResponseStatics(root)).rejects.toThrow("Response.redirect");
-});
-
-test("the alpha 21 fingerprint covers its sources and is as released", async () => {
-  expect(A21_PATCH_FINGERPRINT).toMatch(/^[0-9a-f]{12}$/);
-  expect(A21_PATCH_FINGERPRINT).toBe(a21SourceFingerprint(import.meta.dir)!);
-  expect(a21SourceFingerprint("/nonexistent")).toBeNull();
-  expect(PORFFOR_A21_COMMIT_FULL).toMatch(/^[0-9a-f]{40}$/);
-  const actual = a21SourceFingerprint(import.meta.dir)!;
-  if (process.env.UPDATE_FINGERPRINT && actual !== A21_RELEASED_FINGERPRINT) {
-    const file = `${import.meta.dir}/fingerprint.ts`;
-    const text = await Bun.file(file).text();
-    await Bun.write(
-      file,
-      text.replace(
-        `A21_RELEASED_FINGERPRINT = "${A21_RELEASED_FINGERPRINT}"`,
-        `A21_RELEASED_FINGERPRINT = "${actual}"`,
-      ),
-    );
-    return;
-  }
-  expect(A21_RELEASED_FINGERPRINT, "run UPDATE_FINGERPRINT=1 bun test packages/toolchain/src/a21/patch.test.ts").toBe(
-    actual,
-  );
-});
-
-test("the alpha 22 pin is the alpha 21 chain plus P8, applied once, and the tree tells its own channel", async () => {
-  const root = await pristine("alpha-22");
-  expect(channelOfTree(root)).toBe("alpha-22");
-  expect(pinOfTree(root).commitFull).toBe("a081ebd71177b898b2859298376e3191f088af32");
-  await ensurePorfforPatchedA21(root);
-  expect(channelOfTree(root)).toBe("alpha-22");
-  const codegen = await readFile(join(root, "compiler/codegen.js"), "utf8");
-  for (const marker of [
-    "sproutboat P1: class functions stay in their module's unit",
-    "sproutboat P5: stable derived names",
-    "sproutboat P8: shared dispatch functions belong to the asking unit",
-    "sharedFunc('((o, k) => o[k])', scope, 'get')",
-  ])
-    expect(codegen, marker).toContain(marker);
-  const render = await readFile(join(root, "compiler/render.js"), "utf8");
-  for (const marker of [
-    "sproutboat P2: app units last, pinned ABI regions",
-    "sproutboat: collector hooks for the fork template",
-    "sproutboat: per-request cpu",
-    "sproutboat: glibc select",
-  ])
-    expect(render, marker).toContain(marker);
-  expect(await readFile(join(root, "compiler/builtins_precompiled.js"), "utf8")).toContain("icFreezeMega");
-  expect(await readFile(join(root, "compiler/builtins/json.ts"), "utf8")).toContain(
-    "sproutboat P9: a wide JSON string is sized by its own length",
-  );
-  // An alpha 21 tree never gets P8 (its codegen has no shared dispatch).
-  const a21 = await pristine("alpha-21");
-  expect(channelOfTree(a21)).toBe("alpha-21");
-  await ensurePorfforPatchedA21(a21);
-  expect(await readFile(join(a21, "compiler/codegen.js"), "utf8")).not.toContain("sproutboat P8");
-  // Idempotent on alpha 22 too.
-  const first = await readFile(join(root, "compiler/codegen.js"), "utf8");
-  const { ensurePorfforPatchedA21: again } = await import(`./patch.ts?a22-${Date.now()}`);
-  await again(root);
-  expect(await readFile(join(root, "compiler/codegen.js"), "utf8")).toBe(first);
-}, 180_000);
-
-test("the alpha 23 pin is the same chain, applied once, and the tree tells its own channel", async () => {
-  const root = await pristine("alpha-23");
-  expect(channelOfTree(root)).toBe("alpha-23");
-  expect(pinOfTree(root).commitFull).toBe("a97a0ae8e296009aee482dff11b150528098a9b7");
-  await ensurePorfforPatchedA21(root);
-  // The patched tree still reads as alpha 23: the discriminator is a codegen line no pass edits.
-  expect(channelOfTree(root)).toBe("alpha-23");
-  const codegen = await readFile(join(root, "compiler/codegen.js"), "utf8");
-  for (const marker of [
-    "sproutboat P1: class functions stay in their module's unit",
-    "sproutboat P5: stable derived names",
-    "sproutboat P8: shared dispatch functions belong to the asking unit",
-  ])
-    expect(codegen, marker).toContain(marker);
-  const render = await readFile(join(root, "compiler/render.js"), "utf8");
-  for (const marker of [
-    "sproutboat P2: app units last, pinned ABI regions",
-    "sproutboat: collector hooks for the fork template",
-    "sproutboat: per-request cpu",
-    "sproutboat: glibc select",
-    // alpha 23's own text, untouched by any pass: js functions carry PORF_CC (swiftcall on clang arm64).
-    "#define PORF_CC __attribute__((swiftcall))",
-  ])
-    expect(render, marker).toContain(marker);
-  const first = await readFile(join(root, "compiler/codegen.js"), "utf8");
-  const { ensurePorfforPatchedA21: again } = await import(`./patch.ts?a23-${Date.now()}`);
-  await again(root);
-  expect(await readFile(join(root, "compiler/codegen.js"), "utf8")).toBe(first);
-}, 180_000);
-
-test("the alpha 24 pin is the same chain with P5 and P11 re-anchored, applied once, and the tree tells its own channel", async () => {
-  const root = await pristine("alpha-24");
-  expect(channelOfTree(root)).toBe("alpha-24");
-  expect(pinOfTree(root).commitFull).toBe("1b8225eafda6664dcd4f274d002603bd9797de6a");
-  await ensurePorfforPatchedA21(root);
-  // typescript.js (the TypeScript lowering) is alpha 24's own file and no pass touches it.
-  expect(channelOfTree(root)).toBe("alpha-24");
-  const codegen = await readFile(join(root, "compiler/codegen.js"), "utf8");
-  for (const marker of [
-    "sproutboat P1: class functions stay in their module's unit",
-    "sproutboat P5: stable derived names",
-    "#class_computed_prop_${unitOf(scope)}_",
-    "sproutboat P8: shared dispatch functions belong to the asking unit",
-    // P11 on alpha 24 leaves a decorated or boxed class alone.
-    "if (!expr && decl._writes && !classDecorators && !decl._boxed) {",
-  ])
-    expect(codegen, marker).toContain(marker);
-  const render = await readFile(join(root, "compiler/render.js"), "utf8");
-  for (const marker of [
-    "sproutboat P2: app units last, pinned ABI regions",
-    "sproutboat: collector hooks for the fork template",
-    "sproutboat: per-request cpu",
-    "sproutboat: glibc select",
-    "#define PORF_CC __attribute__((swiftcall))",
-  ])
-    expect(render, marker).toContain(marker);
-  const first = await readFile(join(root, "compiler/codegen.js"), "utf8");
-  const { ensurePorfforPatchedA21: again } = await import(`./patch.ts?a24-${Date.now()}`);
-  await again(root);
-  expect(await readFile(join(root, "compiler/codegen.js"), "utf8")).toBe(first);
-}, 180_000);
-
 test("plan 001 step B: the collector's budget and nursery cap are clamped by the app's memory limit", async () => {
-  const root = await pristine("alpha-23");
-  await ensurePorfforPatchedA21(root);
+  const root = await patched();
   const render = await readFile(join(root, "compiler/render.js"), "utf8");
   // Both edits are in, each once: the limit and its setter, the budget clamp and the nursery cap clamp.
   for (const needle of [
@@ -362,9 +297,8 @@ test("plan 001 step B: the collector's budget and nursery cap are clamped by the
   ]);
 }, 180_000);
 
-test("P8: alpha 23's shared dispatch functions sit in the unit that asked, under stable names", async () => {
-  const root = await pristine("alpha-23");
-  await ensurePorfforPatchedA21(root);
+test("P8: the shared dispatch functions sit in the unit that asked, under stable names", async () => {
+  const root = await patched();
   const work = join(root, "work");
   await mkdir(work);
   // The prelude dispatches trim and padStart on an untyped receiver; the app dispatches four methods, two of them the same.
@@ -402,7 +336,7 @@ test("P8: alpha 23's shared dispatch functions sit in the unit that asked, under
     "utf8",
   );
   const main = await readFile(join(out, "porf__main.c"), "utf8");
-  // Stock alpha 23 put every one of these into porf__main.c as p__main__23anonymous_1, _1_, _1__, ...
+  // Stock alpha put every one of these into porf__main.c as p__main__23anonymous_1, _1_, _1__, ...
   expect(main).not.toMatch(/^(?:PORF_CC )?jsval p__main__23anonymous_1_*\(/m);
   expect(main).not.toMatch(/^(?:PORF_CC )?jsval p__main__23shared_/m);
   expect(prelude).toMatch(/^(?:PORF_CC )?jsval p_\w+__23shared_trim_0\(jsval r\) \{$/m);
@@ -422,9 +356,8 @@ test("P8: alpha 23's shared dispatch functions sit in the unit that asked, under
   expect(new TextDecoder().decode(run.stdout).trim()).toBe("ABab  abb c c  2,3");
 }, 180_000);
 
-test("P9: JSON.parse of a large document with wide strings runs on patched alpha 23", async () => {
-  const root = await pristine("alpha-23");
-  await ensurePorfforPatchedA21(root);
+test("P9: JSON.parse of a large document with wide strings runs on the shipped alpha 24 tree", async () => {
+  const root = await patched();
   const work = join(root, "work-p9");
   await mkdir(work);
   await writeFile(
@@ -453,8 +386,7 @@ test("P9: JSON.parse of a large document with wide strings runs on patched alpha
 }, 180_000);
 
 test("P14: runtime globals are pinned to the template's set, and a free reference outside it is a compile error", async () => {
-  const root = await pristine("alpha-23");
-  await ensurePorfforPatchedA21(root);
+  const root = await patched();
   // The shared prelude owns performance (an assignment) and process (a lazy accessor, `Object.defineProperty(globalThis, 'process', ...)`),
   // both P4, the way sproutd's does; the template names MessageEvent.
   const prelude =

@@ -1,55 +1,84 @@
 # Porffor patches against upstream
 
-The 25 passes of `ensurePorfforPatchedA21` (`src/a21/patch.ts`), each checked against
-[CanadaHonk/porffor](https://github.com/CanadaHonk/porffor) issues and PRs, open and closed. Update this
-file whenever a pass is added, dropped or filed upstream.
+The patch series is the source of truth: `packages/toolchain/porffor-patches/`, a `git format-patch` series of
+26 patches against ONE upstream commit, [CanadaHonk/porffor](https://github.com/CanadaHonk/porffor)
+`1b8225e` (tag `alpha-24`, 2026-11-14). The toolchain supports one Porffor alpha at a time. This file is the index.
 
-**Last checked: alpha 24 (`1b8225e`, 2026-11-14), 2026-11-14, by running it.** The chain was applied to a pristine
-alpha 24 tree: 23 of 25 passes anchor once unchanged, P5 and P11 had moved anchors and were re-anchored (see "Alpha 24
-check" below), and the repros were compiled and run on the unpatched tree. The chain now pins alpha 21, 22, 23 and 24
-(`src/a21/pin.ts`); no pass was dropped by alpha 24. Before that, alpha 23 (`a97a0ae`, 2026-11-10) was checked the same way on
-2026-11-12 (see "Alpha 23 check").
+What ships is the patched tree: `vendor/porffor-patched.tar.gz` (the commit with the series applied) and
+`vendor/porffor-patched.json` (upstream commit, series hash, tar and tarball sha256). `ensurePorfforA21` verifies the
+tarball and unpacks it; nothing is patched on the user's machine, so it needs no git. `scripts/porffor-patches.ts` makes
+and checks all of it:
 
-Classes:
+```sh
+bun scripts/porffor-patches.ts apply   [--dir D] [--base alpha-NN] [--upstream URL|PATH]  # upstream commit + series -> a git checkout (git am --3way)
+bun scripts/porffor-patches.ts export  [--dir D]                                          # the checkout's commits -> porffor-patches/
+bun scripts/porffor-patches.ts vendor  [--dir D] [--tag alpha-NN]                         # -> vendor/porffor-patched.tar.gz + .json
+bun scripts/porffor-patches.ts verify  [--upstream URL|PATH]                              # apply + export + vendor in a temp dir, compare byte for byte
+bun scripts/porffor-patches.ts check                                                      # no git, no network: series hash and tarball sha256 vs the manifest
+```
 
-- **upstream**: Porffor itself is wrong or missing something. Anyone running Porffor could hit it.
-- **ours**: a consequence of our shared-template model, our GC and CPU hooks, our link inputs or our host.
-  Upstream would not need it.
+`verify` is a CI job (`porffor patch series`). `check` and the shape of every patch below run in `patch.test.ts`.
+
+Classes (a `Class:` trailer in every patch):
+
+- **upstream**: Porffor itself is wrong or missing something. Anyone running Porffor could hit it. The patch names the issue (`Upstream:` trailer).
+- **ours**: a consequence of our shared-template model, our GC and CPU hooks, our link inputs or our host. Upstream would not need it.
+- **generated**: `compiler/builtins_precompiled.js`, which upstream tracks and which follows every builtin edit.
 
 Filing on upstream needs explicit human approval, and Porffor's [AI policy](https://github.com/CanadaHonk/porffor/blob/main/AI_POLICY.md)
 applies. Drafts live in [`sproutboat/patches/upstream`](https://github.com/baronunread/sproutboat/tree/main/patches/upstream).
 
-## Table
+## The series
 
-| Pass (`patch…A21` / function)                | P   | Group | Class    | Upstream issue or PR                                                                                                                                                                                                                  | Repro, one line                                                                                                                                                  | Last checked      |
-| -------------------------------------------- | --- | ----- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------- |
-| `patchCompilerArgsA21`                       |     | 1     | ours     | none needed                                                                                                                                                                                                                           | `SB_EXTRA_LINK` and `SB_EXTRA_CFLAGS` add the link inputs and flags for SQLite, BearSSL and the broker glue; upstream names libraries in source (`Porffor.link`) | alpha 24, 1b8225e |
-| `patchNavigatorWritableA21`                  |     | 1     | ours     | none needed                                                                                                                                                                                                                           | `navigator.userAgent` is frozen to `Porffor/<v>`; the prelude must set `Cloudflare-Workers` for pg's Workers socket path                                         | alpha 24, 1b8225e |
-| `patchReplaceAll`                            |     | 1     | upstream | [#459](https://github.com/CanadaHonk/porffor/issues/459), open (filed by us 2026-11-11)                                                                                                                                                                                                                            | `String.prototype.replaceAll` is quadratic: each match concatenates the whole output again                                                                       | alpha 24, 1b8225e |
-| `patchRepeatDoubling`                        |     | 1     | upstream | not filed: on `a97a0ae` `repeat` is linear (1.6 MB in 8 ms, 32 MB in 105 ms), only slower by a constant than doubling copies; nothing to report ([#150](https://github.com/CanadaHonk/porffor/pull/150) and [#312](https://github.com/CanadaHonk/porffor/pull/312) are closed `repeat` count-coercion PRs, a different problem)                                            | `"ab".repeat(300000)` makes 300,000 small copies instead of log2(n) doubling copies                                                                              | alpha 24, 1b8225e |
-| `patchCaseMapping`                           |     | 1     | upstream | [#461](https://github.com/CanadaHonk/porffor/issues/461), open (filed by us 2026-11-11)                                                                                                                                                                                                                            | `toUpperCase` / `toLowerCase` map only ASCII: `"é".toUpperCase()` stays `"é"`, `"ж".toUpperCase()` stays `"ж"`                                                   | alpha 24, 1b8225e |
-| `patchRegexReplace`                          |     | 1     | upstream | [#460](https://github.com/CanadaHonk/porffor/issues/460), open (filed by us 2026-11-11)                                                                                                                                                                                                                            | `str.replace(/re/g, fn)` is quadratic: a full `strcat` copy per match                                                                                            | alpha 24, 1b8225e |
-| `patchAppModuleIds`                          | P6  | 2     | ours     | none needed                                                                                                                                                                                                                           | records app module ids and declares their namespaces after the shared ones, so the template's initializer prefix does not depend on the app                      | alpha 24, 1b8225e |
-| `patchPreludeOwnedGlobals`                   | P4  | 2     | ours     | none needed                                                                                                                                                                                                                           | a name the shared prelude declares, assigns on `globalThis` or defines there with a literal name (`Object.defineProperty(globalThis, "process", ...)`, a lazy accessor) must not also install the runtime's global, or a free `fetch(` links the whole fetch stack         | alpha 24, 1b8225e |
-| `patchGlobalsPin`                            | P14 | 2     | ours     | none needed                                                                                                                                                                                                                           | the runtime globals an app references decide the order of the template's `globals.js` installs, so a free `performance` reordered every node unit behind it (sproutd issue 97); with `SB_GLOBALS_PIN` the set and order are the template's and any other name is a compile error| not checked (ours)|
-| `patchClassUnit`                             | P1  | 2     | ours     | none needed                                                                                                                                                                                                                           | class methods and constructors land in `main` instead of their module's unit, so an app's classes change the shared prefix                                       | alpha 24, 1b8225e |
-| `patchSharedDispatchUnit`                    | P8  | 2     | ours     | none needed (alpha 22 and later only)                                                                                                                                                                                                 | the shared dispatch functions for unknown receivers (`#anonymous_1`, ...) are created into `main` in creation order, so one app shifts every other app's ABI     | alpha 24, 1b8225e |
-| `patchStableNames`                           | P5  | 2     | ours     | none needed                                                                                                                                                                                                                           | `#func_cache_<global index>` and class computed-key globals are named by creation order, so the prelude's unit differs byte-wise between apps                    | alpha 24, 1b8225e |
-| `patchUnitLayout`                            | P2  | 2     | ours     | none needed                                                                                                                                                                                                                           | app units go last, data segments are laid out by content (P3, P3b) and the ABI regions are pinned at 1, 2 and 4 MiB so the template ABI holds across apps        | alpha 24, 1b8225e |
-| `patchStableEntryPath`                       | P7  | 2     | ours     | none needed                                                                                                                                                                                                                           | `node:process` bakes the absolute entry path into its unit; `--sb-entry-file` pins it so templates compare equal                                                 | alpha 24, 1b8225e |
-| `patchGcHooks`                               |     | 2     | ours     | none needed (our earlier GC reports [#425](https://github.com/CanadaHonk/porffor/issues/425) and [#428](https://github.com/CanadaHonk/porffor/issues/428) are closed and unrelated)                                                    | `porf_gc_quiet`, `porf_gc_seal_heap` and immortal sealed template pages, so forked workers do not copy-on-write the template heap                                | alpha 24, 1b8225e |
-| `patchCpuStamp`                              |     | 2     | ours     | none needed                                                                                                                                                                                                                           | stamps each promise reaction with a per-request id and sums thread CPU per request                                                                               | alpha 24, 1b8225e |
-| `patchIcMegaFreeze`                          |     | 2     | ours     | none needed. Open upstream IC rewrites [#420](https://github.com/CanadaHonk/porffor/pull/420) and [#421](https://github.com/CanadaHonk/porffor/pull/421) (arv) would touch the same code, so recheck the anchors when they merge     | the 80 KiB megamorphic cache is written by every worker's misses; freezing it after warm-up keeps the pages shared                                               | alpha 24, 1b8225e |
-| `patchReservedSelect`                        |     | 3     | upstream | [#462](https://github.com/CanadaHonk/porffor/issues/462), open (filed by us 2026-11-11). [#426](https://github.com/CanadaHonk/porffor/issues/426) (ours, closed) fixed all-caps macro names only; lowercase libc functions are still missing from `cReservedNames`                                                 | `const select = 1; console.log(select)` fails the C compile on Linux (glibc `sys/select.h` declares `select()`)                                                  | alpha 24, 1b8225e |
-| `patchResponseStatics`                       |     | 3     | upstream | [#463](https://github.com/CanadaHonk/porffor/issues/463), open (filed by us 2026-11-11)                                                                                                                                                                                                                            | `Response.redirect(url, status)` and `Response.error()` are missing; only `Response.json` exists                                                                 | alpha 24, 1b8225e |
-| `patchProcessNullTables`                     |     | 3     | ours     | none needed. Upstream's CLI always has an argv and an environment; only an embedding host that runs `clearenv()` (sproutd's template) reaches it                                                                                      | `node:process` init reads `porf_argv[i]` and `environ[i]` without a null check, so a host with no argv or a cleared `environ` crashes before the first module    | alpha 24, 1b8225e |
-| `patchJsonWideStringBound`                   | P9  | 3     | upstream | [#464](https://github.com/CanadaHonk/porffor/issues/464), open (filed by us 2026-11-11)                                                                                                                                                                                                                            | `JSON.parse` of 6,000 objects containing `"naïve 中文"` in a 316 KB document dies (signal 138/139): wide strings are sized by the whole document, not the string    | alpha 24, 1b8225e |
-| `patchDispatchArgOrder`                      | P10 | 3     | upstream | [#454](https://github.com/CanadaHonk/porffor/issues/454), open, same bug (filed by us 2026-11-08). Related family, different code paths: [#437](https://github.com/CanadaHonk/porffor/issues/437), [#438](https://github.com/CanadaHonk/porffor/issues/438), [#448](https://github.com/CanadaHonk/porffor/issues/448) | `x.toString("utf8", i, i += n)` on an untyped `x` reads `i` after the increment on arm64                                                                         | alpha 24, 1b8225e |
-| `patchClassBindingWrite`                     | P11 | 3     | upstream | [#457](https://github.com/CanadaHonk/porffor/issues/457), open, same bug (filed by us 2026-11-08)                                                                                                                                     | `class A {}; A = A` leaves `A` undefined; drizzle-orm's `(SQL \|\| (SQL = {}))` namespace merge dies with "Cannot get property of null"                          | alpha 24, 1b8225e |
-| `patchDateOffsets`                           | P12 | 3     | upstream | [#455](https://github.com/CanadaHonk/porffor/issues/455), open, same bug (filed by us 2026-11-08). The earlier colon form was [#387](https://github.com/CanadaHonk/porffor/issues/387), ours, closed                                   | `new Date("2026-11-08 14:48:19.097+00")` and `...+0000` are `NaN` (V8 and Bun accept `+HH`, `+HHmm`, `+HH:mm`)                                                   | alpha 24, 1b8225e |
-| `patchLogicalBranchInference`                | P13 | 3     | upstream | [#456](https://github.com/CanadaHonk/porffor/issues/456), open, same bug (filed by us 2026-11-08)                                                                                                                                     | in a function, `let o = 1; o \|\| (o = {}); typeof o` answers `"object"`: the right operand's assignment retypes the local as if it always ran                   | alpha 24, 1b8225e |
+Applied in this order. Every patch has what and why in its commit message.
 
-`precompileBuiltinsA21` runs last and is a build step, not a patch: it compiles the builtins the passes above edited.
+| Patch | Change | Class | Upstream issue or PR | What it fixes, one line |
+| ----- | ------ | ----- | -------------------- | ----------------------- |
+| [`0001-compiler-SB_EXTRA_LINK-and-SB_EXTRA_CFLAGS-add-link-.patch`](porffor-patches/0001-compiler-SB_EXTRA_LINK-and-SB_EXTRA_CFLAGS-add-link-.patch) | SB_EXTRA_LINK / SB_EXTRA_CFLAGS | ours | none needed | link inputs and C flags from the environment for SQLite, BearSSL and the broker glue; upstream names libraries in source (`Porffor.link`) |
+| [`0002-builtins-navigator-is-writable.patch`](porffor-patches/0002-builtins-navigator-is-writable.patch) | writable `navigator` | ours | none needed | `navigator.userAgent` is frozen to `Porffor/<v>`; the prelude must set `Cloudflare-Workers` for pg's Workers socket path |
+| [`0003-string-replaceAll-joins-its-pieces-once-instead-of-c.patch`](porffor-patches/0003-string-replaceAll-joins-its-pieces-once-instead-of-c.patch) | `replaceAll` pieces | upstream | [#459](https://github.com/CanadaHonk/porffor/issues/459), open (filed by us 2026-11-11) | `String.prototype.replaceAll` is quadratic: each match concatenates the whole output again |
+| [`0004-string-repeat-copies-by-doubling.patch`](porffor-patches/0004-string-repeat-copies-by-doubling.patch) | `repeat` doubling | upstream | not filed: `repeat` is linear on alpha 23/24 (1.6 MB in 8 ms, 32 MB in 105 ms), the patch only cuts a constant factor; candidate to drop ([#150](https://github.com/CanadaHonk/porffor/pull/150) and [#312](https://github.com/CanadaHonk/porffor/pull/312) are closed count-coercion PRs, a different problem) | `"ab".repeat(300000)` makes 300,000 small copies instead of log2(n) doubling copies |
+| [`0005-string-toUpperCase-and-toLowerCase-map-the-Unicode-c.patch`](porffor-patches/0005-string-toUpperCase-and-toLowerCase-map-the-Unicode-c.patch) | Unicode case mapping | upstream | [#461](https://github.com/CanadaHonk/porffor/issues/461), open (filed by us 2026-11-11) | `toUpperCase` / `toLowerCase` map only ASCII: `"é".toUpperCase()` stays `"é"` |
+| [`0006-regexp-replace-with-a-global-regexp-and-a-function-b.patch`](porffor-patches/0006-regexp-replace-with-a-global-regexp-and-a-function-b.patch) | regexp `replace` with a function | upstream | [#460](https://github.com/CanadaHonk/porffor/issues/460), open (filed by us 2026-11-11) | `str.replace(/re/g, fn)` is quadratic: a full `strcat` copy per match |
+| [`0007-modules-record-app-module-ids-and-declare-their-name.patch`](porffor-patches/0007-modules-record-app-module-ids-and-declare-their-name.patch) | app module ids (P6, modules.js) | ours | none needed | records app module ids and declares their namespaces after the shared ones, so the template's initializer prefix does not depend on the app |
+| [`0008-modules-names-the-shared-prelude-declares-or-assigns.patch`](porffor-patches/0008-modules-names-the-shared-prelude-declares-or-assigns.patch) | prelude-owned globals (P4) | ours | none needed | a name the shared prelude declares, assigns on `globalThis` or defines there with a literal name must not also install the runtime's global, or a free `fetch(` links the whole fetch stack |
+| [`0009-modules-SB_GLOBALS_PIN-pins-the-runtime-globals-to-t.patch`](porffor-patches/0009-modules-SB_GLOBALS_PIN-pins-the-runtime-globals-to-t.patch) | `SB_GLOBALS_PIN` (P14) | ours | none needed | the globals an app references decide the order of the template's `globals.js` installs (sproutd issue 97); with the pin the set and order are the template's |
+| [`0010-codegen-class-methods-and-constructors-stay-in-their.patch`](porffor-patches/0010-codegen-class-methods-and-constructors-stay-in-their.patch) | class functions in their unit (P1) | ours | none needed | class methods and constructors land in `main` instead of their module's unit, so an app's classes change the shared prefix |
+| [`0011-codegen-shared-dispatch-functions-belong-to-the-aski.patch`](porffor-patches/0011-codegen-shared-dispatch-functions-belong-to-the-aski.patch) | shared dispatch per unit (P8) | ours | none needed | the shared dispatch functions for unknown receivers (`#anonymous_1`, ...) are created into `main` in creation order, so one app shifts every other app's ABI |
+| [`0012-codegen-stable-derived-names-and-app-modules-builtin.patch`](porffor-patches/0012-codegen-stable-derived-names-and-app-modules-builtin.patch) | stable derived names (P5, P6 codegen) | ours | none needed | `#func_cache_<global index>` and class computed-key globals are named by creation order, so the prelude's unit differs byte-wise between apps. Alpha 24: the computed-key anchor is indentation-free |
+| [`0013-render-app-units-last-content-ordered-data-segments-.patch`](porffor-patches/0013-render-app-units-last-content-ordered-data-segments-.patch) | unit layout (P2, P3, P3b, P6 render) | ours | none needed | app units go last, data segments are laid out by content and the ABI regions are pinned at 1, 2 and 4 MiB so the template ABI holds across apps |
+| [`0014-modules-sb-entry-file-pins-the-entry-path-baked-into.patch`](porffor-patches/0014-modules-sb-entry-file-pins-the-entry-path-baked-into.patch) | stable entry path (P7) | ours | none needed | `node:process` bakes the absolute entry path into its unit; `--sb-entry-file` pins it so templates compare equal |
+| [`0015-render-collector-hooks-for-the-fork-template-quiet-s.patch`](porffor-patches/0015-render-collector-hooks-for-the-fork-template-quiet-s.patch) | collector hooks | ours | none needed (our earlier GC reports [#425](https://github.com/CanadaHonk/porffor/issues/425) and [#428](https://github.com/CanadaHonk/porffor/issues/428) are closed and unrelated) | `porf_gc_quiet`, `porf_gc_seal_heap`, immortal sealed template pages and `porf_gc_set_limit`, so forked workers do not copy-on-write the template heap and the app's memory limit reaches the collector |
+| [`0016-render-promise-per-request-CPU-stamp-on-promise-reac.patch`](porffor-patches/0016-render-promise-per-request-CPU-stamp-on-promise-reac.patch) | per-request CPU stamp | ours | none needed | stamps each promise reaction with a per-request id and sums thread CPU per request |
+| [`0017-builtins-the-megamorphic-inline-cache-can-be-frozen-.patch`](porffor-patches/0017-builtins-the-megamorphic-inline-cache-can-be-frozen-.patch) | megamorphic cache freeze | ours | none needed. Open upstream IC rewrites [#420](https://github.com/CanadaHonk/porffor/pull/420) and [#421](https://github.com/CanadaHonk/porffor/pull/421) would touch the same code: recheck when they merge | the 80 KiB megamorphic cache is written by every worker's misses; freezing it after warm-up keeps the pages shared |
+| [`0018-render-select-is-a-reserved-C-name.patch`](porffor-patches/0018-render-select-is-a-reserved-C-name.patch) | `select` is a reserved C name | upstream | [#462](https://github.com/CanadaHonk/porffor/issues/462), open (filed by us 2026-11-11). [#426](https://github.com/CanadaHonk/porffor/issues/426) (ours, closed) fixed all-caps macro names only | `const select = 1` fails the C compile on Linux (glibc `sys/select.h`) |
+| [`0019-fetch-Response.redirect-and-Response.error.patch`](porffor-patches/0019-fetch-Response.redirect-and-Response.error.patch) | `Response.redirect` / `Response.error` | upstream | [#463](https://github.com/CanadaHonk/porffor/issues/463), open (filed by us 2026-11-11) | only `Response.json` exists |
+| [`0020-process-tolerate-a-null-argv-and-environ.patch`](porffor-patches/0020-process-tolerate-a-null-argv-and-environ.patch) | null argv and environ | ours | none needed: only an embedding host that runs `clearenv()` (sproutd's template) reaches it | `node:process` init reads `porf_argv[i]` and `environ[i]` without a null check |
+| [`0021-json-a-wide-JSON-string-is-sized-by-its-own-length-P.patch`](porffor-patches/0021-json-a-wide-JSON-string-is-sized-by-its-own-length-P.patch) | JSON wide strings (P9) | upstream | [#464](https://github.com/CanadaHonk/porffor/issues/464), open (filed by us 2026-11-11) | `JSON.parse` of 6,000 objects containing `"naïve 中文"` in a 316 KB document dies (signal 138/139): wide strings are sized by the whole document |
+| [`0022-codegen-shared-dispatch-arguments-are-evaluated-in-o.patch`](porffor-patches/0022-codegen-shared-dispatch-arguments-are-evaluated-in-o.patch) | dispatch argument order (P10) | upstream | [#454](https://github.com/CanadaHonk/porffor/issues/454), open, same bug (filed by us 2026-11-08). Related, different paths: [#437](https://github.com/CanadaHonk/porffor/issues/437), [#438](https://github.com/CanadaHonk/porffor/issues/438), [#448](https://github.com/CanadaHonk/porffor/issues/448) | `x.toString("utf8", i, i += n)` on an untyped `x` reads `i` after the increment on arm64 |
+| [`0023-codegen-a-written-class-declaration-initialises-its-.patch`](porffor-patches/0023-codegen-a-written-class-declaration-initialises-its-.patch) | written class declaration (P11) | upstream | [#457](https://github.com/CanadaHonk/porffor/issues/457), open, same bug (filed by us 2026-11-08) | `class A {}; A = A` leaves `A` undefined; drizzle-orm's `(SQL \|\| (SQL = {}))` merge dies. Alpha 24 only: a decorated or boxed class is skipped (plain code now, no per-tree anchor choice) |
+| [`0024-codegen-the-right-operand-of-and-is-generated-as-a-b.patch`](porffor-patches/0024-codegen-the-right-operand-of-and-is-generated-as-a-b.patch) | logical right operand is a branch (P13) | upstream | [#456](https://github.com/CanadaHonk/porffor/issues/456), open, same bug (filed by us 2026-11-08) | in a function, `let o = 1; o \|\| (o = {}); typeof o` answers `"object"` |
+| [`0025-date-Date.parse-takes-HH-and-HHmm-offsets-as-well-as.patch`](porffor-patches/0025-date-Date.parse-takes-HH-and-HHmm-offsets-as-well-as.patch) | `Date.parse` offsets (P12) | upstream | [#455](https://github.com/CanadaHonk/porffor/issues/455), open, same bug (filed by us 2026-11-08). The colon form was [#387](https://github.com/CanadaHonk/porffor/issues/387), ours, closed | `new Date("2026-11-08 14:48:19.097+00")` and `...+0000` are `NaN` |
+| [`0026-builtins-regenerate-compiler-builtins_precompiled.js.patch`](porffor-patches/0026-builtins-regenerate-compiler-builtins_precompiled.js.patch) | regenerated `builtins_precompiled.js` | generated | n/a | the precompiled builtin table, which upstream tracks; `apply` skips this patch and regenerates it, `verify` fails when it is stale |
+
+Counts: 25 patches + 1 generated: 12 upstream (11 passes; 10 with an issue, #454 to #457 and #459 to #464, all open with no fix or PR), 13 ours.
+No upstream PR covers any of them; Porffor's AI policy does not allow LLM-written PR text, so any PR needs a human-written description.
+
+## Upgrading to a new alpha
+
+1. `bun scripts/porffor-patches.ts apply --base alpha-NN [--upstream <local clone>]`. It fetches the new tag, applies the
+   series on the OLD commit first (so every intermediate blob exists), then `git am --3way` onto the new tag, then regenerates
+   `builtins_precompiled.js`. The generated patch is never applied, so it never conflicts.
+2. On a conflict: edit the files in the checkout (`.porffor-series/` by default), `git add`, `git am --continue`; the
+   branch `sb-patches-old` holds the series on the old commit for reference. A patch that upstream fixed is dropped with
+   `git am --skip`. Then `bun scripts/porffor-patches.ts precompile`.
+3. Passes that made a per-tree choice (P11 picked its anchor by tree before) are plain code now: change the patch for the new alpha.
+4. `export` (rewrites `porffor-patches/`), then `vendor --tag alpha-NN` (tarball and manifest), with the bun CI pins.
+   Set `CURRENT_ALPHA` in `src/a21/pin.ts` and the `standalone` channel names; update this table.
+5. `verify` must pass. Re-run the repros of every upstream issue on the stock tree and note which still fail (see the checks below).
+6. Requalify at the tier the change needs (sproutd's `requalify.sh`; a new alpha is the porffor tier, see "Requal tiers").
+
+Dropping or adding a pass is the same flow: `git rebase -i` in the checkout, `export`, `vendor`.
 
 ## Alpha 24 check (2026-11-14)
 
@@ -92,53 +121,6 @@ five need `SB_CLI` (`sockets-starttls`, `do-evict`, `websockets-outbound`, `asyn
 sproutboat-cli `cb5624a` worktree linked to this checkout: 5 of 5 pass; `native-cc` and `native-lto` skipped because their gate was `=== "alpha-23"`
 (this PR widens it to alpha 24) and pass on the Mac on alpha 24. So every `test:native-*` script has passed on alpha 24. No new Porffor bug was found.
 The sproutd side (a template-script break from `e92728e3`'s new `porf_invoke` tables) is sproutd #123.
-
-## Alpha 23 check (2026-11-12)
-
-Alpha 23 is eight commits on alpha 22 (+25/-21 lines, five files under `compiler/`; nothing in `compiler/builtins/`
-or `runtime/`; upstream `main` is this commit, no later one). Every anchor of every pass is found once, so the chain applies
-unchanged; the one new rule is that P8 and P10 are applied on every tree but alpha 21's (`channelOfTree`).
-
-| Upstream commit | Touches | Effect on the chain |
-| --- | --- | --- |
-| `f85e9473` swiftcall for js functions on clang arm64 | `render.js`: `PORF_CC` on every js function definition and prototype, the dynamic thunks and `porf_call<n>` | none of our passes anchors on a js function signature; the **template script** does (`sproutd/build/a21/prepare-dynamic-template.py`), and so do tests that grep the emitted C |
-| `56b08ce5` six dynamic call args in registers | `render.js`: `DYN_REGS` 4 to 6, so `porf_thk` entries take `u64 ra, jsval thisv` and six `jsval` | none for the chain; the template's `SproutThunk` typedef must follow it |
-| `6f64fd79` strict assignments to captured bindings | `codegen.js` `isIdentAssignable` | none; `#457` (`A = A` on a class) is a different path and is still wrong, see below |
-| `ea2d36c3` constructor returns test `new.target` by type | `codegen.js` | none (P1 anchors on `declareClass`) |
-| `ece6782f`, `22159adc`, `f5eb200f`, `a97a0ae8` | `Math` constants, module export lists, `.d.ts` candidates, a pkg-config message | none |
-
-Repros run on the **unpatched** alpha 23 tree (macOS arm64, `porf native`), 2026-11-12. All still fail, so no pass can be dropped:
-
-| Issue | Result on stock alpha 23 |
-| --- | --- |
-| [#454](https://github.com/CanadaHonk/porffor/issues/454) | `decode(Buffer.from("hello world"), 6, 5)` gives `"|11"`, expected `"world|11"` |
-| [#455](https://github.com/CanadaHonk/porffor/issues/455) | `new Date("2026-11-08 14:48:19.097+00")` and `...+0000` are `NaN` |
-| [#456](https://github.com/CanadaHonk/porffor/issues/456) | `let o = 1; o || (o = {}); typeof o` is `"object"` |
-| [#457](https://github.com/CanadaHonk/porffor/issues/457) | `class A {}; A = A; typeof A` is `"undefined"` |
-| [#459](https://github.com/CanadaHonk/porffor/issues/459) | `replaceAll` over 148,890 characters 147 ms, over 628,890 characters 2,009 ms (4x input, 13.7x time) |
-| [#460](https://github.com/CanadaHonk/porffor/issues/460) | `replace(/\d+/g, fn)` over 628,890 characters (80,000 matches) 3,653 ms stock, 26 ms patched; with a template string 3,564 ms stock, 45 ms patched. This is the pass the "regex rewrite" question is about: alpha 23 changes nothing in `builtins/regexp.ts`, so `patchRegexReplace` stays |
-| [#461](https://github.com/CanadaHonk/porffor/issues/461) | `"é".toUpperCase()` and `"ж".toUpperCase()` are unchanged |
-| [#462](https://github.com/CanadaHonk/porffor/issues/462) | not run (Linux glibc only); the anchor `const cReservedNames = new Set([` is still there once |
-| [#463](https://github.com/CanadaHonk/porffor/issues/463) | `typeof Response.redirect` and `Response.error` are `"undefined"` |
-| [#464](https://github.com/CanadaHonk/porffor/issues/464) | `JSON.parse` of 12,000 objects with `"naïve 中文 x<i>"` exits 139 |
-
-All ten issues are still open, none has a comment or a linked PR. Our passes that are not upstream bugs (the 13 "ours") are
-not covered by any upstream change.
-
-## Counts
-
-- 24 passes: 11 upstream, 13 ours.
-- Of the 11 upstream: 10 have an upstream issue (#454 to #457 and #459 to #464, all open, none has a fix or PR yet) and 1 has none (`patchRepeatDoubling`, see below).
-- No upstream PR covers any of the 24. The 2026-11-11 issues were filed without PRs: Porffor's AI policy
-  does not allow LLM-written PR text, so any PR has to be opened with a human-written description.
-
-Reproduced on unpatched upstream `a97a0ae` (macOS arm64, `porf native`) on 2026-11-11 before filing: all of the above except
-`repeat`. Timings, 2 sizes each: `replaceAll` 96 ms at 80,000 characters and 1,386 ms at 320,000 (4x input, 14x time); regex
-`replace` with a function 271 ms at 100,000 characters and 7,128 ms at 400,000 (26x). The one-line `select` fix and the P9 bound were
-each applied to the clean tree and fixed their repro (`JSON.parse` of 48,000 objects, 1.5 MB, no longer crashes).
-
-`repeat` is not quadratic: `"ab".repeat(16e6)` takes 105 ms (32 MB). `patchRepeatDoubling` only cuts a constant factor, so there is
-nothing to report; consider dropping the pass.
 
 ## Issues we filed that are not tied to a pass
 

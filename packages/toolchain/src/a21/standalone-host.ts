@@ -1,7 +1,7 @@
 /**
- * A host build of a standalone binary on the alpha 22 channel, for the tools that compile one on the
+ * A host build of a standalone binary on the alpha 21 line (the current alpha), for the tools that compile one on the
  * machine they run on (the runtime's native tests, the monorepo's compat suite, `sproutboat dev`):
- * compose the sources, render the units with the alpha 22 compiler, build with the bridge and the
+ * compose the sources, render the units with the patched alpha compiler, build with the bridge and the
  * server shim (`standalone-build.ts`) against the host's uWebSockets checkout. The CLI's cross builds
  * do the same with zig (`compileSproutA21` in sproutboat-cli).
  */
@@ -63,7 +63,7 @@ export type HostCompileInput = {
   log?: (line: string) => void;
 };
 
-/** Compile `generatedPath` to a host binary at `outPath` on the alpha 21 line (alpha 24 unless the channel says alpha 23 or alpha 22). */
+/** Compile `generatedPath` to a host binary at `outPath` on the alpha 21 line (the current alpha). */
 export async function compileStandaloneHostA21(input: HostCompileInput): Promise<void> {
   const channel = standaloneA21Channel(standaloneChannel());
   const [alpha19, a21] = await Promise.all([ensurePorffor(), ensurePorfforA21(channel)]);

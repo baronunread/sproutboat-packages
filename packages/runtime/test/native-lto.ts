@@ -20,9 +20,9 @@ const handler = `export default {async fetch(request) {
   return new Response("hello");
 }};`;
 
-if (standaloneChannel() !== "alpha-23" && standaloneChannel() !== "alpha-24") {
-  // the bug is alpha 23's (PORF_CC, still there on alpha 24); alpha 22 has no swiftcall and alpha 19 builds through the compiler's own native build
-  console.log(`SKIPPED: the -flto check is for the alpha-23 and alpha-24 channels, not ${standaloneChannel()}`);
+if (standaloneChannel() !== "alpha-24") {
+  // the bug is alpha 23's (PORF_CC, still there on alpha 24); alpha 19 builds through the compiler's own native build
+  console.log(`SKIPPED: the -flto check is for the alpha-24 channel, not ${standaloneChannel()}`);
   process.exit(0);
 }
 

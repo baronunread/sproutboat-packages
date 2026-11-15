@@ -82,7 +82,7 @@ async function uwsDirectory(alpha19: string): Promise<string> {
   return dir;
 }
 
-/** Compile a generated module into a native binary on the standalone channel (alpha 24 by default, `SPROUTBOAT_PORFFOR_CHANNEL=alpha-23` for the previous default, `=alpha-19` for the oldest fallback). */
+/** Compile a generated module into a native binary on the standalone channel (alpha 24 by default, `SPROUTBOAT_PORFFOR_CHANNEL=alpha-19` for the frozen older build). */
 export async function compileNative(input: NativeCompileInput): Promise<void> {
   const which = channel();
   const dir = input.dir ?? dirname(input.binary);
@@ -152,7 +152,7 @@ export type RenderUnitsInput = Pick<
 
 /**
  * The compiler's half of a standalone build on the alpha 21 line: compose the sources, render the C units
- * with the pinned alpha 22 or 23 compiler, and return the units directory (porf.h, porf__main.c, the units).
+ * with the pinned (patched) alpha 24 compiler, and return the units directory (porf.h, porf__main.c, the units).
  */
 export async function renderStandaloneUnits(input: RenderUnitsInput): Promise<string> {
   const dir = input.dir ?? dirname(input.binary);
