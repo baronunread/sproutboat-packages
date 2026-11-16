@@ -257,7 +257,7 @@ try {
   assert.equal(db.query("PRAGMA integrity_check").get()?.integrity_check, "ok");
   db.close();
   const cleanPosition = await readFile(root + "/position", "utf8");
-  assert(cleanPosition.split("\n")[2].startsWith("C "));
+  assert(cleanPosition.split("\n")[2].split(" ")[1] === "C");
   const finishedBefore = await readdir(join(root, epoch));
   // SIGKILL can land between mkstemp and unlink. Only the next lock owner may
   // discard that reserved scratch name; unrelated files and links stay intact.
