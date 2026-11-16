@@ -107,6 +107,8 @@ async function runScenario(
   opts: {
     prep: Cmd[];
     prepKill?: boolean;
+    prepEnv?: Record<string, string>;
+    prepEnv?: Record<string, string>;
     traced: Cmd[];
     env: Record<string, string>;
     closeAtEnd?: boolean;
@@ -117,7 +119,7 @@ async function runScenario(
   // the initial state: built by an untraced process, then synced
   const prepAcked: Acked = { d1: new Set(), store: new Set() };
   {
-    const d = await spawnDriver(binary, root, opts.env);
+    const d = await spawnDriver(binary, root, { ...opts.env, ...opts.prepEnv });
     for (const line of SCHEMA) await d.send(line);
     for (const c of opts.prep) {
       await d.send(c.line);
@@ -317,6 +319,23 @@ try {
           prep,
           traced,
           env: { SB_LTX_CKPT_BYTES: "131072", SB_LTX_CKPT_MS: "3600000" },
+          closeAtEnd: true,
+        }),
+      );
+    }
+    // E. capture is switched on for a database that has rows and no spool: the first open takes a base image (fsynced, with its
+    // directory), then commits; cuts land inside the base image's own write
+    seq = 0;
+    {
+      const prep = Array.from({ length: 40 }, (_, i) => insert(i % 2 ? "store" : "d1"));
+      const traced: Cmd[] = [];
+      for (let i = 0; i < 30; i++) traced.push(insert(i % 2 ? "store" : "d1"));
+      results.push(
+        await runScenario("newbase", {
+          prep,
+          prepEnv: { SB_LTX_ENABLE: "0" },
+          traced,
+          env: { SB_LTX_CKPT_BYTES: "65536", SB_LTX_CKPT_MS: "3600000" },
           closeAtEnd: true,
         }),
       );
