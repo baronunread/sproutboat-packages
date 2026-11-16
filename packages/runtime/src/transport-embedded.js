@@ -509,7 +509,8 @@ typedef struct {
   uint64_t txid, offset, checksum;
   // LTXPOS3 (design 029 S1): epochSeq only ever grows, also after a lost spool; ino and mtime of the database file
   // when a clean record was written let a reopen skip the full page checksum.
-  uint64_t epoch_seq, db_ino, db_mtime_ns;
+  uint64_t epoch_seq, db_ino, db_mtime_ns, ltx_size;
+  int fast;
   long dirty_ms;
 } sb_ltx_state;
 static sb_ltx_state sb_ltx_states[SB_MAX_DB];
@@ -776,17 +777,23 @@ static int sb_ltx_position(sb_ltx_state *s) {
   // A clean record also pins the database file it describes (inode, mtime, size = commit * page size), so the next
   // open can trust it without reading every page. Taken now, after the checkpoint that made the file final.
   struct stat dbst;
-  s->db_ino = s->db_mtime_ns = 0;
+  s->db_ino = s->db_mtime_ns = s->ltx_size = 0;
   if (s->checkpointed && s->read_fd >= 0 && !fstat(s->read_fd, &dbst)) {
     s->db_ino = (uint64_t)dbst.st_ino;
     s->db_mtime_ns = SB_LTX_MTIME_NS(dbst);
+    // and the size of the last LTX file (published, fsynced and never rewritten), so a reopen need not read it
+    char ltmp[SB_LTX_PATH], lfinal[SB_LTX_PATH], ldir[SB_LTX_PATH];
+    struct stat lst;
+    if (!sb_ltx_names(s, s->txid, ltmp, lfinal, ldir) && !stat(lfinal, &lst))
+      s->ltx_size = (uint64_t)lst.st_size;
   }
   int n = snprintf(body, sizeof(body),
-                   "LTXPOS3\n%s\n%llu %c %llu %u %u %llu %016llx %u %u %u %u %llu %llu\n", s->epoch,
+                   "LTXPOS3\n%s\n%llu %c %llu %u %u %llu %016llx %u %u %u %u %llu %llu %llu\n", s->epoch,
                    (unsigned long long)s->epoch_seq, s->checkpointed ? 'C' : 'W',
                    (unsigned long long)s->txid, s->salt1, s->salt2, (unsigned long long)s->offset,
                    (unsigned long long)s->checksum, s->wal_c1, s->wal_c2, s->page_size, s->commit,
-                   (unsigned long long)s->db_ino, (unsigned long long)s->db_mtime_ns);
+                   (unsigned long long)s->db_ino, (unsigned long long)s->db_mtime_ns,
+                   (unsigned long long)s->ltx_size);
   if (n < 0 || n >= (int)sizeof(body))
     return -1;
   FILE *f = fopen(tmp, "wb");
@@ -1261,20 +1268,21 @@ static int sb_ltx_load_position(sb_ltx_state *s) {
     return 0;
   text[n] = 0;
   sb_ltx_state candidate = *s;
-  unsigned long long txid, offset, checksum, digest, seq, ino, mtime;
+  unsigned long long txid, offset, checksum, digest, seq, ino, mtime, ltxsize;
   char mode;
   int used = 0, tail = 0;
   // LTXPOS2 (the format before epochSeq) is not read: its owner starts a new epoch, which the shipper sees as one
   // full image. A record of any other kind falls back the same way.
-  if (sscanf(text, "LTXPOS3\n%63s\n%llu %c %llu %u %u %llu %16llx %u %u %u %u %llu %llu\n%n",
+  if (sscanf(text, "LTXPOS3\n%63s\n%llu %c %llu %u %u %llu %16llx %u %u %u %u %llu %llu %llu\n%n",
              candidate.epoch, &seq, &mode, &txid, &candidate.salt1, &candidate.salt2, &offset,
              &checksum, &candidate.wal_c1, &candidate.wal_c2, &candidate.page_size,
-             &candidate.commit, &ino, &mtime, &used) != 14 ||
+             &candidate.commit, &ino, &mtime, &ltxsize, &used) != 15 ||
       !seq)
     return 0;
   candidate.epoch_seq = seq;
   candidate.db_ino = ino;
   candidate.db_mtime_ns = mtime;
+  candidate.ltx_size = ltxsize;
   if (!used || sscanf(text + used, "%16llx\n%n", &digest, &tail) != 1 ||
       (size_t)(used + tail) != n || digest != ~sb_ltx_crc(UINT64_MAX, text, (size_t)used))
     return 0;
@@ -1295,7 +1303,14 @@ static int sb_ltx_load_position(sb_ltx_state *s) {
   candidate.txid = txid;
   candidate.offset = offset;
   candidate.checksum = checksum;
-  if (!sb_ltx_verify_last(&candidate))
+  // A clean record names the size of its last LTX file. When the file has that size, and the database file is the one
+  // the record pinned (checked by the resume), the file is not read again: a base image can be as large as the
+  // database. Its own CRC is the shipper's check before it packs it. Otherwise it is read in full as before.
+  struct stat lst;
+  char ltmp[SB_LTX_PATH], lfinal[SB_LTX_PATH], ldir[SB_LTX_PATH];
+  candidate.fast = mode == 'C' && ino && ltxsize && !sb_ltx_names(&candidate, txid, ltmp, lfinal, ldir) &&
+                   !stat(lfinal, &lst) && (uint64_t)lst.st_size == ltxsize;
+  if (!candidate.fast && !sb_ltx_verify_last(&candidate))
     return 0;
   // A published orphan ahead of the record is never overwritten. A new base
   // captures the recovered source and preserves the old generation for restore.
@@ -1352,6 +1367,9 @@ static int sb_ltx_resume(sb_ltx_state *s) {
       sb_ltx_stat_cheap++;
       return 1;
     }
+    // Not the pinned file: nothing was read yet, so the last LTX file is checked in full before the pages are.
+    if (s->fast && !sb_ltx_verify_last(s))
+      return 0;
     return sb_ltx_verify_database(s);
   }
   int fd = open(path, O_RDONLY);

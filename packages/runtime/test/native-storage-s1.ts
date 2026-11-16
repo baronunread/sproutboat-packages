@@ -196,6 +196,7 @@ async function epochOf(spool: string) {
     txid: BigInt(f[2]),
     ino: BigInt(f[11]),
     mtime: BigInt(f[12]),
+    size: BigInt(f[13]),
   };
 }
 // The spool's chain restored byte for byte against the database file (after a clean close, no -wal remains).
@@ -272,7 +273,7 @@ try {
       const pos = await epochOf(p.spool[kind]);
       assert.equal(pos.mode, "C", kind + " clean after close");
       assert(pos.txid > 25n, kind + " txid " + pos.txid);
-      assert(pos.ino > 0n && pos.mtime > 0n, kind + " clean record pins the file");
+      assert(pos.ino > 0n && pos.mtime > 0n && pos.size > 0n, kind + " clean record pins the file");
       assert(pos.seq > 1n << 30n, kind + " epochSeq is a clock-sized number");
       await assertEquals(p.spool[kind], p[kind], kind);
       const dirMode = (await stat(p.spool[kind])).mode & 0o777;
@@ -432,6 +433,22 @@ try {
     assert.notEqual(fourth.epoch, old.epoch, "an older position format starts a new epoch");
     assert(fourth.seq > third.seq);
     await assertEquals(p.spool.d1, p.d1, "after an LTXPOS2 record");
+    // a damaged last LTX file is never trusted, even with the database untouched: a new epoch, nothing resumed
+    {
+      const epoch = await epochOf(p.spool.d1);
+      const names = (await readdir(join(p.spool.d1, epoch.epoch))).filter((n) => n.endsWith(".ltx")).sort();
+      const last = join(p.spool.d1, epoch.epoch, names[names.length - 1]);
+      const bytes = new Uint8Array(await readFile(last));
+      await writeFile(last, bytes.subarray(0, bytes.length - 1));
+      const h = await spawn(dir, {});
+      await h.send("sql d1 DB INSERT INTO t VALUES('w')");
+      const hs = JSON.parse(await h.send("stats"));
+      assert.equal(hs.fresh, 1, "a truncated last LTX file forces a new base");
+      await h.send("close d1 DB");
+      await h.quit();
+      assert.notEqual((await epochOf(p.spool.d1)).epoch, epoch.epoch);
+      await assertEquals(p.spool.d1, p.d1, "after a damaged last file");
+    }
     console.log(
       "PASS LTXPOS3: clean record trusts only its own file; epochSeq grows across epochs, a lost spool and an LTXPOS2 record",
     );
