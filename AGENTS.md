@@ -6,7 +6,7 @@
 - Versioning: changesets, one per PR that touches a package. Independent versions per package; breaking contract changes land with both consumers updated in the same release train.
 - Behaviour changes that an existing app can observe must be gated on a compatibility date (`globalThis.__sbCompat >= "YYYY-MM-DD"`), and the changeset must name the date. See `.changeset/README.md`; `__sbUpstream()` in `packages/runtime/src/native-fetch-prelude.js` is the worked example.
 - Native tests: `bun run test:native` runs every `test:native-*` script, 4 at a time (`NATIVE_TEST_CONCURRENCY`), and prints the full output of any that fail. `bun run test:native crypto url` runs just those. New native tests must bind ports with port 0 (the `freePort()` helper), never a fixed number, because they run side by side.
-- CI's `downstream` job builds `baronunread/sproutboat-cli`'s kitchen-sink (compatibility date `2026-08-26`) against your PR. To reproduce it locally: in a CLI checkout, `bun install`, replace each `node_modules/@sproutboat/<name>` with a symlink to this repo's `packages/<name>`, then `bun run kitchen-sink` and `bun run kitchen-sink:standalone`.
+- CI's `downstream` job builds `sproutboat/cli`'s kitchen-sink (compatibility date `2026-08-26`) against your PR. To reproduce it locally: in a CLI checkout, `bun install`, replace each `node_modules/@sproutboat/<name>` with a symlink to this repo's `packages/<name>`, then `bun run kitchen-sink` and `bun run kitchen-sink:standalone`.
 - `bun install` sets up lefthook: pre-commit formats staged files with oxfmt and lints the whole tree.
 
 ## Lint rules that commonly fire

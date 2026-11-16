@@ -16,11 +16,11 @@ on:
 #
 # Auth is npm Trusted Publishing (OIDC) -- no token secret, no OTP. One-time
 # setup on npmjs.com, once per package (toolchain, runtime, wire, config):
-# Settings -> Trusted Publisher -> GitHub Actions, user baronunread, repo
-# sproutboat-packages, workflow release.yml. Check "also allow this trusted
+# Settings -> Trusted Publisher -> GitHub Actions, owner sproutboat, repo
+# packages (case-sensitive), workflow release.yml. Check "also allow this trusted
 # publisher to publish directly" -- the default staged-publish-only mode
 # fails a plain `npm publish` from CI with E403, it doesn't queue it (hit
-# this exact gotcha setting up sproutboat-cli's platform packages). Provenance
+# this exact gotcha setting up the CLI's platform packages). Provenance
 # is generated automatically; the repo must stay public.
 permissions:
   contents: write
@@ -29,7 +29,7 @@ permissions:
 
 jobs:
   release:
-    if: github.repository == 'baronunread/sproutboat-packages'
+    if: github.repository == 'sproutboat/packages'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

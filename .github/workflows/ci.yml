@@ -128,7 +128,7 @@ jobs:
           key: porffor-alpha-24-${{ runner.os }}-${{ hashFiles('packages/toolchain/package.json', 'packages/toolchain/src/**/*.ts', 'packages/toolchain/src/**/*.c', 'packages/toolchain/src/**/*.cpp', 'packages/toolchain/src/**/*.js', 'packages/toolchain/src/**/*.patch', 'packages/toolchain/vendor/**') }}
       - run: bun run test:native lto cc
 
-  # The published packages' consumer: sproutboat-cli's kitchen-sink app, built
+  # The published packages' consumer: the kitchen-sink app of sproutboat/cli, built
   # against this PR's packages. Its compatibility_date is 2026-08-26, so it is
   # the "an app written before a behaviour change keeps working" check that
   # caught the last three regressions only after they were published.
@@ -140,7 +140,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/checkout@v7
         with:
-          repository: baronunread/sproutboat-cli
+          repository: sproutboat/cli
           # Set the SPROUTBOAT_CLI_REF repository variable to test against a CLI
           # branch, e.g. one already adapted to a breaking change in this PR.
           ref: ${{ vars.SPROUTBOAT_CLI_REF || 'main' }}
