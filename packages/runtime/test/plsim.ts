@@ -9,7 +9,8 @@
 //     durable (without it SQLite's own WAL could vanish after its first fsync, which no filesystem we run on does);
 //   - "strict" mode (A): the surviving state is exactly the durable one: every volatile byte and entry is lost;
 //   - "torn" mode (B, seeded): the worst the filesystem may do on top: a random subset of the volatile writes of each file
-//     survives (in any order, so a later write may land while an earlier one is lost) and a random prefix of the volatile
+//     survives (in any order, so a later write may land while an earlier one is lost; but not past a lost truncate of the same
+//     file: size changes are journaled in order) and a random prefix of the volatile
 //     namespace changes of each directory survives (a journal commits a prefix, so renames keep their order);
 //   - memory-mapped files (the WAL index, -shm) are never durable and are removed from the image: SQLite rebuilds it.
 // It is stricter than any one real filesystem; code that survives it needs no assumption about writeback order.
@@ -386,8 +387,16 @@ export class Disk {
       let data = this.durData.get(node.id) ?? new Uint8Array(0);
       if (mode === "torn") {
         const pending = this.pendingData.get(node.id) ?? [];
+        // A truncate changes the file's size and extents, which a journal commits in order: a write issued after a truncate
+        // reaches the disk only if the truncate did (it lands in the blocks the truncate left, or not at all). So once a pending
+        // truncate is lost, every later pending operation on that file is lost with it.
+        let blocked = false;
         for (const w of pending) {
-          if (rnd() < 0.5) continue; // this write did not reach the disk
+          if (blocked) break;
+          if (rnd() < 0.5) {
+            if ("len" in w) blocked = true;
+            continue; // this write did not reach the disk
+          }
           if ("len" in w) {
             const next = new Uint8Array(w.len);
             next.set(data.subarray(0, Math.min(data.length, w.len)));

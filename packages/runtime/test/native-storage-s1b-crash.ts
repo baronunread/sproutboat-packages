@@ -114,6 +114,7 @@ async function runScenario(
     closeAtEnd?: boolean;
   },
 ) {
+  if (process.env.SB_S1B_SCEN && process.env.SB_S1B_SCEN !== name) return { name, ops: 0, checked: 0, kinds: {} };
   const root = join(work, name);
   mkdirSync(root, { recursive: true });
   // the initial state: built by an untraced process, then synced
@@ -212,6 +213,18 @@ async function runScenario(
   const ops = parseTrace(readFileSync(tracePath, "utf8"), root);
   rmSync(tracePath, { force: true });
   assert(ops.length > 50, name + ": the trace is empty");
+  // SB_S1B_DUMP=FROM-TO prints those operations of every scenario (for reading a failure)
+  if (process.env.SB_S1B_DUMP) {
+    const [from, to] = process.env.SB_S1B_DUMP.split("-").map(Number);
+    ops
+      .slice(from, to)
+      .forEach((op, j) =>
+        console.log(
+          from + j,
+          JSON.stringify(op, (_k, v) => (v instanceof Uint8Array ? `<${v.length} bytes>` : v)).replace(root, ""),
+        ),
+      );
+  }
   // which operations are crash points
   const interesting = (op: Op, i: number) => op.t !== "write" || i % 4 === 0;
   const all = ops.map((op, i) => ({ op, i })).filter(({ op, i }) => interesting(op, i));
@@ -235,6 +248,17 @@ async function runScenario(
       const img = join(work, `${name}-image`);
       disk.materialize(img, mode, 1000 + i);
       await recoverAndCheck(img, acked, `${name} cut after op ${i} (${op.t}) ${mode}`, have).catch((e) => {
+        if (process.env.SB_S1B_HISTORY)
+          ops
+            .slice(0, i + 1)
+            .filter((o) => ("path" in o && o.path.includes(process.env.SB_S1B_HISTORY!)) || o.t === "ack")
+            .slice(-60)
+            .forEach((o) =>
+              console.log(
+                o.k,
+                JSON.stringify(o, (_k, v) => (v instanceof Uint8Array ? `<${v.length} bytes>` : v)).replace(root, ""),
+              ),
+            );
         // keep the disk the cut left, for a look (SB_S1B_KEEP=DIR)
         if (process.env.SB_S1B_KEEP) {
           rmSync(process.env.SB_S1B_KEEP, { recursive: true, force: true });
