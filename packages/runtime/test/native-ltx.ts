@@ -10,6 +10,9 @@ const transport = await readFile(new URL("../src/transport-embedded.js", import.
 const start = transport.indexOf("// BEGIN LTX NATIVE");
 const end = transport.indexOf("// END LTX NATIVE", start);
 assert(start > 0 && end > start);
+// This file's crash boundaries are the ones of a checkpoint after every statement (the policy of stage S1, still
+// available as SB_LTX_CKPT_BYTES=0). The default policy of stage S1b is tested in native-storage-s1b.ts.
+process.env.SB_LTX_CKPT_BYTES = "0";
 const work = await mkdtemp(join(tmpdir(), "sb-native-ltx-"));
 const binary = join(work, "driver");
 const source = `
@@ -47,7 +50,7 @@ int main(int argc,char **argv) {
     if(sb_ltx_after(0))rc=10;
     printf("%d %s\\n",rc,error?error:sqlite3_errmsg(db));fflush(stdout);sqlite3_free(error);
   }
-  free(line);sqlite3_close(db);close(lock);return 0;
+  free(line);sb_ltx_settle(&sb_ltx_states[0]);sqlite3_close(db);close(lock);return 0;
 }
 `;
 await writeFile(join(work, "driver.c"), source);

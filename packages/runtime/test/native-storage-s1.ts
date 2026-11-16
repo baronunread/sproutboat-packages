@@ -187,7 +187,7 @@ function paths(dir: string) {
 async function epochOf(spool: string) {
   const text = await readFile(join(spool, "position"), "utf8");
   const lines = text.split("\n");
-  assert.equal(lines[0], "LTXPOS3");
+  assert.equal(lines[0], "LTXPOS4");
   const f = lines[2].split(" ");
   return {
     epoch: lines[1],
@@ -197,6 +197,7 @@ async function epochOf(spool: string) {
     ino: BigInt(f[11]),
     mtime: BigInt(f[12]),
     size: BigInt(f[13]),
+    synced: BigInt(f[14]),
   };
 }
 // The spool's chain restored byte for byte against the database file (after a clean close, no -wal remains).

@@ -10664,11 +10664,65 @@ function __sbD1Table(r) {
   return { columns, rows };
 }
 function __sbD1Promise(run) {
+  if (__sbGroupOn()) return __sbGrouped(run);
   try {
     return Promise.resolve(run());
   } catch (err) {
     return Promise.reject(err);
   }
+}
+// ---- group commit (design 029 stage S1b) ----
+// With SB_LTX_GROUP=1 a strict D1 call does not wait for its own fsync. Its commit is made (SQLite believes it is durable,
+// synchronous=FULL stays set) but the WAL sync is owed, and the promise it returns settles only after one flush: a timer
+// of delay 0, which runs after every request already read in this turn has made its own call, then one fsync per owed WAL
+// and the capture of what was committed. N concurrent requests so cost one fsync, not N. Nothing is acknowledged before it:
+// the caller sees a result only through a promise, and every call, read or write, waits while anything is owed, so no
+// request can act on data a power cut could still take back. A call that returns nothing owed settles at once.
+let __sbGroupState = -1;
+let __sbGroupWaiters = [];
+let __sbGroupTimer = false;
+function __sbGroupOn() {
+  if (__sbGroupState < 0)
+    __sbGroupState = __sbEnv("SB_LTX_ENABLE") === "1" && __sbEnv("SB_LTX_GROUP") === "1" && __sbD1Strict() ? 1 : 0;
+  return __sbGroupState === 1;
+}
+function __sbGroupFlush() {
+  __sbGroupTimer = false;
+  const list = __sbGroupWaiters;
+  __sbGroupWaiters = [];
+  let failed = false;
+  try {
+    failed = Number(__sbLtxRaw("f")) < 0;
+  } catch (e) {
+    failed = true;
+  }
+  for (let i = 0; i < list.length; i++) {
+    const w = list[i];
+    if (failed) w.reject(new Error("sproutboat d1.query: LTX capture failed: the transaction may be committed locally but is not durable in the replication log; writes are refused until restart"));
+    else if (w.threw) w.reject(w.err);
+    else w.resolve(w.value);
+  }
+}
+function __sbGrouped(run) {
+  let value;
+  let err;
+  let threw = false;
+  __sbLtxRaw("d");
+  try {
+    value = run();
+  } catch (e) {
+    threw = true;
+    err = e;
+  }
+  __sbLtxRaw("n");
+  if (__sbLtxRaw("o") === "0") return threw ? Promise.reject(err) : Promise.resolve(value);
+  return new Promise((resolve, reject) => {
+    __sbGroupWaiters.push({ resolve, reject, value, err, threw });
+    if (!__sbGroupTimer) {
+      __sbGroupTimer = true;
+      __sbSetTimeout(__sbGroupFlush, 0);
+    }
+  });
 }
 // A strict query's reply from the embedded transport's direct lane, or through the generic
 // dispatch. The errors read the same either way: "D1_ERROR: ..." for SQLite's, and the
@@ -10709,6 +10763,11 @@ class __SbD1Statement {
   }
   all() {
     if (!__sbD1Strict()) return __sbD1Query(this.__name, this.__sql, this.__params, false, true);
+    if (__sbGroupOn())
+      return __sbGrouped(() => {
+        const t = __sbD1Query(this.__name, this.__sql, this.__params, true, true);
+        return { success: true, meta: t.meta, results: __sbD1Objects(t.columns, t.rows) };
+      });
     try {
       const t = __sbD1Query(this.__name, this.__sql, this.__params, true, true);
       return Promise.resolve({ success: true, meta: t.meta, results: __sbD1Objects(t.columns, t.rows) });
@@ -10730,6 +10789,11 @@ class __SbD1Statement {
       }
       return out;
     }
+    if (__sbGroupOn())
+      return __sbGrouped(() => {
+        const t = __sbD1Query(this.__name, this.__sql, this.__params, true, false);
+        return options && options.columnNames ? [t.columns].concat(t.rows) : t.rows;
+      });
     try {
       const t = __sbD1Query(this.__name, this.__sql, this.__params, true, false);
       return Promise.resolve(options && options.columnNames ? [t.columns].concat(t.rows) : t.rows);
@@ -10743,6 +10807,15 @@ class __SbD1Statement {
       if (rows.length === 0) return null;
       return column == null ? rows[0] : rows[0][column];
     }
+    if (__sbGroupOn())
+      return __sbGrouped(() => {
+        const t = __sbD1Query(this.__name, this.__sql, this.__params, true, false);
+        if (column == null) return t.rows.length ? __sbD1Objects(t.columns, [t.rows[0]])[0] : null;
+        const at = t.columns.indexOf(String(column));
+        if (!t.rows.length) return null;
+        if (at < 0) throw __sbD1Fail("D1_COLUMN_NOTFOUND: Column not found (" + column + ")");
+        return t.rows[0][t.columns.lastIndexOf(String(column))];
+      });
     try {
       const t = __sbD1Query(this.__name, this.__sql, this.__params, true, false);
       if (column == null) return Promise.resolve(t.rows.length ? __sbD1Objects(t.columns, [t.rows[0]])[0] : null);
