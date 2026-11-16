@@ -131,8 +131,70 @@ native CI. These are process-crash tests, not power-cut or storage-failure tests
 Linux CI exercises the same C implementation; a randomized full executable Linux
 campaign and a power-loss campaign are not yet qualified.
 
-No uploader is included. Finished local files are retained without a retention
+No uploader is included in this package (storage stage S2 adds one to sproutd). Finished local files are retained without a retention
 policy; disk usage of the backup chain is not bounded by the WAL ceiling.
+
+## Storage stage S1: owner lock, every kind of file, shared spool
+
+Everything in this section is off unless the host sets the variables below (design 029, stage S1). A standalone
+binary and any host that sets none of them behave as described above.
+
+| Variable | Meaning |
+|---|---|
+| `SB_OWNER_LOCK` | unset or `0`: off. `1`: one storage owner per app. `deny`: this process may never own storage |
+| `SB_OWNER_WAIT_MS` | how long taking the lock waits, default 5000, at most 120000 |
+| `SB_LTX_SCOPE` | `d1`, `store`, `do-sql`, a comma list. Every file of a listed kind is captured. Replaces `SB_LTX_DATABASE` |
+| `SB_LTX_ROOT` | spool root. A file's spool is `ROOT/<key>/` instead of `<db>.ltx/`. Also turns on the dirty list |
+
+All of them need `SB_LTX_ENABLE=1` and compatibility date `2026-10-22` for capture; the lock does not.
+
+**Owner lock.** The first captured-file open, or the first Durable Object construction, takes an exclusive `flock`
+on `DATA/.owner.lock` and keeps it for the life of the process. `DATA` is `SB_DATA_DIR`, then `SPROUTBOAT_DATA`,
+else the directory above `d1/`, `do-sql/` or `store.sqlite`. The kernel releases it when the process dies, however
+it dies. A second worker waits in 20 ms steps and then fails the call with "storage of this app is owned by another
+worker; retry": no state is changed and the next call tries again, so a worker started during a deploy overlap
+simply serves once the old one is gone. The path and the meaning are a contract across runtime generations. With
+the lock on, the per-file `<db>.ltx.lock` is not used.
+
+**Keys.** `d1/NAME`, `store`, `do-sql/CLASS/FILE` (the file name without `.sqlite`). A byte outside `A-Za-z0-9_-`
+in a name is written as `%XX` (a Durable Object class may hold a dollar sign); the real name is recoverable from
+the key. `volatile.sqlite` has no key and is never captured.
+
+**Position record `LTXPOS3`.**
+
+```
+LTXPOS3
+<epoch dir name>
+<epochSeq> <W|C> <txid> <salt1> <salt2> <wal offset> <db checksum hex> <wal c1> <wal c2> <page size> <pages> <ino> <mtime ns>
+<CRC-64 of the lines above, hex>
+```
+
+`epochSeq` is the larger of the previous one plus one and the clock in milliseconds, so it only grows, also after
+the spool was deleted. A `C` (clean) record also holds the inode and mtime of the database file as it was after
+the checkpoint. A reopen that finds the same inode, mtime and size (pages times page size) trusts the file and
+does not read every page; anything else takes the full page checksum and, if that fails, starts a new epoch. An
+`LTXPOS2` record (the format before this one) is not resumed: a new epoch starts, which a shipper sees as one
+full image. The first three lines are what a shipper needs; it must ignore fields it does not know on line 3.
+
+**Shared spool.** With `SB_LTX_ROOT` the worker creates `ROOT/<key>/` one directory at a time under the host's
+setgid `ROOT` (mode 0770, so each keeps the shipper's group), sets `umask(007)` once so its files are
+group-readable, names epochs with random bytes made by `mkdir`, and never `chmod`s a spool directory (that would
+clear the setgid bit). A shipper in the group reads the spool and deletes shipped LTX files below the position;
+the worker's resume tolerates files below the position being gone.
+
+**Dirty list.** `ROOT/dirty` has one line per file with a commit the shipper may not know about, appended by the
+worker at a file's first commit and again after a second of silence. It is a hint: a shipper must still scan every
+spool now and then. To rotate it, rename it; appenders notice within a second (they compare the inode once a
+second) and start a new `dirty`; read the renamed file after two seconds.
+
+**Handles that leave.** A captured Durable Object SQL handle is closed like any other (a slot is needed, or the
+instance leaves memory): capture is unhooked, the file is checkpointed, a clean record is written, then
+`sqlite3_close`, and only after that the raw descriptor on the same inode is closed. A close that cannot finish
+(open transaction, a leaked statement, a failed capture) leaves the handle open.
+
+Qualification: `bun run test:native-storage-s1` (scope, all three kinds restored byte for byte, owner lock with
+takeover after `SIGKILL`, 14 objects through 8 slots, `LTXPOS3` cases, the dirty list, 25 `SIGKILL` rounds over all
+three kinds).
 
 Format and API references: [SQLite WAL](https://www.sqlite.org/fileformat2.html#walformat),
 [commit hook](https://www.sqlite.org/c3ref/wal_hook.html),

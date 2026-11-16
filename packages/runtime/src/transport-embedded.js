@@ -839,7 +839,10 @@ static uint64_t sb_ltx_prev_seq(const char *root) {
     return 0;
   return seq;
 }
+// Counters for the tests and the host's stats line: how the opens of captured files went.
+static unsigned long sb_ltx_stat_fresh, sb_ltx_stat_cheap, sb_ltx_stat_full, sb_ltx_stat_resume;
 static int sb_ltx_snapshot(sb_ltx_state *s) {
+  sb_ltx_stat_fresh++;
   if (sb_ltx_checkpoint(s, 0))
     return -1;
   // EXCLUSIVE SQLite locking mode excludes other connections. BEGIN pins the
@@ -1306,6 +1309,7 @@ static int sb_ltx_load_position(sb_ltx_state *s) {
 // Verify its full page checksum before trusting an absent/empty WAL. Opening no
 // additional database fd preserves SQLite's process-level POSIX locks.
 static int sb_ltx_verify_database(sb_ltx_state *s) {
+  sb_ltx_stat_full++;
   struct stat st;
   if (fstat(s->read_fd, &st) || (uint64_t)st.st_size != (uint64_t)s->commit * s->page_size)
     return 0;
@@ -1344,8 +1348,10 @@ static int sb_ltx_resume(sb_ltx_state *s) {
     struct stat now;
     if (s->db_ino && !fstat(s->read_fd, &now) && (uint64_t)now.st_ino == s->db_ino &&
         SB_LTX_MTIME_NS(now) == s->db_mtime_ns &&
-        (uint64_t)now.st_size == (uint64_t)s->commit * s->page_size)
+        (uint64_t)now.st_size == (uint64_t)s->commit * s->page_size) {
+      sb_ltx_stat_cheap++;
       return 1;
+    }
     return sb_ltx_verify_database(s);
   }
   int fd = open(path, O_RDONLY);
@@ -1506,6 +1512,7 @@ static int sb_ltx_start(int idx, sqlite3 *db, const char *path, int lock) {
   int resumed = sb_ltx_resume(s);
   if (resumed < 0 || (resumed == 0 && sb_ltx_snapshot(s)))
     return -1;
+  sb_ltx_stat_resume += resumed > 0;
   sqlite3_wal_hook(db, sb_ltx_hook, s);
   sqlite3_set_authorizer(db, sb_ltx_authorize, s);
   return 0;
@@ -5630,6 +5637,22 @@ function __sbD1Quota(path) {
 function __sbStore() {
   return __sbDir() + "/store.sqlite";
 }
+// Where Analytics Engine datapoints, rate-limit windows and the Cache API live. Normally in store.sqlite. When
+// store.sqlite is captured (design 029 S1: SB_LTX_SCOPE lists store) they move to volatile.sqlite, which is never
+// captured: a rate-limit check would otherwise cost a commit's worth of fsyncs and a cache entry would be replicated
+// and kept for 30 days. Their rows are rebuilt or expire on their own; rows left in store.sqlite stay unused there.
+var __sbVolatilePath = "";
+function __sbVolatileStore() {
+  if (__sbVolatilePath === "") {
+    let moved = false;
+    if (__sbEnv("SB_LTX_ENABLE") === "1" && __sbCompatDate() >= "2026-10-22") {
+      const scope = "," + String(__sbEnv("SB_LTX_SCOPE") || "") + ",";
+      moved = scope.indexOf(",store,") !== -1;
+    }
+    __sbVolatilePath = moved ? __sbDir() + "/volatile.sqlite" : __sbStore();
+  }
+  return __sbVolatilePath;
+}
 // "<data>/do-sql/CLASS/FILE.sqlite". The shim sends the file as 64 hex digits (the id, or a
 // hash of an older id); both parts are checked so nothing leaves the directory.
 function __sbDOSqlName(text, hex) {
@@ -5769,17 +5792,18 @@ function __sbEnsureSchema() {
     "CREATE TABLE IF NOT EXISTS do_alarm_delivery (cls TEXT NOT NULL, id TEXT NOT NULL, at INTEGER NOT NULL, attempts INTEGER NOT NULL, token TEXT NOT NULL, expires INTEGER NOT NULL, PRIMARY KEY(cls,id))",
     [],
   );
+  const v = __sbVolatileStore();
   __sbSql(
-    s,
+    v,
     "CREATE TABLE IF NOT EXISTS ae (dataset TEXT NOT NULL, ts INTEGER NOT NULL, indexes_json TEXT NOT NULL, blobs_json TEXT NOT NULL, doubles_json TEXT NOT NULL)",
   );
   __sbSql(
-    s,
+    v,
     "CREATE TABLE IF NOT EXISTS ratelimit (name TEXT NOT NULL, key TEXT NOT NULL, window_start INTEGER NOT NULL, count INTEGER NOT NULL, PRIMARY KEY (name, key))",
   );
   // #59 — caches.default, ambient like the broker's copy of this table.
   __sbSql(
-    s,
+    v,
     "CREATE TABLE IF NOT EXISTS cache (name TEXT NOT NULL, cache_key TEXT NOT NULL, status INTEGER NOT NULL, headers_json TEXT NOT NULL, body TEXT NOT NULL, expires_at INTEGER, PRIMARY KEY (name, cache_key))",
   );
 }
@@ -6498,7 +6522,7 @@ function __sbEmbeddedDispatch(msg) {
 
   if (op === "ae.write") {
     __sbSql(
-      store,
+      __sbVolatileStore(),
       "INSERT INTO ae (dataset, ts, indexes_json, blobs_json, doubles_json) VALUES (?1,?2,?3,?4,?5)",
       [
         msg.dataset,
@@ -6514,11 +6538,11 @@ function __sbEmbeddedDispatch(msg) {
     // Reply must match the broker's: { count, rows: [{timestamp, indexes, blobs, doubles}] }.
     const limit = Math.min(Math.max(Number(msg.limit) || 20, 1), 200);
     const r = __sbSql(
-      store,
+      __sbVolatileStore(),
       "SELECT ts, indexes_json, blobs_json, doubles_json FROM ae WHERE dataset = ? ORDER BY ts DESC, rowid DESC LIMIT ?",
       [msg.dataset, limit],
     );
-    const total = __sbSql(store, "SELECT count(*) FROM ae WHERE dataset = ?", [msg.dataset]);
+    const total = __sbSql(__sbVolatileStore(), "SELECT count(*) FROM ae WHERE dataset = ?", [msg.dataset]);
     const rows = [];
     for (let i = 0; i < r.rows.length; i++) {
       rows.push({
@@ -6541,7 +6565,7 @@ function __sbEmbeddedDispatch(msg) {
     const now = Math.floor(Date.now() / 1000);
     const windowStart = now - (now % period);
     const r = __sbSql(
-      store,
+      __sbVolatileStore(),
       "INSERT INTO ratelimit (name, key, window_start, count) VALUES (?1, ?2, ?3, 1) " +
         "ON CONFLICT (name, key) DO UPDATE SET count = CASE WHEN window_start = ?3 THEN count + 1 ELSE 1 END, " +
         "window_start = ?3 RETURNING count",
@@ -6554,14 +6578,14 @@ function __sbEmbeddedDispatch(msg) {
   if (op === "cache.match") {
     const name = msg.name || "default";
     const r = __sbSql(
-      store,
+      __sbVolatileStore(),
       "SELECT status, headers_json, body, expires_at FROM cache WHERE name = ? AND cache_key = ?",
       [name, msg.key],
     );
     if (!r.rows.length) return { ok: true, found: false };
     const [status, headersJson, body, expiresAt] = r.rows[0];
     if (expiresAt != null && expiresAt <= Date.now()) {
-      __sbSql(store, "DELETE FROM cache WHERE name = ? AND cache_key = ?", [name, msg.key]);
+      __sbSql(__sbVolatileStore(), "DELETE FROM cache WHERE name = ? AND cache_key = ?", [name, msg.key]);
       return { ok: true, found: false };
     }
     return { ok: true, found: true, status, headers: JSON.parse(headersJson), body };
@@ -6587,7 +6611,7 @@ function __sbEmbeddedDispatch(msg) {
     const ttlSeconds = sMaxAge ? Number(sMaxAge[1]) : maxAge ? Number(maxAge[1]) : null;
     const expiresAt = ttlSeconds != null ? Date.now() + ttlSeconds * 1000 : null;
     __sbSql(
-      store,
+      __sbVolatileStore(),
       "INSERT INTO cache (name, cache_key, status, headers_json, body, expires_at) VALUES (?1,?2,?3,?4,?5,?6) " +
         "ON CONFLICT (name, cache_key) DO UPDATE SET status = ?3, headers_json = ?4, body = ?5, expires_at = ?6",
       [name, msg.key, status, JSON.stringify(headers), msg.body, expiresAt],
@@ -6596,7 +6620,7 @@ function __sbEmbeddedDispatch(msg) {
   }
   if (op === "cache.delete") {
     const name = msg.name || "default";
-    const r = __sbSql(store, "DELETE FROM cache WHERE name = ? AND cache_key = ?", [name, msg.key]);
+    const r = __sbSql(__sbVolatileStore(), "DELETE FROM cache WHERE name = ? AND cache_key = ?", [name, msg.key]);
     return { ok: true, deleted: r.changes > 0 };
   }
 
@@ -6813,6 +6837,30 @@ globalThis.__sbAssetsGet = function (path) {
   const manifest = globalThis.__sbAssets.manifest || {};
   reply.rules = { headers: manifest.headers || [], redirects: manifest.redirects || [] };
   return reply;
+};
+
+// One storage owner per app (plan 013 phase A): a Durable Object is constructed only by the worker that holds the
+// app-wide owner lock, so two workers of one app (a deploy overlap, a handover, a canary) never run the same object.
+// SB_OWNER_LOCK unset or 0 leaves everything as before. The prelude calls this before it constructs an instance.
+// oxlint-disable-next-line no-unused-vars -- `dir` is read inside the RawC block below, not by JS.
+function __sbOwnerAcquireRaw(dir) {
+  let status = -1;
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    const char* __p; size_t __pl; char* __po = 0;
+    porf_native_fetch_read_value(dir, &__p, &__pl, &__po);
+    char* __dir = (char*)malloc(__pl + 1); memcpy(__dir, __p, __pl); __dir[__pl] = 0;
+    if (__po) free(__po);
+    status = (f64)sb_owner_acquire_dir(__dir);
+    free(__dir);
+  `;
+  return status;
+}
+var __sbOwnerHeld = false;
+globalThis.__sbOwnerAcquire = function () {
+  if (__sbOwnerHeld) return;
+  if (__sbOwnerAcquireRaw(__sbDir()) < 0) throw new Error("storage of this app is owned by another worker; retry");
+  __sbOwnerHeld = true;
 };
 
 /** The transport contract: one request string in, one reply string out. */

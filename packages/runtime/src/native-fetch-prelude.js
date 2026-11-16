@@ -12531,8 +12531,9 @@ globalThis.__sbInstallFetch = function () {
 // __sbDOEnter) keeps them out while a storage read is in flight, as in workerd.
 // Only `state.storage.*` goes to the broker (so object state outlives a sprout
 // restart), scoped to (class, id).
-// ponytail: one instance per id relies on the single sprout process; a
-// multi-sprout deployment needs the broker to hold a per-id lock (cloud).
+// One instance per id relies on one worker owning the app's storage: the embedded transport takes an app-wide
+// flock before an instance is built (SB_OWNER_LOCK, see __sbOwnerAcquire there). The broker transport has one
+// sprout process per deployment; a multi-sprout deployment needs the broker to hold a per-id lock (cloud).
 
 function __sbMakeDONamespace(binding, className) {
   if (__sbDOv2()) return __sbMakeDONamespaceV2(className);
@@ -12876,6 +12877,7 @@ function __sbGetDOInstance(cls, idText, idObj) {
   const cacheKey = cls + " " + id;
   let inst = __sbDOInstances[cacheKey];
   if (!inst) {
+    if (__sbIsFn(globalThis.__sbOwnerAcquire)) globalThis.__sbOwnerAcquire();
     if (stateId !== null && stateId.name !== undefined) __sbDOAdopt(cls, "name:" + stateId.name, id);
     // #57 — was a no-op: a DO calling `state.waitUntil(p)` had `p` vanish with
     // no error. The instance outlives any one call (cached in
@@ -13354,6 +13356,8 @@ function __sbDONow() {
 
 function __sbDOBuild(L, cls, id, stateId, key) {
   const Ctor = __sbDOClasses[cls];
+  // One storage owner per app (plan 013 phase A, embedded transport only): fail before anything is registered.
+  if (__sbIsFn(globalThis.__sbOwnerAcquire)) globalThis.__sbOwnerAcquire();
   const t0 = __sbDONow();
   if (stateId.name !== undefined) __sbDOAdopt(cls, "name:" + stateId.name, id);
   const tasks = [];
