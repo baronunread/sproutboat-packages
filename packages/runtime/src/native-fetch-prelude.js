@@ -15,7 +15,11 @@ function __sbSetCompat(date) {
   if (date >= "2026-11-17") navigator.userAgent = "Cloudflare-Workers";
   Request._cd = date;
   if (date >= "2026-11-15" && Error.captureStackTrace === undefined) Error.captureStackTrace = __sbCaptureStackTrace;
+  // The acknowledgement gate (design 029 S3): on only for an app on this date or later, and only where the host asked for it.
+  if (date >= __SB_GATE_DATE) __sbGateActive = __sbGateRaw("e") === "1";
 }
+const __SB_GATE_DATE = "2026-11-20";
+let __sbGateActive = false;
 // V8's Error.captureStackTrace(target): drivers (pg, @neondatabase/serverless) call it on the errors they
 // build and rethrow. Porffor keeps no frames, so the stack is the first line, as Error.stack is.
 function __sbCaptureStackTrace(target) {
@@ -12506,6 +12510,11 @@ function __sbFollowHop(op, msg, label, mode, signal, hops) {
 // without awaiting keep working; sproutd's answered with promises at any date
 // (__sbAsyncAtAnyDate). `always` is for RPC, which has no older behaviour to keep.
 function __sbUpstream(op, msg, label, signal, always) {
+  // After a commit the host has not had confirmed, nothing leaves the worker (design 029 S3, Cloudflare's output gate).
+  if (__sbGateActive && __sbGateRaw("b") === "1") return __sbGateWait(signal).then(() => __sbUpstreamNow(op, msg, label, signal, always));
+  return __sbUpstreamNow(op, msg, label, signal, always);
+}
+function __sbUpstreamNow(op, msg, label, signal, always) {
   if (signal) signal.throwIfAborted();
   const promised = always || __sbCompatDate() >= "2026-10-22" || __sbAsyncAtAnyDate();
   if (!promised) return __sbUpstreamResponse(globalThis.__sbFetchUpstream(op, msg));
@@ -14241,12 +14250,14 @@ function __sbDOAsyncStorage(cls, id, gate, rec) {
     get: (key) => read(() => s.get(key)),
     list: (options) => read(() => s.list(options)),
     getAlarm: () => read(() => s.getAlarm()),
-    put: (key, value) => settle(() => s.put(key, value)),
-    delete: (key) => settle(() => s.delete(key)),
-    deleteAll: () => settle(() => s.deleteAll()),
-    setAlarm: (when) => settle(() => s.setAlarm(when)),
-    deleteAlarm: () => settle(() => s.deleteAlarm()),
-    sync: () => Promise.resolve(),
+    // The options of a storage write (Cloudflare's): allowUnconfirmed makes the call's own commit one nothing waits for.
+    put: (key, value, options) =>
+      settle(() => __sbUnconfirmed(key !== null && __sbIsObj(key) && !Array.isArray(key) ? value : options, () => s.put(key, value))),
+    delete: (key, options) => settle(() => __sbUnconfirmed(options, () => s.delete(key))),
+    deleteAll: (options) => settle(() => __sbUnconfirmed(options, () => s.deleteAll())),
+    setAlarm: (when, options) => settle(() => __sbUnconfirmed(options, () => s.setAlarm(when))),
+    deleteAlarm: (options) => settle(() => __sbUnconfirmed(options, () => s.deleteAlarm())),
+    sync: () => __sbGateSync(),
     transaction: (fn) => {
       if (rec !== undefined && rec.dead) return Promise.reject(__sbDOZombie(rec));
       return __sbDOTransaction(cls, id, s, gate, fn);
@@ -14799,6 +14810,54 @@ function __sbDOTransactionRun(cls, id, s, gate, fn) {
 // routes the internal `x-sb-trigger` requests (sent by the broker, authenticated
 // with SB_BROKER_TOKEN) to the right user handler, and everything else to
 // `handlers.fetch`.
+
+// ---- the acknowledgement gate, worker side (design 029 S3) ----
+// The reply, the WebSocket messages and the streamed bodies are held by the host (every frame leaves with the commit counter). What
+// the host cannot hold is a call the worker makes itself, so it waits here: it asks the host to have the store confirm what is
+// committed so far (a note), and polls the confirmed counter the host writes. A call that is not confirmed in 30 s is not made and
+// rejects. Standalone (no host) and the older compatibility dates never get here: the gate is off.
+let __sbGateTestAt = 0;
+const __sbGateWaitMs = 30000;
+// What a storage call that passed allowUnconfirmed runs inside: its commit does not move the counter the host waits for.
+function __sbUnconfirmed(options, f) {
+  if (!__sbGateActive || options == null || options.allowUnconfirmed !== true) return f();
+  __sbGateRaw("u");
+  try {
+    return f();
+  } finally {
+    __sbGateRaw("v");
+  }
+}
+// The standalone stand-in for the host, for tests only (SB_GATE_TEST_CONFIRM_MS): the commits seen so far count as confirmed
+// that many milliseconds after the first time somebody waited for them.
+function __sbGateTestConfirm(seq) {
+  const ms = Number(__sbEnv("SB_GATE_TEST_CONFIRM_MS") || 0);
+  if (!(ms > 0) || __sbGateTestAt === seq) return;
+  __sbGateTestAt = seq;
+  __sbSetTimeout(() => __sbGateRaw("k" + seq), ms);
+}
+function __sbGateWait(signal) {
+  return new Promise((resolve, reject) => {
+    const seq = Number(__sbGateRaw("p"));
+    __sbHostNote("gate " + seq);
+    __sbGateTestConfirm(seq);
+    const t0 = Date.now();
+    const step = () => {
+      if (signal && signal.aborted) return reject(signal.reason);
+      if (__sbGateRaw("b") === "0") return resolve();
+      if (Date.now() - t0 > __sbGateWaitMs) return reject(new Error("storage write not confirmed within 30 s: the call was not made, retry"));
+      __sbSetTimeout(step, 1);
+    };
+    step();
+  });
+}
+// storage.sync(): resolves when what was committed before the call has reached the quorum (or R2).
+function __sbGateSync() {
+  if (!__sbGateActive || __sbGateRaw("b") === "0") return Promise.resolve();
+  return __sbGateWait(undefined);
+}
+globalThis.__sbGateSeq = () => Number(__sbGateRaw("p"));
+globalThis.__sbGateConfirmed = () => Number(__sbGateRaw("c"));
 
 // B22: a note to the host that runs this worker. Only sproutd's worker host takes notes
 // (its bridge sets sb_host_note_hook); everywhere else the hook is null and this returns

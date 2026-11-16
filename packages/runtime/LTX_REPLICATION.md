@@ -247,3 +247,23 @@ three kinds).
 Format and API references: [SQLite WAL](https://www.sqlite.org/fileformat2.html#walformat),
 [commit hook](https://www.sqlite.org/c3ref/wal_hook.html),
 [checkpoint](https://www.sqlite.org/c3ref/wal_checkpoint_v2.html).
+
+## Stage S3: the acknowledgement gate (runtime half)
+
+Design 029 section 3.2. Off unless the host sets `SB_LTX_GATE=1` (the `gate` flag of its capture scope) **and** the app's compatibility
+date is 2026-11-20 or later (`__SB_GATE_DATE` in the prelude; a placeholder for the generation that ships it). Standalone binaries and the
+broker never turn it on (nothing confirms for them).
+
+| What | How |
+|---|---|
+| **Commit position** | `uint64_t sb_commit_seq` (exported), incremented once per captured commit after its LTX file is published and the position record written. Not incremented while a storage call that passed `allowUnconfirmed` runs. It counts commits of every captured file of the app (D1, KV, Durable Object SQL), cumulative: a reply carries all of them, not only its own. The first use of a database also counts the commits that set it up |
+| **Confirmed position** | `uint64_t sb_commit_confirmed` (exported), written only by the host: everything up to it is durable on two replicas (or in an R2 bundle) |
+| **What the host does** | stamps each frame that leaves the worker (reply, stream chunk, WebSocket frame) with `sb_commit_seq`; holds the frame until `confirmed >= position`; keeps the frames in order |
+| **Outgoing calls** | `__sbUpstream` (fetch, service bindings, RPC) first checks `sb_gate_op("b")`: unconfirmed commits behind this call. If so it sends the host the note `gate N` (the host asks the store) and polls `sb_commit_confirmed` every millisecond; after 30 s the call rejects and is not made |
+| **`allowUnconfirmed`** | `put`, `delete`, `deleteAll`, `setAlarm`, `deleteAlarm` of Durable Object storage take the option (`put(entries, options)` too): the commit is captured and shipped, and the counter does not move for it |
+| **`storage.sync()`** | resolves when `confirmed` has reached what was committed at the call (the same wait as an outgoing call) |
+| **Tests** | `native-storage-s3-app.ts` (compiled standalone binary; `SB_GATE_TEST_CONFIRM_MS` stands in for the host), and sproutd's `test/storage-s3-smoke.ts` for the host half |
+
+What the runtime cannot do is make the worker wait for its own outgoing calls from outside: that wait is cooperative (a tenant could open
+a socket itself if the sandbox allowed it; egress is checked by the host and by seccomp, not by the gate). The reply and WebSocket gates
+are in the host and are not cooperative.

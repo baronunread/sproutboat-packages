@@ -184,6 +184,51 @@ typedef struct {
 #define SB_LTX_OWED_MAX 64
 static sb_ltx_file *sb_ltx_owed_files[SB_LTX_OWED_MAX];
 static int sb_ltx_owed_n, sb_ltx_defer_ok, sb_ltx_nodefer;
+// Design 029 stage S3: the acknowledgement gate. sb_commit_seq counts the commits this process captured (and so published to the
+// spool); the host reads it (dlsym) and stamps every frame that leaves the worker with it, then holds the frame until the store
+// has the commits durable on two replicas (or in R2). sb_commit_confirmed is what the host has had confirmed: the host writes it,
+// the runtime reads it (an outgoing call after an unconfirmed commit waits; storage.sync() resolves when it catches up). Both are
+// exported and plain 64-bit words (one writer each, aligned: no lock). Nothing is counted unless the host set SB_LTX_GATE=1 and the
+// prelude enabled the gate for an app whose compatibility date reached the gate's date (sb_gate_op('e')), so every older app, the
+// standalone binary and the broker behave as before. sb_gate_skip is non-zero while a storage call that passed Cloudflare's
+// allowUnconfirmed runs: its commit is replicated but nothing waits for it.
+uint64_t sb_commit_seq, sb_commit_confirmed;
+static int sb_gate_allowed, sb_gate_skip;
+static int sb_gate_on(void) {
+  static int env = -1;
+  if (env < 0) {
+    const char *v = getenv("SB_LTX_GATE");
+    env = v && v[0] == '1' && !v[1];
+  }
+  return sb_gate_allowed && env;
+}
+// What the prelude may ask (one letter, optionally a number after it): e, enable (1 when the gate is then on); p, the commit
+// counter; c, the confirmed counter; b, 1 when commits are unconfirmed; u and v, enter and leave an allowUnconfirmed call; k N,
+// set the confirmed counter to N (the standalone test stand-in for the host). Returns 0 for anything else.
+static unsigned long long sb_gate_op(const char *w) {
+  switch (w[0]) {
+  case 'e':
+    sb_gate_allowed = 1;
+    return sb_gate_on() ? 1 : 0;
+  case 'p':
+    return sb_commit_seq;
+  case 'c':
+    return sb_commit_confirmed;
+  case 'b':
+    return sb_gate_on() && sb_commit_seq > sb_commit_confirmed ? 1 : 0;
+  case 'u':
+    sb_gate_skip++;
+    return 1;
+  case 'v':
+    if (sb_gate_skip > 0)
+      sb_gate_skip--;
+    return 1;
+  case 'k':
+    sb_commit_confirmed = strtoull(w + 1, 0, 10);
+    return 1;
+  }
+  return 0;
+}
 // Counters for the tests and the host's stats line: syncs SQLite asked the VFS for and that really ran (vfs_syncs), those it
 // asked for while group commit held them back (deferred_syncs), syncs of the capture's own files and directories (fsyncs),
 // and flushes that found something owed or uncaptured (flushes).
@@ -1265,6 +1310,8 @@ static int sb_ltx_capture(sb_ltx_state *s, uint32_t frames) {
     s->wal_c1 = a;
     s->wal_c2 = b;
     rc = sb_ltx_position(s);
+    if (!rc && !sb_gate_skip && sb_gate_on())
+      sb_commit_seq++; // published and recorded: a barrier that reads the spool now sees it
   }
 done:
   if (wal >= 0)
@@ -5650,6 +5697,22 @@ function __sbD1DbRaw(path, what) {
     if (__wo) free(__wo);
     free(__path);
     char __n[16]; int __k = snprintf(__n, sizeof(__n), "%d", __r);
+    res = porf_box((f64)porf_native_fetch_alloc_bytestring(__n, (size_t)__k), 195);
+  `;
+  return res;
+}
+
+// The acknowledgement gate (design 029 S3, sb_gate_op): a letter and an optional number in, an unsigned number out as a bytestring.
+// oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
+function __sbGateRaw(what) {
+  let res = "";
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    const char* __w; size_t __wl; char* __wo = 0;
+    porf_native_fetch_read_value(what, &__w, &__wl, &__wo);
+    char __wb[32]; size_t __wn = __wl < 31 ? __wl : 31; memcpy(__wb, __w, __wn); __wb[__wn] = 0;
+    if (__wo) free(__wo);
+    char __n[32]; int __k = snprintf(__n, sizeof(__n), "%llu", sb_gate_op(__wb));
     res = porf_box((f64)porf_native_fetch_alloc_bytestring(__n, (size_t)__k), 195);
   `;
   return res;

@@ -58,6 +58,7 @@
     "test:native-storage-s1b": "bun packages/runtime/test/native-storage-s1b.ts",
     "test:native-storage-s1b-crash": "bun packages/runtime/test/native-storage-s1b-crash.ts",
     "test:native-storage-s1b-app": "bun packages/runtime/test/native-storage-s1b-app.ts",
+    "test:native-storage-s3-app": "bun packages/runtime/test/native-storage-s3-app.ts",
     "test:native-db-table": "bun packages/runtime/test/native-db-table.ts",
     "test:native-do-evict": "bun packages/runtime/test/native-do-evict.ts",
     "test:native-d1": "bun packages/runtime/test/native-d1.ts",
