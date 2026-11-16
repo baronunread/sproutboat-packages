@@ -8,6 +8,13 @@ export type SourceValidation = { ok: true } | { ok: false; errors: string[] };
 // that resolves to nothing never gets this far — the bundler fails first.
 const NODE_GLOBAL_USE = /\b(process|Bun|Deno|Buffer)\.[a-zA-Z_$]|\bnew\s+Buffer\s*\(/;
 
+/**
+ * A `node:` specifier in import position: `from "node:fs"`, `import "node:fs"`, `import("node:fs")`,
+ * `require("node:fs")`. The string `node:async_hooks` alone is not one: Effect looks it up behind
+ * `globalThis.process?.getBuiltinModule?.(...)` and a doc link or log message can carry any prefix.
+ */
+const NODE_SPECIFIER = /\b(?:from|import|require)\s*\(?\s*['"`]node:/;
+
 const alwaysForbidden: Array<[RegExp, string]> = [
   [/^\s*import\s/m, "an import survived bundling — only static imports can be resolved at build time"],
   [/\bimport\s*\(/, "dynamic import() is not supported: nothing can resolve it at build time"],
@@ -23,10 +30,10 @@ const alwaysForbidden: Array<[RegExp, string]> = [
   // any (`process.env`, always contiguous), while prose mentioning the word
   // does (a bundled comment ending "...unique to this process. The id...").
   [NODE_GLOBAL_USE, "Node, Bun, and Deno APIs are not supported"],
-  // `node:` only means something as an import specifier; a bare substring
-  // match would also flag it appearing in an ordinary string a dependency
-  // happens to construct (a doc link, a log message).
-  [/['"`]node:/, "Node, Bun, and Deno APIs are not supported"],
+  // `node:` only means something as an import specifier, so only one in import
+  // position counts (NODE_SPECIFIER); a bare substring match flagged Effect, whose bundle
+  // mentions "node:async_hooks" in a guarded runtime lookup.
+  [NODE_SPECIFIER, "Node, Bun, and Deno APIs are not supported"],
 ];
 
 /**
@@ -101,7 +108,7 @@ export function validateHttpSyncSource(module: string, compatibilityDate?: strin
   const guardedGlobals = compatibilityDate !== undefined && compatibilityDate >= GUARDED_GLOBALS_DATE;
   const sockets = compatibilityDate !== undefined && compatibilityDate >= SOCKETS_DATE;
   for (const [pattern, message] of alwaysForbidden) {
-    if (sockets && driverAllowed(message) && !/['"`]node:/.test(source)) continue;
+    if (sockets && driverAllowed(message) && !NODE_SPECIFIER.test(source)) continue;
     if (pattern === NODE_GLOBAL_USE && guardedGlobals ? !usesNodeGlobalUnguarded(source) : !pattern.test(source))
       continue;
     errors.push(message);

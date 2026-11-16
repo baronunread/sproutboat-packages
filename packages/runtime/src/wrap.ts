@@ -139,7 +139,14 @@ function hasBindings(b: Bindings): boolean {
 export function inlineWorkersImports(source: string): string {
   // `cloudflare:sockets` (compatibility date 2026-11-17): connect() lives on a prelude global.
   // postgres/cf loads it lazily: `await import("cloudflare:sockets")`.
-  source = source.replace(/\bimport\(\s*["']cloudflare:sockets["']\s*\)/g, "Promise.resolve(globalThis.__sbSockets)");
+  source = source.replace(/\bimport\(\s*["'`]cloudflare:sockets["'`]\s*\)/g, "Promise.resolve(globalThis.__sbSockets)");
+  // The dynamic form of cloudflare:workers (Alchemy: `import("cloudflare:workers").catch(() => ({ env: {} }))`)
+  // resolves to a namespace of the same four names the static form can destructure. Read when the
+  // import runs, so a handler that imports at module top level sees the env the tail already set.
+  source = source.replace(
+    /\bimport\(\s*["'`]cloudflare:workers["'`]\s*\)/g,
+    "Promise.resolve({ env: globalThis.env, WorkerEntrypoint: globalThis.WorkerEntrypoint, DurableObject: globalThis.DurableObject, RpcTarget: globalThis.RpcTarget })",
+  );
   source = source.replace(
     /^import\s*\{([^}]*)\}\s*from\s*["']cloudflare:sockets["'];?[ \t]*$/gm,
     (_match, names: string) => {
@@ -162,6 +169,40 @@ export function inlineWorkersImports(source: string): string {
       return `const { ${pairs.join(", ")} } = globalThis;`;
     },
   );
+}
+
+/** What `import.meta.url` is in a compiled app: a stable name, as in workerd, never the build machine's path. */
+export const IMPORT_META_URL = "file:///bundle/index.js";
+
+const HAS_IMPORT_META = /(?<![$\w])(?<![^.]\.)import\.meta\b/;
+const IMPORT_META = new RegExp(HAS_IMPORT_META.source, "g");
+// One pass over strings, comments and the use itself, so the text "import.meta.env" in a message stays as written.
+const IMPORT_META_SCAN =
+  /"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|`(?:[^`\\]|\\.)*`|\/\/[^\n]*|\/\*[\s\S]*?\*\/|(?<![$\w])(?<![^.]\.)import\.meta\b/g;
+
+/**
+ * `import.meta` as workerd has it: `url`, `main` and `resolve()`, and nothing else (`import.meta.env` is
+ * Vite's, `dirname`/`filename` are Node's: both read `undefined`). Alchemy reads `import.meta.env`.
+ * Porffor would turn any use but `.url`/`.filename`/`.dirname`/`.main` into a load of `node:module`, whose C needs
+ * the ada URL header the host build does not have, and bakes the build directory into `url`. The bundled
+ * handler is one module, so one object serves every use. Returns the body unchanged when it has none.
+ */
+export function inlineImportMeta(body: string): string {
+  if (!HAS_IMPORT_META.test(body)) return body;
+  let used = false;
+  const use = () => {
+    used = true;
+    return "__sbImportMeta";
+  };
+  const out = body.replace(IMPORT_META_SCAN, (match) => {
+    if (match.startsWith("import")) return use();
+    // `...${import.meta.url}...`: only the interpolations are code.
+    if (match[0] === "`") return match.replace(/\$\{[^}]*\}/g, (part) => part.replace(IMPORT_META, use));
+    return match;
+  });
+  if (!used) return body;
+  const url = JSON.stringify(IMPORT_META_URL);
+  return `const __sbImportMeta = { url: ${url}, main: true, resolve(specifier) { return new URL(String(specifier), ${url}).href; } };\n${out}`;
 }
 
 export function neutraliseExports(source: string): string | null {
@@ -336,7 +377,7 @@ export function wrapNativeFetchHandler(
   // at module top level, so they stay outside the function.
   const importPattern = /^import\s(?:[\s\S]*?\sfrom\s*)?["'][^"'\n]+["'];?[ \t]*$/gm;
   const imports = (neutralised.match(importPattern) ?? []).join("\n");
-  const body = neutralised.replace(importPattern, "");
+  const body = inlineImportMeta(neutralised.replace(importPattern, ""));
   return (
     `${prelude}\n${nativeTransferAbi}${compat}${env}${versionMetadataLine}${wire}` +
     `${imports ? `${imports}\n` : ""}const __sbUserHandlers = (() => {\n${body}\n` +
