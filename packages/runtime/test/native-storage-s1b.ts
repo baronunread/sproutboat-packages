@@ -233,6 +233,58 @@ try {
     console.log("PASS a torn W record and an LTXPOS3 record are not trusted: new epoch, no row lost");
   }
 
+  // 7b. What the dead process left above the position (a power cut keeps files its stale record never named): an unpublished
+  // .ltx.tmp is removed and the epoch goes on; a published file above the position makes a new epoch and is never overwritten.
+  {
+    const dir = await fresh();
+    const d = await spawn(dir, big);
+    await d.send("sql d1 DB CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)");
+    await fill(d, 10);
+    const epoch = (await state(d)).epoch;
+    await d.kill();
+    const pos = await position(dir);
+    const name = (n: bigint, ext = ".ltx") =>
+      join(spool(dir), epoch, n.toString(16).padStart(16, "0") + "-" + n.toString(16).padStart(16, "0") + ext);
+    await writeFile(name(pos.txid + 1n, ".ltx.tmp"), "partial");
+    await writeFile(name(pos.txid + 3n, ".ltx.tmp"), "partial");
+    const e = await spawn(dir, big);
+    await fill(e, 5, "n");
+    const s = await stats(e);
+    assert.equal(s.resume, 1, "stale tmp files do not stop a resume");
+    assert.equal(s.fresh, 0);
+    assert.equal((await state(e)).epoch, epoch);
+    await e.send("close d1 DB");
+    await e.quit();
+    assert.equal(count(dir), 15);
+    await assertEquals(dir, "after stale tmp files");
+    // a published file above the position
+    const dir2 = await fresh();
+    const g = await spawn(dir2, big);
+    await g.send("sql d1 DB CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)");
+    await fill(g, 10);
+    const epoch2 = (await state(g)).epoch;
+    await g.kill();
+    const pos2 = await position(dir2);
+    const orphan = join(
+      spool(dir2),
+      epoch2,
+      (pos2.txid + 3n).toString(16).padStart(16, "0") + "-" + (pos2.txid + 3n).toString(16).padStart(16, "0") + ".ltx",
+    );
+    await writeFile(orphan, "from the dead process");
+    const h = await spawn(dir2, big);
+    await fill(h, 5, "n");
+    assert.equal((await stats(h)).fresh, 1, "a published file above the position: a new epoch");
+    assert.notEqual((await state(h)).epoch, epoch2);
+    await h.send("close d1 DB");
+    await h.quit();
+    assert.equal(await readFile(orphan, "utf8"), "from the dead process", "the orphan is preserved, not overwritten");
+    assert.equal(count(dir2), 15);
+    await assertEquals(dir2, "after a published orphan");
+    console.log(
+      "PASS leftovers above the position: unpublished tmp files removed and the epoch continues, a published file starts a new epoch and is kept",
+    );
+  }
+
   // 8. Group commit: the commits are in the WAL with their syncs owed, capture is held, one flush syncs once and captures
   // them as one LTX file.
   {

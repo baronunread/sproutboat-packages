@@ -1606,6 +1606,34 @@ static int sb_ltx_verify_chain(sb_ltx_state *s) {
   }
   return 1;
 }
+// Files of the epoch above the position's txid. With the position and the LTX files not fsynced (S1b) a power cut can leave
+// any of them behind (the dead process wrote txids the stale record never named): a published file above the position is
+// an orphan that must never be overwritten or built on (1: the caller takes a new epoch, the old files stay for restore); an
+// unpublished one (.ltx.tmp) was never visible and is removed so the next capture can create its name. 0: none.
+static int sb_ltx_orphans(const sb_ltx_state *s, uint64_t txid) {
+  char dir[SB_LTX_PATH];
+  if (snprintf(dir, sizeof(dir), "%s/%s", s->root, s->epoch) >= sizeof(dir))
+    return 1;
+  DIR *d = opendir(dir);
+  if (!d)
+    return 1;
+  int found = 0;
+  for (struct dirent *e; (e = readdir(d));) {
+    unsigned long long lo, hi;
+    size_t n = strlen(e->d_name);
+    if (n == 37 && sscanf(e->d_name, "%16llx-%16llx.ltx", &lo, &hi) == 2 && hi > txid) {
+      found = 1;
+      break;
+    }
+    if (n == 41 && !strcmp(e->d_name + 37, ".tmp")) {
+      char path[SB_LTX_PATH];
+      if (snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) < (int)sizeof(path))
+        unlink(path);
+    }
+  }
+  closedir(d);
+  return found;
+}
 static int sb_ltx_load_position(sb_ltx_state *s) {
   char path[SB_LTX_PATH], text[768];
   if (snprintf(path, sizeof(path), "%s/position", s->root) >= sizeof(path))
@@ -1669,8 +1697,7 @@ static int sb_ltx_load_position(sb_ltx_state *s) {
     return 0;
   // A published orphan ahead of the record is never overwritten. A new base
   // captures the recovered source and preserves the old generation for restore.
-  char tmp[SB_LTX_PATH], final[SB_LTX_PATH], dir[SB_LTX_PATH];
-  if (sb_ltx_names(&candidate, txid + 1, tmp, final, dir) || access(final, F_OK) == 0)
+  if (sb_ltx_orphans(&candidate, txid))
     return 0;
   *s = candidate;
   return 1;

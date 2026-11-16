@@ -75,14 +75,17 @@ async function recoverAndCheck(img: string, acked: Acked, label: string, have: {
     recovered.cheap += s.cheap;
     recovered.full += s.full;
     // the recovered handle takes a statement, then closes cleanly
-    if (have.d1) assert.match(await d.send("sql d1 DB INSERT INTO t(v) VALUES('after-recovery')"), /^0 /, label);
+    if (have.d1) {
+      const reply = await d.send("sql d1 DB INSERT INTO t(v) VALUES('after-recovery')");
+      assert.match(reply, /^0 /, label + ": " + reply);
+    }
     if (have.d1) await d.send("close d1 DB");
     if (have.store) await d.send("close store x");
   } finally {
     await d.quit();
   }
   if (have.d1) {
-    const got = new Set(values(join(img, "data/d1/DB.sqlite"), "SELECT v FROM t"));
+    const got = new Set(values(join(img, "data/d1/DB.sqlite"), "SELECT substr(v, 1, instr(v || '|', '|') - 1) FROM t"));
     for (const v of acked.d1) assert(got.has(v), `${label}: acknowledged d1 row ${v} is lost`);
     await chainEqualsFile(join(img, "spool/d1/DB"), join(img, "data/d1/DB.sqlite"), label + " d1");
   }
@@ -230,6 +233,11 @@ async function runScenario(
       const img = join(work, `${name}-image`);
       disk.materialize(img, mode, 1000 + i);
       await recoverAndCheck(img, acked, `${name} cut after op ${i} (${op.t}) ${mode}`, have).catch((e) => {
+        // keep the disk the cut left, for a look (SB_S1B_KEEP=DIR)
+        if (process.env.SB_S1B_KEEP) {
+          rmSync(process.env.SB_S1B_KEEP, { recursive: true, force: true });
+          disk.materialize(process.env.SB_S1B_KEEP, mode, 1000 + i);
+        }
         throw new Error(`${e.message}\n  op ${i}: ${JSON.stringify({ ...op, data: undefined })}`);
       });
       checked++;
@@ -302,7 +310,7 @@ try {
       const traced: Cmd[] = [];
       for (let i = 0; i < 30; i++) {
         const v = `v${seq++}`;
-        traced.push({ line: `sql d1 DB INSERT INTO t(v) VALUES('${v}' || hex(randomblob(3000)))`, ack: { d1: v } });
+        traced.push({ line: `sql d1 DB INSERT INTO t(v) VALUES('${v}|' || hex(randomblob(3000)))`, ack: { d1: v } });
       }
       results.push(
         await runScenario("big", {
