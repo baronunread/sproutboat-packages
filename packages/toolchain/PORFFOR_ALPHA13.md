@@ -6,4 +6,4 @@ Alpha-11 brings array and typed array fast paths (merge sort, `shift`, same-type
 
 The native package suite passed 152 tests, plus the native crypto vectors. Linked to this toolchain, the CLI passed 103 tests (`SURFACE.md` only needs the new provenance stamp), 28 broker checks, 30 standalone checks and all 21 examples. The platform's 32-handler comparison compiled all 32 and matched Bun on 30, unchanged from alpha-10. The remaining two failures are non-ISO date parsing in `15-date-iso.js` and `16-date-parts.js`. See [the scorecard](PORFFOR_SCORECARD.md) for the exact results.
 
-The open runtime bugs reproduce unchanged: baronunread/sproutboat#168 (an async chain using `new Date().toISOString()` flips to permanent 500s after 5 to 12 requests) and the read half of #189 (non-ASCII D1 and KV values come back as Latin-1 bytes).
+The open runtime bugs reproduce unchanged: sproutboat/sproutboat#168 (an async chain using `new Date().toISOString()` flips to permanent 500s after 5 to 12 requests) and the read half of #189 (non-ASCII D1 and KV values come back as Latin-1 bytes).

@@ -6,16 +6,16 @@ atomically. That is why they live together instead of one repo per package.
 
 ## Issues
 
-Tracked centrally in [baronunread/sproutboat](https://github.com/baronunread/sproutboat/issues).
+Tracked centrally in [sproutboat/sproutboat](https://github.com/sproutboat/sproutboat/issues).
 Please file there.
 
 | Package | Owns | Lives today in |
 | --- | --- | --- |
-| `@sproutboat/config` | `sproutboat.jsonc` parsing, validation, binding slots | adopted (was `sproutboat-cli/src/config.ts`) |
-| `@sproutboat/artifact` | Artifact manifest schema, bindings report | adopted (was `sproutboat-cli/src/manifest.ts`) |
-| `@sproutboat/wire` | Broker frame protocol, JSON utilities | adopted (was `sproutboat-cli/src/broker.ts`, `json.ts`) |
-| `@sproutboat/assets` | Static asset manifests and key resolution | adopted (was `sproutboat-cli/src/assets.ts`) |
-| `@sproutboat/runtime` | Wrapper, source validation, transports, prelude | adopted (was `sproutboat-cli/src/wrap.ts` et al) |
+| `@sproutboat/config` | `sproutboat.jsonc` parsing, validation, binding slots | adopted (was `src/config.ts` in sproutboat/cli) |
+| `@sproutboat/artifact` | Artifact manifest schema, bindings report | adopted (was `src/manifest.ts` in sproutboat/cli) |
+| `@sproutboat/wire` | Broker frame protocol, JSON utilities | adopted (was `src/broker.ts` and `src/json.ts` in sproutboat/cli) |
+| `@sproutboat/assets` | Static asset manifests and key resolution | adopted (was `src/assets.ts` in sproutboat/cli) |
+| `@sproutboat/runtime` | Wrapper, source validation, transports, prelude | adopted (was `src/wrap.ts` et al in sproutboat/cli) |
 
 Later candidates: `@sproutboat/crypto` (prelude shims shared by both transports).
 
@@ -42,7 +42,7 @@ The scorecard records behavior matches, same-target compile time and binary
 size from the compatibility harness, and every active patch marker by upstream
 file. Compare it with the previous pin before deciding whether to keep, reduce,
 or replace the Porffor integration. Build telemetry remains tracked in
-[sproutboat#35](https://github.com/baronunread/sproutboat/issues/35).
+[sproutboat#35](https://github.com/sproutboat/sproutboat/issues/35).
 
 ## Status
 
@@ -52,7 +52,7 @@ hold; the platform imports the packages directly.
 
 ## Adoption
 
-- Packages home (this repo): baronunread/sproutboat-packages#1
-- CLI consumer: baronunread/sproutboat-cli#33
+- Packages home (this repo): sproutboat/packages#1
+- CLI consumer: sproutboat/cli#33
 - All five packages adopted; both consumers import them directly. The CLI
   keeps re-export shims so its `sproutboat/runtime/*` export paths hold.
