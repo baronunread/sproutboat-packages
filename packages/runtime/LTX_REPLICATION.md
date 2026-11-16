@@ -267,3 +267,21 @@ broker never turn it on (nothing confirms for them).
 What the runtime cannot do is make the worker wait for its own outgoing calls from outside: that wait is cooperative (a tenant could open
 a socket itself if the sandbox allowed it; egress is checked by the host and by seccomp, not by the gate). The reply and WebSocket gates
 are in the host and are not cooperative.
+
+## Stage S4: the barrier names the touched keys (runtime half)
+
+Design 029, S3's open item 7. For an app with the gate on, the runtime appends the **key of every commit it counts for the gate** to
+the app's `dirty` list, *before* it moves `sb_commit_seq`, with no one-second throttle (`sb_ltx_dirty_line(s, 1)`). A reply that carries
+position P therefore implies that every key committed up to P has a line in the list the store reads at the barrier; the store ships
+just those keys (and keys that failed earlier) instead of reading every key of the app. Without the gate nothing changes: the list is a
+hint, a key is named at its first commit and again after a second.
+
+| Rule the store relies on | Where |
+|---|---|
+| a line for every counted commit, written before the counter moves | `sb_ltx_capture`, success branch |
+| a rotated list (`dirty.old`) is read until it is removed, so a line written between the runtime's `stat` and its `write` is not lost | the store's `touched_keys` |
+| a commit that passed `allowUnconfirmed` is not counted and has no forced line; the regular throttled line and the periodic full scan cover it | unchanged |
+
+Cost: one `write` (under 4 KiB, to an `O_APPEND` descriptor, atomic) and one `stat` per counted commit. Test: `native-storage-s3-app.ts`
+checks that the list has at least as many lines as the commits the gate counted; the store's `tests/touched.rs` and the failover simulation's
+`touched-keys` profile check the reader.

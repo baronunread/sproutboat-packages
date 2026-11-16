@@ -1189,6 +1189,7 @@ static void sb_ltx_wal_checksum(const unsigned char *p, size_t n, int big, uint3
 // checksum chain continues from the cursor's recorded checksum instead of re-reading the WAL from frame 1, and the old
 // version of a page comes from the WAL through the page index, so a capture costs the size of the new frames, not the
 // size of the WAL (S1b: the WAL now lives until a size or time checkpoint, not one statement).
+static void sb_ltx_dirty_line(sb_ltx_state *s, int force);
 static int sb_ltx_capture(sb_ltx_state *s, uint32_t frames) {
   char path[SB_LTX_PATH];
   if (snprintf(path, sizeof(path), "%s-wal", s->path) >= sizeof(path))
@@ -1310,8 +1311,13 @@ static int sb_ltx_capture(sb_ltx_state *s, uint32_t frames) {
     s->wal_c1 = a;
     s->wal_c2 = b;
     rc = sb_ltx_position(s);
-    if (!rc && !sb_gate_skip && sb_gate_on())
+    if (!rc && !sb_gate_skip && sb_gate_on()) {
+      // Design 029 S4: the key goes on the app's dirty list *before* the commit is counted, unthrottled, so that the store's barrier
+      // can read just the keys that were touched instead of every key of the app (the list is no longer only a hint for an app that
+      // is gated: the store relies on a line for every commit that the gate counted).
+      sb_ltx_dirty_line(s, 1);
       sb_commit_seq++; // published and recorded: a barrier that reads the spool now sees it
+    }
   }
 done:
   if (wal >= 0)
@@ -1329,14 +1335,14 @@ done:
 // to an O_APPEND descriptor is atomic.
 static int sb_ltx_dirty_fd = -1;
 static uint64_t sb_ltx_dirty_ino;
-static void sb_ltx_dirty(sb_ltx_state *s) {
+static void sb_ltx_dirty_line(sb_ltx_state *s, int force) {
   const char *shared = getenv("SB_LTX_ROOT");
   if (!shared || !*shared || !s->key[0])
     return;
   struct timespec t;
   clock_gettime(CLOCK_MONOTONIC, &t);
   long now = (long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
-  if (s->dirty_ms && now - s->dirty_ms < 1000)
+  if (!force && s->dirty_ms && now - s->dirty_ms < 1000)
     return;
   char path[SB_LTX_PATH], line[256];
   if (snprintf(path, sizeof(path), "%s/dirty", shared) >= sizeof(path))
@@ -1355,6 +1361,9 @@ static void sb_ltx_dirty(sb_ltx_state *s) {
   int n = snprintf(line, sizeof(line), "%s\n", s->key);
   if (n > 0 && n < (int)sizeof(line) && write(sb_ltx_dirty_fd, line, (size_t)n) == n)
     s->dirty_ms = now ? now : 1;
+}
+static void sb_ltx_dirty(sb_ltx_state *s) {
+  sb_ltx_dirty_line(s, 0);
 }
 // Capture what has been committed and not yet captured. A commit made while group commit is on (sb_ltx_defer_ok) only
 // noted its frame count; the capture waits for the flush, so a group of commits becomes one LTX file.

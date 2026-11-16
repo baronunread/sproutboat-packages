@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -160,6 +160,10 @@ try {
     await still("/obj/delete-unconfirmed", "nor does a delete under it");
     await moved("/obj/put?v=c", "an ordinary write after them");
     assert.equal((await s.get("/state")).confirmed, 0, "nothing confirmed without a host");
+    // S4: the store's barrier reads only the keys the dirty list names, so every commit the gate counted has its line, unthrottled
+    // (the list is otherwise one line per key per second)
+    const dirtyLines = readFileSync(join(workdir, "spool-1/dirty"), "utf8").split("\n").filter(Boolean).length;
+    assert(dirtyLines >= last, `the gate counted ${last} commits and the dirty list has ${dirtyLines} lines`);
     await s.kill();
     console.log(
       "PASS compiled app: the commit position counts D1, KV and Durable Object commits, not reads, not allowUnconfirmed",
