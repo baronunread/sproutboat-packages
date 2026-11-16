@@ -96,6 +96,9 @@ static int sb_db_count = 0;
 #include <errno.h>
 #include <limits.h>
 #include <sys/file.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 
 // Public SQLite VFS ABI, from sqlite3.h (public domain). Keeping declarations
 // here preserves standalone builds without an installed SQLite development SDK.
@@ -579,7 +582,9 @@ typedef struct {
   // the page cache may lose or tear any of them, and a resume verifies every one of them before it trusts the position.
   // pending_frames: WAL frames committed but not yet captured (group commit holds capture until the flush);
   // frames_seen: frames in the WAL as of the last commit; ckpt_ms: monotonic ms of the last checkpoint (or open).
-  uint64_t synced_txid;
+  // synced_checksum: the post-apply checksum at synced_txid, so the chain above it can be checked without reading a file
+  // a shipper may already have removed (it may remove files below the position that are also at or below synced_txid).
+  uint64_t synced_txid, synced_checksum;
   uint32_t pending_frames, frames_seen;
   long ckpt_ms;
   // page number -> latest WAL frame at or before the capture cursor (open addressing, power-of-two capacity, page 0 =
@@ -697,6 +702,23 @@ static int sb_ltx_sync_dir(const char *path) {
   if (close(fd) && !rc)
     rc = -1;
   return rc;
+}
+// Start the write-out of a file's dirty pages without waiting for it (Linux sync_file_range, SYNC_FILE_RANGE_WRITE). A captured
+// commit's LTX file is not fsynced when it is written (S1b); this makes sure the kernel is already moving its bytes, so the
+// fsync that comes before a clean record finds most of them on disk. SB_LTX_WRITEBACK=0 turns it off. Best effort: an error
+// changes nothing, durability is the fsync's job.
+static int sb_ltx_writeback_on = -1;
+static void sb_ltx_writeback(int fd) {
+#if defined(__linux__) && defined(SYS_sync_file_range)
+  if (sb_ltx_writeback_on < 0) {
+    const char *v = getenv("SB_LTX_WRITEBACK");
+    sb_ltx_writeback_on = !(v && v[0] == '0' && !v[1]);
+  }
+  if (sb_ltx_writeback_on)
+    (void)syscall(SYS_sync_file_range, fd, (long long)0, (long long)0, 2u);
+#else
+  (void)fd;
+#endif
 }
 static int sb_ltx_flush(FILE *f) { return fflush(f) || sb_ltx_fsync(fileno(f)) ? -1 : 0; }
 #ifdef __APPLE__
@@ -877,6 +899,8 @@ static int sb_ltx_finish(sb_ltx_writer *w, uint64_t checksum, int durable) {
   // commit's file is only flushed to the kernel: its fsync is paid once for all of them before a clean record (S1b).
   if (durable ? sb_ltx_flush(w->out) : fflush(w->out))
     return -1;
+  if (!durable)
+    sb_ltx_writeback(fileno(w->out));
   sb_ltx_phase("ltx-fsynced");
   return 0;
 }
@@ -927,6 +951,7 @@ static int sb_ltx_sync_ltx(sb_ltx_state *s) {
   if (sb_ltx_names(s, s->txid, tmp, final, dir) || sb_ltx_sync_dir(dir))
     return -1;
   s->synced_txid = s->txid;
+  s->synced_checksum = s->checksum;
   return 0;
 }
 static int sb_ltx_position(sb_ltx_state *s) {
@@ -953,12 +978,13 @@ static int sb_ltx_position(sb_ltx_state *s) {
   if (s->checkpointed && sb_ltx_sync_ltx(s))
     return -1;
   int n = snprintf(body, sizeof(body),
-                   "LTXPOS4\n%s\n%llu %c %llu %u %u %llu %016llx %u %u %u %u %llu %llu %llu %llu\n", s->epoch,
+                   "LTXPOS4\n%s\n%llu %c %llu %u %u %llu %016llx %u %u %u %u %llu %llu %llu %llu %016llx\n", s->epoch,
                    (unsigned long long)s->epoch_seq, s->checkpointed ? 'C' : 'W',
                    (unsigned long long)s->txid, s->salt1, s->salt2, (unsigned long long)s->offset,
                    (unsigned long long)s->checksum, s->wal_c1, s->wal_c2, s->page_size, s->commit,
                    (unsigned long long)s->db_ino, (unsigned long long)s->db_mtime_ns,
-                   (unsigned long long)s->ltx_size, (unsigned long long)s->synced_txid);
+                   (unsigned long long)s->ltx_size, (unsigned long long)s->synced_txid,
+                   (unsigned long long)s->synced_checksum);
   if (n < 0 || n >= (int)sizeof(body))
     return -1;
   FILE *f = fopen(tmp, "wb");
@@ -1078,6 +1104,7 @@ static int sb_ltx_snapshot(sb_ltx_state *s) {
   if (!rc) {
     s->checkpointed = 1;
     s->synced_txid = 1; // the base image was fsynced with its directory
+    s->synced_checksum = s->checksum;
     rc = sb_ltx_position(s);
   }
 done:
@@ -1559,30 +1586,13 @@ static int sb_ltx_verify_last(sb_ltx_state *s) {
   return sb_ltx_verify_file(s, s->txid, &commit, &pre, &post) && commit == s->commit && post == s->checksum;
 }
 // A W record: every file above synced_txid was written without an fsync, so each of them is verified, and the chain is
-// followed (each file's pre-apply checksum is the post-apply checksum of the one before; the first one's is the tail of
-// the last synced file, which a clean record promised is on disk). A hole, a zero-length or torn file, a file that
+// followed (each file's pre-apply checksum is the post-apply checksum of the one before; the first one's is
+// synced_checksum, so no file at or below synced_txid is read: a shipper may have removed it). A hole, a zero-length or torn file, a file that
 // survived while an earlier one did not: any of them fails the whole resume, which costs a new epoch and nothing else.
 static int sb_ltx_verify_chain(sb_ltx_state *s) {
-  uint64_t first = s->synced_txid, prev_post = 0;
+  uint64_t first = s->synced_txid, prev_post = s->synced_checksum;
   if (first >= s->txid)
     return sb_ltx_verify_last(s);
-  if (first) {
-    // the last synced file: its tail only (it was verified when it was synced)
-    char tmp[SB_LTX_PATH], final[SB_LTX_PATH], dir[SB_LTX_PATH];
-    unsigned char tail[24];
-    struct stat st;
-    if (sb_ltx_names(s, first, tmp, final, dir))
-      return 0;
-    int fd = open(final, O_RDONLY);
-    if (fd < 0)
-      return 0;
-    int bad = fstat(fd, &st) || st.st_size < 131 || sb_ltx_read(fd, tail, 24, (uint64_t)st.st_size - 24);
-    close(fd);
-    if (bad)
-      return 0;
-    for (int i = 0; i < 8; i++)
-      prev_post = (prev_post << 8) | tail[8 + i];
-  }
   for (uint64_t id = first + 1; id <= s->txid; id++) {
     uint32_t commit = 0;
     uint64_t pre = 0, post = 0;
@@ -1610,18 +1620,19 @@ static int sb_ltx_load_position(sb_ltx_state *s) {
     return 0;
   text[n] = 0;
   sb_ltx_state candidate = *s;
-  unsigned long long txid, offset, checksum, digest, seq, ino, mtime, ltxsize, synced;
+  unsigned long long txid, offset, checksum, digest, seq, ino, mtime, ltxsize, synced, synced_sum;
   char mode;
   int used = 0, tail = 0;
   // LTXPOS2 (the format before epochSeq) and LTXPOS3 (before synced_txid, S1b) are not read: their owner starts a new
   // epoch, which the shipper sees as one full image. A record of any other kind falls back the same way.
-  if (sscanf(text, "LTXPOS4\n%63s\n%llu %c %llu %u %u %llu %16llx %u %u %u %u %llu %llu %llu %llu\n%n",
+  if (sscanf(text, "LTXPOS4\n%63s\n%llu %c %llu %u %u %llu %16llx %u %u %u %u %llu %llu %llu %llu %16llx\n%n",
              candidate.epoch, &seq, &mode, &txid, &candidate.salt1, &candidate.salt2, &offset,
              &checksum, &candidate.wal_c1, &candidate.wal_c2, &candidate.page_size,
-             &candidate.commit, &ino, &mtime, &ltxsize, &synced, &used) != 16 ||
+             &candidate.commit, &ino, &mtime, &ltxsize, &synced, &synced_sum, &used) != 17 ||
       !seq)
     return 0;
   candidate.synced_txid = synced;
+  candidate.synced_checksum = synced_sum;
   candidate.epoch_seq = seq;
   candidate.db_ino = ino;
   candidate.db_mtime_ns = mtime;
@@ -1638,7 +1649,8 @@ static int sb_ltx_load_position(sb_ltx_state *s) {
   if (ps < 512 || ps > 65536 || (ps & (ps - 1)))
     return 0;
   if (mode == 'C') {
-    if (offset || candidate.salt1 || candidate.salt2 || candidate.wal_c1 || candidate.wal_c2 || synced != txid)
+    if (offset || candidate.salt1 || candidate.salt2 || candidate.wal_c1 || candidate.wal_c2 || synced != txid ||
+        synced_sum != checksum)
       return 0;
   } else if (mode != 'W' || offset < 32 || offset > sb_ltx_max_bytes || (offset - 32) % (ps + 24) || synced > txid)
     return 0;

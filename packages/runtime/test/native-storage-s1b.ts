@@ -52,8 +52,8 @@ async function fill(d: Driver, n: number, tag = "r") {
 const big = { SB_LTX_CKPT_BYTES: "8388608", SB_LTX_CKPT_MS: "3600000" };
 
 try {
-  // 1. The steady state of the new write path: the WAL is not reset after every statement, no capture file is synced, so a
-  // commit costs the WAL's own sync and nothing else.
+  // 1. The new write path between checkpoints: the WAL is not reset after every statement, no capture file is synced, so a
+  // commit costs the WAL's own sync and nothing else. (The LTX files are synced once, when a checkpoint comes: test 2.)
   {
     const dir = await fresh();
     const d = await spawn(dir, big);
@@ -79,7 +79,7 @@ try {
     await assertEquals(dir, "after a clean close");
     assert.equal(count(dir), 200);
     console.log(
-      `PASS steady state: ${syncs} syncs for 200 commits (1.0 per commit), no capture sync, WAL ${walSize} bytes kept`,
+      `PASS steady state: ${syncs} syncs for 200 commits (1.0 per commit while no checkpoint is due), no capture sync, WAL ${walSize} bytes kept`,
     );
   }
 

@@ -41,7 +41,10 @@ rolls back. Reduce transaction size to fit the ceiling; this implementation does
 not split a transaction. Frame metadata is bounded by that same ceiling, about
 8 bytes per WAL frame. SQLite's normal page cache remains capped at 2 MiB.
 
-After each statement resets, checkpoint TRUNCATE runs. Multi-statement `exec`
+Checkpoint TRUNCATE runs after a statement when the WAL holds `SB_LTX_CKPT_BYTES`
+(default 1 MiB) or when a statement runs `SB_LTX_CKPT_MS` (default 1000) after the last
+checkpoint with frames to move, and when a handle closes (stage S1b, below; `SB_LTX_CKPT_BYTES=0` is the older
+checkpoint after every statement). Multi-statement `exec`
 steps and finalizes each statement separately under this opt-in, so every commit
 gets a checkpoint opportunity. Inside an explicit open transaction, BUSY/LOCKED
 can defer checkpointing; the VFS ceiling still applies. SQL that changes the WAL,
@@ -66,20 +69,20 @@ Its transient disk usage grows with the index records and is not visible to the
 directory-walk storage quota after unlink. Allow disk headroom for that scratch
 space as well as the LTX output; the quota is not a hard filesystem limit.
 
-For every LTX file:
+For every LTX file (stage S1b; stage S1 fsynced each of these steps, ten fsyncs a commit, see "Stage S1b" below):
 
-1. Write a `.tmp` file, flush it and fsync it.
-2. Publish the completed filename with an atomic, no-replace hard link, unlink
-   the temporary name, and fsync the generation directory. A finished file is
-   never replaced. This has rename-style publication with no overwrite race.
-3. Write a versioned, checksummed position record to `position.tmp`, fsync it,
-   rename it to `position`, and fsync the root directory. The record includes
+1. Write a `.tmp` file and flush it to the kernel. (No fsync; on Linux the write-out is started with
+   `sync_file_range` so the later fsync finds the bytes on disk.)
+2. Publish the completed filename with an atomic, no-replace hard link and unlink
+   the temporary name. A finished file is
+   never replaced. This has rename-style publication with no overwrite race. (No directory fsync.)
+3. Write a versioned, checksummed position record to `position.tmp` and rename it to `position`: the W record, which
+   is not fsynced. The record includes
    generation, TXID, salts, next WAL byte offset, database checksum, WAL checksum
-   state, page size and committed page count.
-4. Only then checkpoint the source database. After checkpoint TRUNCATE succeeds,
-   atomically persist a second position record marking the database checkpointed.
-   The same file/directory fsync sequence applies to that record. A crash between
-   checkpoint and publication of the marker retains the conservative fallback.
+   state, page size, committed page count and `synced_txid`.
+4. When a checkpoint is due (size, time, close), after TRUNCATE succeeds: every LTX file above `synced_txid` is fsynced,
+   then the generation directory, then the clean record (`C`) is written with fsync of the file and the root
+   directory. A crash between checkpoint and publication of the marker retains the conservative fallback.
 
 Capture, fsync and publication failures latch the database closed to subsequent
 operations until restart. The SQL commit has already happened when a hook error
@@ -160,12 +163,12 @@ the lock on, the per-file `<db>.ltx.lock` is not used.
 in a name is written as `%XX` (a Durable Object class may hold a dollar sign); the real name is recoverable from
 the key. `volatile.sqlite` has no key and is never captured.
 
-**Position record `LTXPOS3`.**
+**Position record `LTXPOS4`** (stage S1b; `LTXPOS3`, the same without the last field, is not resumed).
 
 ```
-LTXPOS3
+LTXPOS4
 <epoch dir name>
-<epochSeq> <W|C> <txid> <salt1> <salt2> <wal offset> <db checksum hex> <wal c1> <wal c2> <page size> <pages> <ino> <mtime ns>
+<epochSeq> <W|C> <txid> <salt1> <salt2> <wal offset> <db checksum hex> <wal c1> <wal c2> <page size> <pages> <ino> <mtime ns> <last LTX size> <synced txid> <synced checksum hex>
 <CRC-64 of the lines above, hex>
 ```
 
@@ -179,8 +182,10 @@ full image. The first three lines are what a shipper needs; it must ignore field
 **Shared spool.** With `SB_LTX_ROOT` the worker creates `ROOT/<key>/` one directory at a time under the host's
 setgid `ROOT` (mode 0770, so each keeps the shipper's group), sets `umask(007)` once so its files are
 group-readable, names epochs with random bytes made by `mkdir`, and never `chmod`s a spool directory (that would
-clear the setgid bit). A shipper in the group reads the spool and deletes shipped LTX files below the position;
-the worker's resume tolerates files below the position being gone.
+clear the setgid bit). A shipper in the group reads the spool (unsynced files included: their bytes are in the page cache and
+verified by their own CRC) and deletes shipped LTX files only when they are below the position's `txid` and at or below its
+`synced txid` (a file above that may not be on disk yet and is checked by the worker's resume); the worker's resume tolerates
+files at or below `synced txid` being gone, and the last file (at `txid`) must exist.
 
 **Dirty list.** `ROOT/dirty` has one line per file with a commit the shipper may not know about, appended by the
 worker at a file's first commit and again after a second of silence. It is a hint: a shipper must still scan every
@@ -191,6 +196,49 @@ second) and start a new `dirty`; read the renamed file after two seconds.
 instance leaves memory): capture is unhooked, the file is checkpointed, a clean record is written, then
 `sqlite3_close`, and only after that the raw descriptor on the same inode is closed. A close that cannot finish
 (open transaction, a leaked statement, a failed capture) leaves the handle open.
+
+**Stage S1b: one sync per commit, group commit, and why each removed fsync is safe** (design 029; numbers in
+`029-s1b-results.md` of the platform folder).
+
+*What a commit promises.* A commit is acknowledged to the application when SQLite's COMMIT returns (inline), or, with
+group commit, when the promise of the D1 call settles. Both happen after the WAL has been fsynced (synchronous stays
+FULL). That fsync is the only one an acknowledgement waits for: it is what survives a power cut, and SQLite's recovery
+replays the WAL, so no acknowledged commit depends on any file the capture writes.
+
+*Checkpoint by size or time, not per statement (removes three fsyncs a commit).* The checkpoint does not make a commit
+durable; it moves frames into the database file. A cut with frames in the WAL is a normal SQLite recovery. The capture's
+cursor (offset, salts, checksum of the last captured frame) is in the W record, and the resume checks it against the
+WAL (salts, the frame-checksum chain at the cursor, a commit frame there) and captures every committed frame beyond
+it before serving. The WAL is bounded by the threshold and, in any case, by the 16 MiB VFS ceiling. A cut in the
+middle of a checkpoint is SQLite's own guarantee; the W record then describes a WAL that was partly reset, the resume
+finds the salts or the checksum chain different, and takes a new epoch.
+
+*LTX files are not fsynced when written (removes two fsyncs a commit).* An LTX file holds the same frames as the WAL
+until a checkpoint discards them, so its loss cannot lose a commit. What a lost, torn or reordered unsynced file could
+cost is a hole in the chain, so (1) a clean record is written only after every file above `synced_txid` and the
+directory are fsynced, so a clean record never claims a file that is not on disk, and (2) a resume from a W record
+verifies every file above `synced_txid` in full (structure, every page, the file CRC) and follows the chain (each
+pre-apply checksum is the previous post-apply checksum; the first is the tail of the last synced file); any failure takes
+a new epoch with a base image of the database, which contains every commit.
+
+*The W record is not fsynced (removes two fsyncs a commit).* It is a hint. A missing record, a torn one (CRC), an older
+one (the cursor then fails the WAL check, or a published file ahead of it is found: new epoch) or a newer one than the
+files can back (chain verification) can only cost a new epoch. `synced_txid` in it is the one field that must not be
+believed blindly; it is checked against the files themselves.
+
+*What stays fsynced.* The base image (it is the root of an epoch), the clean record, the files above `synced_txid` at the
+moment a clean record is written, and the directories those need: about six fsyncs per checkpoint plus one per LTX file
+written since the last one.
+
+*Group commit* (`SB_LTX_GROUP=1`, strict D1 calls). SQLite keeps `synchronous=FULL`. The VFS does not run a WAL commit
+sync while the prelude's promise barrier is open (`sb_ltx_group('d')`); it records that the sync is owed and SQLite sees it
+succeed. The D1 call's promise settles only after `sb_ltx_group('f')`: one fsync of every owed WAL and the capture of
+everything committed since (one LTX file per file per group). Nothing is acknowledged before the flush, and every D1 call,
+read or write, waits while anything is owed, so no request acts on data a power cut could take back. A statement run
+outside the barrier (non-strict D1, Durable Object SQL, KV) flushes what is owed before it returns. Checkpoint and close
+never defer their own syncs. A WAL sync that fails at the flush rejects every waiting call and latches every captured
+file closed (the commits it covered are in an unknown state). Not covered: a D1 promise the application never awaits
+(workerd does not guarantee its completion either) and the answer to such a request.
 
 Qualification: `bun run test:native-storage-s1` (scope, all three kinds restored byte for byte, owner lock with
 takeover after `SIGKILL`, 14 objects through 8 slots, `LTXPOS3` cases, the dirty list, 25 `SIGKILL` rounds over all

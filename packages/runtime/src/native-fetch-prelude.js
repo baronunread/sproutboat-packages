@@ -10674,13 +10674,19 @@ function __sbD1Promise(run) {
 // ---- group commit (design 029 stage S1b) ----
 // With SB_LTX_GROUP=1 a strict D1 call does not wait for its own fsync. Its commit is made (SQLite believes it is durable,
 // synchronous=FULL stays set) but the WAL sync is owed, and the promise it returns settles only after one flush: a timer
-// of delay 0, which runs after every request already read in this turn has made its own call, then one fsync per owed WAL
-// and the capture of what was committed. N concurrent requests so cost one fsync, not N. Nothing is acknowledged before it:
+// that runs after the requests already read in this loop iteration have made their own calls, then one fsync per owed WAL
+// and the capture of what was committed. N concurrent requests so cost one fsync, not N. The wait is adaptive: while commits
+// arrive one at a time the flush runs at the end of the turn (a lone request pays its own fsync and nothing for the group),
+// and once a flush has carried more than one commit the next ones wait the timer's 1 ms so the others can join; four flushes of
+// one in a row go back to the first mode, and every eighth idle flush tries the wait again. Nothing is acknowledged before it:
 // the caller sees a result only through a promise, and every call, read or write, waits while anything is owed, so no
 // request can act on data a power cut could still take back. A call that returns nothing owed settles at once.
 let __sbGroupState = -1;
 let __sbGroupWaiters = [];
 let __sbGroupTimer = false;
+let __sbGroupBusy = false;
+let __sbGroupSingles = 0;
+let __sbGroupProbe = 0;
 function __sbGroupOn() {
   if (__sbGroupState < 0)
     __sbGroupState = __sbEnv("SB_LTX_ENABLE") === "1" && __sbEnv("SB_LTX_GROUP") === "1" && __sbD1Strict() ? 1 : 0;
@@ -10690,6 +10696,12 @@ function __sbGroupFlush() {
   __sbGroupTimer = false;
   const list = __sbGroupWaiters;
   __sbGroupWaiters = [];
+  if (list.length > 1) {
+    __sbGroupBusy = true;
+    __sbGroupSingles = 0;
+  } else if (__sbGroupBusy && ++__sbGroupSingles >= 4) {
+    __sbGroupBusy = false;
+  }
   let failed = false;
   try {
     failed = Number(__sbLtxRaw("f")) < 0;
@@ -10720,7 +10732,8 @@ function __sbGrouped(run) {
     __sbGroupWaiters.push({ resolve, reject, value, err, threw });
     if (!__sbGroupTimer) {
       __sbGroupTimer = true;
-      __sbSetTimeout(__sbGroupFlush, 0);
+      if (__sbGroupBusy || ++__sbGroupProbe % 8 === 0) __sbSetTimeout(__sbGroupFlush, 1);
+      else Promise.resolve().then(__sbGroupFlush);
     }
   });
 }
