@@ -52,7 +52,7 @@ async function drain(child: Bun.Subprocess<"ignore", "pipe", "pipe">) {
   return { exitCode, stdout, stderr };
 }
 
-/** Compile a generated module into a native binary on the standalone channel (alpha 24). */
+/** Compile a generated module into a native binary on the standalone channel (alpha 25). */
 export async function compileNative(input: NativeCompileInput): Promise<void> {
   const dir = input.dir ?? dirname(input.binary);
   const optimize = input.optimize ?? 0;
@@ -95,7 +95,7 @@ export type RenderUnitsInput = Pick<
 
 /**
  * The compiler's half of a standalone build on the alpha 21 line: compose the sources, render the C units
- * with the pinned (patched) alpha 24 compiler, and return the units directory (porf.h, porf__main.c, the units).
+ * with the pinned (patched) alpha 25 compiler, and return the units directory (porf.h, porf__main.c, the units).
  */
 export async function renderStandaloneUnits(input: RenderUnitsInput): Promise<string> {
   const dir = input.dir ?? dirname(input.binary);

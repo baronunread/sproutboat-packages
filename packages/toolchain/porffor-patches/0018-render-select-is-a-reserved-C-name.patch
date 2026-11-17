@@ -15,7 +15,7 @@ Upstream: https://github.com/CanadaHonk/porffor/issues/462
  1 file changed, 1 insertion(+)
 
 diff --git a/compiler/render.js b/compiler/render.js
-index 12126cf28674d5c0d3ce83ef669ede6c717bca9d..7df859a3a9543af17dee323c8eded0f9dcb7f3f5 100644
+index 817af18a9180d3fcc8e7345ddb443726a6589e97..135904f906aefe6c93b999cde0a36c07e449f27c 100644
 --- a/compiler/render.js
 +++ b/compiler/render.js
 @@ -35,6 +35,7 @@ const BIN_PREC = {

@@ -1,10 +1,10 @@
 {
   "upstream": {
     "repo": "https://github.com/CanadaHonk/porffor",
-    "channel": "alpha-24",
-    "tag": "alpha-24",
-    "commit": "1b8225eafda6664dcd4f274d002603bd9797de6a",
-    "npmVersion": "0.0.0-alpha.24"
+    "channel": "alpha-25",
+    "tag": "alpha-25",
+    "commit": "c9af40c8c6913e04d491412ae9fe0f34b97b51df",
+    "npmVersion": "0.0.0-alpha.25"
   },
   "series": {
     "dir": "packages/toolchain/porffor-patches",
@@ -36,16 +36,16 @@
       "0025-date-Date.parse-takes-HH-and-HHmm-offsets-as-well-as.patch",
       "0026-builtins-regenerate-compiler-builtins_precompiled.js.patch"
     ],
-    "sha256": "2e77fe54585c72c95689f3c3cc12ba97f7daee3bf8bd4e7228f00be58473e02d"
+    "sha256": "7fa00686c95b7e2134d67d083f6c8181a93554a79cd24e049d3351de20712ef9"
   },
   "tar": {
-    "sha256": "ec3deef7349c264b39b98b134e2d3ede6851725d81a2efd1845d494dc388b88a",
-    "bytes": 6315008
+    "sha256": "1932c5d41c9b8cee0d9967d7d45f66c944804ac18346016eaf17cbd4a32b4678",
+    "bytes": 6346240
   },
   "tarball": {
     "file": "porffor-patched.tar.gz",
-    "sha256": "6aff867ee9d8c1960e74cba26a9317bf210b8453738c5c11e9742f3b27e8cabd",
-    "bytes": 1583827,
-    "compressor": "bun 1.4.0 gzipSync level 9"
+    "sha256": "5dfee096720f3478b3556d723bf838fd8fd6baa48f964caf15cb76e7ef8b94bc",
+    "bytes": 1594586,
+    "compressor": "bun 1.4.4 gzipSync level 9"
   }
 }

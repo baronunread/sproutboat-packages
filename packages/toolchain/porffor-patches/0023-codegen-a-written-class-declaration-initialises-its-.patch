@@ -22,10 +22,10 @@ Upstream: https://github.com/CanadaHonk/porffor/issues/457
  1 file changed, 9 insertions(+)
 
 diff --git a/compiler/codegen.js b/compiler/codegen.js
-index bfbf60feb795beb93c5a7d1c849a10b2749547b6..3d830eb78b19715875706215055c59b8517787bb 100644
+index 4bb0e7012eb88d43348b4c69dc5496d3b27236bf..6d399d35f4819e0f955ef9c057677dc28d25f531 100644
 --- a/compiler/codegen.js
 +++ b/compiler/codegen.js
-@@ -5455,6 +5455,15 @@ const generateClass0 = (scope, decl) => {
+@@ -5526,6 +5526,15 @@ const generateClass0 = (scope, decl) => {
    if (classDecorators && !expr && decl._variable.scope.type === 'Program') allocVar(scope, name, true);
    if (decl._boxed) generateVarDstr(scope, 'let', decl.id, { type: 'ObjectExpression', properties: [] }, undefined, scope.topLevel);
  

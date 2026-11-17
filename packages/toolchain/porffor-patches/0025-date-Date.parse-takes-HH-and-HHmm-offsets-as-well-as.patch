@@ -17,7 +17,7 @@ Upstream: https://github.com/CanadaHonk/porffor/issues/455
  1 file changed, 13 insertions(+), 3 deletions(-)
 
 diff --git a/compiler/builtins/date.ts b/compiler/builtins/date.ts
-index 9b436faaab0882c45e4cac954c5c0bb2a3075968..19d91fed23dc40a4029c68ea1ba903e0058e60ef 100644
+index 7c6eecf9a9630744eeb6e8ba86c534b92d25397a..445b3a813dc4138b37bac339ea837f08c0a4eec3 100644
 --- a/compiler/builtins/date.ts
 +++ b/compiler/builtins/date.ts
 @@ -505,15 +505,25 @@ export const __ecma262_ParseDTSF = (string: bytestring): number => {

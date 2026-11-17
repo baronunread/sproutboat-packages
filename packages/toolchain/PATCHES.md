@@ -2,7 +2,7 @@
 
 The patch series is the source of truth: `packages/toolchain/porffor-patches/`, a `git format-patch` series of
 26 patches against ONE upstream commit, [CanadaHonk/porffor](https://github.com/CanadaHonk/porffor)
-`1b8225e` (tag `alpha-24`, 2026-11-14). The toolchain supports one Porffor alpha at a time. This file is the index.
+`c9af40c` (tag `alpha-25`, 2026-11-17). The toolchain supports one Porffor alpha at a time. This file is the index.
 
 What ships is the patched tree: `vendor/porffor-patched.tar.gz` (the commit with the series applied) and
 `vendor/porffor-patched.json` (upstream commit, series hash, tar and tarball sha256). `ensurePorfforA21` verifies the
@@ -37,7 +37,7 @@ Applied in this order. Every patch has what and why in its commit message.
 | [`0001-compiler-SB_EXTRA_LINK-and-SB_EXTRA_CFLAGS-add-link-.patch`](porffor-patches/0001-compiler-SB_EXTRA_LINK-and-SB_EXTRA_CFLAGS-add-link-.patch) | SB_EXTRA_LINK / SB_EXTRA_CFLAGS | ours | none needed | link inputs and C flags from the environment for SQLite, BearSSL and the broker glue; upstream names libraries in source (`Porffor.link`) |
 | [`0002-builtins-navigator-is-writable.patch`](porffor-patches/0002-builtins-navigator-is-writable.patch) | writable `navigator` | ours | none needed | `navigator.userAgent` is frozen to `Porffor/<v>`; the prelude must set `Cloudflare-Workers` for pg's Workers socket path |
 | [`0003-string-replaceAll-joins-its-pieces-once-instead-of-c.patch`](porffor-patches/0003-string-replaceAll-joins-its-pieces-once-instead-of-c.patch) | `replaceAll` pieces | upstream | [#459](https://github.com/CanadaHonk/porffor/issues/459), open (filed by us 2026-11-11) | `String.prototype.replaceAll` is quadratic: each match concatenates the whole output again |
-| [`0004-string-repeat-copies-by-doubling.patch`](porffor-patches/0004-string-repeat-copies-by-doubling.patch) | `repeat` doubling | upstream | not filed: `repeat` is linear on alpha 23/24 (1.6 MB in 8 ms, 32 MB in 105 ms), the patch only cuts a constant factor; candidate to drop ([#150](https://github.com/CanadaHonk/porffor/pull/150) and [#312](https://github.com/CanadaHonk/porffor/pull/312) are closed count-coercion PRs, a different problem) | `"ab".repeat(300000)` makes 300,000 small copies instead of log2(n) doubling copies |
+| [`0004-string-repeat-copies-by-doubling.patch`](porffor-patches/0004-string-repeat-copies-by-doubling.patch) | `repeat` doubling | upstream | not filed: `repeat` is linear on alpha 23 to 25 (1.6 MB in 8 ms, 32 MB in 105 ms), the patch only cuts a constant factor; candidate to drop ([#150](https://github.com/CanadaHonk/porffor/pull/150) and [#312](https://github.com/CanadaHonk/porffor/pull/312) are closed count-coercion PRs, a different problem) | `"ab".repeat(300000)` makes 300,000 small copies instead of log2(n) doubling copies |
 | [`0005-string-toUpperCase-and-toLowerCase-map-the-Unicode-c.patch`](porffor-patches/0005-string-toUpperCase-and-toLowerCase-map-the-Unicode-c.patch) | Unicode case mapping | upstream | [#461](https://github.com/CanadaHonk/porffor/issues/461), open (filed by us 2026-11-11) | `toUpperCase` / `toLowerCase` map only ASCII: `"é".toUpperCase()` stays `"é"` |
 | [`0006-regexp-replace-with-a-global-regexp-and-a-function-b.patch`](porffor-patches/0006-regexp-replace-with-a-global-regexp-and-a-function-b.patch) | regexp `replace` with a function | upstream | [#460](https://github.com/CanadaHonk/porffor/issues/460), open (filed by us 2026-11-11) | `str.replace(/re/g, fn)` is quadratic: a full `strcat` copy per match |
 | [`0007-modules-record-app-module-ids-and-declare-their-name.patch`](porffor-patches/0007-modules-record-app-module-ids-and-declare-their-name.patch) | app module ids (P6, modules.js) | ours | none needed | records app module ids and declares their namespaces after the shared ones, so the template's initializer prefix does not depend on the app |
@@ -56,7 +56,7 @@ Applied in this order. Every patch has what and why in its commit message.
 | [`0020-process-tolerate-a-null-argv-and-environ.patch`](porffor-patches/0020-process-tolerate-a-null-argv-and-environ.patch) | null argv and environ | ours | none needed: only an embedding host that runs `clearenv()` (sproutd's template) reaches it | `node:process` init reads `porf_argv[i]` and `environ[i]` without a null check |
 | [`0021-json-a-wide-JSON-string-is-sized-by-its-own-length-P.patch`](porffor-patches/0021-json-a-wide-JSON-string-is-sized-by-its-own-length-P.patch) | JSON wide strings (P9) | upstream | [#464](https://github.com/CanadaHonk/porffor/issues/464), open (filed by us 2026-11-11) | `JSON.parse` of 6,000 objects containing `"naïve 中文"` in a 316 KB document dies (signal 138/139): wide strings are sized by the whole document |
 | [`0022-codegen-shared-dispatch-arguments-are-evaluated-in-o.patch`](porffor-patches/0022-codegen-shared-dispatch-arguments-are-evaluated-in-o.patch) | dispatch argument order (P10) | upstream | [#454](https://github.com/CanadaHonk/porffor/issues/454), open, same bug (filed by us 2026-11-08). Related, different paths: [#437](https://github.com/CanadaHonk/porffor/issues/437), [#438](https://github.com/CanadaHonk/porffor/issues/438), [#448](https://github.com/CanadaHonk/porffor/issues/448) | `x.toString("utf8", i, i += n)` on an untyped `x` reads `i` after the increment on arm64 |
-| [`0023-codegen-a-written-class-declaration-initialises-its-.patch`](porffor-patches/0023-codegen-a-written-class-declaration-initialises-its-.patch) | written class declaration (P11) | upstream | [#457](https://github.com/CanadaHonk/porffor/issues/457), open, same bug (filed by us 2026-11-08) | `class A {}; A = A` leaves `A` undefined; drizzle-orm's `(SQL \|\| (SQL = {}))` merge dies. Alpha 24 only: a decorated or boxed class is skipped (plain code now, no per-tree anchor choice) |
+| [`0023-codegen-a-written-class-declaration-initialises-its-.patch`](porffor-patches/0023-codegen-a-written-class-declaration-initialises-its-.patch) | written class declaration (P11) | upstream | [#457](https://github.com/CanadaHonk/porffor/issues/457), open, same bug (filed by us 2026-11-08) | `class A {}; A = A` leaves `A` undefined; drizzle-orm's `(SQL \|\| (SQL = {}))` merge dies. Alpha 24 and 25: a decorated or boxed class is skipped (plain code now, no per-tree anchor choice) |
 | [`0024-codegen-the-right-operand-of-and-is-generated-as-a-b.patch`](porffor-patches/0024-codegen-the-right-operand-of-and-is-generated-as-a-b.patch) | logical right operand is a branch (P13) | upstream | [#456](https://github.com/CanadaHonk/porffor/issues/456), open, same bug (filed by us 2026-11-08) | in a function, `let o = 1; o \|\| (o = {}); typeof o` answers `"object"` |
 | [`0025-date-Date.parse-takes-HH-and-HHmm-offsets-as-well-as.patch`](porffor-patches/0025-date-Date.parse-takes-HH-and-HHmm-offsets-as-well-as.patch) | `Date.parse` offsets (P12) | upstream | [#455](https://github.com/CanadaHonk/porffor/issues/455), open, same bug (filed by us 2026-11-08). The colon form was [#387](https://github.com/CanadaHonk/porffor/issues/387), ours, closed | `new Date("2026-11-08 14:48:19.097+00")` and `...+0000` are `NaN` |
 | [`0026-builtins-regenerate-compiler-builtins_precompiled.js.patch`](porffor-patches/0026-builtins-regenerate-compiler-builtins_precompiled.js.patch) | regenerated `builtins_precompiled.js` | generated | n/a | the precompiled builtin table, which upstream tracks; `apply` skips this patch and regenerates it, `verify` fails when it is stale |
@@ -79,6 +79,47 @@ No upstream PR covers any of them; Porffor's AI policy does not allow LLM-writte
 6. Requalify at the tier the change needs (sproutd's `requalify.sh`; a new alpha is the porffor tier, see "Requal tiers").
 
 Dropping or adding a pass is the same flow: `git rebase -i` in the checkout, `export`, `vendor`.
+
+## Alpha 25 check (2026-11-17)
+
+Alpha 25 is twenty-five commits on alpha 24 (npm `0.0.0-alpha.25`, gitHead `c9af40c`, upstream `main`, published 2026-11-17 08:05 UTC): +387/-129
+lines in `compiler/` (`codegen.js` +177, `render.js` +125, `builtins/date.ts`, `json.ts`, `object.ts`, `index.js`, `ir.js`) and `runtime/node/`
+(`buffer.js`, `crypto.js` with AES-GCM, `stream/consumers.js`, `internal/bytes.js`, `internal/loop.js`). It is performance work (inlined
+`charCodeAt`, fewer calls to out-of-line helpers, a bigger small-heap nursery, native Buffer search) plus two fixes and Node API additions.
+
+`apply --base alpha-25` applied 22 of the 25 patches as they were and stopped on three, resolved by hand (**no pass dropped, none rewritten**):
+
+| Patch | Upstream commit that moved the anchor | Resolution |
+| --- | --- | --- |
+| 0011 shared dispatch per unit (P8) | the `generateCall` dispatch block is wrapped in a `const dispatch = () => { ... }` closure | the same `sharedFunc(src, scope, name + '_' + arity)` call inside the closure |
+| 0022 dispatch argument order (P10) | same block | `reuse(scope, ...)` on each argument, inside the closure |
+| 0015 collector hooks | `fc25f011` render: small heap nursery up to **eight** times live (was twice), `fa10dfbb` promoted limit follows nursery survival | our memory-limit clamp (`porf_gc_limit_room`) stays on top of upstream's cap: `cap = min(cap_free, cap_room)`, `cap_free` now uses `8u` |
+
+Upstream commits that touch our areas and need no change: `7dcc16ee` (darwin link: export only `main`, `-no_compact_unwind`; Linux unchanged, and `SB_EXTRA_LINK` is
+independent), `c1ec0114` (split units read `porf_mem` as a `const`; `main` calls a new noinline `porf_start`; our P2/P3 layout and the pinned ABI regions
+are not in that code), `454a12a9` (`spawnSync` for large links), `7d6a67cc` (cleared timers drop their context; our per-request CPU stamp is on promise reactions),
+`36047302`/`a43dfe0a` (for-in slot and object-literal order; #454's repro still fails without P10).
+
+Repros on the **unpatched** alpha 25 tree (macOS arm64), 2026-11-17: all still fail, so no pass can be dropped, and all pass on the patched tree.
+
+| Issue | Stock alpha 25 | Patched |
+| --- | --- | --- |
+| [#454](https://github.com/CanadaHonk/porffor/issues/454) | `decode(Buffer.from("hello world"), 6, 5)` gives `"\|11"` | `world\|11` |
+| [#455](https://github.com/CanadaHonk/porffor/issues/455) | `new Date("2026-11-08 14:48:19.097+00")` is `NaN` | the epoch ms |
+| [#456](https://github.com/CanadaHonk/porffor/issues/456) | `o \|\| (o = {})` retypes `o`: `typeof o` is `"object"` | `"number"` |
+| [#457](https://github.com/CanadaHonk/porffor/issues/457) | `class A {}; A = A; typeof A` is `"undefined"` | `"function"` |
+| [#459](https://github.com/CanadaHonk/porffor/issues/459) | `"ab".repeat(200000).replaceAll("a", "xyz")`: 7.4 s | fast |
+| [#460](https://github.com/CanadaHonk/porffor/issues/460) | `.replace(/a/g, fn)` on 200 KB: 5.0 s | fast |
+| [#461](https://github.com/CanadaHonk/porffor/issues/461) | `"é".toUpperCase()` unchanged | `É` |
+| [#462](https://github.com/CanadaHonk/porffor/issues/462) | `const select = 1` fails the C compile (also on macOS: `select` is a function in `<sys/select.h>`) | 1 |
+| [#463](https://github.com/CanadaHonk/porffor/issues/463) | `typeof Response.redirect` is `"undefined"` | `function` |
+| [#464](https://github.com/CanadaHonk/porffor/issues/464) | `JSON.parse` of 6,000 objects with `"naïve 中文"` dies (no output) | parses |
+
+All ten issues are still open with no comments and no linked PR. Open upstream PRs that cover a patch: [#467](https://github.com/CanadaHonk/porffor/pull/467) (`select`, #462),
+[#468](https://github.com/CanadaHonk/porffor/pull/468) (wide JSON strings, #464) and [#466](https://github.com/CanadaHonk/porffor/pull/466) (`Response.redirect`/`error`, #463, by another contributor);
+none is merged, none is in alpha 25. [#420](https://github.com/CanadaHonk/porffor/pull/420)/[#421](https://github.com/CanadaHonk/porffor/pull/421) (inline caches, near P17's code) are open.
+Our two older PRs, [#422](https://github.com/CanadaHonk/porffor/pull/422) and [#423](https://github.com/CanadaHonk/porffor/pull/423), are closed unmerged.
+`typeof` namespace/enum/decorator code still compiles; no workaround in this repo for TypeScript syntax exists.
 
 ## Alpha 24 check (2026-11-14)
 

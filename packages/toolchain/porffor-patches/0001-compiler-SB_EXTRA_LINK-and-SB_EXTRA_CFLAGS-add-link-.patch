@@ -15,7 +15,7 @@ Pass: patchCompilerArgsA21
  1 file changed, 2 insertions(+)
 
 diff --git a/compiler/index.js b/compiler/index.js
-index 7454c7653213c06fa04569cfa776f7f19dd3d5ec..fb8a4d0b799eb64bdf42ae02eed11d29b18db5d6 100644
+index 38d58a779040b2770cc5ab79ac6b1699a4f35a57..acf8454a9712ba418ab3cad0b5b19cbc36c6f8b9 100644
 --- a/compiler/index.js
 +++ b/compiler/index.js
 @@ -195,6 +195,7 @@ export default (code, module = Prefs.module, opts = {}) => {

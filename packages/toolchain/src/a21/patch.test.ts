@@ -150,7 +150,7 @@ test("the shipped tree carries every patch's edit", async () => {
     ["compiler/codegen.js", "#class_computed_prop_${unitOf(scope)}_"],
     ["compiler/codegen.js", "sproutboat P10: shared dispatch arguments are evaluated in order"],
     ["compiler/codegen.js", "sproutboat P13: the right operand of a logical expression is a branch"],
-    // P11 on alpha 24 leaves a decorated or boxed class alone.
+    // P11 on alpha 25 leaves a decorated or boxed class alone.
     ["compiler/codegen.js", "if (!expr && decl._writes && !classDecorators && !decl._boxed) {"],
     ["compiler/modules.js", "sproutboat P6: app-owned modules"],
     ["compiler/modules.js", "sproutboat P4: prelude-declared names override runtime globals"],
@@ -164,7 +164,7 @@ test("the shipped tree carries every patch's edit", async () => {
     ["compiler/render.js", "sproutboat P3: a unit's segments by content"],
     ["compiler/render.js", "sproutboat P6: app-module globals last"],
     ["compiler/render.js", "sproutboat: glibc select"],
-    // alpha 24's own text, untouched by any patch: js functions carry PORF_CC (swiftcall on clang arm64).
+    // alpha 25's own text, untouched by any patch: js functions carry PORF_CC (swiftcall on clang arm64).
     ["compiler/render.js", "#define PORF_CC __attribute__((swiftcall))"],
     ["compiler/builtins/_internal_object.ts", "sproutboat: frozen megamorphic cache"],
     ["compiler/builtins/promise.ts", "sproutboat: per-request cpu"],
@@ -181,7 +181,7 @@ test("the shipped tree carries every patch's edit", async () => {
     ["compiler/builtins/regexp.ts", "export const __Porffor_regex_replaceCallback = "],
   ] as const)
     expect(text[f], `${marker} in ${f}`).toContain(marker);
-  // alpha 24's own file (the TypeScript lowering) is untouched by every patch.
+  // alpha 25's own file (the TypeScript lowering) is untouched by every patch.
   expect(await Bun.file(join(root, "compiler/typescript.js")).exists()).toBe(true);
   // The table was regenerated after the builtin edits: it carries the replaceAll rewrite and the mega freeze.
   expect(text["compiler/builtins_precompiled.js"]).toContain("replaceAll");
@@ -356,7 +356,7 @@ test("P8: the shared dispatch functions sit in the unit that asked, under stable
   expect(new TextDecoder().decode(run.stdout).trim()).toBe("ABab  abb c c  2,3");
 }, 180_000);
 
-test("P9: JSON.parse of a large document with wide strings runs on the shipped alpha 24 tree", async () => {
+test("P9: JSON.parse of a large document with wide strings runs on the shipped alpha 25 tree", async () => {
   const root = await patched();
   const work = join(root, "work-p9");
   await mkdir(work);

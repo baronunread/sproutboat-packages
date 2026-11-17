@@ -4,9 +4,9 @@ import { join } from "node:path";
 import { extractPatchedTree } from "./patched-tree";
 
 // Three miscompiles the control-plane spike found on Porffor alpha 22 (postgres.js and drizzle-orm
-// run into all three; still there on alpha 23 and alpha 24, the stock repros fail on both). Each program is
+// run into all three; still there on alpha 23, 24 and 25, the stock repros fail on all three). Each program is
 // compiled to a native binary with the shipped patched tree.
-for (const channel of ["alpha-24"] as const) {
+for (const channel of ["alpha-25"] as const) {
   describe(channel, () => {
     let root = "";
     let work = "";
