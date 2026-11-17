@@ -18,10 +18,10 @@ Upstream: https://github.com/CanadaHonk/porffor/issues/456
  1 file changed, 3 insertions(+)
 
 diff --git a/compiler/codegen.js b/compiler/codegen.js
-index 3d830eb78b19715875706215055c59b8517787bb..51f189d9af75936e13830b07d190414906605fc6 100644
+index 6d399d35f4819e0f955ef9c057677dc28d25f531..ced70517a07814fb29334e4e5250a5c3a7725d51 100644
 --- a/compiler/codegen.js
 +++ b/compiler/codegen.js
-@@ -1584,8 +1584,11 @@ const generateLogicExp = (scope, decl, valueUnused = false) => {
+@@ -1587,8 +1587,11 @@ const generateLogicExp = (scope, decl, valueUnused = false) => {
    const check = logicalChecks[decl.operator];
    const res = tmp(scope, T.jsval, coerceValue(generate(scope, decl.left), T.jsval));
    emitIf(scope, check(scope, res, getNodeType(scope, decl.left)), () => {

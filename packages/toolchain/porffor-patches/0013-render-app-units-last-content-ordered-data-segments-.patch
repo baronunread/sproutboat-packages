@@ -19,11 +19,11 @@ Pass: patchUnitLayout (P2, P3, P3b, P6 render.js part)
  1 file changed, 22 insertions(+), 4 deletions(-)
 
 diff --git a/compiler/render.js b/compiler/render.js
-index 219c5bfab128dc915058903500ba4ddbb53ad5c3..2a5b5f594d1ed3a90f55f3072a4eb27975df8e3b 100644
+index e32bbf17f56b54596eee61e546e821945a6ac9c7..cb4bda5240246555dab88479353ec724037f9f37 100644
 --- a/compiler/render.js
 +++ b/compiler/render.js
 @@ -5,6 +5,7 @@ import {
-   CONVERT_RANGE_KNOWN, CONVERT_SIGNED
+   CONVERT_RANGE_KNOWN, CONVERT_SIGNED, CONVERT_CHECKED
  } from './ir.js';
  import { TYPES, TYPE_NAMES, ITERATOR_TYPES } from './types.js';
 +import { appModuleIds } from './modules.js'; // sproutboat P6
@@ -86,12 +86,12 @@ index 219c5bfab128dc915058903500ba4ddbb53ad5c3..2a5b5f594d1ed3a90f55f3072a4eb279
    placeData(zbase, true);
    const staticEnd = off;
  
-@@ -1605,6 +1621,8 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null,
+@@ -1641,6 +1657,8 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null,
    }
  
    // module globals (top-level JS bindings)
 +  // sproutboat P6: app-module globals last, so the shared prefix of the declaration and root lists is app-independent
 +  { const isApp = g => [ ...appModuleIds ].some(id => g.name.includes('#m' + id) || g.name.includes('_' + id + '_') || g.name.endsWith('_' + id)); globals = [ ...globals.filter(g => !isApp(g)), ...globals.filter(isApp) ]; }
    for (const g of globals) link.push(`${st}${CT[g.type]} ${sanitize(g.name)}${g.type === T.jsval ? ` = {0.0, ${TYPES.undefined}}` : ''};\n`);
+   if (!split) for (const f of linkFuncs) link.push(guard(f));
    link.push('\n');
-   if (gcEnabled) {
