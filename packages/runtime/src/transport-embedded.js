@@ -96,6 +96,9 @@ static int sb_db_count = 0;
 #include <errno.h>
 #include <limits.h>
 #include <sys/file.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 
 // Public SQLite VFS ABI, from sqlite3.h (public domain). Keeping declarations
 // here preserves standalone builds without an installed SQLite development SDK.
@@ -172,10 +175,101 @@ typedef struct {
   sqlite3_file base;
   sqlite3_file *real;
   int wal;
+  // Design 029 S1b (group commit): the WAL's xSync was not run at commit but is owed before anything is acknowledged.
+  int owed, owed_flags;
 } sb_ltx_file;
+// The WAL files whose commit sync is owed, and the two switches that decide it. A sync is deferred only while a
+// statement runs whose result the caller holds back until sb_ltx_group('f') (sb_ltx_defer_ok), and never inside a
+// checkpoint or a close (sb_ltx_nodefer): those syncs order SQLite's own writes and are not commits.
+#define SB_LTX_OWED_MAX 64
+static sb_ltx_file *sb_ltx_owed_files[SB_LTX_OWED_MAX];
+static int sb_ltx_owed_n, sb_ltx_defer_ok, sb_ltx_nodefer;
+// Design 029 stage S3: the acknowledgement gate. sb_commit_seq counts the commits this process captured (and so published to the
+// spool); the host reads it (dlsym) and stamps every frame that leaves the worker with it, then holds the frame until the store
+// has the commits durable on two replicas (or in R2). sb_commit_confirmed is what the host has had confirmed: the host writes it,
+// the runtime reads it (an outgoing call after an unconfirmed commit waits; storage.sync() resolves when it catches up). Both are
+// exported and plain 64-bit words (one writer each, aligned: no lock). Nothing is counted unless the host set SB_LTX_GATE=1 and the
+// prelude enabled the gate for an app whose compatibility date reached the gate's date (sb_gate_op('e')), so every older app, the
+// standalone binary and the broker behave as before. sb_gate_skip is non-zero while a storage call that passed Cloudflare's
+// allowUnconfirmed runs: its commit is replicated but nothing waits for it.
+uint64_t sb_commit_seq, sb_commit_confirmed;
+static int sb_gate_allowed, sb_gate_skip;
+static int sb_gate_on(void) {
+  static int env = -1;
+  if (env < 0) {
+    const char *v = getenv("SB_LTX_GATE");
+    env = v && v[0] == '1' && !v[1];
+  }
+  return sb_gate_allowed && env;
+}
+// What the prelude may ask (one letter, optionally a number after it): e, enable (1 when the gate is then on); p, the commit
+// counter; c, the confirmed counter; b, 1 when commits are unconfirmed; u and v, enter and leave an allowUnconfirmed call; k N,
+// set the confirmed counter to N (the standalone test stand-in for the host). Returns 0 for anything else.
+static unsigned long long sb_gate_op(const char *w) {
+  switch (w[0]) {
+  case 'e':
+    sb_gate_allowed = 1;
+    return sb_gate_on() ? 1 : 0;
+  case 'p':
+    return sb_commit_seq;
+  case 'c':
+    return sb_commit_confirmed;
+  case 'b':
+    return sb_gate_on() && sb_commit_seq > sb_commit_confirmed ? 1 : 0;
+  case 'u':
+    sb_gate_skip++;
+    return 1;
+  case 'v':
+    if (sb_gate_skip > 0)
+      sb_gate_skip--;
+    return 1;
+  case 'k':
+    sb_commit_confirmed = strtoull(w + 1, 0, 10);
+    return 1;
+  }
+  return 0;
+}
+// Counters for the tests and the host's stats line: syncs SQLite asked the VFS for and that really ran (vfs_syncs), those it
+// asked for while group commit held them back (deferred_syncs), syncs of the capture's own files and directories (fsyncs),
+// and flushes that found something owed or uncaptured (flushes).
+static unsigned long sb_ltx_stat_vfs_syncs, sb_ltx_stat_deferred_syncs, sb_ltx_stat_fsyncs, sb_ltx_stat_flushes;
+static int sb_ltx_fsync(int fd) {
+  sb_ltx_stat_fsyncs++;
+  return fsync(fd);
+}
+static void sb_ltx_owed_clear(sb_ltx_file *w) {
+  for (int i = 0; i < sb_ltx_owed_n; i++)
+    if (sb_ltx_owed_files[i] == w) {
+      sb_ltx_owed_files[i] = sb_ltx_owed_files[--sb_ltx_owed_n];
+      break;
+    }
+  w->owed = 0;
+}
+// Run every owed WAL sync (one fsync per file, however many commits it covers). 0, or the first error.
+static int sb_ltx_flush_owed(void) {
+  int rc = 0;
+  while (sb_ltx_owed_n > 0) {
+    sb_ltx_file *w = sb_ltx_owed_files[sb_ltx_owed_n - 1];
+    int flags = w->owed_flags;
+    sb_ltx_owed_clear(w);
+    sb_ltx_stat_vfs_syncs++;
+    int e = w->real->pMethods->xSync(w->real, flags);
+    if (e && !rc)
+      rc = e;
+  }
+  return rc;
+}
 static sqlite3_file *sb_ltx_real(sqlite3_file *f) { return ((sb_ltx_file *)f)->real; }
 static int sb_ltx_vclose(sqlite3_file *f) {
   sqlite3_file *r = sb_ltx_real(f);
+  sb_ltx_file *w = (sb_ltx_file *)f;
+  if (w->owed) {
+    // closing with a sync owed: do it now, the commit it covers may already have been promised
+    int flags = w->owed_flags;
+    sb_ltx_owed_clear(w);
+    if (r->pMethods->xSync(r, flags))
+      fprintf(stderr, "LTX: the WAL sync owed at close failed\n");
+  }
   return r->pMethods->xClose(r);
 }
 static int sb_ltx_vread(sqlite3_file *f, void *b, int n, sqlite3_int64 o) {
@@ -196,8 +290,24 @@ static int sb_ltx_vtruncate(sqlite3_file *f, sqlite3_int64 n) {
   return r->pMethods->xTruncate(r, n);
 }
 static int sb_ltx_vsync(sqlite3_file *f, int n) {
-  sqlite3_file *r = sb_ltx_real(f);
-  return r->pMethods->xSync(r, n);
+  sb_ltx_file *w = (sb_ltx_file *)f;
+  sqlite3_file *r = w->real;
+  if (w->wal && sb_ltx_defer_ok && !sb_ltx_nodefer && (w->owed || sb_ltx_owed_n < SB_LTX_OWED_MAX)) {
+    // SQLite believes the commit is durable (synchronous=FULL stays set); it is made so by sb_ltx_flush_owed before the
+    // caller is told, and the caller is told only through sb_ltx_group('f').
+    if (!w->owed) {
+      w->owed = 1;
+      sb_ltx_owed_files[sb_ltx_owed_n++] = w;
+    }
+    w->owed_flags = n;
+    sb_ltx_stat_deferred_syncs++;
+    return 0;
+  }
+  sb_ltx_stat_vfs_syncs++;
+  int rc = r->pMethods->xSync(r, n);
+  if (!rc && w->owed)
+    sb_ltx_owed_clear(w); // this sync covers everything written before it
+  return rc;
 }
 static int sb_ltx_vsize(sqlite3_file *f, sqlite3_int64 *n) {
   sqlite3_file *r = sb_ltx_real(f);
@@ -308,6 +418,12 @@ static int sb_ltx_register(void) {
       return -1;
     sb_ltx_max_bytes = value;
   }
+  // With a shared spool the shipper reads files this process creates through its group, so they must be
+  // group-readable whatever umask the host gave the worker. Spool directories sit under a setgid parent and keep
+  // its group; nothing else the worker creates is shared. Process-wide, once, and only in that mode.
+  const char *shared = getenv("SB_LTX_ROOT");
+  if (shared && *shared)
+    umask(007);
   sb_ltx_parent = sqlite3_vfs_find(0);
   if (!sb_ltx_parent)
     return -1;
@@ -319,18 +435,265 @@ static int sb_ltx_register(void) {
   return sqlite3_vfs_register(&sb_ltx_vfs, 0);
 }
 
+// ---- One storage owner per app (plan 013 phase A, design 029 S1) ----
+// SB_OWNER_LOCK unset or 0: nothing changes. 1: the first storage call of the process takes an exclusive flock on
+// DATA/.owner.lock and keeps it until the process dies, so two workers of one app (a deploy overlap, a handover, a
+// canary) can never both commit to its captured files or both construct one Durable Object. deny: this process
+// may never own storage (a canary): the call fails at once. The kernel drops the lock on any death, so a crash
+// needs no cleanup. Taking it waits in 20 ms steps up to SB_OWNER_WAIT_MS (default 5000), then fails with no state
+// changed, so the next call tries again. The path and the meaning are a contract across runtime generations.
+static int sb_owner_fd = -1;
+static int sb_owner_mode(void) {
+  const char *v = getenv("SB_OWNER_LOCK");
+  if (!v || !*v || !strcmp(v, "0"))
+    return 0;
+  return !strcmp(v, "deny") ? 2 : 1;
+}
+static int sb_owner_wait_ms(void) {
+  const char *v = getenv("SB_OWNER_WAIT_MS");
+  if (!v || !*v)
+    return 5000;
+  char *end = 0;
+  unsigned long long n = strtoull(v, &end, 10);
+  return *end || n > 120000 ? 5000 : (int)n;
+}
+static int sb_ltx_mkdirs(const char *path, mode_t mode) {
+  char tmp[SB_LTX_PATH];
+  size_t n = strlen(path);
+  if (!n || n >= sizeof(tmp))
+    return -1;
+  memcpy(tmp, path, n + 1);
+  for (char *p = tmp + 1; *p; p++) {
+    if (*p != '/')
+      continue;
+    *p = 0;
+    if (mkdir(tmp, mode) && errno != EEXIST)
+      return -1;
+    *p = '/';
+  }
+  return mkdir(tmp, mode) && errno != EEXIST ? -1 : 0;
+}
+// Returns 0 when this process owns the app's storage (or owner locking is off), -1 when another worker does or the
+// process may not own it. 1 is returned once, at the call that took the lock, so a caller can tell the host.
+static int sb_owner_acquire_dir(const char *dir) {
+  int mode = sb_owner_mode();
+  if (mode == 0 || sb_owner_fd >= 0)
+    return 0;
+  if (mode == 2)
+    return -1;
+  char path[SB_LTX_PATH];
+  if (snprintf(path, sizeof(path), "%s/.owner.lock", dir) >= sizeof(path) ||
+      sb_ltx_mkdirs(dir, 0700))
+    return -1;
+  int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+  if (fd < 0)
+    return -1;
+  for (int waited = 0, limit = sb_owner_wait_ms();; waited += 20) {
+    if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
+      sb_owner_fd = fd;
+      return 1;
+    }
+    if (errno != EWOULDBLOCK || waited >= limit) {
+      close(fd);
+      return -1;
+    }
+    usleep(20000);
+  }
+}
+// The app's data directory, from a database path under it: DATA/d1/NAME.sqlite, DATA/do-sql/CLASS/FILE.sqlite
+// and DATA/store.sqlite all give DATA.
+static const char *sb_ltx_last(const char *path, const char *needle) {
+  const char *found = 0;
+  for (const char *p = strstr(path, needle); p; p = strstr(p + 1, needle))
+    found = p;
+  return found;
+}
+// 1 D1, 2 store, 3 Durable Object SQL, 0 anything else (volatile.sqlite, a stray file).
+static int sb_ltx_kind(const char *path) {
+  const char *d = sb_ltx_last(path, "/do-sql/");
+  if (d) {
+    const char *rest = d + 8, *slash = strchr(rest, '/');
+    if (slash && !strchr(slash + 1, '/'))
+      return 3;
+  }
+  d = sb_ltx_last(path, "/d1/");
+  if (d && !strchr(d + 4, '/'))
+    return 1;
+  size_t n = strlen(path);
+  return n >= 13 && !strcmp(path + n - 13, "/store.sqlite") ? 2 : 0;
+}
+static int sb_ltx_data_dir(const char *path, char *out, size_t cap) {
+  int kind = sb_ltx_kind(path);
+  const char *cut = kind == 3   ? sb_ltx_last(path, "/do-sql/")
+                    : kind == 1 ? sb_ltx_last(path, "/d1/")
+                                : strrchr(path, '/');
+  if (!kind || !cut || (size_t)(cut - path) >= cap)
+    return -1;
+  memcpy(out, path, (size_t)(cut - path));
+  out[cut - path] = 0;
+  if (!*out)
+    strcpy(out, "/");
+  return 0;
+}
+static int sb_owner_acquire_for(const char *path) {
+  if (sb_owner_mode() == 0 || sb_owner_fd >= 0)
+    return 0;
+  if (sb_owner_mode() == 2)
+    return -1;
+  char dir[SB_LTX_PATH];
+  const char *env = getenv("SB_DATA_DIR");
+  if (!env || !*env)
+    env = getenv("SPROUTBOAT_DATA");
+  if (env && *env)
+    return sb_owner_acquire_dir(env);
+  return sb_ltx_data_dir(path, dir, sizeof(dir)) ? -1 : sb_owner_acquire_dir(dir);
+}
+// SB_LTX_SCOPE: which kinds of file are captured, a comma list of d1, store and do-sql. Bit 0 d1, 1 store, 2 do-sql.
+// -1 when the variable is unset (then SB_LTX_DATABASE selects one D1 binding, as before) and -2 for a bad list.
+static int sb_ltx_scope(void) {
+  const char *v = getenv("SB_LTX_SCOPE");
+  if (!v || !*v)
+    return -1;
+  int mask = 0;
+  const char *p = v;
+  while (*p) {
+    size_t n = strcspn(p, ",");
+    if (n == 2 && !strncmp(p, "d1", 2))
+      mask |= 1;
+    else if (n == 5 && !strncmp(p, "store", 5))
+      mask |= 2;
+    else if (n == 6 && !strncmp(p, "do-sql", 6))
+      mask |= 4;
+    else
+      return -2;
+    p += n + (p[n] == ',');
+  }
+  return mask ? mask : -2;
+}
+// The spool of one file. Without SB_LTX_ROOT it is PATH.ltx beside the database (the layout so far). With it, a
+// sibling of the app's tree that the host gives to the shipper's group: ROOT/KEY, where KEY is d1/NAME, store or
+// do-sql/CLASS/FILE. A byte outside A-Za-z0-9_- in a name (a Durable Object class may hold a dollar sign) is written
+// as %XX, which is reversible; the key is a frozen contract.
+static int sb_ltx_key(const char *path, char *key, size_t cap) {
+  int kind = sb_ltx_kind(path);
+  if (!kind)
+    return -1;
+  const char *name = kind == 3   ? sb_ltx_last(path, "/do-sql/") + 8
+                     : kind == 1 ? sb_ltx_last(path, "/d1/") + 4
+                                 : "store.sqlite";
+  size_t len = strlen(name);
+  if (len < 8 || strcmp(name + len - 7, ".sqlite"))
+    return -1;
+  len -= 7;
+  size_t o = 0;
+  const char *head = kind == 3 ? "do-sql/" : kind == 1 ? "d1/" : "";
+  if (kind == 2) {
+    if (cap < 6)
+      return -1;
+    memcpy(key, "store", 6);
+    return 0;
+  }
+  o = strlen(head);
+  if (o >= cap)
+    return -1;
+  memcpy(key, head, o);
+  for (size_t i = 0; i < len; i++) {
+    unsigned char c = (unsigned char)name[i];
+    int plain = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                c == '_' || c == '-' || (c == '/' && kind == 3);
+    if (o + (plain ? 1 : 3) + 1 >= cap)
+      return -1;
+    if (plain)
+      key[o++] = (char)c;
+    else
+      o += (size_t)snprintf(key + o, 4, "%%%02X", c);
+  }
+  key[o] = 0;
+  return 0;
+}
 typedef struct {
   sqlite3 *db;
-  char path[SB_LTX_PATH], root[SB_LTX_PATH], epoch[64];
+  char path[SB_LTX_PATH], root[SB_LTX_PATH], epoch[64], key[192];
   int lock, failed, read_fd, checkpointed;
   uint32_t page_size, commit, salt1, salt2, wal_c1, wal_c2;
   uint64_t txid, offset, checksum;
+  // LTXPOS3 (design 029 S1): epochSeq only ever grows, also after a lost spool; ino and mtime of the database file
+  // when a clean record was written let a reopen skip the full page checksum.
+  uint64_t epoch_seq, db_ino, db_mtime_ns, ltx_size;
+  int fast;
+  long dirty_ms;
+  // S1b. synced_txid: every LTX file up to this txid, and its directory entry, is known durable (a clean record is only
+  // ever written with synced_txid == txid). Files above it are written and linked but not fsynced: a crash that loses
+  // the page cache may lose or tear any of them, and a resume verifies every one of them before it trusts the position.
+  // pending_frames: WAL frames committed but not yet captured (group commit holds capture until the flush);
+  // frames_seen: frames in the WAL as of the last commit; ckpt_ms: monotonic ms of the last checkpoint (or open).
+  // synced_checksum: the post-apply checksum at synced_txid, so the chain above it can be checked without reading a file
+  // a shipper may already have removed (it may remove files below the position that are also at or below synced_txid).
+  uint64_t synced_txid, synced_checksum;
+  uint32_t pending_frames, frames_seen;
+  long ckpt_ms;
+  // page number -> latest WAL frame at or before the capture cursor (open addressing, power-of-two capacity, page 0 =
+  // empty): the old version of a page is read from the WAL, not the database, until the next checkpoint.
+  uint32_t *ix_page, *ix_frame;
+  uint32_t ix_cap, ix_n;
 } sb_ltx_state;
 static sb_ltx_state sb_ltx_states[SB_MAX_DB];
 static uint64_t sb_ltx_crc_table[256];
 static int sb_ltx_crc_ready;
 static uint32_t sb_ltx_be32(const unsigned char *p) {
   return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+static uint32_t sb_ltx_ix_get(const sb_ltx_state *s, uint32_t pgno) {
+  if (!s->ix_cap)
+    return 0;
+  for (uint32_t h = (pgno * 2654435761u) & (s->ix_cap - 1);; h = (h + 1) & (s->ix_cap - 1)) {
+    if (!s->ix_page[h])
+      return 0;
+    if (s->ix_page[h] == pgno)
+      return s->ix_frame[h];
+  }
+}
+static int sb_ltx_ix_put(sb_ltx_state *s, uint32_t pgno, uint32_t frame) {
+  if ((s->ix_n + 1) * 2 > s->ix_cap) {
+    uint32_t cap = s->ix_cap ? s->ix_cap * 2 : 64;
+    uint32_t *np = calloc(cap, sizeof(uint32_t)), *nf = calloc(cap, sizeof(uint32_t));
+    if (!np || !nf) {
+      free(np);
+      free(nf);
+      return -1;
+    }
+    for (uint32_t i = 0; i < s->ix_cap; i++)
+      if (s->ix_page[i])
+        for (uint32_t h = (s->ix_page[i] * 2654435761u) & (cap - 1);; h = (h + 1) & (cap - 1))
+          if (!np[h]) {
+            np[h] = s->ix_page[i];
+            nf[h] = s->ix_frame[i];
+            break;
+          }
+    free(s->ix_page);
+    free(s->ix_frame);
+    s->ix_page = np;
+    s->ix_frame = nf;
+    s->ix_cap = cap;
+  }
+  for (uint32_t h = (pgno * 2654435761u) & (s->ix_cap - 1);; h = (h + 1) & (s->ix_cap - 1)) {
+    if (!s->ix_page[h]) {
+      s->ix_page[h] = pgno;
+      s->ix_frame[h] = frame;
+      s->ix_n++;
+      return 0;
+    }
+    if (s->ix_page[h] == pgno) {
+      s->ix_frame[h] = frame;
+      return 0;
+    }
+  }
+}
+static void sb_ltx_ix_free(sb_ltx_state *s) {
+  free(s->ix_page);
+  free(s->ix_frame);
+  s->ix_page = s->ix_frame = 0;
+  s->ix_cap = s->ix_n = 0;
 }
 static void sb_ltx_put32(unsigned char *p, uint32_t v) {
   for (int i = 3; i >= 0; i--) {
@@ -380,12 +743,71 @@ static int sb_ltx_sync_dir(const char *path) {
   int fd = open(path, O_RDONLY | O_DIRECTORY);
   if (fd < 0)
     return -1;
-  int rc = fsync(fd);
+  int rc = sb_ltx_fsync(fd);
   if (close(fd) && !rc)
     rc = -1;
   return rc;
 }
-static int sb_ltx_flush(FILE *f) { return fflush(f) || fsync(fileno(f)) ? -1 : 0; }
+// Start the write-out of a file's dirty pages without waiting for it (Linux sync_file_range, SYNC_FILE_RANGE_WRITE). A captured
+// commit's LTX file is not fsynced when it is written (S1b); this makes sure the kernel is already moving its bytes, so the
+// fsync that comes before a clean record finds most of them on disk. SB_LTX_WRITEBACK=0 turns it off. Best effort: an error
+// changes nothing, durability is the fsync's job.
+static int sb_ltx_writeback_on = -1;
+static void sb_ltx_writeback(int fd) {
+#if defined(__linux__) && defined(SYS_sync_file_range)
+  if (sb_ltx_writeback_on < 0) {
+    const char *v = getenv("SB_LTX_WRITEBACK");
+    sb_ltx_writeback_on = !(v && v[0] == '0' && !v[1]);
+  }
+  if (sb_ltx_writeback_on)
+    (void)syscall(SYS_sync_file_range, fd, (long long)0, (long long)0, 2u);
+#else
+  (void)fd;
+#endif
+}
+static int sb_ltx_flush(FILE *f) { return fflush(f) || sb_ltx_fsync(fileno(f)) ? -1 : 0; }
+#ifdef __APPLE__
+#define SB_LTX_MTIME_NS(st) ((uint64_t)(st).st_mtimespec.tv_sec * 1000000000ull + (uint64_t)(st).st_mtimespec.tv_nsec)
+#else
+#define SB_LTX_MTIME_NS(st) ((uint64_t)(st).st_mtim.tv_sec * 1000000000ull + (uint64_t)(st).st_mtim.tv_nsec)
+#endif
+static long sb_ltx_mono_ms(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  long now = (long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+  return now ? now : 1;
+}
+static uint64_t sb_ltx_now_ms(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_REALTIME, &t);
+  return (uint64_t)t.tv_sec * 1000u + (uint64_t)t.tv_nsec / 1000000u;
+}
+// A fresh epoch directory name: epoch- and six characters from /dev/urandom. mkdtemp would make it 0700, which
+// a shipper in the spool's group could not enter.
+static int sb_ltx_new_epoch(const char *root, char *name, size_t cap, char *dir, size_t dircap) {
+  static const char alpha[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+  for (int attempt = 0; attempt < 16; attempt++) {
+    unsigned char r[6];
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    ssize_t got = fd < 0 ? -1 : read(fd, r, sizeof(r));
+    if (fd >= 0)
+      close(fd);
+    if (got != (ssize_t)sizeof(r))
+      return -1;
+    char id[7];
+    for (int i = 0; i < 6; i++)
+      id[i] = alpha[r[i] % 36];
+    id[6] = 0;
+    if (snprintf(name, cap, "epoch-%s", id) >= (int)cap ||
+        snprintf(dir, dircap, "%s/%s", root, name) >= (int)dircap)
+      return -1;
+    if (mkdir(dir, 0770) == 0)
+      return 0;
+    if (errno != EEXIST)
+      return -1;
+  }
+  return -1;
+}
 #ifdef SB_LTX_TESTING
 static int sb_ltx_test_armed, sb_ltx_test_commits;
 static void sb_ltx_phase(const char *phase) {
@@ -497,7 +919,7 @@ static int sb_ltx_page(sb_ltx_writer *w, uint32_t pgno, const unsigned char *pag
              ? -1
              : 0;
 }
-static int sb_ltx_finish(sb_ltx_writer *w, uint64_t checksum) {
+static int sb_ltx_finish(sb_ltx_writer *w, uint64_t checksum, int durable) {
   unsigned char zero[6] = {0}, buf[65536];
   if (sb_ltx_write(w, zero, 6, 1) || fflush(w->index))
     return -1;
@@ -518,8 +940,12 @@ static int sb_ltx_finish(sb_ltx_writer *w, uint64_t checksum) {
   if (sb_ltx_write(w, buf, 8, 0))
     return -1;
   sb_ltx_phase("ltx-written");
-  if (sb_ltx_flush(w->out))
+  // A base image is made durable here (it is the epoch's root, and its directory entry is synced with it). A captured
+  // commit's file is only flushed to the kernel: its fsync is paid once for all of them before a clean record (S1b).
+  if (durable ? sb_ltx_flush(w->out) : fflush(w->out))
     return -1;
+  if (!durable)
+    sb_ltx_writeback(fileno(w->out));
   sb_ltx_phase("ltx-fsynced");
   return 0;
 }
@@ -537,13 +963,40 @@ static int sb_ltx_names(sb_ltx_state *s, uint64_t txid, char *tmp, char *final, 
     return -1;
   return snprintf(tmp, SB_LTX_PATH, "%s.tmp", final) >= SB_LTX_PATH ? -1 : 0;
 }
-static int sb_ltx_publish(const char *tmp, const char *final, const char *dir) {
+static int sb_ltx_publish(const char *tmp, const char *final, const char *dir, int durable) {
   // Never replace a finished file, including an orphan ahead of position.
   if (link(tmp, final))
     return -1; // Atomic no-replace publication on the same filesystem.
-  if (unlink(tmp) || sb_ltx_sync_dir(dir))
+  if (unlink(tmp) || (durable && sb_ltx_sync_dir(dir)))
     return -1;
   sb_ltx_phase("ltx-published");
+  return 0;
+}
+static int sb_ltx_names(sb_ltx_state *s, uint64_t txid, char *tmp, char *final, char *dir);
+// Make every captured LTX file above synced_txid durable: one fsync per file and one for the directory. They are
+// written and linked without a sync (S1b) because the WAL, synced at commit, holds the same frames until a checkpoint
+// discards them; this is the price, paid once per checkpoint, and it comes before the clean record that claims them.
+static int sb_ltx_sync_ltx(sb_ltx_state *s) {
+  if (s->synced_txid >= s->txid)
+    return 0;
+  char tmp[SB_LTX_PATH], final[SB_LTX_PATH], dir[SB_LTX_PATH];
+  for (uint64_t id = s->synced_txid + 1; id <= s->txid; id++) {
+    if (sb_ltx_names(s, id, tmp, final, dir))
+      return -1;
+    int fd = open(final, O_RDONLY);
+    if (fd < 0)
+      return -1;
+    int rc = sb_ltx_fsync(fd);
+    if (close(fd) && !rc)
+      rc = -1;
+    if (rc)
+      return -1;
+  }
+  sb_ltx_phase("ltx-batch-fsynced");
+  if (sb_ltx_names(s, s->txid, tmp, final, dir) || sb_ltx_sync_dir(dir))
+    return -1;
+  s->synced_txid = s->txid;
+  s->synced_checksum = s->checksum;
   return 0;
 }
 static int sb_ltx_position(sb_ltx_state *s) {
@@ -551,10 +1004,32 @@ static int sb_ltx_position(sb_ltx_state *s) {
   if (snprintf(path, sizeof(path), "%s/position", s->root) >= sizeof(path) ||
       snprintf(tmp, sizeof(tmp), "%s/position.tmp", s->root) >= sizeof(tmp))
     return -1;
-  int n = snprintf(body, sizeof(body), "LTXPOS2\n%s\n%c %llu %u %u %llu %016llx %u %u %u %u\n",
-                   s->epoch, s->checkpointed ? 'C' : 'W', (unsigned long long)s->txid, s->salt1,
-                   s->salt2, (unsigned long long)s->offset, (unsigned long long)s->checksum,
-                   s->wal_c1, s->wal_c2, s->page_size, s->commit);
+  // A clean record also pins the database file it describes (inode, mtime, size = commit * page size), so the next
+  // open can trust it without reading every page. Taken now, after the checkpoint that made the file final.
+  struct stat dbst;
+  s->db_ino = s->db_mtime_ns = s->ltx_size = 0;
+  if (s->checkpointed && s->read_fd >= 0 && !fstat(s->read_fd, &dbst)) {
+    s->db_ino = (uint64_t)dbst.st_ino;
+    s->db_mtime_ns = SB_LTX_MTIME_NS(dbst);
+    // and the size of the last LTX file (published, fsynced and never rewritten), so a reopen need not read it
+    char ltmp[SB_LTX_PATH], lfinal[SB_LTX_PATH], ldir[SB_LTX_PATH];
+    struct stat lst;
+    if (!sb_ltx_names(s, s->txid, ltmp, lfinal, ldir) && !stat(lfinal, &lst))
+      s->ltx_size = (uint64_t)lst.st_size;
+  }
+  // S1b. A clean record is the only one that is made durable: its files first (every LTX file it claims), then the record
+  // itself and its directory. A W record is a hint (see sb_ltx_resume): written and renamed, never fsynced. Its loss, a torn
+  // or a stale copy after a power cut is detected at resume and costs a new epoch, never data.
+  if (s->checkpointed && sb_ltx_sync_ltx(s))
+    return -1;
+  int n = snprintf(body, sizeof(body),
+                   "LTXPOS4\n%s\n%llu %c %llu %u %u %llu %016llx %u %u %u %u %llu %llu %llu %llu %016llx\n", s->epoch,
+                   (unsigned long long)s->epoch_seq, s->checkpointed ? 'C' : 'W',
+                   (unsigned long long)s->txid, s->salt1, s->salt2, (unsigned long long)s->offset,
+                   (unsigned long long)s->checksum, s->wal_c1, s->wal_c2, s->page_size, s->commit,
+                   (unsigned long long)s->db_ino, (unsigned long long)s->db_mtime_ns,
+                   (unsigned long long)s->ltx_size, (unsigned long long)s->synced_txid,
+                   (unsigned long long)s->synced_checksum);
   if (n < 0 || n >= (int)sizeof(body))
     return -1;
   FILE *f = fopen(tmp, "wb");
@@ -562,24 +1037,33 @@ static int sb_ltx_position(sb_ltx_state *s) {
     return -1;
   int rc = fwrite(body, 1, n, f) != (size_t)n ||
            fprintf(f, "%016llx\n", (unsigned long long)~sb_ltx_crc(UINT64_MAX, body, n)) < 0 ||
-           sb_ltx_flush(f);
+           (s->checkpointed ? sb_ltx_flush(f) : fflush(f));
   if (fclose(f))
     rc = -1;
   if (rc)
     return -1;
   sb_ltx_phase(s->checkpointed ? "checkpoint-record-fsynced" : "position-fsynced");
-  if (rename(tmp, path) || sb_ltx_sync_dir(s->root))
+  if (rename(tmp, path) || (s->checkpointed && sb_ltx_sync_dir(s->root)))
     return -1;
   sb_ltx_phase(s->checkpointed ? "checkpoint-record-published" : "position-published");
   return 0;
 }
+static int sb_ltx_capture_pending(sb_ltx_state *s);
 static int sb_ltx_checkpoint(sb_ltx_state *s, int persist) {
   int a, b;
+  // The WAL is about to be discarded: first the commits it holds must be synced (owed ones) and captured (pending ones).
+  if (sb_ltx_flush_owed() || sb_ltx_capture_pending(s))
+    return -1;
   sb_ltx_phase("before-checkpoint");
+  sb_ltx_nodefer++;
   int rc = sqlite3_wal_checkpoint_v2(s->db, "main", 3, &a, &b);
+  sb_ltx_nodefer--;
   if (!rc) {
     s->offset = 0;
     s->salt1 = s->salt2 = s->wal_c1 = s->wal_c2 = 0;
+    s->frames_seen = s->pending_frames = 0;
+    sb_ltx_ix_free(s);
+    s->ckpt_ms = sb_ltx_mono_ms();
   }
   sb_ltx_phase("after-checkpoint");
   // The WAL record remains authoritative until checkpoint has completed. A
@@ -590,7 +1074,46 @@ static int sb_ltx_checkpoint(sb_ltx_state *s, int persist) {
   }
   return rc;
 }
+// The epoch floor: the host role's reseed wipes the spool when this host takes over a shard, and with it the position record above, so
+// the clock would be the only number left; a host whose clock is behind the previous leader's last epoch would number its epochs below
+// what every replica already applied and they would be skipped for good. The reseed leaves the epoch the replica's file has reached in
+// epoch-floor (decimal, beside the position record); the next epoch is numbered above it (independent review 029, M4).
+static uint64_t sb_ltx_epoch_floor(const char *root) {
+  char path[SB_LTX_PATH], text[64];
+  if (snprintf(path, sizeof(path), "%s/epoch-floor", root) >= sizeof(path))
+    return 0;
+  FILE *f = fopen(path, "rb");
+  if (!f)
+    return 0;
+  size_t n = fread(text, 1, sizeof(text) - 1, f);
+  fclose(f);
+  text[n] = 0;
+  unsigned long long v = 0;
+  return sscanf(text, "%llu", &v) == 1 ? v : 0;
+}
+// The epochSeq of the last position record, whatever else is wrong with it (a torn or damaged record still tells
+// how far the numbering got). 0 when there is none or it is an older format.
+// The larger of that and the epoch floor.
+static uint64_t sb_ltx_prev_seq(const char *root) {
+  char path[SB_LTX_PATH], text[256], epoch[64];
+  uint64_t floor = sb_ltx_epoch_floor(root);
+  if (snprintf(path, sizeof(path), "%s/position", root) >= sizeof(path))
+    return floor;
+  FILE *f = fopen(path, "rb");
+  if (!f)
+    return floor;
+  size_t n = fread(text, 1, sizeof(text) - 1, f);
+  fclose(f);
+  text[n] = 0;
+  unsigned long long seq = 0;
+  if (strncmp(text, "LTXPOS4\n", 8) || sscanf(text + 8, "%63s\n%llu", epoch, &seq) != 2)
+    return floor;
+  return seq > floor ? seq : floor;
+}
+// Counters for the tests and the host's stats line: how the opens of captured files went.
+static unsigned long sb_ltx_stat_fresh, sb_ltx_stat_cheap, sb_ltx_stat_full, sb_ltx_stat_resume;
 static int sb_ltx_snapshot(sb_ltx_state *s) {
+  sb_ltx_stat_fresh++;
   if (sb_ltx_checkpoint(s, 0))
     return -1;
   // EXCLUSIVE SQLite locking mode excludes other connections. BEGIN pins the
@@ -614,9 +1137,11 @@ static int sb_ltx_snapshot(sb_ltx_state *s) {
   s->txid = 1;
   s->checksum = SB_LTX_FLAG;
   char dir[SB_LTX_PATH], tmp[SB_LTX_PATH], final[SB_LTX_PATH];
-  if (snprintf(dir, sizeof(dir), "%s/epoch-XXXXXX", s->root) >= sizeof(dir) || !mkdtemp(dir))
+  if (sb_ltx_new_epoch(s->root, s->epoch, sizeof(s->epoch), dir, sizeof(dir)))
     goto done;
-  snprintf(s->epoch, sizeof(s->epoch), "%s", strrchr(dir, '/') + 1);
+  // epochSeq: the larger of the previous one plus one and the clock, so it grows across a lost spool too.
+  uint64_t seq = sb_ltx_prev_seq(s->root) + 1, now = sb_ltx_now_ms();
+  s->epoch_seq = now > seq ? now : seq;
   if (sb_ltx_sync_dir(s->root) || sb_ltx_names(s, 1, tmp, final, dir))
     goto done;
   unsigned char *page = malloc(s->page_size);
@@ -636,12 +1161,14 @@ static int sb_ltx_snapshot(sb_ltx_state *s) {
   }
   free(page);
   if (!rc)
-    rc = sb_ltx_finish(&w, s->checksum);
+    rc = sb_ltx_finish(&w, s->checksum, 1);
   sb_ltx_writer_close(&w);
   if (!rc)
-    rc = sb_ltx_publish(tmp, final, dir);
+    rc = sb_ltx_publish(tmp, final, dir, 1);
   if (!rc) {
     s->checkpointed = 1;
+    s->synced_txid = 1; // the base image was fsynced with its directory
+    s->synced_checksum = s->checksum;
     rc = sb_ltx_position(s);
   }
 done:
@@ -677,13 +1204,18 @@ static void sb_ltx_wal_checksum(const unsigned char *p, size_t n, int big, uint3
     *b += y + *a;
   }
 }
+// Capture the WAL frames after the cursor (prior frames, 0 after a checkpoint) up to frames as one LTX file. The frame
+// checksum chain continues from the cursor's recorded checksum instead of re-reading the WAL from frame 1, and the old
+// version of a page comes from the WAL through the page index, so a capture costs the size of the new frames, not the
+// size of the WAL (S1b: the WAL now lives until a size or time checkpoint, not one statement).
+static void sb_ltx_dirty_line(sb_ltx_state *s, int force);
 static int sb_ltx_capture(sb_ltx_state *s, uint32_t frames) {
   char path[SB_LTX_PATH];
   if (snprintf(path, sizeof(path), "%s-wal", s->path) >= sizeof(path))
     return -1;
   int wal = open(path, O_RDONLY), db = s->read_fd;
   unsigned char head[32], fh[24];
-  unsigned char *page = 0;
+  unsigned char *page = 0, *old = 0;
   sb_ltx_frame *map = 0;
   int rc = -1;
   if (wal < 0 || db < 0 || sb_ltx_read(wal, head, 32, 0))
@@ -699,12 +1231,21 @@ static int sb_ltx_capture(sb_ltx_state *s, uint32_t frames) {
   uint32_t prior = s->offset ? (uint32_t)((s->offset - 32) / (ps + 24)) : 0;
   if (s->offset && (s->salt1 != salt1 || s->salt2 != salt2 || prior > frames))
     goto done;
+  if (prior) {
+    a = s->wal_c1;
+    b = s->wal_c2;
+  }
+  if (frames == prior) {
+    rc = 0;
+    goto done;
+  }
+  uint32_t fresh = frames - prior;
   page = malloc(ps);
-  map = malloc((size_t)frames * sizeof(*map));
+  map = malloc((size_t)fresh * sizeof(*map));
   if (!page || !map)
     goto done;
   uint32_t commit = 0;
-  for (uint32_t f = 1; f <= frames; f++) {
+  for (uint32_t f = prior + 1; f <= frames; f++) {
     uint64_t off = 32 + (uint64_t)(f - 1) * (ps + 24);
     if (sb_ltx_read(wal, fh, 24, off) || sb_ltx_read(wal, page, ps, off + 24) ||
         sb_ltx_be32(fh + 8) != salt1 || sb_ltx_be32(fh + 12) != salt2 || !sb_ltx_be32(fh))
@@ -713,58 +1254,44 @@ static int sb_ltx_capture(sb_ltx_state *s, uint32_t frames) {
     sb_ltx_wal_checksum(page, ps, magic & 1, &a, &b);
     if (a != sb_ltx_be32(fh + 16) || b != sb_ltx_be32(fh + 20))
       goto done;
-    if (f == prior && (a != s->wal_c1 || b != s->wal_c2))
-      goto done;
-    map[f - 1] = (sb_ltx_frame){sb_ltx_be32(fh), f};
+    map[f - prior - 1] = (sb_ltx_frame){sb_ltx_be32(fh), f};
     commit = sb_ltx_be32(fh + 4);
   }
   if (!commit)
     goto done;
-  if (frames == prior) {
-    rc = 0;
-    goto done;
-  }
-  qsort(map, frames, sizeof(*map), sb_ltx_frame_cmp);
+  qsort(map, fresh, sizeof(*map), sb_ltx_frame_cmp);
   uint64_t checksum = s->checksum;
-  unsigned char *old = malloc(ps);
+  old = malloc(ps);
   if (!old)
     goto done;
   // Remove truncated old pages, reading the last captured WAL version if present.
   for (uint32_t p = commit + 1; p && p <= s->commit; p++) {
     if (p == (0x40000000u / ps) + 1)
       continue;
-    uint32_t prev = 0;
-    for (uint32_t i = 0; i < frames; i++)
-      if (map[i].pgno == p && map[i].frame <= prior)
-        prev = map[i].frame;
+    uint32_t prev = sb_ltx_ix_get(s, p);
     if (sb_ltx_read(prev ? wal : db, old, ps,
-                    prev ? 32 + (uint64_t)(prev - 1) * (ps + 24) + 24 : (uint64_t)(p - 1) * ps)) {
-      free(old);
+                    prev ? 32 + (uint64_t)(prev - 1) * (ps + 24) + 24 : (uint64_t)(p - 1) * ps))
       goto done;
-    }
     checksum = SB_LTX_FLAG | (checksum ^ sb_ltx_page_crc(p, old, ps));
   }
   char tmp[SB_LTX_PATH], final[SB_LTX_PATH], dir[SB_LTX_PATH];
-  if (sb_ltx_names(s, s->txid + 1, tmp, final, dir)) {
-    free(old);
+  if (sb_ltx_names(s, s->txid + 1, tmp, final, dir))
     goto done;
-  }
+  uint32_t salt1_was = s->salt1, salt2_was = s->salt2;
   s->salt1 = salt1;
   s->salt2 = salt2;
   sb_ltx_writer w;
   rc = sb_ltx_begin(&w, tmp, s, commit, 0, (uint64_t)(frames - prior) * (ps + 24));
-  for (uint32_t i = 0; !rc && i < frames;) {
-    uint32_t p = map[i].pgno, latest = 0, prev = 0;
+  for (uint32_t i = 0; !rc && i < fresh;) {
+    uint32_t p = map[i].pgno, latest = 0;
     do {
-      if (map[i].frame <= prior)
-        prev = map[i].frame;
-      else
-        latest = map[i].frame;
+      latest = map[i].frame;
       i++;
-    } while (i < frames && map[i].pgno == p);
-    if (!latest || p > commit || p == (0x40000000u / ps) + 1)
+    } while (i < fresh && map[i].pgno == p);
+    if (p > commit || p == (0x40000000u / ps) + 1)
       continue;
     if (p <= s->commit) {
+      uint32_t prev = sb_ltx_ix_get(s, p);
       if (sb_ltx_read(prev ? wal : db, old, ps,
                       prev ? 32 + (uint64_t)(prev - 1) * (ps + 24) + 24 : (uint64_t)(p - 1) * ps)) {
         rc = -1;
@@ -779,12 +1306,21 @@ static int sb_ltx_capture(sb_ltx_state *s, uint32_t frames) {
     }
     checksum = SB_LTX_FLAG | (checksum ^ sb_ltx_page_crc(p, page, ps));
   }
-  free(old);
   if (!rc)
-    rc = sb_ltx_finish(&w, checksum);
+    rc = sb_ltx_finish(&w, checksum, 0);
   sb_ltx_writer_close(&w);
   if (!rc)
-    rc = sb_ltx_publish(tmp, final, dir);
+    rc = sb_ltx_publish(tmp, final, dir, 0);
+  if (rc) {
+    s->salt1 = salt1_was;
+    s->salt2 = salt2_was;
+  }
+  if (!rc) {
+    // the index now says, for every page of the new frames, where its latest version in the WAL is
+    for (uint32_t i = 0; !rc && i < fresh; i++)
+      if (i + 1 == fresh || map[i + 1].pgno != map[i].pgno)
+        rc = sb_ltx_ix_put(s, map[i].pgno, map[i].frame);
+  }
   if (!rc) {
     s->checkpointed = 0;
     s->txid++;
@@ -794,13 +1330,73 @@ static int sb_ltx_capture(sb_ltx_state *s, uint32_t frames) {
     s->wal_c1 = a;
     s->wal_c2 = b;
     rc = sb_ltx_position(s);
+    if (!rc && !sb_gate_skip && sb_gate_on()) {
+      // Design 029 S4: the key goes on the app's dirty list *before* the commit is counted, unthrottled, so that the store's barrier
+      // can read just the keys that were touched instead of every key of the app (the list is no longer only a hint for an app that
+      // is gated: the store relies on a line for every commit that the gate counted).
+      sb_ltx_dirty_line(s, 1);
+      sb_commit_seq++; // published and recorded: a barrier that reads the spool now sees it
+    }
   }
 done:
   if (wal >= 0)
     close(wal);
   free(page);
+  free(old);
   free(map);
   return rc;
+}
+// The dirty list (design 029 S1, plan 013 phase D): ROOT/dirty holds one line per file that has a commit the shipper
+// may not know about, so the shipper never walks thousands of Durable Object spools every second. Only a hint: the
+// shipper still scans everything now and then, so a lost line costs time, never data. A file is named at its first
+// commit and again after a second, which is how a rotation shows: the shipper renames the list, reads the old file
+// after two seconds, and appenders that still hold it have moved to the new one by then. One write of under 4 KiB
+// to an O_APPEND descriptor is atomic.
+static int sb_ltx_dirty_fd = -1;
+static uint64_t sb_ltx_dirty_ino;
+static void sb_ltx_dirty_line(sb_ltx_state *s, int force) {
+  const char *shared = getenv("SB_LTX_ROOT");
+  if (!shared || !*shared || !s->key[0])
+    return;
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  long now = (long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+  if (!force && s->dirty_ms && now - s->dirty_ms < 1000)
+    return;
+  char path[SB_LTX_PATH], line[256];
+  if (snprintf(path, sizeof(path), "%s/dirty", shared) >= sizeof(path))
+    return;
+  struct stat st;
+  if (sb_ltx_dirty_fd >= 0 && (stat(path, &st) || (uint64_t)st.st_ino != sb_ltx_dirty_ino)) {
+    close(sb_ltx_dirty_fd);
+    sb_ltx_dirty_fd = -1;
+  }
+  if (sb_ltx_dirty_fd < 0) {
+    sb_ltx_dirty_fd = open(path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0660);
+    if (sb_ltx_dirty_fd < 0 || fstat(sb_ltx_dirty_fd, &st))
+      return;
+    sb_ltx_dirty_ino = (uint64_t)st.st_ino;
+  }
+  int n = snprintf(line, sizeof(line), "%s\n", s->key);
+  if (n > 0 && n < (int)sizeof(line) && write(sb_ltx_dirty_fd, line, (size_t)n) == n)
+    s->dirty_ms = now ? now : 1;
+}
+static void sb_ltx_dirty(sb_ltx_state *s) {
+  sb_ltx_dirty_line(s, 0);
+}
+// Capture what has been committed and not yet captured. A commit made while group commit is on (sb_ltx_defer_ok) only
+// noted its frame count; the capture waits for the flush, so a group of commits becomes one LTX file.
+static int sb_ltx_capture_pending(sb_ltx_state *s) {
+  if (!s->db || !s->pending_frames)
+    return 0;
+  if (s->failed || sb_ltx_capture(s, s->pending_frames)) {
+    s->failed = 1;
+    fprintf(stderr, "LTX capture failed for %s, restart required\n", s->path);
+    return -1;
+  }
+  s->pending_frames = 0;
+  sb_ltx_dirty(s);
+  return 0;
 }
 static int sb_ltx_hook(void *ctx, sqlite3 *db, const char *name, int frames) {
   (void)db;
@@ -809,12 +1405,18 @@ static int sb_ltx_hook(void *ctx, sqlite3 *db, const char *name, int frames) {
   sb_ltx_test_commits++;
 #endif
   sb_ltx_phase("wal-committed");
-  if (s->failed || strcmp(name, "main") || sb_ltx_capture(s, (uint32_t)frames)) {
+  if (s->failed || strcmp(name, "main")) {
     s->failed = 1;
     fprintf(stderr, "LTX capture failed for %s, restart required\n", s->path);
     return 10;
   }
-  // Checkpoint after the statement resets, so a subsequent transaction cannot
+  s->frames_seen = (uint32_t)frames;
+  s->pending_frames = (uint32_t)frames;
+  if (sb_ltx_defer_ok)
+    return 0; // captured at the flush, together with the commits that join it
+  if (sb_ltx_capture_pending(s))
+    return 10;
+  // The checkpoint, when one is due, runs after the statement (sb_ltx_after), so a subsequent transaction cannot
   // reset the WAL salts before the in-memory cursor has been cleared.
   return 0;
 }
@@ -833,12 +1435,94 @@ static int sb_ltx_authorize(void *ctx, int action, const char *a, const char *b,
     return 1;
   return 0;
 }
+// S1b: when to checkpoint. The WAL is no longer reset after every statement: it grows until it holds
+// SB_LTX_CKPT_BYTES (default 1 MiB) or until a statement runs SB_LTX_CKPT_MS (default 1000) after the last checkpoint with
+// frames to move. SB_LTX_CKPT_BYTES=0 brings back the checkpoint after every statement. A closing handle checkpoints
+// anyway (sb_ltx_settle), and a crash with frames in the WAL is resumed from them (sb_ltx_resume).
+static long sb_ltx_ckpt_bytes = -1, sb_ltx_ckpt_ms = -1;
+static void sb_ltx_ckpt_config(void) {
+  if (sb_ltx_ckpt_bytes >= 0)
+    return;
+  const char *b = getenv("SB_LTX_CKPT_BYTES"), *m = getenv("SB_LTX_CKPT_MS");
+  char *end = 0;
+  long bytes = 1048576, ms = 1000;
+  if (b && *b) {
+    long v = strtol(b, &end, 10);
+    if (!*end && v >= 0 && v <= 8388608)
+      bytes = v;
+  }
+  if (m && *m) {
+    long v = strtol(m, &end, 10);
+    if (!*end && v >= 0 && v <= 3600000)
+      ms = v;
+  }
+  sb_ltx_ckpt_bytes = bytes;
+  sb_ltx_ckpt_ms = ms;
+}
+static int sb_ltx_ckpt_due(const sb_ltx_state *s) {
+  if (!s->frames_seen)
+    return 0; // nothing in the WAL
+  sb_ltx_ckpt_config();
+  if (sb_ltx_ckpt_bytes == 0 || 32 + (uint64_t)s->frames_seen * (s->page_size + 24) >= (uint64_t)sb_ltx_ckpt_bytes)
+    return 1;
+  return sb_ltx_mono_ms() - s->ckpt_ms >= sb_ltx_ckpt_ms;
+}
+// Group commit's flush: every owed WAL sync (the durability of the commits about to be acknowledged), then the capture
+// of every commit that was only noted. 0, or -1 with every captured file refused from now on (a sync that failed leaves the
+// commits it covered in an unknown state, so nothing may be built on them).
+static int sb_ltx_flush_all(void) {
+  sb_ltx_stat_flushes++;
+  int rc = sb_ltx_flush_owed();
+  if (rc)
+    fprintf(stderr, "LTX: a deferred WAL sync failed (%d): writes are refused until restart\n", rc);
+  for (int i = 0; i < SB_MAX_DB; i++) {
+    sb_ltx_state *s = &sb_ltx_states[i];
+    if (!s->db)
+      continue;
+    if (rc)
+      s->failed = 1;
+    else if (sb_ltx_capture_pending(s))
+      rc = -1;
+  }
+  return rc ? -1 : 0;
+}
+// What a caller outside the transport (the prelude's promise barrier) may ask: d, defer from now on; n, stop deferring;
+// o, is anything committed and not yet synced or captured (1 or 0); f, flush (0, or -1 when it failed). Returns -2 for
+// anything else.
+static int sb_ltx_group(int what) {
+  switch (what) {
+  case 'd':
+    sb_ltx_defer_ok = 1;
+    return 0;
+  case 'n':
+    sb_ltx_defer_ok = 0;
+    return 0;
+  case 'o':
+    if (sb_ltx_owed_n)
+      return 1;
+    for (int i = 0; i < SB_MAX_DB; i++)
+      if (sb_ltx_states[i].db && sb_ltx_states[i].pending_frames)
+        return 1;
+    return 0;
+  case 'f':
+    return sb_ltx_flush_all();
+  }
+  return -2;
+}
 static int sb_ltx_after(int idx) {
   sb_ltx_state *s = &sb_ltx_states[idx];
   if (!s->db)
     return 0;
   if (s->failed)
     return -1;
+  // A caller that is not holding its reply back (anything outside the prelude's promise barrier) must not return with a
+  // commit unsynced or uncaptured.
+  if (!sb_ltx_defer_ok && (sb_ltx_owed_n || s->pending_frames) && sb_ltx_flush_all()) {
+    s->failed = 1;
+    return -1;
+  }
+  if (!sb_ltx_ckpt_due(s))
+    return 0;
   // SQLITE_BUSY can occur with an explicit transaction holding a read lock.
   // Keep the validated WAL and position; the VFS still imposes the hard ceiling.
   int rc = sb_ltx_checkpoint(s, 1);
@@ -848,11 +1532,40 @@ static int sb_ltx_after(int idx) {
   }
   return 0;
 }
-// Verify our literal-block file before trusting a position. Reads stay bounded
-// even for a large base; CRC covers the logical uncompressed LTX contents.
-static int sb_ltx_verify_last(sb_ltx_state *s) {
+// Before a captured handle is closed (a Durable Object leaving memory, or its slot taken): leave the spool the way a
+// clean stop would, a checkpoint and a clean position record, so the next open of the same file trusts it. Returns
+// -1 when the handle must stay open (a checkpoint that could not finish, or a capture that already failed).
+static int sb_ltx_settle(sb_ltx_state *s) {
+  if (!s->db || s->failed)
+    return s->failed ? -1 : 0;
+  sqlite3_wal_hook(s->db, 0, 0);
+  int rc = sb_ltx_checkpoint(s, 1);
+  if (rc) {
+    sqlite3_wal_hook(s->db, sb_ltx_hook, s);
+    return -1;
+  }
+  if (s->checkpointed && s->db_ino == 0)
+    rc = sb_ltx_position(s);
+  return rc;
+}
+// After sqlite3_close succeeded: only now may the raw descriptors on the database inode go (POSIX locks are per
+// process, not per descriptor), and the state is free for another file.
+static void sb_ltx_release(sb_ltx_state *s) {
+  if (s->read_fd >= 0)
+    close(s->read_fd);
+  if (s->lock >= 0)
+    close(s->lock);
+  sb_ltx_ix_free(s);
+  memset(s, 0, sizeof(*s));
+  s->read_fd = s->lock = -1;
+}
+// Verify one of our literal-block files before trusting it: the structure, every page, the whole-file CRC (it covers the
+// logical uncompressed LTX contents) and its place in the chain (its txid, the page size, and the pre-apply and post-apply
+// checksums and the commit size it reports through the three out parameters). Reads stay bounded even for a large base.
+static int sb_ltx_verify_file(sb_ltx_state *s, uint64_t want, uint32_t *commit_out, uint64_t *pre_out,
+                              uint64_t *post_out) {
   char tmp[SB_LTX_PATH], final[SB_LTX_PATH], dir[SB_LTX_PATH];
-  if (sb_ltx_names(s, s->txid, tmp, final, dir))
+  if (sb_ltx_names(s, want, tmp, final, dir))
     return 0;
   int fd = open(final, O_RDONLY);
   struct stat st;
@@ -862,16 +1575,18 @@ static int sb_ltx_verify_last(sb_ltx_state *s) {
   if (fd < 0 || !page || fstat(fd, &st) || st.st_size < 131 || sb_ltx_read(fd, h, 100, 0) ||
       sb_ltx_read(fd, tail, 24, (uint64_t)st.st_size - 24))
     goto done;
-  uint64_t min = 0, max = 0, post = 0, file_crc = 0, index_size = 0;
+  uint64_t min = 0, max = 0, post = 0, pre = 0, file_crc = 0, index_size = 0;
   for (int i = 0; i < 8; i++) {
     min = (min << 8) | h[16 + i];
     max = (max << 8) | h[24 + i];
+    pre = (pre << 8) | h[40 + i];
     post = (post << 8) | tail[8 + i];
     file_crc = (file_crc << 8) | tail[16 + i];
     index_size = (index_size << 8) | tail[i];
   }
-  if (memcmp(h, "LTX1", 4) || sb_ltx_be32(h + 4) || sb_ltx_be32(h + 8) != s->page_size ||
-      sb_ltx_be32(h + 12) != s->commit || min != s->txid || max != s->txid || post != s->checksum)
+  uint32_t commit = sb_ltx_be32(h + 12);
+  if (memcmp(h, "LTX1", 4) || sb_ltx_be32(h + 4) || sb_ltx_be32(h + 8) != s->page_size || min != want ||
+      max != want)
     goto done;
   uint64_t offset = 100, hash = sb_ltx_crc(UINT64_MAX, h, 100);
   uint32_t prev = 0;
@@ -886,7 +1601,7 @@ static int sb_ltx_verify_last(sb_ltx_state *s) {
         goto done;
       break;
     }
-    if (pgno <= prev || pgno > s->commit || fh[4] || fh[5] != 1)
+    if (pgno <= prev || pgno > commit || fh[4] || fh[5] != 1)
       goto done;
     prev = pgno;
     if (sb_ltx_read(fd, fh, 4, offset))
@@ -925,11 +1640,74 @@ static int sb_ltx_verify_last(sb_ltx_state *s) {
     offset += n;
   }
   valid = (SB_LTX_FLAG | ~hash) == file_crc;
+  if (valid) {
+    if (commit_out)
+      *commit_out = commit;
+    if (pre_out)
+      *pre_out = pre;
+    if (post_out)
+      *post_out = post;
+  }
 done:
   if (fd >= 0)
     close(fd);
   free(page);
   return valid;
+}
+// The last file only (a clean record: everything below it was synced before the record was).
+static int sb_ltx_verify_last(sb_ltx_state *s) {
+  uint32_t commit = 0;
+  uint64_t pre, post = 0;
+  return sb_ltx_verify_file(s, s->txid, &commit, &pre, &post) && commit == s->commit && post == s->checksum;
+}
+// A W record: every file above synced_txid was written without an fsync, so each of them is verified, and the chain is
+// followed (each file's pre-apply checksum is the post-apply checksum of the one before; the first one's is
+// synced_checksum, so no file at or below synced_txid is read: a shipper may have removed it). A hole, a zero-length or torn file, a file that
+// survived while an earlier one did not: any of them fails the whole resume, which costs a new epoch and nothing else.
+static int sb_ltx_verify_chain(sb_ltx_state *s) {
+  uint64_t first = s->synced_txid, prev_post = s->synced_checksum;
+  if (first >= s->txid)
+    return sb_ltx_verify_last(s);
+  for (uint64_t id = first + 1; id <= s->txid; id++) {
+    uint32_t commit = 0;
+    uint64_t pre = 0, post = 0;
+    if (!sb_ltx_verify_file(s, id, &commit, &pre, &post))
+      return 0;
+    if (pre != prev_post) // (0 when the chain starts at the base image)
+      return 0;
+    prev_post = post;
+    if (id == s->txid && (commit != s->commit || post != s->checksum))
+      return 0;
+  }
+  return 1;
+}
+// Files of the epoch above the position's txid. With the position and the LTX files not fsynced (S1b) a power cut can leave
+// any of them behind (the dead process wrote txids the stale record never named): a published file above the position is
+// an orphan that must never be overwritten or built on (1: the caller takes a new epoch, the old files stay for restore); an
+// unpublished one (.ltx.tmp) was never visible and is removed so the next capture can create its name. 0: none.
+static int sb_ltx_orphans(const sb_ltx_state *s, uint64_t txid) {
+  char dir[SB_LTX_PATH];
+  if (snprintf(dir, sizeof(dir), "%s/%s", s->root, s->epoch) >= sizeof(dir))
+    return 1;
+  DIR *d = opendir(dir);
+  if (!d)
+    return 1;
+  int found = 0;
+  for (struct dirent *e; (e = readdir(d));) {
+    unsigned long long lo, hi;
+    size_t n = strlen(e->d_name);
+    if (n == 37 && sscanf(e->d_name, "%16llx-%16llx.ltx", &lo, &hi) == 2 && hi > txid) {
+      found = 1;
+      break;
+    }
+    if (n == 41 && !strcmp(e->d_name + 37, ".tmp")) {
+      char path[SB_LTX_PATH];
+      if (snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) < (int)sizeof(path))
+        unlink(path);
+    }
+  }
+  closedir(d);
+  return found;
 }
 static int sb_ltx_load_position(sb_ltx_state *s) {
   char path[SB_LTX_PATH], text[768];
@@ -945,14 +1723,23 @@ static int sb_ltx_load_position(sb_ltx_state *s) {
     return 0;
   text[n] = 0;
   sb_ltx_state candidate = *s;
-  unsigned long long txid, offset, checksum, digest;
+  unsigned long long txid, offset, checksum, digest, seq, ino, mtime, ltxsize, synced, synced_sum;
   char mode;
   int used = 0, tail = 0;
-  if (sscanf(text, "LTXPOS2\n%63s\n%c %llu %u %u %llu %16llx %u %u %u %u\n%n", candidate.epoch,
-             &mode, &txid, &candidate.salt1, &candidate.salt2, &offset, &checksum,
-             &candidate.wal_c1, &candidate.wal_c2, &candidate.page_size, &candidate.commit,
-             &used) != 11)
+  // LTXPOS2 (the format before epochSeq) and LTXPOS3 (before synced_txid, S1b) are not read: their owner starts a new
+  // epoch, which the shipper sees as one full image. A record of any other kind falls back the same way.
+  if (sscanf(text, "LTXPOS4\n%63s\n%llu %c %llu %u %u %llu %16llx %u %u %u %u %llu %llu %llu %llu %16llx\n%n",
+             candidate.epoch, &seq, &mode, &txid, &candidate.salt1, &candidate.salt2, &offset,
+             &checksum, &candidate.wal_c1, &candidate.wal_c2, &candidate.page_size,
+             &candidate.commit, &ino, &mtime, &ltxsize, &synced, &synced_sum, &used) != 17 ||
+      !seq)
     return 0;
+  candidate.synced_txid = synced;
+  candidate.synced_checksum = synced_sum;
+  candidate.epoch_seq = seq;
+  candidate.db_ino = ino;
+  candidate.db_mtime_ns = mtime;
+  candidate.ltx_size = ltxsize;
   if (!used || sscanf(text + used, "%16llx\n%n", &digest, &tail) != 1 ||
       (size_t)(used + tail) != n || digest != ~sb_ltx_crc(UINT64_MAX, text, (size_t)used))
     return 0;
@@ -965,20 +1752,27 @@ static int sb_ltx_load_position(sb_ltx_state *s) {
   if (ps < 512 || ps > 65536 || (ps & (ps - 1)))
     return 0;
   if (mode == 'C') {
-    if (offset || candidate.salt1 || candidate.salt2 || candidate.wal_c1 || candidate.wal_c2)
+    if (offset || candidate.salt1 || candidate.salt2 || candidate.wal_c1 || candidate.wal_c2 || synced != txid ||
+        synced_sum != checksum)
       return 0;
-  } else if (mode != 'W' || offset < 32 || offset > sb_ltx_max_bytes || (offset - 32) % (ps + 24))
+  } else if (mode != 'W' || offset < 32 || offset > sb_ltx_max_bytes || (offset - 32) % (ps + 24) || synced > txid)
     return 0;
   candidate.checkpointed = mode == 'C';
   candidate.txid = txid;
   candidate.offset = offset;
   candidate.checksum = checksum;
-  if (!sb_ltx_verify_last(&candidate))
+  // A clean record names the size of its last LTX file. When the file has that size, and the database file is the one
+  // the record pinned (checked by the resume), the file is not read again: a base image can be as large as the
+  // database. Its own CRC is the shipper's check before it packs it. Otherwise it is read in full as before.
+  struct stat lst;
+  char ltmp[SB_LTX_PATH], lfinal[SB_LTX_PATH], ldir[SB_LTX_PATH];
+  candidate.fast = mode == 'C' && ino && ltxsize && !sb_ltx_names(&candidate, txid, ltmp, lfinal, ldir) &&
+                   !stat(lfinal, &lst) && (uint64_t)lst.st_size == ltxsize;
+  if (!candidate.fast && !(mode == 'C' ? sb_ltx_verify_last(&candidate) : sb_ltx_verify_chain(&candidate)))
     return 0;
   // A published orphan ahead of the record is never overwritten. A new base
   // captures the recovered source and preserves the old generation for restore.
-  char tmp[SB_LTX_PATH], final[SB_LTX_PATH], dir[SB_LTX_PATH];
-  if (sb_ltx_names(&candidate, txid + 1, tmp, final, dir) || access(final, F_OK) == 0)
+  if (sb_ltx_orphans(&candidate, txid))
     return 0;
   *s = candidate;
   return 1;
@@ -987,6 +1781,7 @@ static int sb_ltx_load_position(sb_ltx_state *s) {
 // Verify its full page checksum before trusting an absent/empty WAL. Opening no
 // additional database fd preserves SQLite's process-level POSIX locks.
 static int sb_ltx_verify_database(sb_ltx_state *s) {
+  sb_ltx_stat_full++;
   struct stat st;
   if (fstat(s->read_fd, &st) || (uint64_t)st.st_size != (uint64_t)s->commit * s->page_size)
     return 0;
@@ -1020,6 +1815,18 @@ static int sb_ltx_resume(sb_ltx_state *s) {
         return 0;
     } else if (errno != ENOENT)
       return 0;
+    // The clean record pinned the file's inode, mtime and size (commit pages). The same file, untouched since, is
+    // the captured state: no need to read every page. Anything else takes the full page checksum.
+    struct stat now;
+    if (s->db_ino && !fstat(s->read_fd, &now) && (uint64_t)now.st_ino == s->db_ino &&
+        SB_LTX_MTIME_NS(now) == s->db_mtime_ns &&
+        (uint64_t)now.st_size == (uint64_t)s->commit * s->page_size) {
+      sb_ltx_stat_cheap++;
+      return 1;
+    }
+    // Not the pinned file: nothing was read yet, so the last LTX file is checked in full before the pages are.
+    if (s->fast && !sb_ltx_verify_last(s))
+      return 0;
     return sb_ltx_verify_database(s);
   }
   int fd = open(path, O_RDONLY);
@@ -1052,6 +1859,9 @@ static int sb_ltx_resume(sb_ltx_state *s) {
       break;
     if (sb_ltx_be32(fh + 4))
       last = i;
+    // the page index for the frames the cursor already covers: a capture reads old pages through it
+    if (i <= prior && sb_ltx_ix_put(s, sb_ltx_be32(fh), i))
+      break;
     if (i == prior)
       valid = a == s->wal_c1 && b == s->wal_c2 && sb_ltx_be32(fh + 4) == s->commit;
   }
@@ -1116,11 +1926,23 @@ static int sb_ltx_start(int idx, sqlite3 *db, const char *path, int lock) {
   s->db = db;
   s->lock = lock;
   s->read_fd = -1;
-  if (snprintf(s->path, sizeof(s->path), "%s", path) >= sizeof(s->path) ||
-      snprintf(s->root, sizeof(s->root), "%s.ltx", path) >= sizeof(s->root))
+  s->ckpt_ms = sb_ltx_mono_ms();
+  const char *shared = getenv("SB_LTX_ROOT");
+  if (snprintf(s->path, sizeof(s->path), "%s", path) >= sizeof(s->path))
     return -1;
-  if (mkdir(s->root, 0700) && errno != EEXIST)
-    return -1;
+  if (shared && *shared) {
+    // The spool is a sibling of the app's tree, ROOT/KEY, made one directory at a time under the setgid ROOT so
+    // each keeps the shipper's group. A worker never chmods a spool directory: that would clear the setgid bit.
+    if (sb_ltx_key(path, s->key, sizeof(s->key)) ||
+        snprintf(s->root, sizeof(s->root), "%s/%s", shared, s->key) >= sizeof(s->root) ||
+        sb_ltx_mkdirs(s->root, 0770))
+      return -1;
+  } else {
+    if (snprintf(s->root, sizeof(s->root), "%s.ltx", path) >= sizeof(s->root))
+      return -1;
+    if (mkdir(s->root, 0700) && errno != EEXIST)
+      return -1;
+  }
   if (sb_ltx_sweep_indexes(s->root))
     return -1;
   char parent[SB_LTX_PATH];
@@ -1132,6 +1954,16 @@ static int sb_ltx_start(int idx, sqlite3 *db, const char *path, int lock) {
       return -1;
   } else if (sb_ltx_sync_dir("."))
     return -1;
+  if (shared && *shared) {
+    // The directory entry of the spool itself, so a crash cannot leave a position record without its directory.
+    snprintf(parent, sizeof(parent), "%s", s->root);
+    slash = strrchr(parent, '/');
+    if (slash && slash != parent) {
+      *slash = 0;
+      if (sb_ltx_sync_dir(parent))
+        return -1;
+    }
+  }
   if (sqlite3_exec(db,
                    "PRAGMA wal_autocheckpoint=0; PRAGMA synchronous=FULL; PRAGMA "
                    "locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; COMMIT;",
@@ -1159,6 +1991,7 @@ static int sb_ltx_start(int idx, sqlite3 *db, const char *path, int lock) {
   int resumed = sb_ltx_resume(s);
   if (resumed < 0 || (resumed == 0 && sb_ltx_snapshot(s)))
     return -1;
+  sb_ltx_stat_resume += resumed > 0;
   sqlite3_wal_hook(db, sb_ltx_hook, s);
   sqlite3_set_authorizer(db, sb_ltx_authorize, s);
   return 0;
@@ -1166,6 +1999,16 @@ static int sb_ltx_start(int idx, sqlite3 *db, const char *path, int lock) {
 static int sb_ltx_opted(const char *path) {
   const char *v = getenv("SB_LTX_ENABLE"), *name = getenv("SB_LTX_DATABASE");
   if (!sb_ltx_compat || !v || strcmp(v, "1"))
+    return 0;
+  // SB_LTX_SCOPE (design 029 S1) captures every file of the listed kinds; it replaces SB_LTX_DATABASE.
+  int scope = sb_ltx_scope();
+  if (scope == -2)
+    return -1;
+  if (scope > 0) {
+    int kind = sb_ltx_kind(path);
+    return kind && (scope & (1 << (kind - 1)));
+  }
+  if (sb_ltx_kind(path) != 1)
     return 0;
   if (!name || !*name ||
       strspn(name, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") !=
@@ -1323,7 +2166,7 @@ static int sb_db_for(const char* path) {
   const int do_sql = sb_is_do_sql(path);
   // A name that would not fit could never be found again.
   if (do_sql && strlen(path) >= sizeof(sb_db_names[0])) return -1;
-  int replicated = do_sql ? 0 : sb_ltx_opted(path), lock = -1;
+  int replicated = sb_ltx_opted(path), lock = -1;
   if (replicated < 0 || (replicated && strlen(path) >= sizeof(sb_db_names[0]))) return -1;
   // A closed slot is reused first. A Durable Object SQL database takes the slot of the one used longest ago
   // (outside a transaction) once sb_do_sql_open are open; any other database does the same when every slot is in use.
@@ -1335,19 +2178,32 @@ static int sb_db_for(const char* path) {
     if (sqlite3_get_autocommit(sb_dbs[i]) && (lru < 0 || sb_db_used[i] < sb_db_used[lru])) lru = i;
   }
   if (slot < 0 && sb_db_count < SB_MAX_DB) slot = sb_db_count;
-  if (!replicated && ((do_sql && open_do_sql >= sb_do_sql_open) || slot < 0)) {
+  if ((do_sql && open_do_sql >= sb_do_sql_open) || slot < 0) {
     // Every candidate inside a transaction, or none open: the new database cannot be opened now.
     if (lru < 0 || sb_db_close(lru)) return -1;
     slot = lru;
   }
   if (slot < 0) return -1;
+  // A slot whose last start failed keeps its name and failed flag (so the caller can say why). Taken for another file,
+  // it must not carry them over: they would make every later call for that file fail.
+  if (strcmp(sb_db_names[slot], path) != 0 && sb_ltx_states[slot].failed && !sb_ltx_states[slot].db) {
+    memset(&sb_ltx_states[slot], 0, sizeof(sb_ltx_states[slot]));
+    sb_ltx_states[slot].read_fd = sb_ltx_states[slot].lock = -1;
+  }
   sqlite3* db = 0;
   sb_mkdirs(path);
   if (replicated) {
-    char lockpath[SB_LTX_PATH];
-    if (snprintf(lockpath, sizeof(lockpath), "%s.ltx.lock", path) >= sizeof(lockpath) || sb_ltx_register()) return -1;
-    lock = open(lockpath, O_RDWR | O_CREAT, 0600);
-    if (lock < 0 || flock(lock, LOCK_EX | LOCK_NB)) { if (lock >= 0) close(lock); return -1; }
+    if (sb_ltx_register()) return -1;
+    if (sb_owner_mode()) {
+      // One owner per app (plan 013 phase A): the app-wide lock replaces the per-file one, and another worker owning
+      // storage fails this call without changing any state, so the next call tries again.
+      if (sb_owner_acquire_for(path) < 0) return -1;
+    } else {
+      char lockpath[SB_LTX_PATH];
+      if (snprintf(lockpath, sizeof(lockpath), "%s.ltx.lock", path) >= sizeof(lockpath)) return -1;
+      lock = open(lockpath, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+      if (lock < 0 || flock(lock, LOCK_EX | LOCK_NB)) { if (lock >= 0) close(lock); return -1; }
+    }
   }
   int open_rc = replicated ? sqlite3_open_v2(path, &db, 6, "sb-ltx-bounded") : sqlite3_open(path, &db);
   if (open_rc != 0) { if (db) sqlite3_close(db); if (lock >= 0) close(lock); return -1; }
@@ -1400,8 +2256,10 @@ static int sb_db_for(const char* path) {
     sqlite3_close(db);
     if (sb_ltx_states[slot].read_fd >= 0) close(sb_ltx_states[slot].read_fd);
     sb_ltx_states[slot].read_fd = -1;
+    sb_ltx_states[slot].db = 0;  // closed above: nothing may reach it through the state (the flag and the name stay)
     sb_dbs[slot] = 0;
-    close(lock); return -1;
+    if (lock >= 0) close(lock);
+    return -1;
   }
   sb_stat_opens++;
   sb_cache_rebalance(slot);
@@ -1465,7 +2323,8 @@ static int sb_db_close(int idx) {
     sb_stmt_cache[idx][i].sql = 0;
   }
   sb_stmt_fifo[idx] = 0;
-  // 2. (phase D inserts: unhook capture, write what is pending)
+  // 2. a captured handle: unhook capture and leave the spool as a clean stop would (checkpoint, clean position record)
+  if (sb_ltx_states[idx].db && sb_ltx_settle(&sb_ltx_states[idx])) return -1;
   // 3. if the connection wrote since it was opened, a TRUNCATE checkpoint and its result. With synchronous=NORMAL this is
   //    the fsync that makes the data durable on the local disk. A read-only open skips it; sqlite3_close below still
   //    checkpoints a WAL that holds schema changes (they do not count as changes), as it does for the last connection.
@@ -1473,7 +2332,7 @@ static int sb_db_close(int idx) {
     int frames = 0, done = 0;
     if (sqlite3_wal_checkpoint_v2(db, "main", 3 /* TRUNCATE */, &frames, &done)) sb_stat_ckpt_fail++;
   }
-  // 4. (phase D inserts: the clean position record)
+  // 4. (the clean position record was written by step 2)
   // 5. sqlite3_close must return SQLITE_OK. SQLITE_BUSY means a leaked statement: the slot stays open.
   if (sqlite3_close(db)) {
     sb_stat_busy++;
@@ -1483,7 +2342,7 @@ static int sb_db_close(int idx) {
   //    process, so closing a descriptor of the file while the SQLite handle is open would drop SQLite's locks. Object
   //    SQL has none; the order is written so that phase D cannot get it wrong.
   // 7. clear the slot.
-  if (sb_ltx_states[idx].db) memset(&sb_ltx_states[idx], 0, sizeof(sb_ltx_states[idx]));
+  if (sb_ltx_states[idx].db) sb_ltx_release(&sb_ltx_states[idx]);
   sb_dbs[idx] = 0;
   sb_db_names[idx][0] = 0;
   sb_quota_frozen[idx] = 0;
@@ -4871,6 +5730,40 @@ function __sbD1DbRaw(path, what) {
   return res;
 }
 
+// The acknowledgement gate (design 029 S3, sb_gate_op): a letter and an optional number in, an unsigned number out as a bytestring.
+// oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
+function __sbGateRaw(what) {
+  let res = "";
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    const char* __w; size_t __wl; char* __wo = 0;
+    porf_native_fetch_read_value(what, &__w, &__wl, &__wo);
+    char __wb[32]; size_t __wn = __wl < 31 ? __wl : 31; memcpy(__wb, __w, __wn); __wb[__wn] = 0;
+    if (__wo) free(__wo);
+    char __n[32]; int __k = snprintf(__n, sizeof(__n), "%llu", sb_gate_op(__wb));
+    res = porf_box((f64)porf_native_fetch_alloc_bytestring(__n, (size_t)__k), 195);
+  `;
+  return res;
+}
+
+// Group commit (design 029 S1b, sb_ltx_group): one letter in, a number out as a bytestring. d: from now on a commit's WAL sync is
+// owed rather than run; n: back to running them; o: 1 when a commit is owed or not yet captured; f: run the owed syncs and capture
+// (0, or -1 when that failed). Only called from the prelude's promise barrier (__sbGrouped), and only with SB_LTX_GROUP=1.
+// oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
+function __sbLtxRaw(what) {
+  let res = "";
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    const char* __w; size_t __wl; char* __wo = 0;
+    porf_native_fetch_read_value(what, &__w, &__wl, &__wo);
+    int __r = sb_ltx_group(__wl ? __w[0] : 0);
+    if (__wo) free(__wo);
+    char __n[16]; int __k = snprintf(__n, sizeof(__n), "%d", __r);
+    res = porf_box((f64)porf_native_fetch_alloc_bytestring(__n, (size_t)__k), 195);
+  `;
+  return res;
+}
+
 // #164 — VACUUM INTO a fresh file. Two strings in, JSON out. Same pattern as
 // __sbSqlScriptRaw.
 // oxlint-disable-next-line no-unused-vars -- read inside the RawC block below, not by JS.
@@ -5257,6 +6150,22 @@ function __sbD1Quota(path) {
 function __sbStore() {
   return __sbDir() + "/store.sqlite";
 }
+// Where Analytics Engine datapoints, rate-limit windows and the Cache API live. Normally in store.sqlite. When
+// store.sqlite is captured (design 029 S1: SB_LTX_SCOPE lists store) they move to volatile.sqlite, which is never
+// captured: a rate-limit check would otherwise cost a commit's worth of fsyncs and a cache entry would be replicated
+// and kept for 30 days. Their rows are rebuilt or expire on their own; rows left in store.sqlite stay unused there.
+var __sbVolatilePath = "";
+function __sbVolatileStore() {
+  if (__sbVolatilePath === "") {
+    let moved = false;
+    if (__sbEnv("SB_LTX_ENABLE") === "1" && __sbCompatDate() >= "2026-10-22") {
+      const scope = "," + String(__sbEnv("SB_LTX_SCOPE") || "") + ",";
+      moved = scope.indexOf(",store,") !== -1;
+    }
+    __sbVolatilePath = moved ? __sbDir() + "/volatile.sqlite" : __sbStore();
+  }
+  return __sbVolatilePath;
+}
 // "<data>/do-sql/CLASS/FILE.sqlite". The shim sends the file as 64 hex digits (the id, or a
 // hash of an older id); both parts are checked so nothing leaves the directory.
 function __sbDOSqlName(text, hex) {
@@ -5396,17 +6305,18 @@ function __sbEnsureSchema() {
     "CREATE TABLE IF NOT EXISTS do_alarm_delivery (cls TEXT NOT NULL, id TEXT NOT NULL, at INTEGER NOT NULL, attempts INTEGER NOT NULL, token TEXT NOT NULL, expires INTEGER NOT NULL, PRIMARY KEY(cls,id))",
     [],
   );
+  const v = __sbVolatileStore();
   __sbSql(
-    s,
+    v,
     "CREATE TABLE IF NOT EXISTS ae (dataset TEXT NOT NULL, ts INTEGER NOT NULL, indexes_json TEXT NOT NULL, blobs_json TEXT NOT NULL, doubles_json TEXT NOT NULL)",
   );
   __sbSql(
-    s,
+    v,
     "CREATE TABLE IF NOT EXISTS ratelimit (name TEXT NOT NULL, key TEXT NOT NULL, window_start INTEGER NOT NULL, count INTEGER NOT NULL, PRIMARY KEY (name, key))",
   );
   // #59 — caches.default, ambient like the broker's copy of this table.
   __sbSql(
-    s,
+    v,
     "CREATE TABLE IF NOT EXISTS cache (name TEXT NOT NULL, cache_key TEXT NOT NULL, status INTEGER NOT NULL, headers_json TEXT NOT NULL, body TEXT NOT NULL, expires_at INTEGER, PRIMARY KEY (name, cache_key))",
   );
 }
@@ -6125,7 +7035,7 @@ function __sbEmbeddedDispatch(msg) {
 
   if (op === "ae.write") {
     __sbSql(
-      store,
+      __sbVolatileStore(),
       "INSERT INTO ae (dataset, ts, indexes_json, blobs_json, doubles_json) VALUES (?1,?2,?3,?4,?5)",
       [
         msg.dataset,
@@ -6141,11 +7051,11 @@ function __sbEmbeddedDispatch(msg) {
     // Reply must match the broker's: { count, rows: [{timestamp, indexes, blobs, doubles}] }.
     const limit = Math.min(Math.max(Number(msg.limit) || 20, 1), 200);
     const r = __sbSql(
-      store,
+      __sbVolatileStore(),
       "SELECT ts, indexes_json, blobs_json, doubles_json FROM ae WHERE dataset = ? ORDER BY ts DESC, rowid DESC LIMIT ?",
       [msg.dataset, limit],
     );
-    const total = __sbSql(store, "SELECT count(*) FROM ae WHERE dataset = ?", [msg.dataset]);
+    const total = __sbSql(__sbVolatileStore(), "SELECT count(*) FROM ae WHERE dataset = ?", [msg.dataset]);
     const rows = [];
     for (let i = 0; i < r.rows.length; i++) {
       rows.push({
@@ -6168,7 +7078,7 @@ function __sbEmbeddedDispatch(msg) {
     const now = Math.floor(Date.now() / 1000);
     const windowStart = now - (now % period);
     const r = __sbSql(
-      store,
+      __sbVolatileStore(),
       "INSERT INTO ratelimit (name, key, window_start, count) VALUES (?1, ?2, ?3, 1) " +
         "ON CONFLICT (name, key) DO UPDATE SET count = CASE WHEN window_start = ?3 THEN count + 1 ELSE 1 END, " +
         "window_start = ?3 RETURNING count",
@@ -6181,14 +7091,14 @@ function __sbEmbeddedDispatch(msg) {
   if (op === "cache.match") {
     const name = msg.name || "default";
     const r = __sbSql(
-      store,
+      __sbVolatileStore(),
       "SELECT status, headers_json, body, expires_at FROM cache WHERE name = ? AND cache_key = ?",
       [name, msg.key],
     );
     if (!r.rows.length) return { ok: true, found: false };
     const [status, headersJson, body, expiresAt] = r.rows[0];
     if (expiresAt != null && expiresAt <= Date.now()) {
-      __sbSql(store, "DELETE FROM cache WHERE name = ? AND cache_key = ?", [name, msg.key]);
+      __sbSql(__sbVolatileStore(), "DELETE FROM cache WHERE name = ? AND cache_key = ?", [name, msg.key]);
       return { ok: true, found: false };
     }
     return { ok: true, found: true, status, headers: JSON.parse(headersJson), body };
@@ -6214,7 +7124,7 @@ function __sbEmbeddedDispatch(msg) {
     const ttlSeconds = sMaxAge ? Number(sMaxAge[1]) : maxAge ? Number(maxAge[1]) : null;
     const expiresAt = ttlSeconds != null ? Date.now() + ttlSeconds * 1000 : null;
     __sbSql(
-      store,
+      __sbVolatileStore(),
       "INSERT INTO cache (name, cache_key, status, headers_json, body, expires_at) VALUES (?1,?2,?3,?4,?5,?6) " +
         "ON CONFLICT (name, cache_key) DO UPDATE SET status = ?3, headers_json = ?4, body = ?5, expires_at = ?6",
       [name, msg.key, status, JSON.stringify(headers), msg.body, expiresAt],
@@ -6223,7 +7133,7 @@ function __sbEmbeddedDispatch(msg) {
   }
   if (op === "cache.delete") {
     const name = msg.name || "default";
-    const r = __sbSql(store, "DELETE FROM cache WHERE name = ? AND cache_key = ?", [name, msg.key]);
+    const r = __sbSql(__sbVolatileStore(), "DELETE FROM cache WHERE name = ? AND cache_key = ?", [name, msg.key]);
     return { ok: true, deleted: r.changes > 0 };
   }
 
@@ -6440,6 +7350,30 @@ globalThis.__sbAssetsGet = function (path) {
   const manifest = globalThis.__sbAssets.manifest || {};
   reply.rules = { headers: manifest.headers || [], redirects: manifest.redirects || [] };
   return reply;
+};
+
+// One storage owner per app (plan 013 phase A): a Durable Object is constructed only by the worker that holds the
+// app-wide owner lock, so two workers of one app (a deploy overlap, a handover, a canary) never run the same object.
+// SB_OWNER_LOCK unset or 0 leaves everything as before. The prelude calls this before it constructs an instance.
+// oxlint-disable-next-line no-unused-vars -- `dir` is read inside the RawC block below, not by JS.
+function __sbOwnerAcquireRaw(dir) {
+  let status = -1;
+  // oxlint-disable-next-line no-unused-expressions -- Porffor.c`...` is inline C the compiler consumes, not a JS expression.
+  Porffor.c`
+    const char* __p; size_t __pl; char* __po = 0;
+    porf_native_fetch_read_value(dir, &__p, &__pl, &__po);
+    char* __dir = (char*)malloc(__pl + 1); memcpy(__dir, __p, __pl); __dir[__pl] = 0;
+    if (__po) free(__po);
+    status = (f64)sb_owner_acquire_dir(__dir);
+    free(__dir);
+  `;
+  return status;
+}
+var __sbOwnerHeld = false;
+globalThis.__sbOwnerAcquire = function () {
+  if (__sbOwnerHeld) return;
+  if (__sbOwnerAcquireRaw(__sbDir()) < 0) throw new Error("storage of this app is owned by another worker; retry");
+  __sbOwnerHeld = true;
 };
 
 /** The transport contract: one request string in, one reply string out. */

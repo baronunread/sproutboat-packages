@@ -20,19 +20,19 @@ Pass: patchSharedDispatchUnit (P8)
  1 file changed, 10 insertions(+), 5 deletions(-)
 
 diff --git a/compiler/codegen.js b/compiler/codegen.js
-index 0a1632c754e338fa4932d602d089bba8010a3c16..36d232d4cb8c374735f7a0666199379918939db3 100644
+index bde50f73ca7bf7737df625c9a6316390a707b13f..bf6f45206a1216826d153922d1fc47ed4dc3db5b 100644
 --- a/compiler/codegen.js
 +++ b/compiler/codegen.js
-@@ -2340,7 +2340,7 @@ const generateCall = (scope, decl) => {
-       if (targetKnownType == null && calleeMember && !calleeMember.computed && !decl.optional && !inOptionalChain(calleeMember) && !decl._sharedDispatch && !globalThis.precompile &&
-         Object.keys(protoBC).length > 1 && !decl.arguments.some(x => x?.type === 'SpreadElement')) {
-         const params = decl.arguments.map((_, i) => 'a' + i);
--        const func = sharedFunc(`((${[ 'r', ...params ].join(', ')}) => r.${protoName}(${params.join(', ')}))`);
-+        const func = sharedFunc(`((${[ 'r', ...params ].join(', ')}) => r.${protoName}(${params.join(', ')}))`, scope, protoName + '_' + params.length);
-         return Call(func.index, [ targetTmp, ...args.map(x => coerceValue(generate(scope, x), T.jsval)) ], func.retType);
-       }
+@@ -2350,7 +2350,7 @@ const generateCall = (scope, decl) => {
+         if (targetKnownType == null && calleeMember && !calleeMember.computed && !decl.optional && !inOptionalChain(calleeMember) && !decl._sharedDispatch && !globalThis.precompile &&
+           Object.keys(protoBC).length > 1 && !decl.arguments.some(x => x?.type === 'SpreadElement')) {
+           const params = decl.arguments.map((_, i) => 'a' + i);
+-          const func = sharedFunc(`((${[ 'r', ...params ].join(', ')}) => r.${protoName}(${params.join(', ')}))`);
++          const func = sharedFunc(`((${[ 'r', ...params ].join(', ')}) => r.${protoName}(${params.join(', ')}))`, scope, protoName + '_' + params.length);
+           return Call(func.index, [ targetTmp, ...args.map(x => coerceValue(generate(scope, x), T.jsval)) ], func.retType);
+         }
  
-@@ -2614,15 +2614,20 @@ const inOptionalChain = node => {
+@@ -2635,15 +2635,20 @@ const inOptionalChain = node => {
  
  // one function for a dispatch many sites would otherwise inline, whose own body takes the inline path
  let sharedFuncs;
@@ -56,7 +56,7 @@ index 0a1632c754e338fa4932d602d089bba8010a3c16..36d232d4cb8c374735f7a06661993799
    return func;
  };
  
-@@ -5236,7 +5241,7 @@ const generateMember = (scope, decl, objValue = null) => {
+@@ -5307,7 +5312,7 @@ const generateMember = (scope, decl, objValue = null) => {
      [ [ TYPES.string, TYPES.bytestring ], () => builtinCall(scope, '__Porffor_string_get', [ obj, prop ]) ],
      // unknown receivers share the rest
      ...(known == null && !globalThis.precompile && !Prefs.d && !decl._sharedDispatch ? [ [ 'default', () => {

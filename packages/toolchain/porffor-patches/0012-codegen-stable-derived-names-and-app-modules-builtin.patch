@@ -17,7 +17,7 @@ Pass: patchStableNames (P5, P6 codegen.js part)
  1 file changed, 5 insertions(+), 3 deletions(-)
 
 diff --git a/compiler/codegen.js b/compiler/codegen.js
-index 36d232d4cb8c374735f7a0666199379918939db3..01f1e6852a5cc6701cfc1da4a157ce26ca2fd142 100644
+index bf6f45206a1216826d153922d1fc47ed4dc3db5b..96582f4c5c3bfba75a6f9cf61db78e0b199d796e 100644
 --- a/compiler/codegen.js
 +++ b/compiler/codegen.js
 @@ -12,7 +12,7 @@ import { BuiltinFuncs, BuiltinVars, fullPrototypes } from './builtins.js';
@@ -38,7 +38,7 @@ index 36d232d4cb8c374735f7a0666199379918939db3..01f1e6852a5cc6701cfc1da4a157ce26
    emitIf(scope, Bin('!=', T.i32, JvType(cache), Const(T.i32, TYPES.function)),
      () => assign(scope, cache, makeFunctionValue(scope, func, markReferenced)));
    return cache;
-@@ -5613,7 +5613,7 @@ const generateClass0 = (scope, decl) => {
+@@ -5684,7 +5684,7 @@ const generateClass0 = (scope, decl) => {
      // computed keys are evaluated once
      let keyNode = () => !storage && generate(func, key);
      if (computed) {
@@ -47,7 +47,7 @@ index 36d232d4cb8c374735f7a0666199379918939db3..01f1e6852a5cc6701cfc1da4a157ce26
        allocVar(scope, keyGlobal, true);
        assign(scope, Global(keyGlobal, T.jsval), k);
        keyNode = () => Global(keyGlobal, T.jsval);
-@@ -6728,6 +6728,8 @@ export default (program, opts = {}) => {
+@@ -6799,6 +6799,8 @@ export default (program, opts = {}) => {
    // a unit's last ic chunk only needs its sites
    for (const unit in icSites) data[icSites[unit].chunk].length = ((icSites[unit].site - 1) % 256 + 1) * 48;
  

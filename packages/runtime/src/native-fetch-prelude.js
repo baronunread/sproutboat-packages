@@ -15,7 +15,11 @@ function __sbSetCompat(date) {
   if (date >= "2026-11-17") navigator.userAgent = "Cloudflare-Workers";
   Request._cd = date;
   if (date >= "2026-11-15" && Error.captureStackTrace === undefined) Error.captureStackTrace = __sbCaptureStackTrace;
+  // The acknowledgement gate (design 029 S3): on only for an app on this date or later, and only where the host asked for it.
+  if (date >= __SB_GATE_DATE) __sbGateActive = __sbGateRaw("e") === "1";
 }
+const __SB_GATE_DATE = "2026-11-20";
+let __sbGateActive = false;
 // V8's Error.captureStackTrace(target): drivers (pg, @neondatabase/serverless) call it on the errors they
 // build and rethrow. Porffor keeps no frames, so the stack is the first line, as Error.stack is.
 function __sbCaptureStackTrace(target) {
@@ -10664,11 +10668,78 @@ function __sbD1Table(r) {
   return { columns, rows };
 }
 function __sbD1Promise(run) {
+  if (__sbGroupOn()) return __sbGrouped(run);
   try {
     return Promise.resolve(run());
   } catch (err) {
     return Promise.reject(err);
   }
+}
+// ---- group commit (design 029 stage S1b) ----
+// With SB_LTX_GROUP=1 a strict D1 call does not wait for its own fsync. Its commit is made (SQLite believes it is durable,
+// synchronous=FULL stays set) but the WAL sync is owed, and the promise it returns settles only after one flush: a timer
+// that runs after the requests already read in this loop iteration have made their own calls, then one fsync per owed WAL
+// and the capture of what was committed. N concurrent requests so cost one fsync, not N. The wait is adaptive: while commits
+// arrive one at a time the flush runs at the end of the turn (a lone request pays its own fsync and nothing for the group),
+// and once a flush has carried more than one commit the next ones wait the timer's 1 ms so the others can join; four flushes of
+// one in a row go back to the first mode, and every eighth idle flush tries the wait again. Nothing is acknowledged before it:
+// the caller sees a result only through a promise, and every call, read or write, waits while anything is owed, so no
+// request can act on data a power cut could still take back. A call that returns nothing owed settles at once.
+let __sbGroupState = -1;
+let __sbGroupWaiters = [];
+let __sbGroupTimer = false;
+let __sbGroupBusy = false;
+let __sbGroupSingles = 0;
+let __sbGroupProbe = 0;
+function __sbGroupOn() {
+  if (__sbGroupState < 0)
+    __sbGroupState = __sbEnv("SB_LTX_ENABLE") === "1" && __sbEnv("SB_LTX_GROUP") === "1" && __sbD1Strict() ? 1 : 0;
+  return __sbGroupState === 1;
+}
+function __sbGroupFlush() {
+  __sbGroupTimer = false;
+  const list = __sbGroupWaiters;
+  __sbGroupWaiters = [];
+  if (list.length > 1) {
+    __sbGroupBusy = true;
+    __sbGroupSingles = 0;
+  } else if (__sbGroupBusy && ++__sbGroupSingles >= 4) {
+    __sbGroupBusy = false;
+  }
+  let failed = false;
+  try {
+    failed = Number(__sbLtxRaw("f")) < 0;
+  } catch (e) {
+    failed = true;
+  }
+  for (let i = 0; i < list.length; i++) {
+    const w = list[i];
+    if (failed) w.reject(new Error("sproutboat d1.query: LTX capture failed: the transaction may be committed locally but is not durable in the replication log; writes are refused until restart"));
+    else if (w.threw) w.reject(w.err);
+    else w.resolve(w.value);
+  }
+}
+function __sbGrouped(run) {
+  let value;
+  let err;
+  let threw = false;
+  __sbLtxRaw("d");
+  try {
+    value = run();
+  } catch (e) {
+    threw = true;
+    err = e;
+  }
+  __sbLtxRaw("n");
+  if (__sbLtxRaw("o") === "0") return threw ? Promise.reject(err) : Promise.resolve(value);
+  return new Promise((resolve, reject) => {
+    __sbGroupWaiters.push({ resolve, reject, value, err, threw });
+    if (!__sbGroupTimer) {
+      __sbGroupTimer = true;
+      if (__sbGroupBusy || ++__sbGroupProbe % 8 === 0) __sbSetTimeout(__sbGroupFlush, 1);
+      else Promise.resolve().then(__sbGroupFlush);
+    }
+  });
 }
 // A strict query's reply from the embedded transport's direct lane, or through the generic
 // dispatch. The errors read the same either way: "D1_ERROR: ..." for SQLite's, and the
@@ -10709,6 +10780,11 @@ class __SbD1Statement {
   }
   all() {
     if (!__sbD1Strict()) return __sbD1Query(this.__name, this.__sql, this.__params, false, true);
+    if (__sbGroupOn())
+      return __sbGrouped(() => {
+        const t = __sbD1Query(this.__name, this.__sql, this.__params, true, true);
+        return { success: true, meta: t.meta, results: __sbD1Objects(t.columns, t.rows) };
+      });
     try {
       const t = __sbD1Query(this.__name, this.__sql, this.__params, true, true);
       return Promise.resolve({ success: true, meta: t.meta, results: __sbD1Objects(t.columns, t.rows) });
@@ -10730,6 +10806,11 @@ class __SbD1Statement {
       }
       return out;
     }
+    if (__sbGroupOn())
+      return __sbGrouped(() => {
+        const t = __sbD1Query(this.__name, this.__sql, this.__params, true, false);
+        return options && options.columnNames ? [t.columns].concat(t.rows) : t.rows;
+      });
     try {
       const t = __sbD1Query(this.__name, this.__sql, this.__params, true, false);
       return Promise.resolve(options && options.columnNames ? [t.columns].concat(t.rows) : t.rows);
@@ -10743,6 +10824,15 @@ class __SbD1Statement {
       if (rows.length === 0) return null;
       return column == null ? rows[0] : rows[0][column];
     }
+    if (__sbGroupOn())
+      return __sbGrouped(() => {
+        const t = __sbD1Query(this.__name, this.__sql, this.__params, true, false);
+        if (column == null) return t.rows.length ? __sbD1Objects(t.columns, [t.rows[0]])[0] : null;
+        const at = t.columns.indexOf(String(column));
+        if (!t.rows.length) return null;
+        if (at < 0) throw __sbD1Fail("D1_COLUMN_NOTFOUND: Column not found (" + column + ")");
+        return t.rows[0][t.columns.lastIndexOf(String(column))];
+      });
     try {
       const t = __sbD1Query(this.__name, this.__sql, this.__params, true, false);
       if (column == null) return Promise.resolve(t.rows.length ? __sbD1Objects(t.columns, [t.rows[0]])[0] : null);
@@ -12420,6 +12510,11 @@ function __sbFollowHop(op, msg, label, mode, signal, hops) {
 // without awaiting keep working; sproutd's answered with promises at any date
 // (__sbAsyncAtAnyDate). `always` is for RPC, which has no older behaviour to keep.
 function __sbUpstream(op, msg, label, signal, always) {
+  // After a commit the host has not had confirmed, nothing leaves the worker (design 029 S3, Cloudflare's output gate).
+  if (__sbGateActive && __sbGateRaw("b") === "1") return __sbGateWait(signal).then(() => __sbUpstreamNow(op, msg, label, signal, always));
+  return __sbUpstreamNow(op, msg, label, signal, always);
+}
+function __sbUpstreamNow(op, msg, label, signal, always) {
   if (signal) signal.throwIfAborted();
   const promised = always || __sbCompatDate() >= "2026-10-22" || __sbAsyncAtAnyDate();
   if (!promised) return __sbUpstreamResponse(globalThis.__sbFetchUpstream(op, msg));
@@ -12531,8 +12626,9 @@ globalThis.__sbInstallFetch = function () {
 // __sbDOEnter) keeps them out while a storage read is in flight, as in workerd.
 // Only `state.storage.*` goes to the broker (so object state outlives a sprout
 // restart), scoped to (class, id).
-// ponytail: one instance per id relies on the single sprout process; a
-// multi-sprout deployment needs the broker to hold a per-id lock (cloud).
+// One instance per id relies on one worker owning the app's storage: the embedded transport takes an app-wide
+// flock before an instance is built (SB_OWNER_LOCK, see __sbOwnerAcquire there). The broker transport has one
+// sprout process per deployment; a multi-sprout deployment needs the broker to hold a per-id lock (cloud).
 
 function __sbMakeDONamespace(binding, className) {
   if (__sbDOv2()) return __sbMakeDONamespaceV2(className);
@@ -12876,6 +12972,7 @@ function __sbGetDOInstance(cls, idText, idObj) {
   const cacheKey = cls + " " + id;
   let inst = __sbDOInstances[cacheKey];
   if (!inst) {
+    if (__sbIsFn(globalThis.__sbOwnerAcquire)) globalThis.__sbOwnerAcquire();
     if (stateId !== null && stateId.name !== undefined) __sbDOAdopt(cls, "name:" + stateId.name, id);
     // #57 — was a no-op: a DO calling `state.waitUntil(p)` had `p` vanish with
     // no error. The instance outlives any one call (cached in
@@ -13354,6 +13451,8 @@ function __sbDONow() {
 
 function __sbDOBuild(L, cls, id, stateId, key) {
   const Ctor = __sbDOClasses[cls];
+  // One storage owner per app (plan 013 phase A, embedded transport only): fail before anything is registered.
+  if (__sbIsFn(globalThis.__sbOwnerAcquire)) globalThis.__sbOwnerAcquire();
   const t0 = __sbDONow();
   if (stateId.name !== undefined) __sbDOAdopt(cls, "name:" + stateId.name, id);
   const tasks = [];
@@ -14151,12 +14250,14 @@ function __sbDOAsyncStorage(cls, id, gate, rec) {
     get: (key) => read(() => s.get(key)),
     list: (options) => read(() => s.list(options)),
     getAlarm: () => read(() => s.getAlarm()),
-    put: (key, value) => settle(() => s.put(key, value)),
-    delete: (key) => settle(() => s.delete(key)),
-    deleteAll: () => settle(() => s.deleteAll()),
-    setAlarm: (when) => settle(() => s.setAlarm(when)),
-    deleteAlarm: () => settle(() => s.deleteAlarm()),
-    sync: () => Promise.resolve(),
+    // The options of a storage write (Cloudflare's): allowUnconfirmed makes the call's own commit one nothing waits for.
+    put: (key, value, options) =>
+      settle(() => __sbUnconfirmed(key !== null && __sbIsObj(key) && !Array.isArray(key) ? value : options, () => s.put(key, value))),
+    delete: (key, options) => settle(() => __sbUnconfirmed(options, () => s.delete(key))),
+    deleteAll: (options) => settle(() => __sbUnconfirmed(options, () => s.deleteAll())),
+    setAlarm: (when, options) => settle(() => __sbUnconfirmed(options, () => s.setAlarm(when))),
+    deleteAlarm: (options) => settle(() => __sbUnconfirmed(options, () => s.deleteAlarm())),
+    sync: () => __sbGateSync(),
     transaction: (fn) => {
       if (rec !== undefined && rec.dead) return Promise.reject(__sbDOZombie(rec));
       return __sbDOTransaction(cls, id, s, gate, fn);
@@ -14709,6 +14810,54 @@ function __sbDOTransactionRun(cls, id, s, gate, fn) {
 // routes the internal `x-sb-trigger` requests (sent by the broker, authenticated
 // with SB_BROKER_TOKEN) to the right user handler, and everything else to
 // `handlers.fetch`.
+
+// ---- the acknowledgement gate, worker side (design 029 S3) ----
+// The reply, the WebSocket messages and the streamed bodies are held by the host (every frame leaves with the commit counter). What
+// the host cannot hold is a call the worker makes itself, so it waits here: it asks the host to have the store confirm what is
+// committed so far (a note), and polls the confirmed counter the host writes. A call that is not confirmed in 30 s is not made and
+// rejects. Standalone (no host) and the older compatibility dates never get here: the gate is off.
+let __sbGateTestAt = 0;
+const __sbGateWaitMs = 30000;
+// What a storage call that passed allowUnconfirmed runs inside: its commit does not move the counter the host waits for.
+function __sbUnconfirmed(options, f) {
+  if (!__sbGateActive || options == null || options.allowUnconfirmed !== true) return f();
+  __sbGateRaw("u");
+  try {
+    return f();
+  } finally {
+    __sbGateRaw("v");
+  }
+}
+// The standalone stand-in for the host, for tests only (SB_GATE_TEST_CONFIRM_MS): the commits seen so far count as confirmed
+// that many milliseconds after the first time somebody waited for them.
+function __sbGateTestConfirm(seq) {
+  const ms = Number(__sbEnv("SB_GATE_TEST_CONFIRM_MS") || 0);
+  if (!(ms > 0) || __sbGateTestAt === seq) return;
+  __sbGateTestAt = seq;
+  __sbSetTimeout(() => __sbGateRaw("k" + seq), ms);
+}
+function __sbGateWait(signal) {
+  return new Promise((resolve, reject) => {
+    const seq = Number(__sbGateRaw("p"));
+    __sbHostNote("gate " + seq);
+    __sbGateTestConfirm(seq);
+    const t0 = Date.now();
+    const step = () => {
+      if (signal && signal.aborted) return reject(signal.reason);
+      if (__sbGateRaw("b") === "0") return resolve();
+      if (Date.now() - t0 > __sbGateWaitMs) return reject(new Error("storage write not confirmed within 30 s: the call was not made, retry"));
+      __sbSetTimeout(step, 1);
+    };
+    step();
+  });
+}
+// storage.sync(): resolves when what was committed before the call has reached the quorum (or R2).
+function __sbGateSync() {
+  if (!__sbGateActive || __sbGateRaw("b") === "0") return Promise.resolve();
+  return __sbGateWait(undefined);
+}
+globalThis.__sbGateSeq = () => Number(__sbGateRaw("p"));
+globalThis.__sbGateConfirmed = () => Number(__sbGateRaw("c"));
 
 // B22: a note to the host that runs this worker. Only sproutd's worker host takes notes
 // (its bridge sets sb_host_note_hook); everywhere else the hook is null and this returns

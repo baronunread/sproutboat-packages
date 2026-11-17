@@ -1,5 +1,46 @@
 # @sproutboat/runtime
 
+## 0.48.0
+
+### Minor Changes
+
+- c409096: Storage stage S1 (design 029), dark: nothing changes for any app until a host sets new environment variables, so no compatibility date is needed. A native host (sproutd) turns the features on per app; a standalone binary stays as it was.
+  
+  - `SB_OWNER_LOCK=1`: the first captured-file open or Durable Object construction of a process takes an exclusive `flock` on `DATA/.owner.lock` and keeps it until the process dies. A second worker of the same app waits up to `SB_OWNER_WAIT_MS` (default 5000) and then fails that call without changing any state, so the next call retries. `deny` fails at once (a canary). This replaces the per-file `<db>.ltx.lock` for apps that set it.
+  - `SB_LTX_SCOPE=d1,store,do-sql` captures every file of the listed kinds as LTX (the old `SB_LTX_DATABASE`, one D1 binding, still works when the scope is unset). A captured Durable Object SQL handle can now leave the handle table and come back: it settles its spool on close (checkpoint, clean position record) and reopens without reading every page.
+  - `SB_LTX_ROOT=DIR` puts each file's spool under `DIR/<key>/` (`d1/NAME`, `store`, `do-sql/CLASS/FILE`) instead of beside the database, with group-readable files and directories for a shipper process, and keeps a dirty list at `DIR/dirty`.
+  - The position record is now `LTXPOS3`: it adds `epochSeq` (only grows, also after a lost spool) and, in a clean record, the database file's inode and mtime. A file that was `LTXPOS2` starts a new epoch (one full image) the first time a worker of this version opens it. Epoch directories are random names made with `mkdir`, not `mkdtemp`.
+  - When `store` is in the scope, Analytics Engine datapoints, rate-limit windows and the Cache API use `volatile.sqlite`, which is never captured. Rows already in `store.sqlite` are left there unused.
+  - A failed capture start no longer leaves its failed flag on the slot for the next file that takes it.
+  
+  Generation impact: this changes the inline C every app with bindings compiles, so it rides a runtime generation and goes through the normal requalification.
+- ab85a70: Storage stage S1b (design 029), dark like S1: it changes how a captured commit is made durable and adds group commit behind a switch. It applies only where capture is on (`SB_LTX_ENABLE=1`); nothing else changes.
+  
+  - A captured commit costs the WAL sync plus, once per checkpoint, one sync per LTX file (about two fsyncs a commit in the worst case, ten in S1), with `synchronous=FULL` unchanged: an acknowledged commit is still on disk when the call returns. The checkpoint no longer runs after every statement but when the WAL holds `SB_LTX_CKPT_BYTES` (default 1 MiB) or a statement runs `SB_LTX_CKPT_MS` (default 1000) after the last one, and when a handle closes (`SB_LTX_CKPT_BYTES=0` is the old behaviour). LTX files, their directory entries and the working position record are written without fsync; the clean record is written only after every file it claims is fsynced. Capture reads the WAL incrementally. On Linux the write-out of an LTX file is started with `sync_file_range` (`SB_LTX_WRITEBACK=0` turns it off).
+  - The position record is now `LTXPOS4` (adds `synced txid` and its checksum). A resume verifies every LTX file above `synced txid`, follows the checksum chain, and removes unpublished `.ltx.tmp` files; a published file above the position starts a new epoch. After a power cut, a captured file written since its last checkpoint is re-based with one full image (a crash that keeps the page cache resumes in place). A shipper must delete only files below `txid` and at or below `synced txid`.
+  - Group commit, `SB_LTX_GROUP=1`, for strict D1 calls: a commit's WAL sync is owed and one flush fsyncs for every commit of the turn and captures them as one LTX file. The call's promise settles only after the flush, and every D1 call waits while a commit is owed, so nothing is acknowledged or read before it is durable. The flush is immediate while commits arrive one at a time and waits 1 ms for company once a flush carried several. Durable Object SQL, KV and non-strict D1 flush before they return.
+  
+  Generation impact: this changes the inline C and the prelude every app with bindings compiles, so it rides a runtime generation and goes through the normal requalification. A captured app starts a new epoch (one full image) the first time it opens on this version, as it did for S1.
+- 35f4583: Storage stage S3 (design 029), the runtime half of the acknowledgement gate, dark like S1 and S1b: nothing changes unless the host sets `SB_LTX_GATE=1` and the app's compatibility date is 2026-11-20 or later. (The date is a placeholder for the generation that ships the gate; move it when that is known.)
+  
+  - **A commit position.** The runtime counts the commits it captured (`sb_commit_seq`, exported; the host reads it and stamps every frame that leaves the worker). The host holds a reply, a WebSocket message or a stream chunk until the store has what the worker committed up to that position durable on two replicas (or in R2). The runtime reads back what was confirmed (`sb_commit_confirmed`, written by the host).
+  - **Outgoing calls wait.** `fetch()` and service-binding calls made after a commit that is not confirmed yet wait for the confirmation (30 s at most, then they reject and are not made). The wait asks the host to have the store confirm now (a note, \`gate N\`) and polls the confirmed word every millisecond. A call with nothing unconfirmed behind it is not delayed.
+  - **\`allowUnconfirmed\`** on a Durable Object storage write (\`put\`, \`delete\`, \`deleteAll\`, \`setAlarm\`, \`deleteAlarm\`) is honoured: the commit is replicated, and nothing waits for it.
+  - **\`storage.sync()\`** resolves when what was committed before the call has reached the quorum (or R2). With the gate off it resolves at once, as before.
+  - Off for the standalone binary and the broker (no host to confirm), and for apps on older compatibility dates. \`SB_GATE_TEST_CONFIRM_MS\` stands in for the host in compiled-app tests.
+  
+  Generation impact: the inline C (two exported words, a counter bump after a capture) and the prelude (outgoing-call wait, storage options, \`sync()\`): a runtime generation, tier \`prelude\` requalification. The host needs a build for the frame change (every reply, stream and WebSocket frame from a worker carries two more numbers), so the two ship together.
+- 3cc53d9: Storage stage S4 (design 029), runtime half of "the barrier names the touched keys", dark like S3: it changes nothing unless the gate is on.
+  
+  - **A dirty line per counted commit.** For an app with the gate on, the runtime appends the key of every commit it counts for the gate (`sb_commit_seq`) to the app's `dirty` list, unthrottled and *before* the counter moves. The store's barrier can then read just the keys that list names since its last read, instead of every key of the app (which costs more the more Durable Objects the app has). Without the gate the list is what it was: a hint, a key named at its first commit and again after a second.
+  - The store side (sproutd `deploy/store-rs`, `touched_keys`) keeps the keys that failed to ship and puts a read list back if the ingest fails, so a key a barrier skipped is never forgotten; a list it cannot read makes it read every key.
+  
+  Generation impact: the inline C (one extra append per counted commit; a `stat` of the list to notice a rotation): ships with the S3 generation (tier `prelude`), no other change.
+
+### Patch Changes
+
+- fd2dc15: Storage review fix M4 (design 029), dark like the rest of S1: the next epoch number of a captured file is also above the `epoch-floor` file in the file's spool directory (decimal; the host role's reseed leaves the epoch the replica's file has reached), not only above the position record and the clock. A promoted host whose clock is behind the previous leader's last epoch no longer numbers its epochs below what the replicas applied.
+
 ## 0.47.0
 
 ### Minor Changes
