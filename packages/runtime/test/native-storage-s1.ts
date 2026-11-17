@@ -455,6 +455,45 @@ try {
     );
   }
 
+  // 5b. The epoch floor (independent review 029, M4): the reseed of a promoted host wipes the spool, and a host whose clock is behind the
+  // previous leader's last epoch must still number its epochs above what the replica holds: `epoch-floor` in the spool root.
+  {
+    const dir = await fresh();
+    const p = paths(dir);
+    const a = await spawn(dir, {});
+    assert.match(await a.send("sql d1 DB CREATE TABLE t(v TEXT)"), /^0 /);
+    await a.send("sql d1 DB INSERT INTO t VALUES('a')");
+    await a.send("close d1 DB");
+    await a.quit();
+    const first = await epochOf(p.spool.d1);
+    // the spool is wiped by a reseed, which leaves a floor a year ahead of this host's clock
+    await rm(p.spool.d1, { recursive: true });
+    await mkdir(p.spool.d1, { recursive: true });
+    const floor = first.seq + 365n * 86_400_000n;
+    await writeFile(join(p.spool.d1, "epoch-floor"), `${floor}\n`);
+    const b = await spawn(dir, {});
+    await b.send("sql d1 DB INSERT INTO t VALUES('b')");
+    await b.send("close d1 DB");
+    await b.quit();
+    const second = await epochOf(p.spool.d1);
+    assert(
+      second.seq > floor,
+      `the new epoch (${second.seq}) is numbered above the floor (${floor}), whatever the clock says`,
+    );
+    await assertEquals(p.spool.d1, p.d1, "after a reseed with a floor");
+    // a floor below the clock changes nothing; garbage in the file is ignored
+    await rm(p.spool.d1, { recursive: true });
+    await mkdir(p.spool.d1, { recursive: true });
+    await writeFile(join(p.spool.d1, "epoch-floor"), "not a number\n");
+    const c = await spawn(dir, {});
+    await c.send("sql d1 DB INSERT INTO t VALUES('c')");
+    await c.send("close d1 DB");
+    await c.quit();
+    const third = await epochOf(p.spool.d1);
+    assert(third.seq > 1n << 30n && third.seq < floor, "an unreadable floor is ignored");
+    console.log("PASS epoch floor: a reseeded spool's floor outranks a clock that is behind; garbage is ignored");
+  }
+
   // 6. The dirty list.
   {
     const dir = await fresh();

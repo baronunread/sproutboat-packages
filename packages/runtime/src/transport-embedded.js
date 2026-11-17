@@ -1076,9 +1076,13 @@ static int sb_ltx_checkpoint(sb_ltx_state *s, int persist) {
 }
 // The epochSeq of the last position record, whatever else is wrong with it (a torn or damaged record still tells
 // how far the numbering got). 0 when there is none or it is an older format.
-static uint64_t sb_ltx_prev_seq(const char *root) {
-  char path[SB_LTX_PATH], text[256], epoch[64];
-  if (snprintf(path, sizeof(path), "%s/position", root) >= sizeof(path))
+// The epoch floor: the host role's reseed wipes the spool when this host takes over a shard, and with it the position record above, so
+// the clock would be the only number left; a host whose clock is behind the previous leader's last epoch would number its epochs below
+// what every replica already applied and they would be skipped for good. The reseed leaves the epoch the replica's file has reached in
+// epoch-floor (decimal, beside the position record); the next epoch is numbered above it (independent review 029, M4).
+static uint64_t sb_ltx_epoch_floor(const char *root) {
+  char path[SB_LTX_PATH], text[64];
+  if (snprintf(path, sizeof(path), "%s/epoch-floor", root) >= sizeof(path))
     return 0;
   FILE *f = fopen(path, "rb");
   if (!f)
@@ -1086,10 +1090,24 @@ static uint64_t sb_ltx_prev_seq(const char *root) {
   size_t n = fread(text, 1, sizeof(text) - 1, f);
   fclose(f);
   text[n] = 0;
+  unsigned long long v = 0;
+  return sscanf(text, "%llu", &v) == 1 ? v : 0;
+}
+static uint64_t sb_ltx_prev_seq(const char *root) {
+  char path[SB_LTX_PATH], text[256], epoch[64];
+  uint64_t floor = sb_ltx_epoch_floor(root);
+  if (snprintf(path, sizeof(path), "%s/position", root) >= sizeof(path))
+    return floor;
+  FILE *f = fopen(path, "rb");
+  if (!f)
+    return floor;
+  size_t n = fread(text, 1, sizeof(text) - 1, f);
+  fclose(f);
+  text[n] = 0;
   unsigned long long seq = 0;
   if (strncmp(text, "LTXPOS4\n", 8) || sscanf(text + 8, "%63s\n%llu", epoch, &seq) != 2)
-    return 0;
-  return seq;
+    return floor;
+  return seq > floor ? seq : floor;
 }
 // Counters for the tests and the host's stats line: how the opens of captured files went.
 static unsigned long sb_ltx_stat_fresh, sb_ltx_stat_cheap, sb_ltx_stat_full, sb_ltx_stat_resume;

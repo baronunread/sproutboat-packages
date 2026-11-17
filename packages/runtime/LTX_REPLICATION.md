@@ -173,7 +173,9 @@ LTXPOS4
 ```
 
 `epochSeq` is the larger of the previous one plus one and the clock in milliseconds, so it only grows, also after
-the spool was deleted. A `C` (clean) record also holds the inode and mtime of the database file as it was after
+the spool was deleted. A spool that was deleted by the host role's reseed (a promoted host) carries `epoch-floor` in the file's spool
+directory: the epoch number the replica's file has reached, in decimal. It counts as the previous epoch, so a host whose clock is behind the
+previous leader's last epoch still numbers its epochs above what every replica has applied (a lower one is skipped for good). A `C` (clean) record also holds the inode and mtime of the database file as it was after
 the checkpoint. A reopen that finds the same inode, mtime and size (pages times page size) trusts the file and
 does not read every page; anything else takes the full page checksum and, if that fails, starts a new epoch. An
 `LTXPOS2` record (the format before this one) is not resumed: a new epoch starts, which a shipper sees as one
