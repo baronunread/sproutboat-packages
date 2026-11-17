@@ -1074,8 +1074,6 @@ static int sb_ltx_checkpoint(sb_ltx_state *s, int persist) {
   }
   return rc;
 }
-// The epochSeq of the last position record, whatever else is wrong with it (a torn or damaged record still tells
-// how far the numbering got). 0 when there is none or it is an older format.
 // The epoch floor: the host role's reseed wipes the spool when this host takes over a shard, and with it the position record above, so
 // the clock would be the only number left; a host whose clock is behind the previous leader's last epoch would number its epochs below
 // what every replica already applied and they would be skipped for good. The reseed leaves the epoch the replica's file has reached in
@@ -1093,6 +1091,9 @@ static uint64_t sb_ltx_epoch_floor(const char *root) {
   unsigned long long v = 0;
   return sscanf(text, "%llu", &v) == 1 ? v : 0;
 }
+// The epochSeq of the last position record, whatever else is wrong with it (a torn or damaged record still tells
+// how far the numbering got). 0 when there is none or it is an older format.
+// The larger of that and the epoch floor.
 static uint64_t sb_ltx_prev_seq(const char *root) {
   char path[SB_LTX_PATH], text[256], epoch[64];
   uint64_t floor = sb_ltx_epoch_floor(root);
