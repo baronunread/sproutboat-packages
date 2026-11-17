@@ -35,7 +35,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.4
       - uses: actions/setup-node@v7
         with:
           node-version: 24
@@ -59,7 +59,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.4
       - run: bun scripts/porffor-patches.ts check
       - run: bun scripts/porffor-patches.ts verify
       # The standalone server's vendored sources (shim, web classes, uWebSockets patches): their hashes, then the
@@ -79,7 +79,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.4
       - uses: actions/setup-node@v7
         with:
           node-version: 24
@@ -115,7 +115,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.4
       - uses: actions/setup-node@v7
         with:
           node-version: 24
@@ -147,7 +147,7 @@ jobs:
           path: sproutboat-cli
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.4
       - uses: actions/setup-node@v7
         with:
           node-version: 24
