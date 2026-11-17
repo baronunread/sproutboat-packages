@@ -20,10 +20,10 @@ Upstream: https://github.com/CanadaHonk/porffor/issues/464
  1 file changed, 8 insertions(+), 1 deletion(-)
 
 diff --git a/compiler/builtins/json.ts b/compiler/builtins/json.ts
-index 26127e6581cb2971f92e66ea2fcc58b7255120ec..ef0bc9d0d7befef63f13fa052dec115fbb5c2de1 100644
+index 5e6ecf444ef74d4c5e2b37ea8482b99d73f3d820..74056a1ad8f8f6a6236050db663e1271e6364b3c 100644
 --- a/compiler/builtins/json.ts
 +++ b/compiler/builtins/json.ts
-@@ -754,7 +754,14 @@ export const __Porffor_json_hex4 = (text: bytestring, pos: i32, len: i32): i32 =
+@@ -771,7 +771,14 @@ export const __Porffor_json_hex4 = (text: bytestring, pos: i32, len: i32): i32 =
  
  // strings with \u escapes past latin-1, from after the opening quote
  export const __Porffor_json_parseWideString = (text: bytestring, start: i32, posPtr: i32, len: i32): string => {

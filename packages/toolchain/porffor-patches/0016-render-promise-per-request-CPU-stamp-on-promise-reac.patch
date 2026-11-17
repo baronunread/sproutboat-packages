@@ -38,10 +38,10 @@ index eb3729064811a01805cd3b8ff5e2c344298da9d0..41130b5f5ef2cbe5f69b1cd7282e871c
    return out;
  };
 diff --git a/compiler/render.js b/compiler/render.js
-index a4ee36bbfa268838c7354518fd21ef8eeb0c9492..12126cf28674d5c0d3ce83ef669ede6c717bca9d 100644
+index 2b95beb14392b505c3f6bd1262ad9775933100a6..817af18a9180d3fcc8e7345ddb443726a6589e97 100644
 --- a/compiler/render.js
 +++ b/compiler/render.js
-@@ -4464,7 +4464,8 @@ extern const u32 porf_static_end;
+@@ -4513,7 +4513,8 @@ extern const u32 porf_static_end;
  #define PORF_REACTION_KIND 32
  #define PORF_REACTION_FLAGS 33
  #define PORF_REACTION_CONTEXT 40
@@ -51,7 +51,7 @@ index a4ee36bbfa268838c7354518fd21ef8eeb0c9492..12126cf28674d5c0d3ce83ef669ede6c
  
  #define PORF_GC_KIND_PROMISE_REACTION 248u
  
-@@ -4511,6 +4512,48 @@ static inline f64 porf_canon(f64 d) { return d == d ? d : porf_bits_to_f64(0x7FF
+@@ -4556,6 +4557,48 @@ static inline f64 porf_canon(f64 d) { return d == d ? d : porf_bits_to_f64(0x7FF
  static u32* porf_promise_job_queue = NULL;
  // async context (AsyncLocalStorage) a promise job runs with, captured when its reaction is made
  static jsbits porf_async_context = JV_UNDEFINED_BITS;
@@ -100,7 +100,7 @@ index a4ee36bbfa268838c7354518fd21ef8eeb0c9492..12126cf28674d5c0d3ce83ef669ede6c
  // bloom filter of key hashes some accessor property was defined for
  static u32 porf_accessor_keys[64];
  static u32 porf_promise_job_head = 0;
-@@ -4539,8 +4582,9 @@ static void porf_promise_enqueue_job(u32 reaction) {
+@@ -4584,8 +4627,9 @@ static void porf_promise_enqueue_job(u32 reaction) {
  }
  
  static u32 porf_promise_dequeue_job(void) {
@@ -111,7 +111,7 @@ index a4ee36bbfa268838c7354518fd21ef8eeb0c9492..12126cf28674d5c0d3ce83ef669ede6c
    porf_promise_job_head = (porf_promise_job_head + 1u) & (porf_promise_job_cap - 1u);
    porf_promise_job_len--;
    if (porf_promise_job_len == 0) porf_promise_job_head = 0;
-@@ -5673,6 +5717,7 @@ static u32 porf_promise_new_coro_reaction(porf_coro_call* call, jsval out_promis
+@@ -5752,6 +5796,7 @@ static u32 porf_promise_new_coro_reaction(porf_coro_call* call, jsval out_promis
    *(u8*)(MEM + reaction + PORF_REACTION_KIND) = 11;
    *(u8*)(MEM + reaction + PORF_REACTION_FLAGS) = 0;
    *(jsbits*)(MEM + reaction + PORF_REACTION_CONTEXT) = porf_async_context;

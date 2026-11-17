@@ -19,16 +19,16 @@ Upstream: https://github.com/CanadaHonk/porffor/issues/454
  1 file changed, 2 insertions(+), 1 deletion(-)
 
 diff --git a/compiler/codegen.js b/compiler/codegen.js
-index 01f1e6852a5cc6701cfc1da4a157ce26ca2fd142..bfbf60feb795beb93c5a7d1c849a10b2749547b6 100644
+index 96582f4c5c3bfba75a6f9cf61db78e0b199d796e..4bb0e7012eb88d43348b4c69dc5496d3b27236bf 100644
 --- a/compiler/codegen.js
 +++ b/compiler/codegen.js
-@@ -2341,7 +2341,8 @@ const generateCall = (scope, decl) => {
-         Object.keys(protoBC).length > 1 && !decl.arguments.some(x => x?.type === 'SpreadElement')) {
-         const params = decl.arguments.map((_, i) => 'a' + i);
-         const func = sharedFunc(`((${[ 'r', ...params ].join(', ')}) => r.${protoName}(${params.join(', ')}))`, scope, protoName + '_' + params.length);
--        return Call(func.index, [ targetTmp, ...args.map(x => coerceValue(generate(scope, x), T.jsval)) ], func.retType);
-+        // sproutboat P10: shared dispatch arguments are evaluated in order
-+        return Call(func.index, [ targetTmp, ...args.map(x => reuse(scope, coerceValue(generate(scope, x), T.jsval))) ], func.retType);
-       }
+@@ -2351,7 +2351,8 @@ const generateCall = (scope, decl) => {
+           Object.keys(protoBC).length > 1 && !decl.arguments.some(x => x?.type === 'SpreadElement')) {
+           const params = decl.arguments.map((_, i) => 'a' + i);
+           const func = sharedFunc(`((${[ 'r', ...params ].join(', ')}) => r.${protoName}(${params.join(', ')}))`, scope, protoName + '_' + params.length);
+-          return Call(func.index, [ targetTmp, ...args.map(x => coerceValue(generate(scope, x), T.jsval)) ], func.retType);
++          // sproutboat P10: shared dispatch arguments are evaluated in order
++          return Call(func.index, [ targetTmp, ...args.map(x => reuse(scope, coerceValue(generate(scope, x), T.jsval))) ], func.retType);
+         }
  
-       const entries = Object.keys(protoBC).map(x => [ +x, protoBC[x] ]).sort((a, b) => a[0] - b[0]);
+         const entries = Object.keys(protoBC).map(x => [ +x, protoBC[x] ]).sort((a, b) => a[0] - b[0]);
