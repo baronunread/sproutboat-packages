@@ -1,5 +1,16 @@
 # @sproutboat/wire
 
+## 0.22.8
+
+### Patch Changes
+
+- Updated dependencies [fd2dc15]
+- Updated dependencies [c409096]
+- Updated dependencies [ab85a70]
+- Updated dependencies [35f4583]
+- Updated dependencies [3cc53d9]
+  - @sproutboat/runtime@0.48.0
+
 ## 0.22.7
 
 ### Patch Changes
