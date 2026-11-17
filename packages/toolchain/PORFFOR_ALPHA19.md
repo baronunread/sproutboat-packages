@@ -14,7 +14,7 @@ vendored uWebSockets archive is unchanged.
 91 commits. The ones that matter to handlers:
 
 - `Map.groupBy`; private names are brands, so `#x` stays out of `Object.keys`,
-  `for-in`, `Object.entries` and `JSON.stringify` (baronunread/sproutboat#286).
+  `for-in`, `Object.entries` and `JSON.stringify` (sproutboat/sproutboat#286).
 - JSON: `stringify` throws on cycles and unwraps boxed primitives; `parse` applies a
   reviver with source text (`context.source`) and rejects trailing input;
   `JSON.rawJSON`.

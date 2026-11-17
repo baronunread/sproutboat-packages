@@ -26,7 +26,7 @@ Classes (a `Class:` trailer in every patch):
 - **generated**: `compiler/builtins_precompiled.js`, which upstream tracks and which follows every builtin edit.
 
 Filing on upstream needs explicit human approval, and Porffor's [AI policy](https://github.com/CanadaHonk/porffor/blob/main/AI_POLICY.md)
-applies. Drafts live in [`sproutboat/patches/upstream`](https://github.com/baronunread/sproutboat/tree/main/patches/upstream).
+applies. Drafts live in [`sproutboat/patches/upstream`](https://github.com/sproutboat/sproutboat/tree/main/patches/upstream).
 
 ## The series
 

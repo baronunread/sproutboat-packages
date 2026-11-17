@@ -60,5 +60,5 @@ Retained, still needed on Alpha 18:
   headers, quiet collection) are Sproutboat features, not Porffor bugs.
 
 Still open upstream, with no patch: `Map.groupBy`, private fields listed by
-`Object.keys` (baronunread/sproutboat#286), per-collection GC page discard
+`Object.keys` (sproutboat/sproutboat#286), per-collection GC page discard
 (#287) and `Error.stack` (the runtime prelude supplies it).

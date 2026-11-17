@@ -23,11 +23,10 @@ test("Buffer and process in a bundle are refused before the sockets date and all
 });
 
 test("a node: import specifier is still refused from the sockets date", () => {
-  const withNode = "export default { fetch() { return new Response('node:fs'.length + \"\"); } };".replace(
-    "'node:fs'",
-    '"node:fs"',
-  );
-  expect(validateHttpSyncSource(withNode, SOCKETS_DATE).ok).toBe(false);
+  for (const spec of ['import fs from "node:fs";', 'import "node:fs";', 'export * from "node:fs";']) {
+    const withNode = spec + '\nexport default { fetch() { return new Response("x"); } };';
+    expect(validateHttpSyncSource(withNode, SOCKETS_DATE).ok).toBe(false);
+  }
 });
 
 test("cloudflare:sockets needs the sockets date", () => {
@@ -39,4 +38,21 @@ test("cloudflare:sockets needs the sockets date", () => {
     `cloudflare:sockets needs compatibility_date ${SOCKETS_DATE} or later`,
   );
   expect(validateHttpSyncSource(app, SOCKETS_DATE)).toEqual({ ok: true });
+});
+
+test("a dynamic import of cloudflare:workers (Alchemy) resolves to the runtime globals", () => {
+  for (const quote of ['"', "'", "`"]) {
+    const out = inlineWorkersImports(
+      `const p = import(${quote}cloudflare:workers${quote}).catch(() => ({ env: {} }));`,
+    );
+    expect(out).toContain("Promise.resolve({ env: globalThis.env, WorkerEntrypoint: globalThis.WorkerEntrypoint");
+    expect(out).toContain(".catch(() => ({ env: {} }))");
+    expect(out).not.toContain("import(");
+  }
+});
+
+test("a dynamic import of cloudflare:workers passes the source check and keeps other dynamic imports refused", () => {
+  const app = `const p = import("cloudflare:workers").catch(() => ({ env: {} }));\nexport default { async fetch() { return new Response(typeof (await p).env); } };`;
+  expect(validateHttpSyncSource(app, "2026-11-18")).toEqual({ ok: true });
+  expect(validateHttpSyncSource(app.replace("cloudflare:workers", "./other.js"), "2026-11-18").ok).toBe(false);
 });

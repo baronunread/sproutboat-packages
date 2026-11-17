@@ -42,3 +42,32 @@ test("from the guarded-globals date an unguarded use still fails", () => {
     expect(result.ok).toBe(false);
   }
 });
+
+// Effect ships exactly this: a guarded lookup that never runs here, since there is no `process`.
+const EFFECT_LOOKUP = `var R=globalThis.process?.getBuiltinModule?.("node:async_hooks")?.AsyncResource;`;
+
+test("the text node: inside a string is not an import, at any date", () => {
+  for (const body of [
+    EFFECT_LOOKUP,
+    `var m="see https://nodejs.org/api/node:fs.html";var t='node:path';`,
+    "var m=`node:crypto is unavailable`;",
+  ]) {
+    for (const date of [undefined, "2026-10-22", GUARDED_GLOBALS_DATE, "2026-11-17"])
+      expect(validateHttpSyncSource(wrap(body), date)).toEqual({ ok: true });
+  }
+});
+
+test("a real node: import or require is still refused, at any date", () => {
+  for (const module of [
+    `import fs from "node:fs";export default{fetch(){return new Response("x");}};`,
+    `import"node:fs";export default{fetch(){return new Response("x");}};`,
+    `import{a}from'node:path';export default{fetch(){return new Response("x");}};`,
+    `export*from"node:fs";export default{fetch(){return new Response("x");}};`,
+    wrap(`var f=require("node:fs");`),
+    wrap("var f=require(`node:fs`);"),
+    wrap(`var f=import("node:fs");`),
+  ]) {
+    for (const date of [undefined, "2026-10-22", GUARDED_GLOBALS_DATE, "2026-11-17"])
+      expect(validateHttpSyncSource(module, date).ok).toBe(false);
+  }
+});

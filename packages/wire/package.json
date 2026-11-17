@@ -1,10 +1,10 @@
 {
   "name": "@sproutboat/wire",
-  "version": "0.22.6",
+  "version": "0.22.7",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/baronunread/sproutboat-packages.git",
+    "url": "git+https://github.com/sproutboat/packages.git",
     "directory": "packages/wire"
   },
   "type": "module",
@@ -23,6 +23,6 @@
   },
   "dependencies": {
     "@sproutboat/assets": "^0.3.1",
-    "@sproutboat/runtime": "^0.46.0"
+    "@sproutboat/runtime": "^0.47.0"
   }
 }
