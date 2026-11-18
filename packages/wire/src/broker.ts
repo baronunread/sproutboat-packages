@@ -426,6 +426,11 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
     "CREATE TABLE IF NOT EXISTS ae (dataset TEXT NOT NULL, ts INTEGER NOT NULL, indexes_json TEXT NOT NULL, " +
       "blobs_json TEXT NOT NULL, doubles_json TEXT NOT NULL)",
   );
+  // A store that predates the index gets it here, on open. (dataset, ts) also holds the rowid, so
+  // ORDER BY ts DESC, rowid DESC LIMIT n for one dataset reads n index entries and sorts nothing.
+  db.exec("CREATE INDEX IF NOT EXISTS ae_dataset_ts ON ae (dataset, ts)");
+  ensureAeCounter(db);
+  const aePrunedAt = new Map<string, number>();
   // #125 — at most one pending alarm per object, which is the Workers rule: a
   // later setAlarm replaces the earlier one rather than queueing beside it.
   doDb.exec(
@@ -1845,13 +1850,15 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
 
       case "ae.write": {
         const ds = requireAe(msg.dataset);
+        const now = Date.now();
         db.query("INSERT INTO ae (dataset, ts, indexes_json, blobs_json, doubles_json) VALUES (?, ?, ?, ?, ?)").run(
           ds,
-          Date.now(),
+          now,
           JSON.stringify(msg.indexes ?? []),
           JSON.stringify(msg.blobs ?? []),
           JSON.stringify(msg.doubles ?? []),
         );
+        pruneAe(db, aePrunedAt, ds, now);
         return { ok: true };
       }
       case "ae.query": {
@@ -1864,7 +1871,7 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
             "SELECT ts, indexes_json, blobs_json, doubles_json FROM ae WHERE dataset = ? ORDER BY ts DESC, rowid DESC LIMIT ?",
           )
           .all(ds, limit);
-        const total = db.query<{ n: number }, [string]>("SELECT count(*) AS n FROM ae WHERE dataset = ?").get(ds);
+        const total = db.query<{ n: number }, [string]>("SELECT n FROM ae_count WHERE dataset = ?").get(ds);
         return {
           ok: true,
           count: total?.n ?? 0,
@@ -2569,6 +2576,70 @@ export function createBroker(opts: BrokerOptions = {}): Broker {
  * Minimal 5-field cron match (`min hour dom month dow`, UTC). Each field is a
  * comma list of: `*`, a step `*` + `/n`, a range `a-b`, or a plain number.
  */
+/**
+ * Analytics Engine keeps a point count per dataset in ae_count, so query() reads one row instead of counting the dataset
+ * (count(*) walks every index entry: O(n)). Two triggers keep it exact inside the statement that inserts or deletes,
+ * whoever runs it: a broker of an older version that has no triggers of its own still counts through them, so a swap or a
+ * rollback leaves no drift. The table is made, filled from the points already there and given its triggers in one
+ * transaction, only when it is not there yet. Same table, triggers and rule as the embedded transport's
+ * (runtime/src/transport-embedded.js).
+ */
+export function ensureAeCounter(db: Database): void {
+  const probe = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ae_count'";
+  if (db.query(probe).get()) return;
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    if (!db.query(probe).get()) {
+      db.exec("CREATE TABLE ae_count (dataset TEXT NOT NULL PRIMARY KEY, n INTEGER NOT NULL) WITHOUT ROWID");
+      db.exec("INSERT INTO ae_count (dataset, n) SELECT dataset, count(*) FROM ae GROUP BY dataset");
+      db.exec(
+        "CREATE TRIGGER ae_count_ins AFTER INSERT ON ae BEGIN INSERT INTO ae_count (dataset, n) VALUES (new.dataset, 1) " +
+          "ON CONFLICT (dataset) DO UPDATE SET n = n + 1; END",
+      );
+      db.exec(
+        "CREATE TRIGGER ae_count_del AFTER DELETE ON ae BEGIN UPDATE ae_count SET n = n - 1 WHERE dataset = old.dataset; END",
+      );
+    }
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+/**
+ * Analytics Engine retention. Cloudflare keeps the data points for three months
+ * (https://developers.cloudflare.com/analytics/analytics-engine/limits/, "Data retention"); 92 days is the longest three
+ * months, so nothing is dropped that Cloudflare would still hold. A dataset also holds at most AE_MAX_ROWS points, the
+ * oldest going first: a bound on disk for an app that writes a lot (Cloudflare has none, and no disk of ours).
+ * Neither rule runs on a request's way in as one big delete: a write prunes its own dataset at most every
+ * AE_PRUNE_EVERY_MS, and removes at most AE_PRUNE_BATCH points, through the (dataset, ts) index. A backlog is worked off
+ * over the writes that follow. Same constants and rules as the embedded transport's.
+ */
+export const AE_MAX_AGE_MS = 92 * 86_400_000;
+export const AE_MAX_ROWS = 1_000_000;
+const AE_PRUNE_BATCH = 1000;
+const AE_PRUNE_EVERY_MS = 10_000;
+function pruneAe(db: Database, prunedAt: Map<string, number>, dataset: string, now: number): void {
+  const last = prunedAt.get(dataset);
+  if (last !== undefined && now - last < AE_PRUNE_EVERY_MS) return;
+  prunedAt.set(dataset, now);
+  try {
+    db.query(
+      "DELETE FROM ae WHERE rowid IN (SELECT rowid FROM ae WHERE dataset = ? AND ts < ? ORDER BY ts LIMIT ?)",
+    ).run(dataset, now - AE_MAX_AGE_MS, AE_PRUNE_BATCH);
+    const held = db.query<{ n: number }, [string]>("SELECT n FROM ae_count WHERE dataset = ?").get(dataset);
+    const over = (held?.n ?? 0) - AE_MAX_ROWS;
+    if (over > 0)
+      db.query("DELETE FROM ae WHERE rowid IN (SELECT rowid FROM ae WHERE dataset = ? ORDER BY ts LIMIT ?)").run(
+        dataset,
+        Math.min(over, AE_PRUNE_BATCH),
+      );
+  } catch {
+    // A point already written must not turn into a failed write because pruning could not run; the next window retries.
+  }
+}
+
 export function cronMatches(expr: string, when: Date): boolean {
   const parts = expr.trim().split(/\s+/);
   if (parts.length !== 5) return false;

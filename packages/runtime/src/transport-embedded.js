@@ -6310,6 +6310,10 @@ function __sbEnsureSchema() {
     v,
     "CREATE TABLE IF NOT EXISTS ae (dataset TEXT NOT NULL, ts INTEGER NOT NULL, indexes_json TEXT NOT NULL, blobs_json TEXT NOT NULL, doubles_json TEXT NOT NULL)",
   );
+  // A store that predates the index gets it here, on open. (dataset, ts) also holds the rowid, so
+  // ORDER BY ts DESC, rowid DESC LIMIT n for one dataset reads n index entries and sorts nothing.
+  __sbSql(v, "CREATE INDEX IF NOT EXISTS ae_dataset_ts ON ae (dataset, ts)", []);
+  __sbAeEnsureCounter(v);
   __sbSql(
     v,
     "CREATE TABLE IF NOT EXISTS ratelimit (name TEXT NOT NULL, key TEXT NOT NULL, window_start INTEGER NOT NULL, count INTEGER NOT NULL, PRIMARY KEY (name, key))",
@@ -6319,6 +6323,69 @@ function __sbEnsureSchema() {
     v,
     "CREATE TABLE IF NOT EXISTS cache (name TEXT NOT NULL, cache_key TEXT NOT NULL, status INTEGER NOT NULL, headers_json TEXT NOT NULL, body TEXT NOT NULL, expires_at INTEGER, PRIMARY KEY (name, cache_key))",
   );
+}
+
+// Analytics Engine keeps a point count per dataset in ae_count, so query() reads one row instead of counting the
+// dataset (count(*) walks every index entry: O(n), 40 ms at 80,000 points). Two triggers keep it exact inside the
+// statement that inserts or deletes, whoever runs it: a worker of an older runtime that has no triggers of its own
+// still counts through them, so a swap or a rollback leaves no drift. The table is made, filled from the points
+// already there and given its triggers in one transaction, only when it is not there yet.
+// Same table, triggers and rule as the broker's (wire/src/broker.ts).
+function __sbAeEnsureCounter(v) {
+  const probe = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ae_count'";
+  if (__sbSql(v, probe, []).rows.length) return;
+  __sbSql(v, "BEGIN IMMEDIATE", []);
+  try {
+    if (!__sbSql(v, probe, []).rows.length) {
+      __sbSql(v, "CREATE TABLE ae_count (dataset TEXT NOT NULL PRIMARY KEY, n INTEGER NOT NULL) WITHOUT ROWID", []);
+      __sbSql(v, "INSERT INTO ae_count (dataset, n) SELECT dataset, count(*) FROM ae GROUP BY dataset", []);
+      __sbSql(
+        v,
+        "CREATE TRIGGER ae_count_ins AFTER INSERT ON ae BEGIN INSERT INTO ae_count (dataset, n) VALUES (new.dataset, 1) ON CONFLICT (dataset) DO UPDATE SET n = n + 1; END",
+        [],
+      );
+      __sbSql(v, "CREATE TRIGGER ae_count_del AFTER DELETE ON ae BEGIN UPDATE ae_count SET n = n - 1 WHERE dataset = old.dataset; END", []);
+    }
+    __sbSql(v, "COMMIT", []);
+  } catch (error) {
+    __sbSql(v, "ROLLBACK", []);
+    throw error;
+  }
+}
+
+// Analytics Engine retention. Cloudflare keeps the data points for three months
+// (https://developers.cloudflare.com/analytics/analytics-engine/limits/, "Data retention"); 92 days is the longest three
+// months, so nothing is dropped that Cloudflare would still hold. A dataset also holds at most __SB_AE_MAX_ROWS points,
+// the oldest going first: a bound on disk for an app that writes a lot (Cloudflare has none, and no disk of ours).
+// Neither rule runs on a request's way in as one big delete: a write prunes its own dataset at most every
+// __SB_AE_PRUNE_EVERY_MS per process, and removes at most __SB_AE_PRUNE_BATCH points, through the (dataset, ts) index.
+// A backlog is worked off over the writes that follow. Same constants and rules as the broker's.
+var __SB_AE_MAX_AGE_MS = 92 * 86400000;
+var __SB_AE_MAX_ROWS = 1000000;
+var __SB_AE_PRUNE_BATCH = 1000;
+var __SB_AE_PRUNE_EVERY_MS = 10000;
+var __sbAePrunedAt = {};
+function __sbAePrune(store, dataset, now) {
+  const last = __sbAePrunedAt[dataset];
+  if (last !== undefined && now - last < __SB_AE_PRUNE_EVERY_MS) return;
+  __sbAePrunedAt[dataset] = now;
+  try {
+    __sbSql(
+      store,
+      "DELETE FROM ae WHERE rowid IN (SELECT rowid FROM ae WHERE dataset = ?1 AND ts < ?2 ORDER BY ts LIMIT ?3)",
+      [dataset, now - __SB_AE_MAX_AGE_MS, __SB_AE_PRUNE_BATCH],
+    );
+    const held = __sbSql(store, "SELECT n FROM ae_count WHERE dataset = ?", [dataset]);
+    const over = held.rows.length ? Number(held.rows[0][0]) - __SB_AE_MAX_ROWS : 0;
+    if (over > 0)
+      __sbSql(
+        store,
+        "DELETE FROM ae WHERE rowid IN (SELECT rowid FROM ae WHERE dataset = ?1 ORDER BY ts LIMIT ?2)",
+        [dataset, over < __SB_AE_PRUNE_BATCH ? over : __SB_AE_PRUNE_BATCH],
+      );
+  } catch (error) {
+    // A point already written must not turn into a failed write because pruning could not run; the next window retries.
+  }
 }
 
 // One page of r2.list for the shim from 2026-10-26: at most LIMIT entries after CURSOR,
@@ -7034,17 +7101,20 @@ function __sbEmbeddedDispatch(msg) {
   }
 
   if (op === "ae.write") {
+    const aeStore = __sbVolatileStore();
+    const aeNow = Date.now();
     __sbSql(
-      __sbVolatileStore(),
+      aeStore,
       "INSERT INTO ae (dataset, ts, indexes_json, blobs_json, doubles_json) VALUES (?1,?2,?3,?4,?5)",
       [
         msg.dataset,
-        Date.now(),
+        aeNow,
         JSON.stringify(msg.indexes || []),
         JSON.stringify(msg.blobs || []),
         JSON.stringify(msg.doubles || []),
       ],
     );
+    __sbAePrune(aeStore, msg.dataset, aeNow);
     return { ok: true };
   }
   if (op === "ae.query") {
@@ -7055,7 +7125,7 @@ function __sbEmbeddedDispatch(msg) {
       "SELECT ts, indexes_json, blobs_json, doubles_json FROM ae WHERE dataset = ? ORDER BY ts DESC, rowid DESC LIMIT ?",
       [msg.dataset, limit],
     );
-    const total = __sbSql(__sbVolatileStore(), "SELECT count(*) FROM ae WHERE dataset = ?", [msg.dataset]);
+    const total = __sbSql(__sbVolatileStore(), "SELECT n FROM ae_count WHERE dataset = ?", [msg.dataset]);
     const rows = [];
     for (let i = 0; i < r.rows.length; i++) {
       rows.push({
