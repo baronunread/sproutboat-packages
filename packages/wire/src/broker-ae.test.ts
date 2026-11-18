@@ -152,3 +152,15 @@ test("100,000 points: query({limit:1}) stays fast", async () => {
   // the full scan took about 8 ms here; the index and the counter take well under 1 ms
   expect((performance.now() - t0) / 20).toBeLessThan(5);
 });
+
+test("the age rule and the cap share one run's 1,000-point budget", async () => {
+  const { path, db } = setup();
+  await write(open(path));
+  const now = Date.now();
+  fill(db, "M", 1000, now - 93 * DAY); // expired
+  fill(db, "M", 1_001_000, now - 60_000); // young, over the cap
+  expect(counter(db, "M")).toBe(1_002_001);
+  await write(open(path));
+  expect(counter(db, "M")).toBe(1_002_002 - 1000); // not 2,000 gone
+  expect(count(db, "M")).toBe(counter(db, "M"));
+});

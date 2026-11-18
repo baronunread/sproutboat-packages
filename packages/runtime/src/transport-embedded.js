@@ -6313,7 +6313,13 @@ function __sbEnsureSchema() {
   // A store that predates the index gets it here, on open. (dataset, ts) also holds the rowid, so
   // ORDER BY ts DESC, rowid DESC LIMIT n for one dataset reads n index entries and sorts nothing.
   __sbSql(v, "CREATE INDEX IF NOT EXISTS ae_dataset_ts ON ae (dataset, ts)", []);
-  __sbAeEnsureCounter(v);
+  try {
+    __sbAeEnsureCounter(v);
+  } catch (error) {
+    // e.g. the write lock was held past the busy timeout: the next call starts the schema over (every statement before is idempotent).
+    __sbSchemaReady = false;
+    throw error;
+  }
   __sbSql(
     v,
     "CREATE TABLE IF NOT EXISTS ratelimit (name TEXT NOT NULL, key TEXT NOT NULL, window_start INTEGER NOT NULL, count INTEGER NOT NULL, PRIMARY KEY (name, key))",
@@ -6358,8 +6364,12 @@ function __sbAeEnsureCounter(v) {
 // months, so nothing is dropped that Cloudflare would still hold. A dataset also holds at most __SB_AE_MAX_ROWS points,
 // the oldest going first: a bound on disk for an app that writes a lot (Cloudflare has none, and no disk of ours).
 // Neither rule runs on a request's way in as one big delete: a write prunes its own dataset at most every
-// __SB_AE_PRUNE_EVERY_MS per process, and removes at most __SB_AE_PRUNE_BATCH points, through the (dataset, ts) index.
-// A backlog is worked off over the writes that follow. Same constants and rules as the broker's.
+// __SB_AE_PRUNE_EVERY_MS per process, and a run removes at most __SB_AE_PRUNE_BATCH points in all (both rules share it),
+// through the (dataset, ts) index. A backlog is worked off over the writes that follow; at a sustained rate above about
+// 100 writes a second to one dataset from one process the cap is a soft bound. Same constants and rules as the broker's.
+// Deleting is observable to an existing app, so only an app of compatibility date __SB_AE_RETENTION_FROM or later prunes
+// (the index and the counter change nothing it can see and apply to every app).
+var __SB_AE_RETENTION_FROM = "2026-11-19";
 var __SB_AE_MAX_AGE_MS = 92 * 86400000;
 var __SB_AE_MAX_ROWS = 1000000;
 var __SB_AE_PRUNE_BATCH = 1000;
@@ -6370,18 +6380,19 @@ function __sbAePrune(store, dataset, now) {
   if (last !== undefined && now - last < __SB_AE_PRUNE_EVERY_MS) return;
   __sbAePrunedAt[dataset] = now;
   try {
-    __sbSql(
+    const aged = __sbSql(
       store,
       "DELETE FROM ae WHERE rowid IN (SELECT rowid FROM ae WHERE dataset = ?1 AND ts < ?2 ORDER BY ts LIMIT ?3)",
       [dataset, now - __SB_AE_MAX_AGE_MS, __SB_AE_PRUNE_BATCH],
     );
     const held = __sbSql(store, "SELECT n FROM ae_count WHERE dataset = ?", [dataset]);
     const over = held.rows.length ? Number(held.rows[0][0]) - __SB_AE_MAX_ROWS : 0;
-    if (over > 0)
+    const room = __SB_AE_PRUNE_BATCH - Number(aged.changes);
+    if (over > 0 && room > 0)
       __sbSql(
         store,
         "DELETE FROM ae WHERE rowid IN (SELECT rowid FROM ae WHERE dataset = ?1 ORDER BY ts LIMIT ?2)",
-        [dataset, over < __SB_AE_PRUNE_BATCH ? over : __SB_AE_PRUNE_BATCH],
+        [dataset, over < room ? over : room],
       );
   } catch (error) {
     // A point already written must not turn into a failed write because pruning could not run; the next window retries.
@@ -7114,7 +7125,7 @@ function __sbEmbeddedDispatch(msg) {
         JSON.stringify(msg.doubles || []),
       ],
     );
-    __sbAePrune(aeStore, msg.dataset, aeNow);
+    if (__sbCompatDate() >= __SB_AE_RETENTION_FROM) __sbAePrune(aeStore, msg.dataset, aeNow);
     return { ok: true };
   }
   if (op === "ae.query") {

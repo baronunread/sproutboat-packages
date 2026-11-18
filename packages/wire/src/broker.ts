@@ -2613,8 +2613,10 @@ export function ensureAeCounter(db: Database): void {
  * months, so nothing is dropped that Cloudflare would still hold. A dataset also holds at most AE_MAX_ROWS points, the
  * oldest going first: a bound on disk for an app that writes a lot (Cloudflare has none, and no disk of ours).
  * Neither rule runs on a request's way in as one big delete: a write prunes its own dataset at most every
- * AE_PRUNE_EVERY_MS, and removes at most AE_PRUNE_BATCH points, through the (dataset, ts) index. A backlog is worked off
- * over the writes that follow. Same constants and rules as the embedded transport's.
+ * AE_PRUNE_EVERY_MS, and a run removes at most AE_PRUNE_BATCH points in all (both rules share it), through the
+ * (dataset, ts) index. A backlog is worked off over the writes that follow; at a sustained rate above about 100 writes a
+ * second to one dataset from one broker the cap is a soft bound. Same constants and rules as the embedded transport's,
+ * except that the broker (the `sproutboat dev` store) has no compatibility date to gate on, so it always prunes.
  */
 export const AE_MAX_AGE_MS = 92 * 86_400_000;
 export const AE_MAX_ROWS = 1_000_000;
@@ -2625,15 +2627,16 @@ function pruneAe(db: Database, prunedAt: Map<string, number>, dataset: string, n
   if (last !== undefined && now - last < AE_PRUNE_EVERY_MS) return;
   prunedAt.set(dataset, now);
   try {
-    db.query(
-      "DELETE FROM ae WHERE rowid IN (SELECT rowid FROM ae WHERE dataset = ? AND ts < ? ORDER BY ts LIMIT ?)",
-    ).run(dataset, now - AE_MAX_AGE_MS, AE_PRUNE_BATCH);
+    const aged = db
+      .query("DELETE FROM ae WHERE rowid IN (SELECT rowid FROM ae WHERE dataset = ? AND ts < ? ORDER BY ts LIMIT ?)")
+      .run(dataset, now - AE_MAX_AGE_MS, AE_PRUNE_BATCH);
     const held = db.query<{ n: number }, [string]>("SELECT n FROM ae_count WHERE dataset = ?").get(dataset);
     const over = (held?.n ?? 0) - AE_MAX_ROWS;
-    if (over > 0)
+    const room = AE_PRUNE_BATCH - aged.changes;
+    if (over > 0 && room > 0)
       db.query("DELETE FROM ae WHERE rowid IN (SELECT rowid FROM ae WHERE dataset = ? ORDER BY ts LIMIT ?)").run(
         dataset,
-        Math.min(over, AE_PRUNE_BATCH),
+        Math.min(over, room),
       );
   } catch {
     // A point already written must not turn into a failed write because pruning could not run; the next window retries.

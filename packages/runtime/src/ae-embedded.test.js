@@ -39,7 +39,7 @@ function sqlRaw(path, sql, paramsJson) {
   }
 }
 // A fresh copy of the transport per app process: its module state (schema flag, prune clock) is per process.
-function process(dir) {
+function process(dir, compat = "2026-11-19") {
   const patched = source.replace("function __sbSqlRaw(", "function __sbSqlRawC(");
   // oxlint-disable-next-line no-function-constructor -- the transport is spliced in as text in production too
   const load = new Function(
@@ -47,6 +47,7 @@ function process(dir) {
     "__sbSqlRaw",
     "__sbEnv",
     "__sbDirBytesRaw",
+    "__sbCompatDate",
     `${patched}\nreturn { dispatch: __sbEmbeddedDispatch };`,
   );
   const env = { SB_DATA_DIR: dir };
@@ -55,6 +56,7 @@ function process(dir) {
     sqlRaw,
     (k) => env[k] || "",
     () => "0 0",
+    () => compat,
   );
   return (msg) => t.dispatch(msg);
 }
@@ -179,4 +181,31 @@ test("100,000 points: query({limit:1}) stays fast", () => {
   const each = (performance.now() - t0) / 20;
   // 85 ms with the full scan; well under 1 ms with the index and the counter
   expect(each).toBeLessThan(10);
+});
+
+test("an app older than compatibility date 2026-11-19 keeps every point; the index and the counter apply to it too", () => {
+  const { dir, store } = setup();
+  const call = process(dir, "2026-11-18");
+  write(call, "M");
+  fill(store, "M", 1500, Date.now() - 200 * DAY);
+  write(process(dir, "2026-11-18"), "M");
+  expect(count(store, "M")).toBe(1502);
+  expect(counter(store, "M")).toBe(1502);
+  expect(call({ op: "ae.query", dataset: "M", limit: 1 }).count).toBe(1502);
+  expect(open(store).query("PRAGMA index_list(ae)").all().length).toBe(1);
+  // the same store, opened by an app from the date on, starts pruning
+  write(process(dir, "2026-11-19"), "M");
+  expect(count(store, "M")).toBe(1503 - 1000);
+});
+
+test("the age rule and the cap share one run's 1,000-point budget", () => {
+  const { dir, store } = setup();
+  write(process(dir), "M");
+  const now = Date.now();
+  fill(store, "M", 1000, now - 93 * DAY); // expired
+  fill(store, "M", 1001000, now - 60000); // young, over the cap
+  expect(counter(store, "M")).toBe(1002001);
+  write(process(dir), "M");
+  expect(counter(store, "M")).toBe(1002002 - 1000); // not 2,000 gone
+  expect(count(store, "M")).toBe(counter(store, "M"));
 });
